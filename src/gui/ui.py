@@ -53,6 +53,7 @@ class LanguageManager(QObject):
             # Parameters
             'temperature': "Temperature",
             'top_p': "Top-p",
+            'max_tempo': "Max Tempo",
             # Main Controls
             'original_score': "Original",
             'version_button': "V{0}",
@@ -93,6 +94,7 @@ class LanguageManager(QObject):
             # Parameters
             'temperature': "Temperature",
             'top_p': "Top-p",
+            'max_tempo': "最大速度",
             # Main Controls
             'original_score': "原乐谱",
             'version_button': "V{0}",
@@ -392,6 +394,7 @@ class AIPianistWindow(QWidget):
         # Parameters
         self.temp_label.setText(self.tr("temperature"))
         self.topp_label.setText(self.tr("top_p"))
+        self.max_tempo_label.setText(self.tr("max_tempo"))
 
         # Bottom controls
         self.switch_to_original_btn.setText(self.tr("original_score"))
@@ -551,7 +554,8 @@ class AIPianistWindow(QWidget):
         self.topp_slider.setEnabled(enabled)
         self.save_render_button.setEnabled(enabled)
         self.save_editable_button.setEnabled(enabled)
-        
+        self.max_tempo_slider.setEnabled(enabled)
+
         if enabled:
             self._update_ui_states()
 
@@ -625,13 +629,40 @@ class AIPianistWindow(QWidget):
         layout = QHBoxLayout(); layout.setSpacing(15)
         # MODIFIED: Store labels as instance variables to retranslate them
         self.temp_label = QLabel()
-        self.temp_slider = QSlider(Qt.Horizontal); self.temp_slider.setRange(0, 200); self.temp_slider.setValue(100)
-        self.temp_value_label = QLabel("1.00"); self.temp_slider.valueChanged.connect(lambda val: self.temp_value_label.setText(f"{val/100.0:.2f}"))
+        self.temp_slider = QSlider(Qt.Horizontal)
+        self.temp_slider.setRange(0, 200)
+        self.temp_slider.setValue(100)
+        self.temp_value_label = QLabel("1.00")
+        self.temp_slider.valueChanged.connect(lambda val: self.temp_value_label.setText(f"{val/100.0:.2f}"))
+        
         self.topp_label = QLabel()
-        self.topp_slider = QSlider(Qt.Horizontal); self.topp_slider.setRange(0, 100); self.topp_slider.setValue(95)
-        self.topp_value_label = QLabel("0.95"); self.topp_slider.valueChanged.connect(lambda val: self.topp_value_label.setText(f"{val/100.0:.2f}"))
-        for widget in [self.temp_label, self.temp_slider, self.temp_value_label, self.topp_label, self.topp_slider, self.topp_value_label]: layout.addWidget(widget)
-        layout.setStretch(1, 1); layout.setStretch(4, 1); return layout
+        self.topp_slider = QSlider(Qt.Horizontal)
+        self.topp_slider.setRange(0, 100)
+        self.topp_slider.setValue(95)
+        self.topp_value_label = QLabel("0.95")
+        self.topp_slider.valueChanged.connect(lambda val: self.topp_value_label.setText(f"{val/100.0:.2f}"))
+        
+        self.max_tempo_label = QLabel()
+        self.max_tempo_slider = QSlider(Qt.Horizontal)
+        self.max_tempo_slider.setRange(200, 999)
+        self.max_tempo_slider.setValue(300)
+        self.max_tempo_value_label = QLabel("300")
+        self.max_tempo_slider.valueChanged.connect(lambda val: self.max_tempo_value_label.setText(str(val)))
+
+        widgets = [
+            self.temp_label, self.temp_slider, self.temp_value_label,
+            self.topp_label, self.topp_slider, self.topp_value_label,
+            self.max_tempo_label, self.max_tempo_slider, self.max_tempo_value_label
+        ]
+        
+        for widget in widgets:
+            layout.addWidget(widget)
+            
+        layout.setStretch(1, 1)
+        layout.setStretch(4, 1)
+        layout.setStretch(7, 1)
+        
+        return layout
 
     def format_time(self, current_sec, total_sec):
         curr_min, curr_sec_rem = divmod(current_sec, 60); total_min, total_sec_rem = divmod(total_sec, 60)
@@ -686,7 +717,8 @@ class AIPianistWindow(QWidget):
         filePath, _ = QFileDialog.getSaveFileName(self, self.tr("save_editable_dialog_title"), default_filename, "MIDI Files (*.mid *.midi)", options=options)
         if filePath:
             try:
-                mapped_midi = map_midi(self.original_midi_obj, active_rendered_midi)
+                max_tempo_val = self.max_tempo_slider.value()
+                mapped_midi = map_midi(self.original_midi_obj, active_rendered_midi, max_tempo_val)
                 mapped_midi.dump(filePath)
                 print(f"Editable MIDI saved to {filePath}")
             except Exception as e:

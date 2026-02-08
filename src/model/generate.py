@@ -123,7 +123,7 @@ def batch_performance_render(
     return res
 
 
-def map_midi(score_midi_obj, performance_midi_obj):
+def map_midi(score_midi_obj, performance_midi_obj, max_tempo=300):
     def compute_duration(start_time, target_duration, tempo_list):
         if target_duration <= 0:
             return 0
@@ -179,7 +179,7 @@ def map_midi(score_midi_obj, performance_midi_obj):
     for i in range(len(score_tempo_change_points) - 1):
         s_ioi = score_tempo_change_points[i+1][0] - score_tempo_change_points[i][0]
         p_ioi = score_tempo_change_points[i+1][1] - score_tempo_change_points[i][1]
-        tempo = max(min(round(s_ioi / p_ioi * 120), 300), 10)
+        tempo = max(min(round(s_ioi / p_ioi * 120), max_tempo), 10)
         tempo_changes.append(TempoChange(tempo, score_tempo_change_points[i][0]))
         tempo_changes_list.append((tempo, score_tempo_change_points[i][2]))
     norm_score.tempo_changes = tempo_changes

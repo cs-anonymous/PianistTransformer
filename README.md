@@ -162,6 +162,7 @@ Our GUI is divided into three main sections: **Control & Parameters**, **Status 
 2.  **Adjust Generation Parameters**:
     *   **`Temperature`**: Controls the randomness of the generated output. A higher value leads to a more "improvisational" feel, while a lower value makes the result more stable and deterministic.
     *   **`Top-p`**: A more advanced sampling strategy that controls the diversity of the output. It is generally recommended to keep the default value.
+    *   **`Max Tempo`**: Controls the maximum tempo value when saving the edited rendered MIDI. Any tempo exceeding this value will be clipped.
 
 3.  **Start Rendering**:
     Once the parameters are set, click `Render` or `Render Again` to start the process. The circular progress bar in the center (`Rendering...`) will show the real-time progress. You can click `Cancel` at any time to terminate the current task.
