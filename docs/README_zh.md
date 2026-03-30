@@ -14,6 +14,15 @@
 - **高效非对称架构**: 采用10层Encoder和2层Decoder的非对称结构，结合编码器序列压缩技术，在保证强大建模能力的同时，实现了`2.1x`的推理加速。可在CPU上高效推理。
 - **可扩展的训练范式**: "预训练-微调"的两阶段训练流程，有效克服了监督数据稀缺的瓶颈。
 - **媲美人类的生成效果**: 在客观和主观评测中，Pianist Transformer 的生成效果均达到SOTA，且在主观盲听测试中与人类钢琴家统计上无法区分。
+- **可编辑的演奏 MIDI 输出**：除了生成富有表现力的钢琴演奏之外，Pianist Transformer 还支持面向真实音乐制作场景的可编辑工作流。通过我们提出的Expressive Tempo Mapping算法，模型输出可以被转换为适用于 DAW 的 MIDI 文件，其中演奏中的速度变化会以动态 tempo curve 的形式表示，同时保留生成结果中的力度、发音和踏板等表情细节。这使得渲染结果不仅具有表现力，而且可以直接用于后续编曲与制作。
+
+## 视频演示
+我们提供了两个 B 站演示视频，展示了 Pianist Transformer 在真实应用场景中的使用案例：
+
+- **AI 渲染钢琴伴奏 + 人类小提琴旋律演奏:** 在这个演示中，Pianist Transformer 被用于生成富有表现力且可编辑的钢琴伴奏MIDI。在经过少量后期调整之后，人类演奏者使用MIDI键盘和MIDI呼吸控制器，演奏小提琴旋律与之进行实时合奏。这个例子展示了 Pianist Transformer 如何支持灵活、可交互的人机音乐表演工作流。（视频中展示的 DAW画面是后期补录用于演示说明的，并不是实际演奏时的电脑屏幕画面）[点击观看](https://www.bilibili.com/video/BV1Qy2jBJEdS/?share_source=copy_web&vd_source=170ea94eca2d273dffbe75cdc4aac193)
+
+- **作曲家用户案例展示:** 在这个演示中，一位作曲家用户使用 Pianist Transformer 对自己的原创钢琴曲的乐谱MIDI进行了渲染，并制作了演示demo。这个例子展示了该系统如何帮助作曲者快速将原始乐谱转化为富有表现力的钢琴演奏，用于展示和分享。[点击观看](https://www.bilibili.com/video/BV1ZUrABrEZj/?share_source=copy_web&vd_source=170ea94eca2d273dffbe75cdc4aac193)
+  
 
 ## 环境依赖
 本项目已在以下环境配置下通过测试。我们强烈建议您使用 `conda` 或 `venv` 创建独立的虚拟环境，以避免与您系统中已有的软件包产生冲突。

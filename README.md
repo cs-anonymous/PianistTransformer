@@ -14,6 +14,15 @@ Our work demonstrates that by pre-training on billions of tokens of unlabeled MI
 - **Efficient Asymmetric Architecture**: Employs an asymmetric structure with a 10-layer Encoder and a 2-layer Decoder, combined with encoder sequence compression, to achieve a `2.1x` inference speedup while maintaining powerful modeling capabilities. Enables efficient inference on CPUs.
 - **Scalable Training Paradigm**: A two-stage "pre-train, fine-tune" workflow that effectively overcomes the bottleneck of scarce supervised data.
 - **Human-Level Generation Quality**: Pianist Transformer achieves State-Of-The-Art (SOTA) results in both objective and subjective evaluations, and is statistically indistinguishable from human pianists in subjective blind listening tests.
+- **Editable Performance MIDI Output**: Beyond generating expressive piano performances, Pianist Transformer also supports an editable workflow for real-world music production. With our proposed Expressive Tempo Mapping algorithm, the model output can be converted into a DAW-friendly MIDI file, where expressive timing variations are represented as a dynamic tempo curve while preserving performance details such as velocity, articulation, and pedal control. This makes the rendered result not only expressive, but also directly usable for further arranging and production.
+
+## Video Demos
+We provide two demo videos on Bilibili to showcase real-world use cases of Pianist Transformer:
+
+- **AI-rendered Piano Accompaniment + Human Violin Melody Performance**: In this demo, Pianist Transformer was used to generate an expressive and editable piano accompaniment MIDI. After slight post-editing, a human performer used a MIDI keyboard and a MIDI breath controller to perform a violin-style melody in real-time duet with the rendered accompaniment. This example demonstrates how Pianist Transformer can support flexible and interactive human-AI music performance workflows. (The DAW footage shown in the video was recorded separately afterwards for presentation purposes, and does not reflect the actual computer screen during the live performance.) [Watch on Bilibili](https://www.bilibili.com/video/BV1Qy2jBJEdS/?share_source=copy_web&vd_source=170ea94eca2d273dffbe75cdc4aac193)
+
+- **Composer User Showcase**: In this demo, a composer user used Pianist Transformer to render the score MIDI of an original piano piece and produce a demo performance. This example shows how the system can help composers quickly transform a raw score into an expressive piano performance for presentation and sharing. [Watch on Bilibili](https://www.bilibili.com/video/BV1ZUrABrEZj/?share_source=copy_web&vd_source=170ea94eca2d273dffbe75cdc4aac193)
+
 
 ## Environment Dependencies
 This project has been tested under the following environment configurations. We highly recommend using `conda` or `venv` to create an isolated virtual environment to avoid conflicts with existing packages on your system.
