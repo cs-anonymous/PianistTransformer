@@ -19,7 +19,7 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in os.sys.path:
     os.sys.path.insert(0, str(ROOT_DIR))
 
-from src.model.hybrid_pianoformer import HybridPianoT5Gemma, HybridPianoT5GemmaConfig
+from src.model.hybrid_pianoformer import HybridPianoT5Gemma, HybridPianoT5GemmaConfig, HybridPianoTransformer
 from src.utils.func import filter_valid_args
 
 
@@ -36,6 +36,24 @@ def print_model_parameters(model):
     print(f"Total Parameters (M):     {total_params / 1_000_000:.2f}M")
     print(f"Trainable Parameters (M): {trainable_params / 1_000_000:.2f}M")
     print("--------------------------------------------------")
+
+
+def load_torch_state_dict(checkpoint_path):
+    checkpoint_path = Path(checkpoint_path)
+    if checkpoint_path.is_dir():
+        safetensors_path = checkpoint_path / "model.safetensors"
+        pytorch_path = checkpoint_path / "pytorch_model.bin"
+        if safetensors_path.exists():
+            from safetensors.torch import load_file
+
+            return load_file(str(safetensors_path))
+        if pytorch_path.exists():
+            checkpoint = torch.load(pytorch_path, map_location="cpu")
+        else:
+            raise FileNotFoundError(f"No model.safetensors or pytorch_model.bin in {checkpoint_path}")
+    else:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    return checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
 
 
 def score_json_path(refined_dir, score_rel_path):
@@ -220,6 +238,8 @@ class PianoCoReNodeSFTDataset(Dataset):
             "continuous": score["score_continuous"][start:end],
             "labels_continuous": labels[start:end],
             "interpolated": interpolated[start:end],
+            "performance_dataset": perf.get("performance_dataset", "unknown"),
+            "performance_id": perf.get("performance_id", "unknown"),
         }
 
 
@@ -272,7 +292,9 @@ class NodeSFTDataCollator:
 
 def create_model(train_config):
     dtype = torch.bfloat16 if train_config.get("bf16", False) and torch.cuda.is_available() else torch.float32
+    backbone_type = train_config.get("backbone_type", "t5").lower()
     model_config = HybridPianoT5GemmaConfig(
+        backbone_type=backbone_type,
         hidden_size=train_config["hidden_size"],
         intermediate_size=train_config["intermediate_size"],
         num_attention_heads=train_config["num_attention_heads"],
@@ -280,6 +302,10 @@ def create_model(train_config):
         head_dim=train_config["head_dim"],
         encoder_layers_num=train_config["encoder_layers_num"],
         decoder_layers_num=train_config["decoder_layers_num"],
+        gpt_layers_num=train_config.get("gpt_layers_num"),
+        bert_layers_num=train_config.get("bert_layers_num"),
+        max_position_embeddings=train_config.get("max_position_embeddings", 4096),
+        attention_dropout=train_config.get("attention_dropout", 0.0),
         continuous_dim=train_config["continuous_dim"],
         max_time_ms=train_config["max_time_ms"],
         time_loss_type=train_config["time_loss_type"],
@@ -292,13 +318,25 @@ def create_model(train_config):
 
     resume_path = train_config.get("resume_path")
     if resume_path:
-        model = HybridPianoT5Gemma.from_pretrained(resume_path, torch_dtype=dtype)
-        print(f"Loaded HybridPianoT5Gemma checkpoint from {resume_path}")
+        if backbone_type in {"t5", "t5gemma"}:
+            model = HybridPianoT5Gemma.from_pretrained(resume_path, torch_dtype=dtype)
+        else:
+            model = HybridPianoTransformer(model_config)
+            model.load_state_dict(load_torch_state_dict(resume_path))
+        print(f"Loaded Hybrid {backbone_type} checkpoint from {resume_path}")
         return model
 
-    model = HybridPianoT5Gemma(model_config)
+    if backbone_type in {"t5", "t5gemma"}:
+        model = HybridPianoT5Gemma(model_config)
+    elif backbone_type in {"bert", "gpt"}:
+        model = HybridPianoTransformer(model_config)
+    else:
+        raise ValueError(f"Unsupported backbone_type: {backbone_type}")
+
     pretrained_model = train_config.get("pretrained_model")
     if pretrained_model and train_config.get("load_pianoformer_backbone", True):
+        if backbone_type not in {"t5", "t5gemma"}:
+            raise ValueError("load_pianoformer_backbone is only supported for t5 backbones")
         incompatible = model.load_pianoformer_backbone(pretrained_model, torch_dtype=dtype)
         print(f"Loaded PianistTransformer backbone from {pretrained_model}")
         print(f"Missing keys: {len(incompatible.missing_keys)}")
@@ -385,6 +423,7 @@ def main():
         seed=train_config["seed"],
         max_performances_per_work=train_config.get("max_performances_per_work"),
         max_windows_per_work=train_config.get("max_windows_per_work"),
+        cache_size=train_config.get("node_cache_size", 16),
     )
     eval_dataset = PianoCoReNodeSFTDataset(
         eval_manifest,
@@ -393,6 +432,7 @@ def main():
         seed=train_config["seed"],
         max_performances_per_work=train_config.get("max_eval_performances_per_work"),
         max_windows_per_work=train_config.get("max_eval_windows_per_work"),
+        cache_size=train_config.get("node_cache_size", 16),
     )
 
     model = create_model(train_config)

@@ -15,7 +15,7 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT_DIR))
 
 from src.evaluate.epr_metrics import EPRMetrics, extract_features_from_continuous
-from src.model.hybrid_pianoformer import HybridPianoT5Gemma, HybridPianoT5GemmaConfig
+from src.model.hybrid_pianoformer import HybridPianoT5Gemma, HybridPianoT5GemmaConfig, HybridPianoTransformer
 from src.train.sft_node import PianoCoReNodeSFTDataset, build_work_manifest, NodeSFTDataCollator
 
 
@@ -24,12 +24,18 @@ def load_model(checkpoint_path, config):
     checkpoint_path = Path(checkpoint_path)
     print(f"Loading model from {checkpoint_path}")
 
+    backbone_type = config.get('backbone_type', 't5').lower()
     model_config = HybridPianoT5GemmaConfig(
+        backbone_type=backbone_type,
         continuous_dim=config.get('continuous_dim', 7),
         max_time_ms=config.get('max_time_ms', 10000.0),
         pitch_pad_id=config.get('pitch_pad_id', 128),
         encoder_layers_num=config.get('encoder_layers_num', 10),
         decoder_layers_num=config.get('decoder_layers_num', 2),
+        gpt_layers_num=config.get('gpt_layers_num'),
+        bert_layers_num=config.get('bert_layers_num'),
+        max_position_embeddings=config.get('max_position_embeddings', 4096),
+        attention_dropout=config.get('attention_dropout', 0.0),
         hidden_size=config.get('hidden_size', 768),
         intermediate_size=config.get('intermediate_size', 3072),
         num_attention_heads=config.get('num_attention_heads', 8),
@@ -37,7 +43,12 @@ def load_model(checkpoint_path, config):
         head_dim=config.get('head_dim', 128),
     )
 
-    model = HybridPianoT5Gemma(model_config)
+    if backbone_type in {'t5', 't5gemma'}:
+        model = HybridPianoT5Gemma(model_config)
+    elif backbone_type in {'bert', 'gpt'}:
+        model = HybridPianoTransformer(model_config)
+    else:
+        raise ValueError(f"Unsupported backbone_type: {backbone_type}")
 
     # Load checkpoint - try multiple formats
     if checkpoint_path.is_dir():
@@ -90,13 +101,14 @@ def predict_batch(model, batch, device):
         return continuous_pred.cpu().numpy(), attention_mask.cpu().numpy()
 
 
-def evaluate_model(model, dataset, config, device='cuda', max_batches=None, pedal_method='binary'):
+def evaluate_model(model, dataset, config, device='cuda', max_batches=None):
     """
     Evaluate model on dataset.
+    Computes BOTH binary and continuous pedal metrics in one pass.
 
     Returns:
-        pred_features: dict of concatenated predictions
-        target_features: dict of concatenated targets
+        pred_features_binary, target_features_binary,
+        pred_features_continuous, target_features_continuous
     """
     model = model.to(device)
     model.eval()
@@ -140,30 +152,45 @@ def evaluate_model(model, dataset, config, device='cuda', max_batches=None, peda
         all_target_continuous.append(target_continuous)
         all_masks.append(mask)
 
-    # Extract features batch by batch to avoid dimension mismatch
-    print("Extracting features...")
+    # Extract features batch by batch - compute BOTH binary and continuous
+    print("Extracting features (binary and continuous pedal methods)...")
 
-    pred_features_list = {'velocity': [], 'duration': [], 'ioi': [], 'pedal': []}
-    target_features_list = {'velocity': [], 'duration': [], 'ioi': [], 'pedal': []}
+    # Binary pedal
+    pred_features_binary_list = {'velocity': [], 'duration': [], 'ioi': [], 'pedal': []}
+    target_features_binary_list = {'velocity': [], 'duration': [], 'ioi': [], 'pedal': []}
+
+    # Continuous pedal
+    pred_features_continuous_list = {'velocity': [], 'duration': [], 'ioi': [], 'pedal': []}
+    target_features_continuous_list = {'velocity': [], 'duration': [], 'ioi': [], 'pedal': []}
 
     for pred_batch, target_batch, mask_batch in zip(all_pred_continuous, all_target_continuous, all_masks):
-        # Extract features for this batch
-        use_joint_config = (pedal_method == 'binary')
-        pred_feats = extract_features_from_continuous(pred_batch, mask_batch, pedal_as_joint_config=use_joint_config)
-        target_feats = extract_features_from_continuous(target_batch, mask_batch, pedal_as_joint_config=use_joint_config)
+        # Extract binary pedal features
+        pred_feats_binary = extract_features_from_continuous(pred_batch, mask_batch, pedal_as_joint_config=True)
+        target_feats_binary = extract_features_from_continuous(target_batch, mask_batch, pedal_as_joint_config=True)
 
-        # Append to lists
-        for key in pred_features_list.keys():
-            pred_features_list[key].append(pred_feats[key])
-            target_features_list[key].append(target_feats[key])
+        for key in pred_features_binary_list.keys():
+            pred_features_binary_list[key].append(pred_feats_binary[key])
+            target_features_binary_list[key].append(target_feats_binary[key])
+
+        # Extract continuous pedal features
+        pred_feats_continuous = extract_features_from_continuous(pred_batch, mask_batch, pedal_as_joint_config=False)
+        target_feats_continuous = extract_features_from_continuous(target_batch, mask_batch, pedal_as_joint_config=False)
+
+        for key in pred_features_continuous_list.keys():
+            pred_features_continuous_list[key].append(pred_feats_continuous[key])
+            target_features_continuous_list[key].append(target_feats_continuous[key])
 
     # Concatenate all features
-    pred_features = {k: np.concatenate(v) for k, v in pred_features_list.items()}
-    target_features = {k: np.concatenate(v) for k, v in target_features_list.items()}
+    pred_features_binary = {k: np.concatenate(v) for k, v in pred_features_binary_list.items()}
+    target_features_binary = {k: np.concatenate(v) for k, v in target_features_binary_list.items()}
 
-    print(f"Collected {len(pred_features['velocity'])} total notes")
+    pred_features_continuous = {k: np.concatenate(v) for k, v in pred_features_continuous_list.items()}
+    target_features_continuous = {k: np.concatenate(v) for k, v in target_features_continuous_list.items()}
 
-    return pred_features, target_features
+    print(f"Collected {len(pred_features_binary['velocity'])} total notes")
+
+    return (pred_features_binary, target_features_binary,
+            pred_features_continuous, target_features_continuous)
 
 
 def main():
@@ -173,8 +200,6 @@ def main():
     parser.add_argument('--output', type=str, default='evaluation_results.json', help='Output JSON file')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use')
     parser.add_argument('--max-samples', type=int, default=None, help='Max samples to evaluate (for quick test)')
-    parser.add_argument('--pedal-method', type=str, default='binary', choices=['binary', 'continuous'],
-                       help='Pedal evaluation method: binary (PT-style 16 configs) or continuous (128 bins)')
     args = parser.parse_args()
 
     # Load config
@@ -187,7 +212,7 @@ def main():
     print(f"Config: {args.config}")
     print(f"Checkpoint: {args.checkpoint}")
     print(f"Device: {args.device}")
-    print(f"Pedal method: {args.pedal_method}")
+    print("Computing BOTH binary and continuous pedal metrics")
     print()
 
     # Build test dataset
@@ -224,48 +249,94 @@ def main():
         max_batches = (args.max_samples + batch_size - 1) // batch_size
         print(f"Limiting to {args.max_samples} samples ({max_batches} batches)")
 
-    # Evaluate
-    pred_features, target_features = evaluate_model(
+    # Evaluate - gets both binary and continuous features
+    (pred_features_binary, target_features_binary,
+     pred_features_continuous, target_features_continuous) = evaluate_model(
         model, test_dataset, config,
         device=args.device,
-        max_batches=max_batches,
-        pedal_method=args.pedal_method
+        max_batches=max_batches
     )
 
     print()
-    print("Computing metrics...")
+    print("Computing metrics for binary and continuous pedal methods...")
 
-    # Compute metrics
-    metrics_calculator = EPRMetrics(bins=100)
-    use_joint_config = (args.pedal_method == 'binary')
-    results = metrics_calculator.compute_metrics(pred_features, target_features, pedal_is_joint_config=use_joint_config)
+    # Binary pedal metrics
+    print("\n" + "=" * 60)
+    print("Binary Pedal Method (BPedal)")
+    print("=" * 60)
 
-    # Print results
-    print()
-    print(metrics_calculator.format_results(results))
-    print()
+    metrics_calculator_binary = EPRMetrics(bins=100)
+    results_binary = metrics_calculator_binary.compute_metrics(
+        pred_features_binary, target_features_binary,
+        pedal_is_joint_config=True
+    )
+    print(metrics_calculator_binary.format_results(results_binary))
 
-    # Add feature statistics
-    results['feature_stats'] = {
-        'pred': {
-            'velocity_mean': float(np.mean(pred_features['velocity'])),
-            'velocity_std': float(np.std(pred_features['velocity'])),
-            'duration_mean': float(np.mean(pred_features['duration'])),
-            'duration_std': float(np.std(pred_features['duration'])),
-            'ioi_mean': float(np.mean(pred_features['ioi'])),
-            'ioi_std': float(np.std(pred_features['ioi'])),
-            'pedal_mean': float(np.mean(pred_features['pedal'])),
-            'pedal_std': float(np.std(pred_features['pedal'])),
+    # Continuous pedal metrics
+    print("\n" + "=" * 60)
+    print("Continuous Pedal Method (CPedal)")
+    print("=" * 60)
+
+    metrics_calculator_continuous = EPRMetrics(bins=100)
+    results_continuous = metrics_calculator_continuous.compute_metrics(
+        pred_features_continuous, target_features_continuous,
+        pedal_is_joint_config=False
+    )
+    print(metrics_calculator_continuous.format_results(results_continuous))
+
+    # Combine results
+    results = {
+        'binary': {
+            'pedal_method': 'binary',
+            'metrics': results_binary,
+            'feature_stats': {
+                'pred': {
+                    'velocity_mean': float(np.mean(pred_features_binary['velocity'])),
+                    'velocity_std': float(np.std(pred_features_binary['velocity'])),
+                    'duration_mean': float(np.mean(pred_features_binary['duration'])),
+                    'duration_std': float(np.std(pred_features_binary['duration'])),
+                    'ioi_mean': float(np.mean(pred_features_binary['ioi'])),
+                    'ioi_std': float(np.std(pred_features_binary['ioi'])),
+                    'pedal_mean': float(np.mean(pred_features_binary['pedal'])),
+                    'pedal_std': float(np.std(pred_features_binary['pedal'])),
+                },
+                'target': {
+                    'velocity_mean': float(np.mean(target_features_binary['velocity'])),
+                    'velocity_std': float(np.std(target_features_binary['velocity'])),
+                    'duration_mean': float(np.mean(target_features_binary['duration'])),
+                    'duration_std': float(np.std(target_features_binary['duration'])),
+                    'ioi_mean': float(np.mean(target_features_binary['ioi'])),
+                    'ioi_std': float(np.std(target_features_binary['ioi'])),
+                    'pedal_mean': float(np.mean(target_features_binary['pedal'])),
+                    'pedal_std': float(np.std(target_features_binary['pedal'])),
+                }
+            }
         },
-        'target': {
-            'velocity_mean': float(np.mean(target_features['velocity'])),
-            'velocity_std': float(np.std(target_features['velocity'])),
-            'duration_mean': float(np.mean(target_features['duration'])),
-            'duration_std': float(np.std(target_features['duration'])),
-            'ioi_mean': float(np.mean(target_features['ioi'])),
-            'ioi_std': float(np.std(target_features['ioi'])),
-            'pedal_mean': float(np.mean(target_features['pedal'])),
-            'pedal_std': float(np.std(target_features['pedal'])),
+        'continuous': {
+            'pedal_method': 'continuous',
+            'metrics': results_continuous,
+            'feature_stats': {
+                'pred': {
+                    'velocity_mean': float(np.mean(pred_features_continuous['velocity'])),
+                    'velocity_std': float(np.std(pred_features_continuous['velocity'])),
+                    'duration_mean': float(np.mean(pred_features_continuous['duration'])),
+                    'duration_std': float(np.std(pred_features_continuous['duration'])),
+                    'ioi_mean': float(np.mean(pred_features_continuous['ioi'])),
+                    'ioi_std': float(np.std(pred_features_continuous['ioi'])),
+                    'pedal_mean': float(np.mean(pred_features_continuous['pedal'])),
+                    'pedal_std': float(np.std(pred_features_continuous['pedal'])),
+                },
+                'target': {
+                    'velocity_mean': float(np.mean(target_features_continuous['velocity'])),
+                    'velocity_std': float(np.std(target_features_continuous['velocity'])),
+                    'duration_mean': float(np.mean(target_features_continuous['duration'])),
+                    'duration_std': float(np.std(target_features_continuous['duration'])),
+                    'ioi_mean': float(np.mean(target_features_continuous['ioi'])),
+                    'ioi_std': float(np.std(target_features_continuous['ioi'])),
+                    'pedal_mean': float(np.mean(target_features_continuous['pedal'])),
+                    'pedal_std': float(np.std(target_features_continuous['pedal'])),
+                }
+            }
         }
     }
 

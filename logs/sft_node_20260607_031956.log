@@ -1,162 +1,0 @@
-/home/kaititech/anaconda3/lib/python3.13/site-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
-  import pynvml  # type: ignore[import]
-W0607 03:19:58.362000 300726 site-packages/torch/distributed/run.py:862] 
-W0607 03:19:58.362000 300726 site-packages/torch/distributed/run.py:862] *****************************************
-W0607 03:19:58.362000 300726 site-packages/torch/distributed/run.py:862] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
-W0607 03:19:58.362000 300726 site-packages/torch/distributed/run.py:862] *****************************************
-/home/kaititech/anaconda3/lib/python3.13/site-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
-  import pynvml  # type: ignore[import]
-/home/kaititech/anaconda3/lib/python3.13/site-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
-  import pynvml  # type: ignore[import]
-/home/kaititech/anaconda3/lib/python3.13/site-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
-  import pynvml  # type: ignore[import]
-Using device: cuda:1
-Using device: cuda:0
-Using device: cuda:2
-Train works: 1780
-Eval works: 32
-Estimated train examples: 1,221,671
-Estimated eval examples: 19,529
-Train works: 1780
-Eval works: 32
-Estimated train examples: 1,221,671
-Estimated eval examples: 19,529
-Train works: 1780
-Eval works: 32
-Estimated train examples: 1,221,671
-Estimated eval examples: 19,529
-Loaded PianistTransformer backbone from models/pretrain/pretrain_2026-06-06-01-13-02/checkpoint-500
-Missing keys: 11
-Unexpected keys: 36
-Total Parameters:     123,438,343
-Trainable Parameters: 123,438,343
-Non-Trainable Parameters: 0
---------------------------------------------------
-Total Parameters (M):     123.44M
-Trainable Parameters (M): 123.44M
---------------------------------------------------
-Loaded PianistTransformer backbone from models/pretrain/pretrain_2026-06-06-01-13-02/checkpoint-500
-Missing keys: 11
-Unexpected keys: 36
-Loaded PianistTransformer backbone from models/pretrain/pretrain_2026-06-06-01-13-02/checkpoint-500
-Missing keys: 11
-Unexpected keys: 36
-Total Parameters:     123,438,343
-Trainable Parameters: 123,438,343
-Non-Trainable Parameters: 0
---------------------------------------------------
-Total Parameters (M):     123.44M
-Trainable Parameters (M): 123.44M
---------------------------------------------------
-Total Parameters:     123,438,343
-Trainable Parameters: 123,438,343
-Non-Trainable Parameters: 0
---------------------------------------------------
-Total Parameters (M):     123.44M
-Trainable Parameters (M): 123.44M
---------------------------------------------------
-  0%|          | 0/1000 [00:00<?, ?it/s]It is strongly recommended to train T5Gemma models with the `eager` attention implementation instead of `sdpa`.
-It is strongly recommended to train T5Gemma models with the `eager` attention implementation instead of `sdpa`.
-It is strongly recommended to train T5Gemma models with the `eager` attention implementation instead of `sdpa`.
-Could not estimate the number of tokens of the input, floating-point operations will not be computed
-Could not estimate the number of tokens of the input, floating-point operations will not be computed
-Could not estimate the number of tokens of the input, floating-point operations will not be computed
-  0%|          | 1/1000 [00:03<50:21,  3.02s/it]                                                {'loss': 0.3114, 'grad_norm': 0.6839485168457031, 'learning_rate': 0.0, 'epoch': 0.0}
-  0%|          | 1/1000 [00:03<50:21,  3.02s/it]  0%|          | 2/1000 [00:05<46:37,  2.80s/it]  0%|          | 3/1000 [00:07<41:27,  2.49s/it]  0%|          | 4/1000 [00:09<39:05,  2.35s/it]  0%|          | 5/1000 [00:12<39:15,  2.37s/it]  1%|          | 6/1000 [00:14<37:55,  2.29s/it]  1%|          | 7/1000 [00:16<37:04,  2.24s/it]  1%|          | 8/1000 [00:18<36:29,  2.21s/it]  1%|          | 9/1000 [00:20<36:06,  2.19s/it]  1%|          | 10/1000 [00:23<35:50,  2.17s/it]  1%|          | 11/1000 [00:25<35:38,  2.16s/it]  1%|          | 12/1000 [00:27<35:25,  2.15s/it]  1%|▏         | 13/1000 [00:29<35:14,  2.14s/it]  1%|▏         | 14/1000 [00:31<35:29,  2.16s/it][rank0]: Traceback (most recent call last):
-[rank0]:   File "/home/kaititech/anaconda3/lib/python3.13/site-packages/accelerate/data_loader.py", line 822, in _fetch_batches
-[rank0]:     batch = concatenate(batches, dim=0)
-[rank0]:   File "/home/kaititech/anaconda3/lib/python3.13/site-packages/accelerate/utils/operations.py", line 616, in concatenate
-[rank0]:     return type(data[0])({k: concatenate([d[k] for d in data], dim=dim) for k in data[0].keys()})
-[rank0]:                              ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-[rank0]:   File "/home/kaititech/anaconda3/lib/python3.13/site-packages/accelerate/utils/operations.py", line 619, in concatenate
-[rank0]:     return torch.cat(data, dim=dim)
-[rank0]:            ~~~~~~~~~^^^^^^^^^^^^^^^
-[rank0]: RuntimeError: Sizes of tensors must match except in dimension 0. Expected size 192 but got size 512 for tensor number 2 in the list.
-
-[rank0]: The above exception was the direct cause of the following exception:
-
-[rank0]: Traceback (most recent call last):
-[rank0]:   File "/home/kaititech/EPR/PianistTransformer/src/train/sft_node.py", line 393, in <module>
-[rank0]:     main()
-[rank0]:     ~~~~^^
-[rank0]:   File "/home/kaititech/EPR/PianistTransformer/src/train/sft_node.py", line 388, in main
-[rank0]:     trainer.train(resume_from_checkpoint=resume_path if resume_path else None)
-[rank0]:     ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-[rank0]:   File "/home/kaititech/anaconda3/lib/python3.13/site-packages/transformers/trainer.py", line 2237, in train
-[rank0]:     return inner_training_loop(
-[rank0]:         args=args,
-[rank0]:     ...<2 lines>...
-[rank0]:         ignore_keys_for_eval=ignore_keys_for_eval,
-[rank0]:     )
-[rank0]:   File "/home/kaititech/anaconda3/lib/python3.13/site-packages/transformers/trainer.py", line 2532, in _inner_training_loop
-[rank0]:     batch_samples, num_items_in_batch = self.get_batch_samples(epoch_iterator, num_batches, args.device)
-[rank0]:                                         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-[rank0]:   File "/home/kaititech/anaconda3/lib/python3.13/site-packages/transformers/trainer.py", line 5343, in get_batch_samples
-[rank0]:     batch_samples.append(next(epoch_iterator))
-[rank0]:                          ~~~~^^^^^^^^^^^^^^^^
-[rank0]:   File "/home/kaititech/anaconda3/lib/python3.13/site-packages/accelerate/data_loader.py", line 899, in __iter__
-[rank0]:     next_batch, next_batch_info = self._fetch_batches(main_iterator)
-[rank0]:                                   ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^
-[rank0]:   File "/home/kaititech/anaconda3/lib/python3.13/site-packages/accelerate/data_loader.py", line 824, in _fetch_batches
-[rank0]:     raise RuntimeError(
-[rank0]:     ...<4 lines>...
-[rank0]:     ) from e
-[rank0]: RuntimeError: You can't use batches of different size with `dispatch_batches=True` or when using an `IterableDataset`.either pass `dispatch_batches=False` and have each process fetch its own batch  or pass `split_batches=True`. By doing so, the main process will fetch a full batch and slice it into `num_processes` batches for each process.
-  1%|▏         | 14/1000 [00:32<37:43,  2.30s/it]
-[rank0]:[W607 03:20:42.521220984 ProcessGroupNCCL.cpp:1647] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
-W0607 03:20:43.918000 300726 site-packages/torch/distributed/elastic/multiprocessing/api.py:1014] Sending process 300744 closing signal SIGTERM
-W0607 03:20:43.918000 300726 site-packages/torch/distributed/elastic/multiprocessing/api.py:1014] Sending process 300745 closing signal SIGTERM
-E0607 03:20:44.247000 300726 site-packages/torch/distributed/elastic/multiprocessing/api.py:988] failed (exitcode: 1) local_rank: 0 (pid: 300743) of binary: /home/kaititech/anaconda3/bin/python3.13
-Traceback (most recent call last):
-  File "/home/kaititech/anaconda3/bin/torchrun", line 7, in <module>
-    sys.exit(main())
-             ~~~~^^
-  File "/home/kaititech/anaconda3/lib/python3.13/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 367, in wrapper
-    return f(*args, **kwargs)
-  File "/home/kaititech/anaconda3/lib/python3.13/site-packages/torch/distributed/run.py", line 1016, in main
-    run(args)
-    ~~~^^^^^^
-  File "/home/kaititech/anaconda3/lib/python3.13/site-packages/torch/distributed/run.py", line 1007, in run
-    elastic_launch(
-    ~~~~~~~~~~~~~~~
-        config=config,
-        ~~~~~~~~~~~~~~
-        entrypoint=cmd,
-        ~~~~~~~~~~~~~~~
-    )(*cmd_args)
-    ~^^^^^^^^^^^
-  File "/home/kaititech/anaconda3/lib/python3.13/site-packages/torch/distributed/launcher/api.py", line 191, in __call__
-    return launch_agent(self._config, self._entrypoint, list(args))
-  File "/home/kaititech/anaconda3/lib/python3.13/site-packages/torch/distributed/launcher/api.py", line 371, in launch_agent
-    raise ChildFailedError(
-    ...<2 lines>...
-    )
-torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
-============================================================
-src/train/sft_node.py FAILED
-------------------------------------------------------------
-Failures:
-[1]:
-  time      : 2026-06-07_03:20:44
-  host      : ai
-  rank      : 1 (local_rank: 1)
-  exitcode  : -15 (pid: 300744)  (SIGTERM)
-  error_file: <N/A>
-  traceback : Signal 15 (SIGTERM) received by PID 300744
-[2]:
-  time      : 2026-06-07_03:20:44
-  host      : ai
-  rank      : 2 (local_rank: 2)
-  exitcode  : -15 (pid: 300745)  (SIGTERM)
-  error_file: <N/A>
-  traceback : Signal 15 (SIGTERM) received by PID 300745
-------------------------------------------------------------
-Root Cause (first observed failure):
-[0]:
-  time      : 2026-06-07_03:20:43
-  host      : ai
-  rank      : 0 (local_rank: 0)
-  exitcode  : 1 (pid: 300743) 
-  error_file: <N/A>
-  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
-============================================================

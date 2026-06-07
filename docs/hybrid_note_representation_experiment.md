@@ -1,6 +1,6 @@
-# Hybrid Note Representation 第一版实验规划
+# Hybrid Note Representation Backbone 对比实验规划
 
-本文档定义一个可执行的第一版实验：保持 PianistTransformer 的 T5Gemma backbone 不变，仅将 MIDI 表示从 8-token note block 改为 note-level continuous node。实验目标是验证：在 EPR 任务中，使用结构化 note node 和连续回归头，是否优于当前离散 tokenizer + LM head 方案。
+本文档定义一个可执行的 Hybrid Note Representation 实验：将 MIDI 表示从 PianistTransformer 的 8-token note block 改为 note-level continuous node，并在同一表示、同一 PianoCoRe-A 数据源、同一目标训练设定下比较多类 Transformer backbone。实验目标是验证：在 EPR 任务中，结构化 note node 和连续回归头是否优于当前离散 tokenizer + LM head 方案，以及不同 backbone 对 note-level EPR 的影响。
 
 ## 0. 当前实现状态
 
@@ -28,7 +28,9 @@ failed reason: pitch_mismatch
 node JSON total size: ~16G
 ```
 
-模型第一版为 `HybridPianoT5Gemma`：保留 T5Gemma encoder-decoder backbone，新增 `HybridNoteEncoder` 和 `HybridContinuousDecoder`。Pitch 只作为输入 embedding，不作为预测目标；decoder 输出 7 个连续字段并使用 sigmoid 限制在 `[0, 1]`。训练默认从旧 PianistTransformer checkpoint 迁移 encoder/decoder backbone，旧 token embedding 和 LM head 跳过，新 note encoder/decoder 随机初始化。
+当前已落地的第一版模型为 `HybridPianoT5Gemma`：保留 T5Gemma encoder-decoder backbone，新增 `HybridNoteEncoder` 和 `HybridContinuousDecoder`。Pitch 只作为输入 embedding，不作为预测目标；decoder 使用 separate heads 分别预测 timing、velocity、pedal，并将 7 个连续字段 concat 后使用 sigmoid 限制在 `[0, 1]`。
+
+后续正式对比实验不默认迁移旧 PianistTransformer checkpoint，而是对所有 Hybrid Note backbone 从随机初始化开始直接在 PianoCoRe-A 上训练。原因是 PianoCoRe-A 已有约 15.7 万个 aligned performance pairs，监督数据规模足够支撑目标任务训练；如果使用大规模 unpaired MIDI 预训练，会额外引入预训练语料、预训练目标和初始化差异，不利于公平比较 backbone 本身。
 
 训练数据集已实现为 map-style Dataset，而不是 IterableDataset。样本索引映射到 `(work, performance, window)`，并使用每进程 LRU cache 缓存最近 work JSON；这样 DDP 的 DistributedSampler 可以稳定分片，避免 IterableDataset 在多卡下 batch dispatch 和尾部耗尽不一致的问题。
 
@@ -43,26 +45,35 @@ tail -f logs/sft_node_*.log
 
 ## 1. 核心假设
 
-当前 PianistTransformer 已经在 encoder 端把每 8 个 token 合并为一个 note embedding，但 decoder 和 loss 仍然是 token-level classification。第一版 Hybrid Note Representation 将输入和输出都改为 note-level object：
+当前 PianistTransformer 已经在 encoder 端把每 8 个 token 合并为一个 note embedding，但 decoder 和 loss 仍然是 token-level classification。Hybrid Note Representation 将输入和输出都改为 note-level object：
 
 ```text
 [pitch, ioi, duration, velocity, pedal_0, pedal_25, pedal_50, pedal_75]
     -> NoteEncoder
-    -> PianistTransformer backbone
+    -> Transformer backbone
     -> NoteDecoder
     -> continuous performance fields
 ```
 
-本实验不更换 backbone，不改变 attention、层数、hidden size 等主干结构。主要变化是：
+本实验将表示层和 backbone 解耦。所有模型共享同一 Hybrid Note interface：
 
 - 数据从 token ids 变为 note feature tensor。
 - 输入端从 `PianoEncoderEmbeddings` 改为 `HybridNoteEncoder`。
 - 输出端从 `lm_head + cross entropy` 改为 `HybridNoteDecoder + regression loss`。
 - Pedal 保持连续 CC value，使用 MSE。
 
+Backbone 作为实验变量，第一阶段比较：
+
+```text
+HN-T5-10+2: encoder-decoder, 10-layer encoder + 2-layer decoder
+HN-T5-6+6:  encoder-decoder, 6-layer encoder + 6-layer decoder
+HN-GPT:     decoder-only causal Transformer
+HN-BERT:    encoder-only bidirectional Transformer
+```
+
 ## 2. 数据来源
 
-第一版只使用 PianoCoRe refined pair，因为 refined data 已经提供 note-by-note aligned score/performance：
+本实验只使用 PianoCoRe-A refined pair，因为 refined data 已经提供 note-by-note aligned score/performance：
 
 ```text
 data/pianocore/metadata.csv 或 data/pianocore/metadata_S.csv
@@ -84,7 +95,20 @@ refined_dir_candidates = [
 data/pianocore/PianoCoRe/refined
 ```
 
-推荐第一版使用：
+推荐正式 backbone 对比使用全量 PianoCoRe-A：
+
+```text
+metadata.csv
+tier_a=True
+```
+
+原因：
+
+- PianoCoRe-A 数据量已经足够大，当前已处理成功 `157198` 个 performance pairs。
+- 本实验目标是比较 Hybrid Note Representation 下的不同 backbone，而不是验证 unpaired pretraining 的收益。
+- 不使用大规模 unpaired MIDI pretrain 可以避免额外变量，使比较更干净。
+
+如果需要快速 smoke test 或首轮调参，可以临时使用：
 
 ```text
 metadata_S.csv
@@ -98,9 +122,9 @@ df = df[df["refined_score_midi_path"].notna()]
 df = df[df["refined_performance_midi_path"].notna()]
 ```
 
-原因：
+临时使用 `metadata_S.csv` 的原因：
 
-- `metadata_S.csv` 更小，适合首轮实验。
+- `metadata_S.csv` 更小，适合 smoke test 或首轮 debug。
 - `tier_a_star=True` 是最高置信 note-level alignment 子集。
 - `refined_score_midi_path` 和 `refined_performance_midi_path` 的音符数一致。
 - `refined_alignment_path` 里有 `interpolated` mask，可用于后续加权 loss 或分析。
@@ -339,44 +363,236 @@ ContinuousMLP:
   Linear(hidden_size, hidden_size)
 ```
 
-### 7.3 Backbone
+### 7.3 Backbone 对比
 
-保持 PianistTransformer 的 encoder-decoder backbone：
+Backbone 指位于 `HybridNoteEncoder` 和 `HybridNoteDecoder` 之间的 Transformer 主干，包括 self-attention、cross-attention、FFN、norm、position encoding/rotary embedding 等上下文建模模块。它不包括 note feature schema、pitch/continuous embedding、continuous regression head 和 loss。
+
+为了公平比较，所有 Hybrid Note backbone 使用相同的输入输出接口：
 
 ```text
-encoder_layers_num = 10
-decoder_layers_num = 2
+score pitch + score continuous
+  -> HybridNoteEncoder
+  -> Backbone
+  -> HybridNoteDecoder
+  -> performance continuous
+```
+
+除结构本身外，应尽量保持以下设置一致：
+
+```text
 hidden_size = 768
 intermediate_size = 3072
 num_attention_heads = 8
 num_key_value_heads = 4
 head_dim = 128
+block_notes = 512
+loss = same masked regression loss
+data = PianoCoRe-A
+pretrained_model = null
 ```
 
-Encoder 接受 note embeddings：
+本实验不使用大规模 unpaired MIDI pretrain。所有 backbone 直接按 EPR 目标在 PianoCoRe-A 上训练，从而把实验变量集中在 backbone 结构本身。
 
-```python
-encoder_outputs = self.model.encoder(
-    inputs_embeds=score_note_embeds,
-    attention_mask=attention_mask,
-)
-```
+### 7.3.1 第一阶段公平比较协议
 
-Decoder 第一版有两个可选方案。
+第一阶段目标是比较 backbone inductive bias，而不是比较预训练收益、模型规模或 attention variant。因此采用以下约束：
 
-推荐第一版采用 non-autoregressive decoder input：
+1. **全部从随机初始化训练。**
 
-```python
-decoder_inputs_embeds = score_note_embeds
-```
+   不使用 text-pretrained T5/GPT/BERT，不使用 MIDI-pretrained PT checkpoint，也不使用大规模 unpaired MIDI object pretraining。所有模型只在 PianoCoRe-A 上按 EPR 目标训练。
 
-也就是：
+2. **Node interface 架构一致，但参数不共享。**
+
+   所有 backbone 使用相同结构的 `HybridNoteEncoder` 和 `HybridNoteDecoder`：
+
+   ```text
+   HybridNoteEncoder:
+     pitch embedding + continuous MLP -> hidden_size
+
+   HybridNoteDecoder:
+     hidden_size -> timing head -> 2 fields
+     hidden_size -> velocity head -> 1 field
+     hidden_size -> pedal head -> 4 fields
+     concat -> 7 fields
+   ```
+
+   但每个模型训练自己独立的一套参数：
+
+   ```text
+   HN-T5-10+2.note_encoder / note_decoder
+   HN-T5-6+6.note_encoder / note_decoder
+   HN-GPT.note_encoder / note_decoder
+   HN-BERT.note_encoder / note_decoder
+   ```
+
+   原因是不同 backbone 的 hidden state 分布不同，输入 embedding space 和输出 head 都需要与各自 backbone 共适应。共享已训练的 node encoder/head 会引入额外依赖，不利于公平解释。
+
+3. **统一基础宽度和 attention 设置。**
+
+   第一阶段固定：
+
+   ```text
+   hidden_size = 768
+   intermediate_size = 3072
+   num_attention_heads = 8
+   num_key_value_heads = 4
+   head_dim = 128
+   attention = GQA
+   ```
+
+   这里沿用 PT/T5Gemma 风格的 grouped-query attention。虽然 `hidden_size=1024, intermediate_size=4096` 更符合传统 `hidden_size = num_heads * head_dim` 的整齐配置，但它会显著增加模型参数和计算量，因此不放入第一阶段公平比较。`hidden_size=1024` 作为后续 scale ablation。
+
+4. **近似参数量匹配并报告效率。**
+
+   第一阶段优先匹配参数量，而不是强行匹配 block 数。T5 decoder block 包含 cross-attention，单层参数量高于 encoder-only / decoder-only block；因此 GPT/BERT 需要更多层才能和 T5 接近：
+
+   ```text
+   HN-T5-10+2: 10 encoder blocks + 2 decoder blocks  ~= 124.6M params
+   HN-T5-6+6:  6 encoder blocks + 6 decoder blocks   ~= 134.1M params
+   HN-GPT:     17 decoder-only blocks                 ~= 124.5M params
+   HN-BERT:    17 encoder-only blocks                 ~= 126.1M params
+   ```
+
+   GPT/BERT 的 17 层配置让参数量落在 T5 两个设置之间，满足第一阶段 fair comparison 的同量级约束。由于 GPT/BERT/T5 的单层计算量仍不会完全相同，因此实验记录必须报告：
+
+   ```text
+   total_params
+   trainable_params
+   notes/sec or samples/sec
+   GPU memory
+   wall-clock time per step
+   ```
+
+   参数量目标是同一量级、尽量接近，而不是强行做到完全相等。若某个 backbone 参数量偏离超过约 `10%`，应调整层数或明确标注为不同规模。
+
+5. **统一训练预算。**
+
+   保持相同：
+
+   ```text
+   PianoCoRe-A split
+   block_notes = 512
+   effective batch size
+   max_steps / epochs
+   optimizer and scheduler
+   loss weights
+   evaluation set
+   fixed MIDI preview samples
+   ```
+
+### 7.3.2 HN-T5-10+2
+
+结构：
 
 ```text
-score node embeddings -> decoder cross-attends encoder -> performance node predictions
+score nodes
+  -> bidirectional encoder, 10 layers
+  -> cross-attention decoder, 2 layers
+  -> continuous prediction
 ```
 
-这避免了连续目标的 teacher forcing 复杂度，且更符合 EPR 的同长 structured prediction。
+这是与 PianistTransformer 最接近的 Hybrid Note 版本。PT 原本使用深 encoder + 浅 decoder，是因为 encoder 端已经压缩到 note-level，而 decoder 端仍然是 token-level 自回归生成，decoder 计算更贵。HN-T5-10+2 保留这个非对称设计，适合作为结构基线。
+
+优点：
+
+- 与当前 `HybridPianoT5Gemma` 实现最接近，工程改动最小。
+- encoder 容量强，适合建模长程 score context。
+- 可以直接回答：只替换 PT 表示层和输出头后，原 10+2 非对称结构是否仍有效。
+
+缺点：
+
+- HN decoder 已经是 note-level，不再有 PT token-level decoder 的 4096-token 瓶颈，2 层 decoder 可能容量不足。
+- 非对称结构可能继承 PT 的效率取向，但未必是 HN 的最优结构。
+
+### 7.3.3 HN-T5-6+6
+
+结构：
+
+```text
+score nodes
+  -> bidirectional encoder, 6 layers
+  -> cross-attention decoder, 6 layers
+  -> continuous prediction
+```
+
+这是对称 encoder-decoder ablation。由于 HN 的 decoder input 也是 note-level，decoder 序列长度约为 `block_notes=512`，不再是 PT 的 `4096` token 序列，因此可以合理增加 decoder 深度。
+
+优点：
+
+- encoder 和 decoder 容量更均衡。
+- 更适合检验 HN 里 decoder 是否仍是性能瓶颈。
+- 仍保留明确的 seq2seq 结构和 cross-attention，对 score-to-performance 映射解释性较好。
+
+缺点：
+
+- 推理和训练成本高于 10+2。
+- 如果 EPR 在 note-aligned 条件下主要是 per-note regression，深 decoder 可能收益有限。
+
+### 7.3.4 HN-GPT
+
+结构：
+
+```text
+<score> score nodes ... <performance> performance nodes ...
+  -> causal decoder-only Transformer
+  -> loss only on performance nodes
+```
+
+HN-GPT 将 score 和 performance 放在同一个 causal object sequence 中。score 段作为 prefix condition，performance 段作为需要预测的目标。对于连续 node，可以使用 teacher-forced performance node embedding、masked performance placeholder，或 shifted performance node embedding；loss 只在 performance 段计算。
+
+优点：
+
+- 最接近现代 LLM 的 decoder-only scaling recipe。
+- 容易扩展到 prompt、style token、performer token、多任务控制等统一序列形式。
+- 如果未来单独研究 object-level pretraining，GPT 形式可以自然做 causal modeling；但该因素不进入本阶段公平比较。
+
+缺点：
+
+- 对 note-aligned EPR 来说，causal prefix conditioning 可能不如 encoder-decoder 的 cross-attention 高效。
+- score-performance 对齐关系需要通过 causal self-attention 学习，没有显式 cross-attention。
+- 保留连续 node 时不能直接使用标准 LM head，需要 mixed discrete-continuous head。
+
+### 7.3.5 HN-BERT
+
+结构：
+
+```text
+score nodes
+  -> bidirectional encoder-only Transformer
+  -> per-note continuous prediction
+```
+
+HN-BERT 把 EPR 视为 aligned note-level structured regression，而不是生成任务。由于 PianoCoRe-A refined pair 已经满足 score/performance note-to-note alignment，输出长度与输入长度一致，pitch 也直接 copy，因此 decoder 在这个设定下并非必要。
+
+优点：
+
+- 训练和推理最简单、最快。
+- 每个输出 note 可以看到完整 score context，没有自回归误差积累。
+- 最贴合 PianoCoRe-A 的 aligned EPR 设定，是检验 “decoder 是否必要” 的强 baseline。
+
+缺点：
+
+- 不适合变长生成、插入/删除 note、performance continuation 等更开放任务。
+- 生成建模能力弱于 T5/GPT，更像 performance parameter predictor。
+- 如果未来单独研究大规模 object-sequence generative pretraining，需要额外设计 masked denoising 目标；但该因素不进入本阶段公平比较。
+
+### 7.3.6 Backbone 比较重点
+
+第一阶段重点比较以下问题：
+
+```text
+1. HN-T5-10+2 vs HN-T5-6+6:
+   PT 的浅 decoder 设计在 note-level HN 中是否仍然合理？
+
+2. HN-T5 vs HN-BERT:
+   在 aligned EPR 中，encoder-decoder 是否优于 encoder-only regression？
+
+3. HN-GPT vs HN-T5:
+   decoder-only LLM-style causal conditioning 是否适合 note-level EPR？
+
+4. HN family vs PT tokenizer baseline:
+   提升来自 Hybrid Note Representation，还是来自 backbone 变化？
+```
 
 ### 7.4 HybridNoteDecoder
 
@@ -395,12 +611,37 @@ continuous_pred: FloatTensor[B, N, 7]
 结构：
 
 ```python
-ContinuousHead:
+TimingHead:
   Linear(hidden_size, hidden_size)
   GELU
-  Linear(hidden_size, 7)
-  Sigmoid
+  Linear(hidden_size, 2)
+
+VelocityHead:
+  Linear(hidden_size, hidden_size)
+  GELU
+  Linear(hidden_size, 1)
+
+PedalHead:
+  Linear(hidden_size, hidden_size)
+  GELU
+  Linear(hidden_size, 4)
+
+continuous_pred = Sigmoid(concat([
+    timing_pred,
+    velocity_pred,
+    pedal_pred,
+]))
 ```
+
+这样保持 shared backbone，但让三个性质不同的目标拥有独立 output head：
+
+```text
+timing:   [ioi, duration]
+velocity: [velocity]
+pedal:    [pedal_0, pedal_25, pedal_50, pedal_75]
+```
+
+相比单一 joint head，separate heads 的额外参数量很小，但能减少 timing、dynamics、pedal 三类目标在最后映射层的梯度干扰。输出仍是 `[B, N, 7]`，因此训练 batch、loss、评估接口保持不变。
 
 第一版不预测 pitch，直接从 score copy pitch。原因：
 
@@ -418,7 +659,7 @@ ContinuousHead:
 [ioi, duration, velocity, pedal_0, pedal_25, pedal_50, pedal_75]
 ```
 
-第一版 loss：
+第一阶段 loss 仍按目标组分别计算并加权相加：
 
 ```python
 loss_ioi = masked_huber(pred[..., 0], target[..., 0], attention_mask)
@@ -448,10 +689,10 @@ weight = torch.where(interpolated, 0.5, 1.0)
 
 ## 9. Trainer Batch 接口
 
-新增训练脚本：
+新增或沿用训练脚本：
 
 ```text
-src/train/sft_nodes.py
+src/train/sft_node.py
 ```
 
 Data collator 输出：
@@ -518,6 +759,17 @@ configs/sft_node_config_pianocore.json
   "min_notes": 64,
   "overlap_ratio": 0.5,
   "pretrained_model": null,
+  "load_pianoformer_backbone": false,
+  "backbone_type": "t5",
+  "encoder_layers_num": 10,
+  "decoder_layers_num": 2,
+  "hidden_size": 768,
+  "intermediate_size": 3072,
+  "num_attention_heads": 8,
+  "num_key_value_heads": 4,
+  "head_dim": 128,
+  "continuous_dim": 7,
+  "attention_variant": "gqa",
   "output_dir": "./models/sft_nodes/",
   "overwrite_output_dir": true,
   "num_train_epochs": 1,
@@ -543,7 +795,18 @@ configs/sft_node_config_pianocore.json
 }
 ```
 
-第一版 `pretrained_model` 设为 `null`，因为旧 checkpoint 的 embedding 和 LM head 与新模型不兼容。后续可以只迁移 backbone 权重。
+正式 backbone 对比中 `pretrained_model` 设为 `null`。旧 checkpoint 的 embedding 和 LM head 与新模型不兼容；即使只迁移 backbone 权重，也会引入额外初始化变量，因此不放入第一阶段公平比较。迁移 PT backbone 可以作为后续单独实验。
+
+不同 backbone 使用独立配置文件更清楚，例如：
+
+```text
+configs/sft_node_t5_10_2_pianocore.json
+configs/sft_node_t5_6_6_pianocore.json
+configs/sft_node_gpt_17_pianocore.json
+configs/sft_node_bert_17_pianocore.json
+```
+
+除 `backbone_type` 和层数外，第一阶段配置应保持一致。
 
 ## 11. 运行步骤
 
@@ -583,7 +846,7 @@ assert min(pitch) >= 0 and max(pitch) <= 127
 ### 11.2 训练
 
 ```bash
-python src/train/sft_nodes.py --config configs/sft_node_config_pianocore.json
+python src/train/sft_node.py --config configs/sft_node_config_pianocore.json
 ```
 
 多 GPU 沿用现有 deepspeed/DDP 流程即可。
@@ -669,13 +932,16 @@ data/midis/node_sft_preview/
 
 建议每轮固定 20 个验证样本，便于横向比较。
 
-## 13. Baseline 对照
+## 13. Baseline 与 Backbone 对照
 
-第一版至少比较：
+第一阶段至少比较：
 
 ```text
-Baseline A: 当前 tokenizer + PianoT5Gemma SFT
-Experiment B: Hybrid node + same backbone
+Baseline A: PT tokenizer + PianoT5Gemma SFT
+Experiment B: HN-T5-10+2
+Experiment C: HN-T5-6+6
+Experiment D: HN-GPT
+Experiment E: HN-BERT
 ```
 
 需要保持：
@@ -684,8 +950,15 @@ Experiment B: Hybrid node + same backbone
 - 同一 train/test split。
 - 同一 note window 大小约 512 notes。
 - 尽量接近的 effective batch size。
+- 不使用大规模 unpaired MIDI pretrain。
+- Hybrid Note 模型均从随机初始化开始直接训练。
+- 相同 `HybridNoteEncoder` / `HybridNoteDecoder` 架构，但各模型参数独立训练。
+- 相同 `hidden_size=768`、`intermediate_size=3072`、GQA attention 设置。
+- 报告 `total_params`、`trainable_params`、吞吐、显存和单 step 时间。
 
 当前 tokenizer `block_size=4096` 对应 512 notes；node 方案使用 `block_notes=512`。
+
+如果需要把 PT tokenizer baseline 也做成完全 from-scratch，应明确记录；如果 PT baseline 使用已有 pretrain checkpoint，则只能作为 “PT full recipe” 参考，不应和 from-scratch HN backbone 直接解释为纯表示差异。
 
 ## 14. 最小实现清单
 
@@ -695,7 +968,7 @@ Experiment B: Hybrid node + same backbone
 src/utils/node_midi.py
 src/data_process/06_generate_sft_node_data_pianocore.py
 src/model/hybrid_pianoformer.py
-src/train/sft_nodes.py
+src/train/sft_node.py
 configs/sft_node_config_pianocore.json
 ```
 
@@ -734,20 +1007,23 @@ src/utils/midi.py
 
 实验阶段：
 
-- 和 tokenizer baseline 在同一验证集上比较 feature-level metrics。
+- 和 tokenizer baseline、HN-T5-10+2、HN-T5-6+6、HN-GPT、HN-BERT 在同一验证集上比较 feature-level metrics。
 - 至少保存 20 个固定验证样本的 MIDI 输出。
 
 ## 16. 后续实验方向
 
-第一版稳定后，再做以下 ablation：
+第一阶段 backbone 对比稳定后，再做以下 ablation：
 
-1. `MAX_TIME_MS=5000` vs `10000` vs `20000`。
-2. `log normalization` vs linear normalization。
-3. 预测 absolute IOI/duration vs 预测 score-relative ratio。
-4. score velocity 保留 vs 置零。
-5. interpolated notes loss weight `1.0` vs `0.5` vs masked。
-6. 加 pitch auxiliary CE head。
-7. 迁移旧 PianistTransformer checkpoint 的 backbone 权重，只随机初始化 note encoder/decoder。
+1. Attention variant: GQA vs MHA vs MQA。
+2. Model scale: `hidden_size=768, intermediate_size=3072` vs `hidden_size=1024, intermediate_size=4096`。
+3. `MAX_TIME_MS=5000` vs `10000` vs `20000`。
+4. `log normalization` vs linear normalization。
+5. 预测 absolute IOI/duration vs 预测 score-relative ratio。
+6. score velocity 保留 vs 置零。
+7. interpolated notes loss weight `1.0` vs `0.5` vs masked。
+8. 加 pitch auxiliary CE head。
+9. 迁移旧 PianistTransformer checkpoint 的 backbone 权重，只随机初始化 note encoder/decoder；该实验单独报告，不与 from-scratch backbone fair comparison 混在一起。
+10. 大规模 unpaired MIDI object pretraining；该实验用于研究预训练收益，不进入第一阶段 backbone fair comparison。
 
 ## 17. 第一版结论预期
 
@@ -757,5 +1033,6 @@ src/utils/midi.py
 - 不再有 timing token clip 到约 5 秒的问题。
 - velocity、duration、pedal 的预测误差更自然，尤其是短时值和 pedal 连续变化。
 - Decoder 不再需要学习 8-token 局部格式语法，训练目标更贴近 EPR。
+- 不同 backbone 在同一 Hybrid Note interface 下呈现不同 trade-off：T5 保留 seq2seq cross-attention，GPT 提供 LLM-style causal modeling，BERT 检验 aligned EPR 是否只需要 bidirectional encoder regression。
 
-这将支持论文中的核心表述：EPR 更适合作为 note-level conditional structured prediction，而不是 token-level language modeling。
+这将支持论文中的核心表述：Hybrid Note Representation 将 EPR 的表示层与 Transformer backbone 解耦，使 EPR 可以作为 note-level conditional structured prediction 来研究，而不是被固定在 token-level language modeling 范式中。

@@ -32,6 +32,7 @@ logger = logging.get_logger(__name__)
 class HybridPianoT5GemmaConfig(PianoT5GemmaConfig):
     def __init__(
         self,
+        backbone_type="t5",
         continuous_dim=7,
         pitch_vocab_size=128,
         pitch_pad_id=128,
@@ -41,12 +42,21 @@ class HybridPianoT5GemmaConfig(PianoT5GemmaConfig):
         huber_delta=0.05,
         loss_weights=None,
         decoder_input_mode="score",
+        gpt_layers_num=None,
+        bert_layers_num=None,
+        max_position_embeddings=4096,
+        attention_dropout=0.0,
         **kwargs,
     ):
         super().__init__(**kwargs)
+        self.backbone_type = backbone_type
         self.continuous_dim = continuous_dim
         self.pitch_vocab_size = pitch_vocab_size
         self.pitch_pad_id = pitch_pad_id
+        self.intermediate_size = self.encoder.intermediate_size
+        self.num_attention_heads = self.encoder.num_attention_heads
+        self.num_key_value_heads = self.encoder.num_key_value_heads
+        self.head_dim = self.encoder.head_dim
         self.max_time_ms = max_time_ms
         self.time_loss_type = time_loss_type
         self.value_loss_type = value_loss_type
@@ -58,6 +68,10 @@ class HybridPianoT5GemmaConfig(PianoT5GemmaConfig):
             "pedal": 1.0,
         }
         self.decoder_input_mode = decoder_input_mode
+        self.gpt_layers_num = gpt_layers_num
+        self.bert_layers_num = bert_layers_num
+        self.max_position_embeddings = max_position_embeddings
+        self.attention_dropout = attention_dropout
 
 
 class HybridNoteEncoder(nn.Module):
@@ -85,14 +99,27 @@ class HybridNoteEncoder(nn.Module):
 class HybridContinuousDecoder(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.head = nn.Sequential(
+        self.timing_head = nn.Sequential(
             nn.Linear(config.hidden_size, config.hidden_size),
             nn.GELU(),
-            nn.Linear(config.hidden_size, config.continuous_dim),
+            nn.Linear(config.hidden_size, 2),
+        )
+        self.velocity_head = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.GELU(),
+            nn.Linear(config.hidden_size, 1),
+        )
+        self.pedal_head = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.GELU(),
+            nn.Linear(config.hidden_size, 4),
         )
 
     def forward(self, hidden_states):
-        return torch.sigmoid(self.head(hidden_states))
+        timing = self.timing_head(hidden_states)
+        velocity = self.velocity_head(hidden_states)
+        pedal = self.pedal_head(hidden_states)
+        return torch.sigmoid(torch.cat([timing, velocity, pedal], dim=-1))
 
 
 class HybridT5GemmaEncoder(T5GemmaPreTrainedModel):
@@ -262,10 +289,214 @@ def _regression_loss(pred, target, mask, loss_type, huber_delta):
     return _masked_mean(values, mask)
 
 
+def _compute_hybrid_loss(config, continuous_pred, labels_continuous, attention_mask):
+    mask = attention_mask.bool()
+    weights = config.loss_weights
+    loss_ioi = _regression_loss(
+        continuous_pred[..., 0],
+        labels_continuous[..., 0],
+        mask,
+        config.time_loss_type,
+        config.huber_delta,
+    )
+    loss_duration = _regression_loss(
+        continuous_pred[..., 1],
+        labels_continuous[..., 1],
+        mask,
+        config.time_loss_type,
+        config.huber_delta,
+    )
+    loss_velocity = _regression_loss(
+        continuous_pred[..., 2],
+        labels_continuous[..., 2],
+        mask,
+        config.value_loss_type,
+        config.huber_delta,
+    )
+    loss_pedal = _regression_loss(
+        continuous_pred[..., 3:7],
+        labels_continuous[..., 3:7],
+        mask.unsqueeze(-1).expand_as(continuous_pred[..., 3:7]),
+        config.value_loss_type,
+        config.huber_delta,
+    )
+    return (
+        weights.get("ioi", 1.0) * loss_ioi
+        + weights.get("duration", 1.0) * loss_duration
+        + weights.get("velocity", 1.0) * loss_velocity
+        + weights.get("pedal", 1.0) * loss_pedal
+    )
+
+
+class HybridGQAAttention(nn.Module):
+    def __init__(self, config, causal=False):
+        super().__init__()
+        if config.num_attention_heads % config.num_key_value_heads != 0:
+            raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.head_dim = config.head_dim
+        self.causal = causal
+        self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=False)
+        self.dropout = nn.Dropout(getattr(config, "attention_dropout", 0.0))
+
+    def _shape(self, tensor, heads):
+        batch_size, seq_len, _ = tensor.shape
+        return tensor.view(batch_size, seq_len, heads, self.head_dim).transpose(1, 2)
+
+    def forward(self, hidden_states, attention_mask=None):
+        batch_size, seq_len, _ = hidden_states.shape
+        query = self._shape(self.q_proj(hidden_states), self.num_heads)
+        key = self._shape(self.k_proj(hidden_states), self.num_key_value_heads)
+        value = self._shape(self.v_proj(hidden_states), self.num_key_value_heads)
+
+        repeat = self.num_heads // self.num_key_value_heads
+        if repeat != 1:
+            key = key.repeat_interleave(repeat, dim=1)
+            value = value.repeat_interleave(repeat, dim=1)
+
+        scores = torch.matmul(query, key.transpose(-2, -1)) * (self.head_dim ** -0.5)
+        if attention_mask is not None:
+            key_mask = attention_mask[:, None, None, :].to(dtype=torch.bool, device=scores.device)
+            scores = scores.masked_fill(~key_mask, torch.finfo(scores.dtype).min)
+        if self.causal:
+            causal_mask = torch.ones(seq_len, seq_len, dtype=torch.bool, device=scores.device).tril()
+            scores = scores.masked_fill(~causal_mask[None, None, :, :], torch.finfo(scores.dtype).min)
+
+        attn_weights = torch.softmax(scores.float(), dim=-1).to(dtype=query.dtype)
+        attn_weights = self.dropout(attn_weights)
+        attn_output = torch.matmul(attn_weights, value)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(
+            batch_size,
+            seq_len,
+            self.num_heads * self.head_dim,
+        )
+        return self.o_proj(attn_output)
+
+
+class HybridTransformerBlock(nn.Module):
+    def __init__(self, config, causal=False):
+        super().__init__()
+        self.self_attn = HybridGQAAttention(config, causal=causal)
+        self.input_norm = nn.LayerNorm(config.hidden_size)
+        self.post_attn_norm = nn.LayerNorm(config.hidden_size)
+        self.mlp = nn.Sequential(
+            nn.Linear(config.hidden_size, config.intermediate_size),
+            nn.GELU(),
+            nn.Linear(config.intermediate_size, config.hidden_size),
+        )
+        self.dropout = nn.Dropout(config.dropout_rate)
+
+    def forward(self, hidden_states, attention_mask=None):
+        attn_input = self.input_norm(hidden_states)
+        hidden_states = hidden_states + self.dropout(self.self_attn(attn_input, attention_mask=attention_mask))
+        mlp_input = self.post_attn_norm(hidden_states)
+        hidden_states = hidden_states + self.dropout(self.mlp(mlp_input))
+        return hidden_states
+
+
+class HybridBertBackbone(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        layer_count = config.bert_layers_num or config.encoder.num_hidden_layers
+        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
+        self.layers = nn.ModuleList([HybridTransformerBlock(config, causal=False) for _ in range(layer_count)])
+        self.norm = nn.LayerNorm(config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout_rate)
+
+    def forward(self, score_note_embeds, attention_mask):
+        batch_size, seq_len, _ = score_note_embeds.shape
+        if seq_len > self.position_embeddings.num_embeddings:
+            raise ValueError(f"Sequence length {seq_len} exceeds max_position_embeddings")
+        position_ids = torch.arange(seq_len, device=score_note_embeds.device).unsqueeze(0)
+        hidden_states = score_note_embeds + self.position_embeddings(position_ids)
+        hidden_states = self.dropout(hidden_states)
+        for layer in self.layers:
+            hidden_states = layer(hidden_states, attention_mask=attention_mask)
+        return self.norm(hidden_states)
+
+
+class HybridGptBackbone(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        layer_count = config.gpt_layers_num or config.encoder.num_hidden_layers + config.decoder.num_hidden_layers
+        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
+        self.performance_query = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
+        self.layers = nn.ModuleList([HybridTransformerBlock(config, causal=True) for _ in range(layer_count)])
+        self.norm = nn.LayerNorm(config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout_rate)
+
+    def forward(self, score_note_embeds, attention_mask):
+        batch_size, seq_len, _ = score_note_embeds.shape
+        total_len = seq_len * 2
+        if total_len > self.position_embeddings.num_embeddings:
+            raise ValueError(f"GPT sequence length {total_len} exceeds max_position_embeddings")
+
+        perf_queries = self.performance_query.expand(batch_size, seq_len, -1)
+        hidden_states = torch.cat([score_note_embeds, perf_queries], dim=1)
+        position_ids = torch.arange(total_len, device=score_note_embeds.device).unsqueeze(0)
+        hidden_states = hidden_states + self.position_embeddings(position_ids)
+        hidden_states = self.dropout(hidden_states)
+
+        full_attention_mask = torch.cat([attention_mask, attention_mask], dim=1)
+        for layer in self.layers:
+            hidden_states = layer(hidden_states, attention_mask=full_attention_mask)
+        hidden_states = self.norm(hidden_states)
+        return hidden_states[:, seq_len:, :]
+
+
+class HybridPianoTransformer(nn.Module):
+    def __init__(self, config: HybridPianoT5GemmaConfig):
+        super().__init__()
+        self.config = config
+        self.note_encoder = HybridNoteEncoder(config)
+        self.continuous_decoder = HybridContinuousDecoder(config)
+        backbone_type = config.backbone_type.lower()
+        if backbone_type == "bert":
+            self.backbone = HybridBertBackbone(config)
+        elif backbone_type == "gpt":
+            self.backbone = HybridGptBackbone(config)
+        else:
+            raise ValueError(f"HybridPianoTransformer supports bert/gpt, got {config.backbone_type}")
+
+    def forward(
+        self,
+        pitch_ids: Optional[torch.LongTensor] = None,
+        continuous: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        labels_continuous: Optional[torch.FloatTensor] = None,
+        interpolated: Optional[torch.BoolTensor] = None,
+        **kwargs,
+    ) -> Seq2SeqLMOutput:
+        del interpolated, kwargs
+        if pitch_ids is None or continuous is None:
+            raise ValueError("pitch_ids and continuous are required")
+        if attention_mask is None:
+            attention_mask = (pitch_ids != self.config.pitch_pad_id).long()
+
+        score_note_embeds = self.note_encoder(pitch_ids, continuous)
+        hidden_states = self.backbone(score_note_embeds, attention_mask)
+        continuous_pred = self.continuous_decoder(hidden_states)
+
+        loss = None
+        if labels_continuous is not None:
+            loss = _compute_hybrid_loss(self.config, continuous_pred, labels_continuous, attention_mask)
+
+        return Seq2SeqLMOutput(loss=loss, logits=continuous_pred)
+
+
 class HybridPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
     config_class = HybridPianoT5GemmaConfig
-    _tp_plan = {"continuous_decoder.head.2": "colwise_rep"}
-    _pp_plan = {"continuous_decoder.head": (["hidden_states"], ["continuous_pred"])}
+    _tp_plan = {
+        "continuous_decoder.timing_head.2": "colwise_rep",
+        "continuous_decoder.velocity_head.2": "colwise_rep",
+        "continuous_decoder.pedal_head.2": "colwise_rep",
+    }
+    _pp_plan = {"continuous_decoder": (["hidden_states"], ["continuous_pred"])}
 
     def __init__(self, config: HybridPianoT5GemmaConfig):
         config.is_encoder_decoder = True
@@ -347,42 +578,7 @@ class HybridPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
 
         loss = None
         if labels_continuous is not None:
-            mask = attention_mask.bool()
-            weights = self.config.loss_weights
-            loss_ioi = _regression_loss(
-                continuous_pred[..., 0],
-                labels_continuous[..., 0],
-                mask,
-                self.config.time_loss_type,
-                self.config.huber_delta,
-            )
-            loss_duration = _regression_loss(
-                continuous_pred[..., 1],
-                labels_continuous[..., 1],
-                mask,
-                self.config.time_loss_type,
-                self.config.huber_delta,
-            )
-            loss_velocity = _regression_loss(
-                continuous_pred[..., 2],
-                labels_continuous[..., 2],
-                mask,
-                self.config.value_loss_type,
-                self.config.huber_delta,
-            )
-            loss_pedal = _regression_loss(
-                continuous_pred[..., 3:7],
-                labels_continuous[..., 3:7],
-                mask.unsqueeze(-1).expand_as(continuous_pred[..., 3:7]),
-                self.config.value_loss_type,
-                self.config.huber_delta,
-            )
-            loss = (
-                weights.get("ioi", 1.0) * loss_ioi
-                + weights.get("duration", 1.0) * loss_duration
-                + weights.get("velocity", 1.0) * loss_velocity
-                + weights.get("pedal", 1.0) * loss_pedal
-            )
+            loss = _compute_hybrid_loss(self.config, continuous_pred, labels_continuous, attention_mask)
 
         return Seq2SeqLMOutput(
             loss=loss,
