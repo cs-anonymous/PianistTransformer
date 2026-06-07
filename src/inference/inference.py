@@ -7,9 +7,10 @@ from miditoolkit import MidiFile
 from src.utils.midi import midi_to_ids, ids_to_midi
 import random
 
-if __name__ == "__main__":    
+if __name__ == "__main__":
+    model_path = "models/sft/sft_2026-06-05-18-55-35"
     model = PianoT5Gemma.from_pretrained(
-        "models/sft/",
+        model_path,
         torch_dtype=torch.bfloat16
     )#.cuda()
 

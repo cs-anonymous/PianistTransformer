@@ -134,7 +134,7 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--config", type=str, default="configs/sft_config.json")
+    parser.add_argument("--config", type=str, default="configs/sft_config_pianocore.json")
     parser.add_argument('--deepspeed', type=str, help='Path to DeepSpeed config')
     parser.add_argument('--local_rank', type=int, default=-1, help='local rank passed from deepspeed')
 
@@ -163,25 +163,28 @@ if __name__ == "__main__":
     dataset = load_dataset("json", data_files=train_config["data_paths"])
     dataset = dataset.shuffle(seed=42) 
     
-    train_dataset = dataset.filter(lambda example: example['split'] == 'train')
-    valid_dataset = dataset.filter(lambda example: example['split'] == 'test')
+    num_proc = 40
+    train_dataset = dataset.filter(lambda example: example['split'] == 'train', num_proc=num_proc)
+    valid_dataset = dataset.filter(lambda example: example['split'] == 'test', num_proc=num_proc)
 
     train_dataset = train_dataset.map(
-        group_ids, 
+        group_ids,
         fn_kwargs={
-            "block_size": train_config["block_size"], 
-            "overlap_ratio": train_config["overlap_ratio"], 
-        }, 
-        batched=True, 
+            "block_size": train_config["block_size"],
+            "overlap_ratio": train_config["overlap_ratio"],
+        },
+        batched=True,
+        num_proc=num_proc,
         remove_columns=['x', 'label', 'score_source', 'performance_source', 'cut', 'split']
     )
     valid_dataset = valid_dataset.map(
-        group_ids, 
+        group_ids,
         fn_kwargs={
-            "block_size": train_config["block_size"], 
-            "overlap_ratio": train_config["overlap_ratio"], 
-        }, 
-        batched=True, 
+            "block_size": train_config["block_size"],
+            "overlap_ratio": train_config["overlap_ratio"],
+        },
+        batched=True,
+        num_proc=num_proc,
         remove_columns=['x', 'label', 'score_source', 'performance_source', 'cut', 'split']
     )
 
@@ -199,6 +202,11 @@ if __name__ == "__main__":
         
     training_args = filter_valid_args(train_config, TrainingArguments)
 
+    # Force DDP for multi-GPU instead of DataParallel
+    if torch.cuda.device_count() > 1:
+        training_args["ddp_find_unused_parameters"] = True
+        training_args["ddp_broadcast_buffers"] = False
+
     training_args = TrainingArguments(**training_args)
 
     trainer = Trainer(
@@ -211,4 +219,3 @@ if __name__ == "__main__":
 
     trainer.train()
     trainer.save_model()
-

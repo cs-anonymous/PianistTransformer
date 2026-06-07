@@ -3,6 +3,6 @@ __pycache__
 .ipynb_checkpoints
 models
 temp
-results
 testset-norm
 tools
+data

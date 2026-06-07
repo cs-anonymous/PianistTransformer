@@ -1,0 +1,35 @@
+============================================================
+Hybrid Node EPR Evaluation
+============================================================
+Config: configs/sft_node_config_pianocore.json
+Checkpoint: models/sft_nodes/sft_node_2026-06-07-03-38-14/checkpoint-1000
+Device: cuda:0
+
+Building test dataset...
+Test dataset size: 757 samples
+
+Loading model from models/sft_nodes/sft_node_2026-06-07-03-38-14/checkpoint-1000
+Loading from safetensors: models/sft_nodes/sft_node_2026-06-07-03-38-14/checkpoint-1000/model.safetensors
+Evaluating on 757 samples...
+Extracting features...
+Collected 383764 total notes
+
+Computing metrics...
+
+============================================================
+EPR Evaluation Results (Pianist Transformer Metrics)
+============================================================
+
+Feature         JS Div (↓)      IA (↑)         
+------------------------------------------------------------
+Velocity        0.2853          0.4977         
+Duration        0.2722          0.5113         
+Ioi             0.0439          0.8456         
+Pedal           0.4922          0.3216         
+------------------------------------------------------------
+Overall         0.2734          0.5440         
+============================================================
+
+Results saved to results/hybrid_node_eval.json
+
+Evaluation complete!

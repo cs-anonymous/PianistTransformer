@@ -1,0 +1,36 @@
+/home/kaititech/anaconda3/lib/python3.13/site-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+============================================================
+Hybrid Node EPR Evaluation
+============================================================
+Config: configs/sft_node_config_pianocore.json
+Checkpoint: models/sft_nodes/sft_node_2026-06-07-03-38-14/checkpoint-1000
+Device: cuda:0
+
+Building test dataset...
+Test dataset size: 757 samples
+
+Loading model from models/sft_nodes/sft_node_2026-06-07-03-38-14/checkpoint-1000
+Loading from safetensors: models/sft_nodes/sft_node_2026-06-07-03-38-14/checkpoint-1000/model.safetensors
+Limiting to 500 samples (250 batches)
+Evaluating on 757 samples...
+Running inference:   0%|          | 0/250 [00:00<?, ?it/s]Running inference:   0%|          | 0/250 [00:00<?, ?it/s]
+Traceback (most recent call last):
+  File "/home/kaititech/EPR/PianistTransformer/src/evaluate/evaluate_hybrid_node.py", line 273, in <module>
+    main()
+    ~~~~^^
+  File "/home/kaititech/EPR/PianistTransformer/src/evaluate/evaluate_hybrid_node.py", line 218, in main
+    pred_features, target_features = evaluate_model(
+                                     ~~~~~~~~~~~~~~^
+        model, test_dataset, config,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        device=args.device,
+        ^^^^^^^^^^^^^^^^^^^
+        max_batches=max_batches
+        ^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/home/kaititech/EPR/PianistTransformer/src/evaluate/evaluate_hybrid_node.py", line 131, in evaluate_model
+    'pitch_ids': torch.stack([s['pitch_ids'] for s in batch_samples]),
+                 ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: expected Tensor as element 0 in argument 0, but got list

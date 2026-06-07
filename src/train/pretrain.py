@@ -168,14 +168,21 @@ if __name__ == "__main__":
 
     data_collator = UltimateDataCollator(config)
 
-    if train_config["resume_path"] is None:
-        model = PianoT5Gemma(config)
-    else:
+    # Support both resume_path (full checkpoint with trainer state) and pretrained_model (just weights)
+    if train_config.get("pretrained_model") is not None:
+        model = PianoT5Gemma.from_pretrained(
+            train_config["pretrained_model"],
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        )
+        print(f"Loaded pretrained model from {train_config['pretrained_model']}!")
+    elif train_config["resume_path"] is not None:
         model = PianoT5Gemma.from_pretrained(
             train_config["resume_path"],
             torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32
         )
         print(f"Loaded pretrained model from {train_config['resume_path']}!")
+    else:
+        model = PianoT5Gemma(config)
 
     model.to(device)
     print_model_parameters(model)
