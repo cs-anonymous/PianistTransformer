@@ -144,6 +144,154 @@ If you wish to train the model on your own dataset, please organize your files a
 
 You will need to modify the `script/data_process.sh` script accordingly or write your own data processing workflow by referencing its logic to ensure your data is loaded and processed correctly.
 
+## INSPIRE / INR Research Track
+
+In addition to the original Pianist Transformer pipeline, this repository also contains an active research direction for:
+
+`INSPIRE = Integrated Note-based Score Performance Interpretation, Reconstruction and Expression`
+
+Its core representation is:
+
+`INR = Integrated Note Representation`
+
+INR moves from the original token-level note block representation to a note-level structured object representation. In the current repository, some implementation class names and scripts still use legacy `Hybrid*` naming for compatibility, but the research terminology is now `INSPIRE / INR`.
+
+### INR Task Split
+
+INR treats symbolic-performance modeling as two related but different tasks:
+
+- `EPR (Expressive Performance Rendering)`: `score -> performance`
+- `CSR (Canonical Score Reconstruction)`: `performance -> score`
+
+These two tasks are intentionally **not** trained with the exact same loss philosophy:
+
+- `EPR` is closer to one-to-many conditional expressive realization, so the loss should be tolerant to multiple plausible outputs.
+- `CSR` is closer to many-to-one canonical reconstruction, so the loss should enforce stricter score-grid and notation recovery.
+
+### Recommended Loss Design
+
+#### EPR Loss
+
+Recommended heads:
+
+- `timing_head -> [ioi, dur]`
+- `velocity_head -> [vel]`
+- `pedal_head -> [pedal_1..4]`
+
+Recommended default losses:
+
+- `ioi`, `dur`: `Laplace NLL`
+- `velocity`: continuous regression, default `Huber`
+- `pedal`: continuous regression, default `Huber`
+
+Recommended form:
+
+```python
+loss_ioi = laplace_nll(ioi_mu, ioi_log_b, ioi_target)
+loss_dur = laplace_nll(dur_mu, dur_log_b, dur_target)
+loss_vel = huber(vel_pred, vel_target)
+loss_pedal = huber(pedal_raw_pred, pedal_target)
+
+loss_epr = (
+    1.0 * loss_ioi
+  + 1.0 * loss_dur
+  + 1.0 * loss_vel
+  + 0.75 * loss_pedal
+)
+```
+
+Why these choices:
+
+- `ioi` and `dur` are the timing targets most affected by one-to-many expressive variation, so they use `Laplace NLL`.
+- `velocity` is a simpler continuous target and can stay as direct regression.
+- `pedal` is also treated as a continuous control signal, with no binary/logit objective by default.
+- The final EPR objective is intentionally simple: `ioi + dur + velocity + 0.75 * pedal`.
+
+Important implementation note for pedal:
+
+- The primary INR recommendation is **not** `sigmoid + BCE`.
+- Use a **linear regression head** for pedal during training.
+- Clamp to `[0, 1]` only at inference/export time.
+
+```python
+pedal_raw_pred = pedal_head(hidden_states)
+loss_pedal = huber(pedal_raw_pred, pedal_target)
+pedal_out = pedal_raw_pred.clamp(0.0, 1.0)
+```
+
+An auxiliary binary pedal-state head can still be added later if clearer on/off boundaries are needed, but it is **not** the default loss.
+
+#### CSR Loss
+
+Recommended heads:
+
+- `score_position_head -> [mo, md]`
+- `measure_structure_head -> [ml, first]`
+- `score_annotation_head -> [staff, trill, grace, staccato]`
+
+Recommended default losses:
+
+- `mo`, `md`, `ml`: `ordinal classification` on the canonical score grid
+- `first`, `staff`, `trill`, `grace`, `staccato`: `BCEWithLogitsLoss`
+
+This is important: `mo/md/ml` should not be treated as the final-form continuous regression targets in CSR. Although a `Huber` baseline is easy to prototype, the preferred INSPIRE/INR design is ordinal/grid-aware prediction because these variables lie on a fixed discrete score lattice.
+
+Current score-grid definitions in this repository are:
+
+- `mo`: range `[0, 6]`, step `1/24`
+- `md`: range `[0, 4]`, step `1/24`
+- `ml`: range `[0, 6]`, step `1/24`
+
+That means:
+
+- `mo` has `145` bins
+- `md` has `97` bins
+- `ml` has `145` bins
+
+Recommended form:
+
+```python
+score_mask = attention_mask * has_score_feature
+ml_mask = score_mask * first_target
+
+loss_mo = 1.0 * ordinal_ce(mo_logits, mo_bin_target, score_mask)
+loss_md = 1.0 * ordinal_ce(md_logits, md_bin_target, score_mask)
+loss_first = 1.0 * bce_with_logits(first_logit, first_target, score_mask)
+
+loss_ml = 1.0 * ordinal_ce(ml_logits, ml_bin_target, ml_mask)
+
+loss_staff = 0.5 * bce_with_logits(staff_logit, staff_target, score_mask)
+loss_trill = 0.40 * bce_with_logits(trill_logit, trill_target, score_mask)
+loss_grace = 0.40 * bce_with_logits(grace_logit, grace_target, score_mask)
+loss_staccato = 0.30 * bce_with_logits(staccato_logit, staccato_target, score_mask)
+
+loss_csr = (
+    loss_mo
+  + loss_md
+  + loss_first
+  + loss_ml
+  + loss_staff
+  + loss_trill
+  + loss_grace
+  + loss_staccato
+)
+```
+
+Why these choices:
+
+- `mo`, `md`, and `first` define the core canonical score structure, so they carry the highest weight.
+- `ml` is meaningful mainly at measure starts, so it is masked by `first`; because `ml_mask` is much sparser than the other masks, its coefficient should stay at `1.0` rather than be reduced.
+- `staff` is an important structural label and is stronger than a light auxiliary tag, so `0.5` is a better default than a very small weight.
+- `trill`, `grace`, and `staccato` are sparse but musically meaningful notation labels, so they should not be left unweighted, but they also should not dominate the main score-grid reconstruction targets.
+
+### Practical Summary
+
+- `EPR`: tolerant continuous regression, with pedal modeled first as a continuous control signal.
+- `CSR`: stricter canonical reconstruction, with `mo/md/ml` modeled on discrete ordinal score grids.
+- `Huber` remains a good baseline loss for continuous targets, but it is not the preferred final-form loss for `mo/md/ml` in CSR.
+
+For the more detailed experiment design and ongoing INR backbone comparison notes, see [docs/hybrid_note_representation_experiment.md](/home/kaititech/EPR/PianistTransformer/docs/hybrid_note_representation_experiment.md).
+
 ## Graphical User Interface (GUI)
 To make our tool accessible to everyone, especially users who are not familiar with the command line, we have developed a simple and intuitive Graphical User Interface (GUI) based on PyQt and Pygame. You can easily use the Pianist Transformer without writing any code.
 

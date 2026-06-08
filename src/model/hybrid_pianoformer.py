@@ -37,6 +37,7 @@ class HybridPianoT5GemmaConfig(PianoT5GemmaConfig):
         pitch_vocab_size=128,
         pitch_pad_id=128,
         max_time_ms=10000.0,
+        pedal_output_activation="sigmoid",
         time_loss_type="huber",
         value_loss_type="mse",
         huber_delta=0.05,
@@ -58,6 +59,7 @@ class HybridPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.num_key_value_heads = self.encoder.num_key_value_heads
         self.head_dim = self.encoder.head_dim
         self.max_time_ms = max_time_ms
+        self.pedal_output_activation = pedal_output_activation
         self.time_loss_type = time_loss_type
         self.value_loss_type = value_loss_type
         self.huber_delta = huber_delta
@@ -99,6 +101,7 @@ class HybridNoteEncoder(nn.Module):
 class HybridContinuousDecoder(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.config = config
         self.timing_head = nn.Sequential(
             nn.Linear(config.hidden_size, config.hidden_size),
             nn.GELU(),
@@ -119,7 +122,13 @@ class HybridContinuousDecoder(nn.Module):
         timing = self.timing_head(hidden_states)
         velocity = self.velocity_head(hidden_states)
         pedal = self.pedal_head(hidden_states)
-        return torch.sigmoid(torch.cat([timing, velocity, pedal], dim=-1))
+        timing = torch.sigmoid(timing)
+        velocity = torch.sigmoid(velocity)
+        if self.config.pedal_output_activation == "sigmoid":
+            pedal = torch.sigmoid(pedal)
+        elif self.config.pedal_output_activation != "linear":
+            raise ValueError(f"Unsupported pedal_output_activation: {self.config.pedal_output_activation}")
+        return torch.cat([timing, velocity, pedal], dim=-1)
 
 
 class HybridT5GemmaEncoder(T5GemmaPreTrainedModel):
@@ -289,9 +298,8 @@ def _regression_loss(pred, target, mask, loss_type, huber_delta):
     return _masked_mean(values, mask)
 
 
-def _compute_hybrid_loss(config, continuous_pred, labels_continuous, attention_mask):
+def _compute_hybrid_loss_components(config, continuous_pred, labels_continuous, attention_mask):
     mask = attention_mask.bool()
-    weights = config.loss_weights
     loss_ioi = _regression_loss(
         continuous_pred[..., 0],
         labels_continuous[..., 0],
@@ -320,11 +328,27 @@ def _compute_hybrid_loss(config, continuous_pred, labels_continuous, attention_m
         config.value_loss_type,
         config.huber_delta,
     )
+    return {
+        "ioi": loss_ioi,
+        "duration": loss_duration,
+        "velocity": loss_velocity,
+        "pedal": loss_pedal,
+    }
+
+
+def _compute_hybrid_loss(config, continuous_pred, labels_continuous, attention_mask):
+    weights = config.loss_weights
+    components = _compute_hybrid_loss_components(
+        config,
+        continuous_pred,
+        labels_continuous,
+        attention_mask,
+    )
     return (
-        weights.get("ioi", 1.0) * loss_ioi
-        + weights.get("duration", 1.0) * loss_duration
-        + weights.get("velocity", 1.0) * loss_velocity
-        + weights.get("pedal", 1.0) * loss_pedal
+        weights.get("ioi", 1.0) * components["ioi"]
+        + weights.get("duration", 1.0) * components["duration"]
+        + weights.get("velocity", 1.0) * components["velocity"]
+        + weights.get("pedal", 1.0) * components["pedal"]
     )
 
 

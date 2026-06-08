@@ -1,11 +1,96 @@
 # Expressive Performance Rendering Evaluation Status
 
-**Date**: 2026-06-07  
+**Date**: 2026-06-08  
 **Task**: Compare Hybrid Node (1 node/note) vs PT (8 tokens/note) on EPR task
 
 ---
 
 ## 1. Evaluation Summary
+
+### 1.0 Corrected Hybrid Node Evaluation ✅ **UPDATED 2026-06-08**
+
+**Important correction**: the earlier `ASAP=256 / PianoCoRe-only=501` split does **not** match the actual `performance_dataset` labels in the 757-window quick evaluation set. The corrected split is:
+
+| Subset | Windows | Notes |
+|--------|---------|-------|
+| ASAP | 104 | 53,248 |
+| PianoCoRe-only / non-ASAP | 653 | 330,516 |
+| Total | 757 | 383,764 |
+
+This corrected split matches the finding in `results/PT_EVALUATION_REPORT.md`.
+
+#### Models Compared
+
+| Name | Checkpoint | Notes |
+|------|------------|-------|
+| Old 1000-step | `models/sft_nodes/sft_node_2026-06-07-03-38-14/checkpoint-1000` | PT-backbone warm start, old joint output head |
+| Current 1-epoch T5-10+2 | `models/sft_nodes_t5_10_2/sft_node_2026-06-07-19-57-08` | full PianoCoRe-A epoch, separate timing/velocity/pedal heads |
+
+Results are saved in:
+
+```text
+results/hybrid_node_checkpoint1000_corrected_evaluation/
+results/hybrid_node_t5_10_2_epoch1_evaluation/
+```
+
+#### ASAP Subset - Current 1-epoch T5-10+2 (104 samples, 53,248 notes)
+
+| Feature | JS ↓ | IA ↑ | MAE ↓ | RMSE ↓ | Pearson ↑ |
+|---------|------|------|-------|--------|-----------|
+| Velocity | 0.2109 | 0.5953 | 10.89 | 13.62 | 0.6292 |
+| Duration | 0.2798 | 0.5236 | 183.73 | 269.46 | 0.7115 |
+| IOI | 0.0132 | 0.9238 | 32.18 | 98.51 | 0.9331 |
+| BPedal | 0.2334 | 0.5363 | 6.61 | 9.65 | 0.0284 |
+| CPedal | 0.5033 | 0.3138 | 42.99 | 51.97 | 0.2194 |
+| **Overall** | **0.2481** | **0.5786** | **55.28** | **88.64** | **0.5043** |
+
+#### ASAP Subset - Old 1000-step (104 samples, 53,248 notes)
+
+| Feature | JS ↓ | IA ↑ | MAE ↓ | RMSE ↓ | Pearson ↑ |
+|---------|------|------|-------|--------|-----------|
+| Velocity | 0.2214 | 0.5878 | 11.58 | 14.44 | 0.5820 |
+| Duration | 0.4011 | 0.3801 | 229.77 | 338.32 | 0.3966 |
+| IOI | 0.0753 | 0.8069 | 57.08 | 154.82 | 0.7640 |
+| BPedal | 0.2922 | 0.5012 | 6.63 | 9.68 | 0.0181 |
+| CPedal | 0.5594 | 0.2560 | 44.21 | 53.09 | 0.0821 |
+| **Overall** | **0.3099** | **0.5064** | **69.86** | **114.07** | **0.3686** |
+
+#### PianoCoRe-only Subset - Current 1-epoch T5-10+2 (653 samples, 330,516 notes)
+
+| Feature | JS ↓ | IA ↑ | MAE ↓ | RMSE ↓ | Pearson ↑ |
+|---------|------|------|-------|--------|-----------|
+| Velocity | 0.2763 | 0.4909 | 11.75 | 14.76 | 0.5085 |
+| Duration | 0.2439 | 0.5445 | 296.43 | 562.68 | 0.5110 |
+| IOI | 0.0116 | 0.9299 | 49.50 | 125.48 | 0.8548 |
+| BPedal | 0.0949 | 0.6722 | 7.88 | 10.44 | -0.0202 |
+| CPedal | 0.5058 | 0.2983 | 47.60 | 54.14 | 0.0256 |
+| **Overall** | **0.2265** | **0.5872** | **82.63** | **153.50** | **0.3759** |
+
+#### PianoCoRe-only Subset - Old 1000-step (653 samples, 330,516 notes)
+
+| Feature | JS ↓ | IA ↑ | MAE ↓ | RMSE ↓ | Pearson ↑ |
+|---------|------|------|-------|--------|-----------|
+| Velocity | 0.3039 | 0.4680 | 11.97 | 15.02 | 0.5029 |
+| Duration | 0.2714 | 0.5054 | 347.66 | 629.73 | 0.1406 |
+| IOI | 0.0460 | 0.8429 | 70.17 | 170.24 | 0.6898 |
+| BPedal | 0.0647 | 0.7296 | 7.18 | 10.00 | 0.0824 |
+| CPedal | 0.4948 | 0.3165 | 47.91 | 54.61 | 0.0512 |
+| **Overall** | **0.2362** | **0.5725** | **96.98** | **175.92** | **0.2934** |
+
+#### Updated Conclusion
+
+- The current 1-epoch T5-10+2 model is **better overall** than the old 1000-step checkpoint on the corrected evaluation split.
+- Improvements are strongest on ASAP:
+  - Overall JS: `0.3099 -> 0.2481`
+  - Overall Pearson: `0.3686 -> 0.5043`
+  - Overall Pearson also improves substantially.
+- PianoCoRe-only also improves overall:
+  - Overall JS: `0.2362 -> 0.2265`
+  - Overall Pearson: `0.2934 -> 0.3759`
+- Pedal is mixed:
+  - ASAP BPedal and CPedal both improve.
+  - PianoCoRe-only BPedal gets worse (`0.0647 -> 0.0949` JS), while CPedal is roughly similar/slightly worse by JS (`0.4948 -> 0.5058`) but slightly better by MAE (`47.91 -> 47.60`).
+- Continuous pedal remains weak overall; this supports the ongoing pedal-head/loss investigation.
 
 ### 1.1 Hybrid Node (Our Model) ✅ **COMPLETED**
 

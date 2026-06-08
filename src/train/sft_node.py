@@ -19,7 +19,12 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in os.sys.path:
     os.sys.path.insert(0, str(ROOT_DIR))
 
-from src.model.hybrid_pianoformer import HybridPianoT5Gemma, HybridPianoT5GemmaConfig, HybridPianoTransformer
+from src.model.hybrid_pianoformer import (
+    HybridPianoT5Gemma,
+    HybridPianoT5GemmaConfig,
+    HybridPianoTransformer,
+    _compute_hybrid_loss_components,
+)
 from src.utils.func import filter_valid_args
 
 
@@ -244,6 +249,46 @@ class PianoCoReNodeSFTDataset(Dataset):
 
 
 class NodeSFTTrainer(Trainer):
+    def _model_config(self, model):
+        return model.module.config if hasattr(model, "module") else model.config
+
+    def _record_loss_components(self, model, outputs, inputs):
+        if not hasattr(outputs, "logits"):
+            return
+        if "labels_continuous" not in inputs or "attention_mask" not in inputs:
+            return
+        components = _compute_hybrid_loss_components(
+            self._model_config(model),
+            outputs.logits.detach(),
+            inputs["labels_continuous"].detach(),
+            inputs["attention_mask"].detach(),
+        )
+        if not getattr(self, "_loss_component_sums", None):
+            self._loss_component_sums = {name: 0.0 for name in components}
+            self._loss_component_count = 0
+        for name, value in components.items():
+            self._loss_component_sums[name] += float(value.detach().float().cpu())
+        self._loss_component_count += 1
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        outputs = model(**inputs)
+        loss = outputs.loss
+        self._record_loss_components(model, outputs, inputs)
+        return (loss, outputs) if return_outputs else loss
+
+    def log(self, logs, *args, **kwargs):
+        count = getattr(self, "_loss_component_count", 0)
+        if count and "loss" in logs:
+            for name, total in self._loss_component_sums.items():
+                logs[f"loss_{name}"] = total / count
+            self._loss_component_sums = {}
+            self._loss_component_count = 0
+        if self.is_world_process_zero():
+            printable_logs = {"step": self.state.global_step}
+            printable_logs.update(logs)
+            print(json.dumps(printable_logs, ensure_ascii=False, sort_keys=True), flush=True)
+        return super().log(logs, *args, **kwargs)
+
     def _get_train_sampler(self, train_dataset=None):
         train_dataset = train_dataset if train_dataset is not None else self.train_dataset
         if train_dataset is None or not hasattr(train_dataset, "__len__"):
@@ -308,6 +353,7 @@ def create_model(train_config):
         attention_dropout=train_config.get("attention_dropout", 0.0),
         continuous_dim=train_config["continuous_dim"],
         max_time_ms=train_config["max_time_ms"],
+        pedal_output_activation=train_config.get("pedal_output_activation", "sigmoid"),
         time_loss_type=train_config["time_loss_type"],
         value_loss_type=train_config["value_loss_type"],
         huber_delta=train_config["huber_delta"],

@@ -29,6 +29,7 @@ def load_model(checkpoint_path, config):
         backbone_type=backbone_type,
         continuous_dim=config.get('continuous_dim', 7),
         max_time_ms=config.get('max_time_ms', 10000.0),
+        pedal_output_activation=config.get('pedal_output_activation', 'sigmoid'),
         pitch_pad_id=config.get('pitch_pad_id', 128),
         encoder_layers_num=config.get('encoder_layers_num', 10),
         decoder_layers_num=config.get('decoder_layers_num', 2),

@@ -7,3 +7,6 @@ testset-norm
 tools
 data
 logs
+results
+MIDI2ScoreTransformer
+.tools
