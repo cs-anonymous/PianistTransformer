@@ -34,14 +34,19 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self,
         backbone_type="t5",
         continuous_dim=7,
+        input_continuous_dim=None,
+        output_continuous_dim=None,
         pitch_vocab_size=128,
         pitch_pad_id=128,
         max_time_ms=10000.0,
         pedal_output_activation="sigmoid",
+        task_type="epr",
         time_loss_type="huber",
         value_loss_type="mse",
+        csr_grid_loss_type="huber",
         huber_delta=0.05,
         loss_weights=None,
+        csr_loss_weights=None,
         decoder_input_mode="score",
         gpt_layers_num=None,
         bert_layers_num=None,
@@ -52,6 +57,8 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         super().__init__(**kwargs)
         self.backbone_type = backbone_type
         self.continuous_dim = continuous_dim
+        self.input_continuous_dim = input_continuous_dim or continuous_dim
+        self.output_continuous_dim = output_continuous_dim or continuous_dim
         self.pitch_vocab_size = pitch_vocab_size
         self.pitch_pad_id = pitch_pad_id
         self.intermediate_size = self.encoder.intermediate_size
@@ -60,14 +67,26 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.head_dim = self.encoder.head_dim
         self.max_time_ms = max_time_ms
         self.pedal_output_activation = pedal_output_activation
+        self.task_type = task_type
         self.time_loss_type = time_loss_type
         self.value_loss_type = value_loss_type
+        self.csr_grid_loss_type = csr_grid_loss_type
         self.huber_delta = huber_delta
         self.loss_weights = loss_weights or {
             "ioi": 1.0,
             "duration": 1.0,
             "velocity": 1.0,
             "pedal": 1.0,
+        }
+        self.csr_loss_weights = csr_loss_weights or {
+            "mo": 1.0,
+            "md": 1.0,
+            "first": 1.0,
+            "ml": 1.0,
+            "staff": 0.5,
+            "trill": 0.4,
+            "grace": 0.4,
+            "staccato": 0.3,
         }
         self.decoder_input_mode = decoder_input_mode
         self.gpt_layers_num = gpt_layers_num
@@ -85,7 +104,7 @@ class IntegratedNoteEncoder(nn.Module):
             padding_idx=config.pitch_pad_id,
         )
         self.continuous_mlp = nn.Sequential(
-            nn.Linear(config.continuous_dim, config.hidden_size),
+            nn.Linear(config.input_continuous_dim, config.hidden_size),
             nn.GELU(),
             nn.Linear(config.hidden_size, config.hidden_size),
         )
@@ -102,6 +121,7 @@ class IntegratedContinuousDecoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.output_dim = config.output_continuous_dim
         self.timing_head = nn.Sequential(
             nn.Linear(config.hidden_size, config.hidden_size),
             nn.GELU(),
@@ -117,8 +137,16 @@ class IntegratedContinuousDecoder(nn.Module):
             nn.GELU(),
             nn.Linear(config.hidden_size, 4),
         )
+        self.generic_head = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.GELU(),
+            nn.Linear(config.hidden_size, self.output_dim),
+        )
 
     def forward(self, hidden_states):
+        if self.output_dim != 7:
+            return self.generic_head(hidden_states)
+
         timing = self.timing_head(hidden_states)
         velocity = self.velocity_head(hidden_states)
         pedal = self.pedal_head(hidden_states)
@@ -299,6 +327,9 @@ def _regression_loss(pred, target, mask, loss_type, huber_delta):
 
 
 def _compute_integrated_loss_components(config, continuous_pred, labels_continuous, attention_mask):
+    if getattr(config, "task_type", "epr") == "csr":
+        return _compute_csr_loss_components(config, continuous_pred, labels_continuous, attention_mask)
+
     mask = attention_mask.bool()
     loss_ioi = _regression_loss(
         continuous_pred[..., 0],
@@ -336,14 +367,59 @@ def _compute_integrated_loss_components(config, continuous_pred, labels_continuo
     }
 
 
+def _bce_loss(logits, target, mask):
+    values = F.binary_cross_entropy_with_logits(logits.float(), target.float(), reduction="none")
+    return _masked_mean(values, mask)
+
+
+def _compute_csr_loss_components(config, score_feature_logits, labels_score_feature, score_feature_mask):
+    score_mask = score_feature_mask.bool()
+    first_target = labels_score_feature[..., 3].float()
+    ml_mask = score_mask & (first_target >= 0.5)
+    grid_loss_type = getattr(config, "csr_grid_loss_type", "huber")
+
+    return {
+        "mo": _regression_loss(
+            torch.sigmoid(score_feature_logits[..., 0]),
+            labels_score_feature[..., 0],
+            score_mask,
+            grid_loss_type,
+            config.huber_delta,
+        ),
+        "md": _regression_loss(
+            torch.sigmoid(score_feature_logits[..., 1]),
+            labels_score_feature[..., 1],
+            score_mask,
+            grid_loss_type,
+            config.huber_delta,
+        ),
+        "first": _bce_loss(score_feature_logits[..., 3], labels_score_feature[..., 3], score_mask),
+        "ml": _regression_loss(
+            torch.sigmoid(score_feature_logits[..., 2]),
+            labels_score_feature[..., 2],
+            ml_mask,
+            grid_loss_type,
+            config.huber_delta,
+        ),
+        "staff": _bce_loss(score_feature_logits[..., 4], labels_score_feature[..., 4], score_mask),
+        "trill": _bce_loss(score_feature_logits[..., 5], labels_score_feature[..., 5], score_mask),
+        "grace": _bce_loss(score_feature_logits[..., 6], labels_score_feature[..., 6], score_mask),
+        "staccato": _bce_loss(score_feature_logits[..., 7], labels_score_feature[..., 7], score_mask),
+    }
+
+
 def _compute_integrated_loss(config, continuous_pred, labels_continuous, attention_mask):
-    weights = config.loss_weights
     components = _compute_integrated_loss_components(
         config,
         continuous_pred,
         labels_continuous,
         attention_mask,
     )
+    if getattr(config, "task_type", "epr") == "csr":
+        weights = config.csr_loss_weights
+        return sum(weights.get(name, 1.0) * value for name, value in components.items())
+
+    weights = config.loss_weights
     return (
         weights.get("ioi", 1.0) * components["ioi"]
         + weights.get("duration", 1.0) * components["duration"]

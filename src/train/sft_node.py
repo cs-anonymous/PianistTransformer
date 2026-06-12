@@ -152,6 +152,7 @@ class PianoCoReNodeSFTDataset(Dataset):
         self,
         manifest,
         split,
+        task_type="epr",
         shuffle=True,
         seed=42,
         max_performances_per_work=None,
@@ -160,6 +161,7 @@ class PianoCoReNodeSFTDataset(Dataset):
     ):
         super().__init__()
         self.split = split
+        self.task_type = task_type
         items = list(manifest)
         if shuffle:
             random.Random(seed).shuffle(items)
@@ -237,15 +239,29 @@ class PianoCoReNodeSFTDataset(Dataset):
         perf = performances[int(perf_slot) % len(performances)]
         labels = perf["label_continuous"]
         interpolated = perf["interpolated"]
+        task_type = self.task_type.lower()
+        if task_type == "epr":
+            continuous = score["score_continuous"][start:end]
+            labels_continuous = labels[start:end]
+            label_mask = None
+        elif task_type == "csr":
+            continuous = labels[start:end]
+            labels_continuous = score["score_feature"][start:end]
+            label_mask = score["has_score_feature"][start:end]
+        else:
+            raise ValueError(f"Unsupported task_type: {self.task_type}")
 
-        return {
+        sample = {
             "pitch_ids": score["pitch"][start:end],
-            "continuous": score["score_continuous"][start:end],
-            "labels_continuous": labels[start:end],
+            "continuous": continuous,
+            "labels_continuous": labels_continuous,
             "interpolated": interpolated[start:end],
             "performance_dataset": perf.get("performance_dataset", "unknown"),
             "performance_id": perf.get("performance_id", "unknown"),
         }
+        if label_mask is not None:
+            sample["label_mask"] = label_mask
+        return sample
 
 
 class NodeSFTTrainer(Trainer):
@@ -305,8 +321,9 @@ class NodeSFTTrainer(Trainer):
 
 
 class NodeSFTDataCollator:
-    def __init__(self, pitch_pad_id=128):
+    def __init__(self, pitch_pad_id=128, task_type="epr"):
         self.pitch_pad_id = pitch_pad_id
+        self.task_type = task_type
 
     def __call__(self, examples):
         pitch_tensors = [torch.tensor(example["pitch_ids"], dtype=torch.long) for example in examples]
@@ -325,6 +342,12 @@ class NodeSFTDataCollator:
         labels_continuous = pad_sequence(label_tensors, batch_first=True, padding_value=0.0)
         interpolated = pad_sequence(interpolated_tensors, batch_first=True, padding_value=False)
         attention_mask = (pitch_ids != self.pitch_pad_id).long()
+        if self.task_type == "csr":
+            label_mask_tensors = [
+                torch.tensor(example["label_mask"], dtype=torch.long) for example in examples
+            ]
+            loss_mask = pad_sequence(label_mask_tensors, batch_first=True, padding_value=0)
+            attention_mask = attention_mask * loss_mask
 
         return {
             "pitch_ids": pitch_ids,
@@ -338,6 +361,7 @@ class NodeSFTDataCollator:
 def create_model(train_config):
     dtype = torch.bfloat16 if train_config.get("bf16", False) and torch.cuda.is_available() else torch.float32
     backbone_type = train_config.get("backbone_type", "t5").lower()
+    task_type = train_config.get("task_type", "epr").lower()
     model_config = IntegratedPianoT5GemmaConfig(
         backbone_type=backbone_type,
         hidden_size=train_config["hidden_size"],
@@ -352,12 +376,17 @@ def create_model(train_config):
         max_position_embeddings=train_config.get("max_position_embeddings", 4096),
         attention_dropout=train_config.get("attention_dropout", 0.0),
         continuous_dim=train_config["continuous_dim"],
+        input_continuous_dim=train_config.get("input_continuous_dim", train_config["continuous_dim"]),
+        output_continuous_dim=train_config.get("output_continuous_dim", train_config["continuous_dim"]),
         max_time_ms=train_config["max_time_ms"],
         pedal_output_activation=train_config.get("pedal_output_activation", "sigmoid"),
+        task_type=task_type,
         time_loss_type=train_config["time_loss_type"],
         value_loss_type=train_config["value_loss_type"],
+        csr_grid_loss_type=train_config.get("csr_grid_loss_type", "huber"),
         huber_delta=train_config["huber_delta"],
         loss_weights=train_config["loss_weights"],
+        csr_loss_weights=train_config.get("csr_loss_weights"),
         decoder_input_mode=train_config["decoder_input_mode"],
         torch_dtype=dtype,
     )
@@ -419,6 +448,7 @@ def main():
 
     with open(args.config, "r", encoding="utf-8") as file:
         train_config = json.load(file)
+    task_type = train_config.get("task_type", "epr").lower()
 
     if args.max_steps is not None:
         train_config["max_steps"] = args.max_steps
@@ -465,6 +495,7 @@ def main():
     train_dataset = PianoCoReNodeSFTDataset(
         train_manifest,
         split="train",
+        task_type=task_type,
         shuffle=True,
         seed=train_config["seed"],
         max_performances_per_work=train_config.get("max_performances_per_work"),
@@ -474,6 +505,7 @@ def main():
     eval_dataset = PianoCoReNodeSFTDataset(
         eval_manifest,
         split="test",
+        task_type=task_type,
         shuffle=False,
         seed=train_config["seed"],
         max_performances_per_work=train_config.get("max_eval_performances_per_work"),
@@ -498,7 +530,10 @@ def main():
     trainer = NodeSFTTrainer(
         model=model,
         args=training_args,
-        data_collator=NodeSFTDataCollator(pitch_pad_id=train_config["pitch_pad_id"]),
+        data_collator=NodeSFTDataCollator(
+            pitch_pad_id=train_config["pitch_pad_id"],
+            task_type=task_type,
+        ),
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
     )
