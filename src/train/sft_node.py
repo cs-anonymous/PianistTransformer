@@ -419,6 +419,22 @@ def create_model(train_config):
     return model
 
 
+def enable_eval_best_checkpointing(train_config):
+    eval_strategy = train_config.get("eval_strategy", train_config.get("evaluation_strategy", "no"))
+    save_strategy = train_config.get("save_strategy", "steps")
+    if eval_strategy == "no" or save_strategy == "no":
+        return
+
+    train_config.setdefault("load_best_model_at_end", True)
+    train_config.setdefault("metric_for_best_model", "eval_loss")
+    train_config.setdefault("greater_is_better", False)
+
+    if train_config["load_best_model_at_end"] and eval_strategy == "steps" and save_strategy == "steps":
+        eval_steps = train_config.get("eval_steps")
+        if eval_steps:
+            train_config["save_steps"] = eval_steps
+
+
 def main():
     current_datetime = datetime.datetime.now()
     outname = "sft_node_" + current_datetime.strftime("%Y-%m-%d-%H-%M-%S")
@@ -459,6 +475,8 @@ def main():
         train_config["max_performances_per_work"] = args.limit_performances_per_work
     if args.limit_windows_per_work is not None:
         train_config["max_windows_per_work"] = args.limit_windows_per_work
+
+    enable_eval_best_checkpointing(train_config)
 
     train_config["output_dir"] = os.path.join(train_config["output_dir"], outname)
     train_config["run_name"] = outname

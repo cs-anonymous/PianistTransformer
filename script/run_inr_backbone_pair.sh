@@ -19,7 +19,7 @@ run_with_batch_fallback() {
   local base_config="$2"
   local batch_size tmp_config log_path
 
-  for batch_size in 32 24 16 8; do
+  for batch_size in 32 16 8; do
     tmp_config="${LOG_DIR}/${SESSION_NAME}_${task_name}_bs${batch_size}.json"
     log_path="${LOG_DIR}/${SESSION_NAME}_${task_name}_bs${batch_size}.log"
     python - "${base_config}" "${tmp_config}" "${batch_size}" <<'PY'
@@ -33,6 +33,8 @@ with open(base_path, "r", encoding="utf-8") as file:
 config["per_device_train_batch_size"] = batch_size
 config["per_device_eval_batch_size"] = min(8, batch_size)
 config["gradient_accumulation_steps"] = 1
+config.pop("max_steps", None)
+config["num_train_epochs"] = 1
 Path(out_path).write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 PY
 
