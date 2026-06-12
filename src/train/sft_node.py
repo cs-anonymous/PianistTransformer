@@ -19,11 +19,11 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in os.sys.path:
     os.sys.path.insert(0, str(ROOT_DIR))
 
-from src.model.hybrid_pianoformer import (
-    HybridPianoT5Gemma,
-    HybridPianoT5GemmaConfig,
-    HybridPianoTransformer,
-    _compute_hybrid_loss_components,
+from src.model.integrated_pianoformer import (
+    IntegratedPianoT5Gemma,
+    IntegratedPianoT5GemmaConfig,
+    IntegratedPianoTransformer,
+    _compute_integrated_loss_components,
 )
 from src.utils.func import filter_valid_args
 
@@ -257,7 +257,7 @@ class NodeSFTTrainer(Trainer):
             return
         if "labels_continuous" not in inputs or "attention_mask" not in inputs:
             return
-        components = _compute_hybrid_loss_components(
+        components = _compute_integrated_loss_components(
             self._model_config(model),
             outputs.logits.detach(),
             inputs["labels_continuous"].detach(),
@@ -338,7 +338,7 @@ class NodeSFTDataCollator:
 def create_model(train_config):
     dtype = torch.bfloat16 if train_config.get("bf16", False) and torch.cuda.is_available() else torch.float32
     backbone_type = train_config.get("backbone_type", "t5").lower()
-    model_config = HybridPianoT5GemmaConfig(
+    model_config = IntegratedPianoT5GemmaConfig(
         backbone_type=backbone_type,
         hidden_size=train_config["hidden_size"],
         intermediate_size=train_config["intermediate_size"],
@@ -365,17 +365,17 @@ def create_model(train_config):
     resume_path = train_config.get("resume_path")
     if resume_path:
         if backbone_type in {"t5", "t5gemma"}:
-            model = HybridPianoT5Gemma.from_pretrained(resume_path, torch_dtype=dtype)
+            model = IntegratedPianoT5Gemma.from_pretrained(resume_path, torch_dtype=dtype)
         else:
-            model = HybridPianoTransformer(model_config)
+            model = IntegratedPianoTransformer(model_config)
             model.load_state_dict(load_torch_state_dict(resume_path))
-        print(f"Loaded Hybrid {backbone_type} checkpoint from {resume_path}")
+        print(f"Loaded Integrated {backbone_type} checkpoint from {resume_path}")
         return model
 
     if backbone_type in {"t5", "t5gemma"}:
-        model = HybridPianoT5Gemma(model_config)
+        model = IntegratedPianoT5Gemma(model_config)
     elif backbone_type in {"bert", "gpt"}:
-        model = HybridPianoTransformer(model_config)
+        model = IntegratedPianoTransformer(model_config)
     else:
         raise ValueError(f"Unsupported backbone_type: {backbone_type}")
 

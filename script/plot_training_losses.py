@@ -139,7 +139,7 @@ def main():
         ax.grid(True, alpha=0.25)
         ax.legend(loc="upper right", ncol=2, fontsize=9)
 
-    fig.suptitle("Hybrid Node Training Curves (h1024, l1024)", fontsize=16)
+    fig.suptitle("Integrated Node Training Curves (h1024, l1024)", fontsize=16)
     fig.tight_layout(rect=(0, 0, 1, 0.98))
     fig.savefig(OUTPUT_PATH, dpi=200)
     print(OUTPUT_PATH)

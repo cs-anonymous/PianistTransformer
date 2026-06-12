@@ -1,11 +1,11 @@
 
 本文档已经形成了一条非常清晰的主线，而且相比我们前面的讨论有两个重要收敛：
 
-1. **创新点不是 ED，而是 Hybrid Note Representation。** Backbone 可以是 GPT、T5、BERT、Mamba，都可以直接替换，表示层与 Backbone 解耦。
+1. **创新点不是 ED，而是 Integrated Note Representation。** Backbone 可以是 GPT、T5、BERT、Mamba，都可以直接替换，表示层与 Backbone 解耦。
 2. **Note 成为一级对象（first-class object）**，控制符号（Bar、Dynamics、Slur 等）仍然保持语言化，而 Note 内部混合离散属性与连续属性，通过统一的 Note Encoder/Decoder 映射到共享表示空间。这一点我认为比单纯提出新的 MIDI tokenizer 或连续回归 head 更具有基础表示层面的意义。
 
 
-# Toward a Hybrid Note Representation for Symbolic Music Foundation Models
+# Toward a Integrated Note Representation for Symbolic Music Foundation Models
 
 ## 1 Motivation
 
@@ -83,7 +83,7 @@ Token
 
 ---
 
-# 3 Hybrid Note Representation
+# 3 Integrated Note Representation
 
 本文提出将 Music Representation 分为两类对象：
 
@@ -690,6 +690,6 @@ Note Embedding
 - Mamba
     
 
-均可直接采用该 Hybrid Note Representation。
+均可直接采用该 Integrated Note Representation。
 
 其创新点并非新的 Transformer，而是一种统一的 Symbolic-Continuous Music Representation，为 Symbolic Music Foundation Model 提供更加符合音乐本质的建模方式。

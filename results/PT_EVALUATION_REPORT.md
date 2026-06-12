@@ -50,11 +50,11 @@ The correct split is by `performance_dataset`, which gives **104 ASAP samples** 
 
 ---
 
-## 3. Comparison with Hybrid Node
+## 3. Comparison with Integrated Node
 
 ### ASAP Subset Comparison
 
-| Metric | PT (ASAP 104 samples) | Hybrid Node (256 samples) |
+| Metric | PT (ASAP 104 samples) | Integrated Node (256 samples) |
 |--------|----------------------|---------------------------|
 | **Velocity JS ↓** | 1.0000 ❌ | 0.2057 |
 | **Duration JS ↓** | 0.6742 | 0.3489 |
@@ -66,7 +66,7 @@ The correct split is by `performance_dataset`, which gives **104 ASAP samples** 
 | **IOI Pearson ↑** | 0.0220 | 0.7342 |
 | **Overall Pearson ↑** | 0.0423 | 0.4254 |
 
-**Note**: Sample sizes differ (104 vs 256). PT was evaluated on ASAP performances within the same 757 windows. The 256 Hybrid Node samples came from a different (previously unknown) split. The correct ASAP sample count in 757 windows is 104.
+**Note**: Sample sizes differ (104 vs 256). PT was evaluated on ASAP performances within the same 757 windows. The 256 Integrated Node samples came from a different (previously unknown) split. The correct ASAP sample count in 757 windows is 104.
 
 ### PianoCoRe-only Subset: Not Evaluated
 
@@ -85,13 +85,13 @@ The PianoCoRe-only evaluation was stopped due to excessive runtime. Based on pre
 ### 4.2 Duration and IOI Also Very Poor
 
 - Duration JS = 0.6742 (very poor distribution overlap)
-- IOI JS = 0.3298 (moderate but far from Hybrid Node's 0.0373)
+- IOI JS = 0.3298 (moderate but far from Integrated Node's 0.0373)
 - RMSE for both is extremely high (>1600ms)
 
 ### 4.3 BPedal is PT's Best Feature
 
 - BPedal JS = 0.5095 is the least bad metric
-- But still far worse than Hybrid Node's 0.2611
+- But still far worse than Integrated Node's 0.2611
 
 ### 4.4 CPedal Better Than BPedal
 
@@ -103,7 +103,7 @@ The PianoCoRe-only evaluation was stopped due to excessive runtime. Based on pre
 ## 5. Conclusion
 
 PT fails on Score → Performance generation even on its own ASAP training domain:
-- Overall JS = 0.6284 (BPedal) / 0.5713 (CPedal) — far worse than Hybrid Node's ~0.26
+- Overall JS = 0.6284 (BPedal) / 0.5713 (CPedal) — far worse than Integrated Node's ~0.26
 - Velocity completely fails (JS=1.0)
 - Poor generalization across all features
 
@@ -119,7 +119,7 @@ This is consistent with previous failed evaluation on PianoCoRe data, confirming
 - Both binary and continuous pedal metrics computed in a single evaluation pass
 
 ### Dataset
-- Same 757 evaluation windows as Hybrid Node (same config, same seed)
+- Same 757 evaluation windows as Integrated Node (same config, same seed)
 - ASAP subset: 104 windows where `performance_dataset == 'ASAP'`
 - Each window: up to 512 notes with 50% overlap
 

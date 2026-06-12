@@ -36,7 +36,7 @@ if str(ROOT_DIR) not in sys.path:
 from src.data_process import score_xml_alignment
 
 
-SCHEMA_VERSION = "pianocore_hybrid_node_work_v2"
+SCHEMA_VERSION = "pianocore_integrated_node_work_v2"
 JSON_SUFFIX = ".node_a.json"
 FEATURE_WIDTH = 8
 
@@ -56,8 +56,8 @@ def find_refined_dir(pianocore_dir: Path) -> Path:
     raise FileNotFoundError("Could not find PianoCoRe refined directory")
 
 
-def node_json_path(refined_dir: Path, refined_score_midi_path: str) -> Path:
-    return (refined_dir / refined_score_midi_path).with_suffix(JSON_SUFFIX)
+def node_json_path(json_dir: Path, refined_score_midi_path: str) -> Path:
+    return (json_dir / refined_score_midi_path).with_suffix(JSON_SUFFIX)
 
 
 def round_rows(rows: list[list[float]], precision: int | None) -> list[list[float]]:
@@ -211,9 +211,9 @@ def update_one(task: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("worker args were not initialized")
     args = WORKER_ARGS
     started = time.time()
-    refined_dir = Path(task["refined_dir"])
+    json_dir = Path(task["json_dir"])
     refined_score_midi_path = task["refined_score_midi_path"]
-    json_path = node_json_path(refined_dir, refined_score_midi_path)
+    json_path = node_json_path(json_dir, refined_score_midi_path)
     result = {
         "refined_score_midi_path": refined_score_midi_path,
         "score_xml_path": task["score_xml_path"],
@@ -339,6 +339,12 @@ def main() -> None:
     parser.add_argument("--pianocore-dir", type=Path, default=Path("data/pianocore"))
     parser.add_argument("--metadata", type=Path, default=None)
     parser.add_argument("--raw-midi-zip", type=Path, default=None)
+    parser.add_argument(
+        "--json-dir",
+        type=Path,
+        default=None,
+        help="Root directory containing mirrored *.node_a.json files. Defaults to the refined directory.",
+    )
     parser.add_argument("--subset", choices=["a", "a_star", "all"], default="a")
     parser.add_argument("--num-proc", type=int, default=20)
     parser.add_argument("--limit-works", type=int, default=None)
@@ -350,18 +356,19 @@ def main() -> None:
     parser.add_argument(
         "--summary-path",
         type=Path,
-        default=Path("data/pianocore/PianoCoRe/refined/pianocore_a_hybrid_score_feature_update_summary.json"),
+        default=Path("data/pianocore/PianoCoRe/refined/pianocore_a_integrated_score_feature_update_summary.json"),
     )
     parser.add_argument(
         "--details-path",
         type=Path,
-        default=Path("data/pianocore/PianoCoRe/refined/pianocore_a_hybrid_score_feature_update_details.jsonl"),
+        default=Path("data/pianocore/PianoCoRe/refined/pianocore_a_integrated_score_feature_update_details.jsonl"),
     )
     args = parser.parse_args()
 
     metadata_path = args.metadata or (args.pianocore_dir / "metadata.csv")
     raw_midi_zip = args.raw_midi_zip or (args.pianocore_dir / "PianoCoRe-1.0-raw-midi.zip")
     refined_dir = find_refined_dir(args.pianocore_dir)
+    json_dir = args.json_dir or refined_dir
 
     rows = load_score_rows(metadata_path, args.subset)
     if args.limit_works is not None:
@@ -371,7 +378,7 @@ def main() -> None:
     for row in rows.to_dict("records"):
         tasks.append(
             {
-                "refined_dir": str(refined_dir),
+                "json_dir": str(json_dir),
                 "score_xml_path": row["score_xml_path"],
                 "score_midi_path": row["score_midi_path"],
                 "refined_score_midi_path": row["refined_score_midi_path"],
@@ -386,6 +393,7 @@ def main() -> None:
     args_dict["raw_midi_zip"] = str(raw_midi_zip)
     args_dict["summary_path"] = str(args.summary_path)
     args_dict["details_path"] = str(args.details_path)
+    args_dict["json_dir"] = str(json_dir)
 
     results = []
     with args.details_path.open("w", encoding="utf-8") as details_file:
@@ -415,6 +423,7 @@ def main() -> None:
     summary["metadata"] = str(metadata_path)
     summary["raw_midi_zip"] = str(raw_midi_zip)
     summary["refined_dir"] = str(refined_dir)
+    summary["json_dir"] = str(json_dir)
     summary["num_proc"] = args.num_proc
     summary["timeout_sec"] = args.timeout_sec
     summary["max_sequence_matcher_notes"] = args.max_sequence_matcher_notes

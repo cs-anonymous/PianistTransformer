@@ -154,7 +154,7 @@ Its core representation is:
 
 `INR = Integrated Note Representation`
 
-INR moves from the original token-level note block representation to a note-level structured object representation. In the current repository, some implementation class names and scripts still use legacy `Hybrid*` naming for compatibility, but the research terminology is now `INSPIRE / INR`.
+INR moves from the original token-level note block representation to a note-level structured object representation. In the current repository, some implementation class names and scripts still use legacy `Integrated*` naming for compatibility, but the research terminology is now `INSPIRE / INR`.
 
 ### INR Task Split
 
@@ -290,7 +290,7 @@ Why these choices:
 - `CSR`: stricter canonical reconstruction, with `mo/md/ml` modeled on discrete ordinal score grids.
 - `Huber` remains a good baseline loss for continuous targets, but it is not the preferred final-form loss for `mo/md/ml` in CSR.
 
-For the more detailed experiment design and ongoing INR backbone comparison notes, see [docs/hybrid_note_representation_experiment.md](/home/kaititech/EPR/PianistTransformer/docs/hybrid_note_representation_experiment.md).
+For the more detailed experiment design and ongoing INR backbone comparison notes, see [docs/integrated_note_representation_experiment.md](/home/kaititech/EPR/PianistTransformer/docs/integrated_note_representation_experiment.md).
 
 ## Graphical User Interface (GUI)
 To make our tool accessible to everyone, especially users who are not familiar with the command line, we have developed a simple and intuitive Graphical User Interface (GUI) based on PyQt and Pygame. You can easily use the Pianist Transformer without writing any code.

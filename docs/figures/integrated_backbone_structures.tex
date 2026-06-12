@@ -21,9 +21,9 @@
 ]
 
 % Panel A: T5
-\node[title] (t5title) at (0, 0) {HN-T5 Encoder-Decoder};
+\node[title] (t5title) at (0, 0) {INR-T5 Encoder-Decoder};
 \node[box, fill=blue!8, below=8mm of t5title] (t5score) {Score note nodes\\$(pitch,\ score\_continuous)$};
-\node[box, fill=blue!16, right=of t5score] (t5encemb) {HybridNoteEncoder};
+\node[box, fill=blue!16, right=of t5score] (t5encemb) {IntegratedNoteEncoder};
 \node[box, fill=green!12, right=of t5encemb] (t5enc) {T5 Encoder\\6 or 10 layers};
 \node[box, fill=yellow!15, below=of t5enc] (t5query) {Decoder note queries\\copy of score embeds};
 \node[box, fill=orange!18, right=of t5enc] (t5dec) {T5 Decoder\\2 or 6 layers};
@@ -41,9 +41,9 @@
 \node[group, fit=(t5enc)(t5dec), label=above:{seq2seq backbone with cross-attention}] {};
 
 % Panel B: GPT
-\node[title] (gpttitle) at (0, -55mm) {HN-GPT Decoder-Only};
+\node[title] (gpttitle) at (0, -55mm) {INR-GPT Decoder-Only};
 \node[box, fill=blue!8, below=8mm of gpttitle] (gptscore) {Score note nodes};
-\node[box, fill=blue!16, right=of gptscore] (gptencemb) {HybridNoteEncoder};
+\node[box, fill=blue!16, right=of gptscore] (gptencemb) {IntegratedNoteEncoder};
 \node[box, fill=yellow!15, right=of gptencemb] (gptquery) {Learnable performance\\query nodes};
 \node[box, fill=purple!14, right=of gptquery] (gptconcat) {Concatenate\\$[score \mid perf\_query]$};
 \node[box, fill=orange!18, right=of gptconcat] (gptbackbone) {Causal Transformer\\17 layers};
@@ -60,9 +60,9 @@
 \node[group, fit=(gptconcat)(gptbackbone), label=above:{loss on performance segment only}] {};
 
 % Panel C: BERT
-\node[title] (berttitle) at (0, -110mm) {HN-BERT Encoder-Only};
+\node[title] (berttitle) at (0, -110mm) {INR-BERT Encoder-Only};
 \node[box, fill=blue!8, below=8mm of berttitle] (bertscore) {Score note nodes\\$(pitch,\ score\_continuous)$};
-\node[box, fill=blue!16, right=of bertscore] (bertencemb) {HybridNoteEncoder};
+\node[box, fill=blue!16, right=of bertscore] (bertencemb) {IntegratedNoteEncoder};
 \node[box, fill=green!12, right=of bertencemb] (bertbackbone) {Bidirectional Transformer\\17 layers};
 \node[box, fill=red!12, right=of bertbackbone] (berthead) {Separate heads\\per note};
 \node[box, fill=red!6, right=of berthead] (bertout) {Performance continuous\\$(B,N,7)$};

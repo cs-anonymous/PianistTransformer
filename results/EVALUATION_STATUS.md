@@ -1,13 +1,13 @@
 # Expressive Performance Rendering Evaluation Status
 
 **Date**: 2026-06-08  
-**Task**: Compare Hybrid Node (1 node/note) vs PT (8 tokens/note) on EPR task
+**Task**: Compare Integrated Node (1 node/note) vs PT (8 tokens/note) on EPR task
 
 ---
 
 ## 1. Evaluation Summary
 
-### 1.0 Corrected Hybrid Node Evaluation ✅ **UPDATED 2026-06-08**
+### 1.0 Corrected Integrated Node Evaluation ✅ **UPDATED 2026-06-08**
 
 **Important correction**: the earlier `ASAP=256 / PianoCoRe-only=501` split does **not** match the actual `performance_dataset` labels in the 757-window quick evaluation set. The corrected split is:
 
@@ -29,8 +29,8 @@ This corrected split matches the finding in `results/PT_EVALUATION_REPORT.md`.
 Results are saved in:
 
 ```text
-results/hybrid_node_checkpoint1000_corrected_evaluation/
-results/hybrid_node_t5_10_2_epoch1_evaluation/
+results/integrated_node_checkpoint1000_corrected_evaluation/
+results/integrated_node_t5_10_2_epoch1_evaluation/
 ```
 
 #### ASAP Subset - Current 1-epoch T5-10+2 (104 samples, 53,248 notes)
@@ -92,14 +92,14 @@ results/hybrid_node_t5_10_2_epoch1_evaluation/
   - PianoCoRe-only BPedal gets worse (`0.0647 -> 0.0949` JS), while CPedal is roughly similar/slightly worse by JS (`0.4948 -> 0.5058`) but slightly better by MAE (`47.91 -> 47.60`).
 - Continuous pedal remains weak overall; this supports the ongoing pedal-head/loss investigation.
 
-### 1.1 Hybrid Node (Our Model) ✅ **COMPLETED**
+### 1.1 Integrated Node (Our Model) ✅ **COMPLETED**
 
 **Model**: `models/sft_nodes/sft_node_2026-06-07-03-38-14/checkpoint-1000`  
 **Task**: Score → Performance generation  
 **Dataset**: PianoCoRe test set (split by work, ASAP + PianoCoRe-only subsets)  
 **Evaluation Method**: Binary and Continuous pedal methods
 
-**Results Location**: `results/hybrid_node_evaluation/`
+**Results Location**: `results/integrated_node_evaluation/`
 
 #### ASAP Subset (256 samples, 131,072 notes)
 
@@ -152,7 +152,7 @@ results/hybrid_node_t5_10_2_epoch1_evaluation/
 
 **Critical Issues**:
 1. **Velocity JS = 0.9998** (almost worst possible value, indicates complete failure)
-2. **Overall JS ~0.48** (far worse than Hybrid Node's ~0.27)
+2. **Overall JS ~0.48** (far worse than Integrated Node's ~0.27)
 3. **Dataset mismatch**: PT trained on ASAP, tested on PianoCoRe
 4. **Poor generalization**: PT cannot generate meaningful performances from PianoCoRe scores
 
@@ -213,14 +213,14 @@ To complete PT evaluation, we need:
 
 ### 3.1 What We Can Conclude
 
-1. **Hybrid Node performs well on both ASAP and PianoCoRe subsets**
+1. **Integrated Node performs well on both ASAP and PianoCoRe subsets**
    - ASAP subset: Overall JS 0.2648, Pearson 0.3541
    - PianoCoRe-only: Overall JS 0.2653, Pearson 0.2911
    - Strong timing prediction (IOI Pearson ~0.70-0.73)
    
 2. **PT shows poor cross-dataset generalization**
    - Cannot generate meaningful performances from PianoCoRe scores
-   - Overall JS 0.4819 vs Hybrid Node's 0.2653
+   - Overall JS 0.4819 vs Integrated Node's 0.2653
    - Velocity prediction completely fails (JS 0.9998)
 
 3. **PT evaluation on ASAP is needed for fair comparison**
@@ -229,7 +229,7 @@ To complete PT evaluation, we need:
 
 ### 3.2 What We Cannot Conclude
 
-1. ❌ **Cannot claim Hybrid Node is better than PT**
+1. ❌ **Cannot claim Integrated Node is better than PT**
    - PT not evaluated on its own test set (ASAP)
    - Dataset mismatch makes comparison unfair
 
@@ -247,7 +247,7 @@ To complete PT evaluation, we need:
 1. Resolve PT alignment tool permissions
 2. Process ASAP test set using PT's pipeline
 3. Evaluate PT on ASAP using score → performance generation
-4. Compare PT (on ASAP) vs Hybrid Node (on ASAP subset)
+4. Compare PT (on ASAP) vs Integrated Node (on ASAP subset)
 
 **Pros**:
 - Fair comparison on same dataset
@@ -261,22 +261,22 @@ To complete PT evaluation, we need:
 ### Option 2: Report Current Results with Caveats
 
 **Reporting**:
-- Hybrid Node: Good performance on PianoCoRe (Overall JS ~0.26, Pearson ~0.35)
+- Integrated Node: Good performance on PianoCoRe (Overall JS ~0.26, Pearson ~0.35)
 - PT: Cannot be evaluated on PianoCoRe due to poor generalization (Overall JS 0.48)
 - PT evaluation on ASAP: **To be completed**
 
 **Pros**:
 - Honest reporting
-- Shows generalization capability of Hybrid Node
+- Shows generalization capability of Integrated Node
 
 **Cons**:
 - Incomplete comparison
 - Cannot claim superiority
 
-### Option 3: Focus on Hybrid Node Strengths
+### Option 3: Focus on Integrated Node Strengths
 
 **Reporting**:
-- Emphasize Hybrid Node's efficiency (1 node vs 8 tokens)
+- Emphasize Integrated Node's efficiency (1 node vs 8 tokens)
 - Show consistent performance across subsets
 - Highlight generalization capability (ASAP + PianoCoRe)
 - Note PT's cross-dataset limitations
@@ -295,9 +295,9 @@ To complete PT evaluation, we need:
 ### Valid Results (Kept)
 ```
 results/
-├── hybrid_node_evaluation/
-│   ├── results_binary.json       # Hybrid Node binary pedal results
-│   └── results_continuous.json   # Hybrid Node continuous pedal results
+├── integrated_node_evaluation/
+│   ├── results_binary.json       # Integrated Node binary pedal results
+│   └── results_continuous.json   # Integrated Node continuous pedal results
 │
 └── pt_evaluation_generation/
     ├── pt_multiworker_results_binary.json      # PT generation (failed)

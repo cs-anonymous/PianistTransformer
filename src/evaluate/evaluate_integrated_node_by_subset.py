@@ -1,5 +1,5 @@
 """
-Evaluate Hybrid Node models on ASAP and PianoCoRe-only subsets in one pass.
+Evaluate Integrated Node models on ASAP and PianoCoRe-only subsets in one pass.
 """
 
 import argparse
@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT_DIR))
 
 from src.evaluate.epr_metrics import EPRMetrics, extract_features_from_continuous
 from src.evaluate.epr_metrics_extended import ExtendedEPRMetrics
-from src.evaluate.evaluate_hybrid_node import load_model, predict_batch
+from src.evaluate.evaluate_integrated_node import load_model, predict_batch
 from src.train.sft_node import PianoCoReNodeSFTDataset, build_work_manifest, NodeSFTDataCollator
 
 
@@ -112,7 +112,7 @@ def main():
         config = json.load(handle)
 
     print("=" * 60)
-    print("Hybrid Node Evaluation by Subset")
+    print("Integrated Node Evaluation by Subset")
     print("=" * 60)
     print(f"Config: {args.config}")
     print(f"Checkpoint: {args.checkpoint}")

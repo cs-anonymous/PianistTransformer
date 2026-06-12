@@ -6,7 +6,7 @@ These scripts belong to the older PianistTransformer/tokenizer data pipeline:
 - Arrow conversion and merge
 - pair-level tokenizer SFT generation
 
-They are not part of the current Hybrid Note pipeline. Current experiments use
+They are not part of the current Integrated Note pipeline. Current experiments use
 PianoCoRe-A paired refined MIDI directly and do not require CPT data.
 
 Use the parent directory entrypoints instead:

@@ -1,6 +1,6 @@
 # Data Process Pipeline
 
-Hybrid Note data processing is intentionally split into two stages.
+Integrated Note data processing is intentionally split into two stages.
 
 ## 1. Generate JSON With Paired MIDI
 
@@ -31,7 +31,7 @@ python src/data_process/update_json_score_feature_with_xml.py
 
 This stage reads the existing `*.node_a.json` files and projects XML/MXL score
 features onto the refined score notes. It updates each JSON in place to schema
-`pianocore_hybrid_node_work_v2`.
+`pianocore_integrated_node_work_v2`.
 
 The output adds:
 
@@ -79,5 +79,5 @@ not part of the main pipeline anymore.
 
 `legacy_pt_cpt/` contains old PT/CPT preprocessing scripts for pretrain, Arrow,
 and tokenizer-style SFT data. They are kept out of the active pipeline because
-the current Hybrid Note experiments train directly on PianoCoRe-A paired data
+the current Integrated Note experiments train directly on PianoCoRe-A paired data
 and do not use CPT data.

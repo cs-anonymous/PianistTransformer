@@ -1,5 +1,5 @@
 """
-Evaluate Hybrid Node model on test set using PT metrics.
+Evaluate Integrated Node model on test set using PT metrics.
 """
 
 import argparse
@@ -15,7 +15,7 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT_DIR))
 
 from src.evaluate.epr_metrics import EPRMetrics, extract_features_from_continuous
-from src.model.hybrid_pianoformer import HybridPianoT5Gemma, HybridPianoT5GemmaConfig, HybridPianoTransformer
+from src.model.integrated_pianoformer import IntegratedPianoT5Gemma, IntegratedPianoT5GemmaConfig, IntegratedPianoTransformer
 from src.train.sft_node import PianoCoReNodeSFTDataset, build_work_manifest, NodeSFTDataCollator
 
 
@@ -25,7 +25,7 @@ def load_model(checkpoint_path, config):
     print(f"Loading model from {checkpoint_path}")
 
     backbone_type = config.get('backbone_type', 't5').lower()
-    model_config = HybridPianoT5GemmaConfig(
+    model_config = IntegratedPianoT5GemmaConfig(
         backbone_type=backbone_type,
         continuous_dim=config.get('continuous_dim', 7),
         max_time_ms=config.get('max_time_ms', 10000.0),
@@ -45,9 +45,9 @@ def load_model(checkpoint_path, config):
     )
 
     if backbone_type in {'t5', 't5gemma'}:
-        model = HybridPianoT5Gemma(model_config)
+        model = IntegratedPianoT5Gemma(model_config)
     elif backbone_type in {'bert', 'gpt'}:
-        model = HybridPianoTransformer(model_config)
+        model = IntegratedPianoTransformer(model_config)
     else:
         raise ValueError(f"Unsupported backbone_type: {backbone_type}")
 
@@ -208,7 +208,7 @@ def main():
         config = json.load(f)
 
     print("=" * 60)
-    print("Hybrid Node EPR Evaluation")
+    print("Integrated Node EPR Evaluation")
     print("=" * 60)
     print(f"Config: {args.config}")
     print(f"Checkpoint: {args.checkpoint}")

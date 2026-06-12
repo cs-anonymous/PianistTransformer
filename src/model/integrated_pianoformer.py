@@ -29,7 +29,7 @@ from src.model.pianoformer import PianoT5Gemma, PianoT5GemmaConfig
 logger = logging.get_logger(__name__)
 
 
-class HybridPianoT5GemmaConfig(PianoT5GemmaConfig):
+class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
     def __init__(
         self,
         backbone_type="t5",
@@ -76,7 +76,7 @@ class HybridPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.attention_dropout = attention_dropout
 
 
-class HybridNoteEncoder(nn.Module):
+class IntegratedNoteEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.pitch_embedding = nn.Embedding(
@@ -98,7 +98,7 @@ class HybridNoteEncoder(nn.Module):
         return self.norm(pitch_embeds + continuous_embeds)
 
 
-class HybridContinuousDecoder(nn.Module):
+class IntegratedContinuousDecoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -131,7 +131,7 @@ class HybridContinuousDecoder(nn.Module):
         return torch.cat([timing, velocity, pedal], dim=-1)
 
 
-class HybridT5GemmaEncoder(T5GemmaPreTrainedModel):
+class IntegratedT5GemmaEncoder(T5GemmaPreTrainedModel):
     _can_record_outputs = {
         "attentions": T5GemmaSelfAttention,
         "hidden_states": T5GemmaEncoderLayer,
@@ -162,7 +162,7 @@ class HybridT5GemmaEncoder(T5GemmaPreTrainedModel):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if inputs_embeds is None:
-            raise ValueError("HybridT5GemmaEncoder expects note-level inputs_embeds")
+            raise ValueError("IntegratedT5GemmaEncoder expects note-level inputs_embeds")
 
         cache_position = torch.arange(0, inputs_embeds.shape[1], device=inputs_embeds.device)
 
@@ -213,12 +213,12 @@ class HybridT5GemmaEncoder(T5GemmaPreTrainedModel):
         return BaseModelOutput(last_hidden_state=hidden_states)
 
 
-class HybridPianoT5GemmaModel(T5GemmaPreTrainedModel):
+class IntegratedPianoT5GemmaModel(T5GemmaPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         if not config.is_encoder_decoder:
-            raise ValueError("HybridPianoT5GemmaModel requires encoder-decoder config.")
-        self.encoder = HybridT5GemmaEncoder(config.encoder)
+            raise ValueError("IntegratedPianoT5GemmaModel requires encoder-decoder config.")
+        self.encoder = IntegratedT5GemmaEncoder(config.encoder)
         self.decoder = T5GemmaDecoder(config.decoder)
         self.post_init()
 
@@ -298,7 +298,7 @@ def _regression_loss(pred, target, mask, loss_type, huber_delta):
     return _masked_mean(values, mask)
 
 
-def _compute_hybrid_loss_components(config, continuous_pred, labels_continuous, attention_mask):
+def _compute_integrated_loss_components(config, continuous_pred, labels_continuous, attention_mask):
     mask = attention_mask.bool()
     loss_ioi = _regression_loss(
         continuous_pred[..., 0],
@@ -336,9 +336,9 @@ def _compute_hybrid_loss_components(config, continuous_pred, labels_continuous, 
     }
 
 
-def _compute_hybrid_loss(config, continuous_pred, labels_continuous, attention_mask):
+def _compute_integrated_loss(config, continuous_pred, labels_continuous, attention_mask):
     weights = config.loss_weights
-    components = _compute_hybrid_loss_components(
+    components = _compute_integrated_loss_components(
         config,
         continuous_pred,
         labels_continuous,
@@ -352,7 +352,7 @@ def _compute_hybrid_loss(config, continuous_pred, labels_continuous, attention_m
     )
 
 
-class HybridGQAAttention(nn.Module):
+class IntegratedGQAAttention(nn.Module):
     def __init__(self, config, causal=False):
         super().__init__()
         if config.num_attention_heads % config.num_key_value_heads != 0:
@@ -402,10 +402,10 @@ class HybridGQAAttention(nn.Module):
         return self.o_proj(attn_output)
 
 
-class HybridTransformerBlock(nn.Module):
+class IntegratedTransformerBlock(nn.Module):
     def __init__(self, config, causal=False):
         super().__init__()
-        self.self_attn = HybridGQAAttention(config, causal=causal)
+        self.self_attn = IntegratedGQAAttention(config, causal=causal)
         self.input_norm = nn.LayerNorm(config.hidden_size)
         self.post_attn_norm = nn.LayerNorm(config.hidden_size)
         self.mlp = nn.Sequential(
@@ -423,12 +423,12 @@ class HybridTransformerBlock(nn.Module):
         return hidden_states
 
 
-class HybridBertBackbone(nn.Module):
+class IntegratedBertBackbone(nn.Module):
     def __init__(self, config):
         super().__init__()
         layer_count = config.bert_layers_num or config.encoder.num_hidden_layers
         self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
-        self.layers = nn.ModuleList([HybridTransformerBlock(config, causal=False) for _ in range(layer_count)])
+        self.layers = nn.ModuleList([IntegratedTransformerBlock(config, causal=False) for _ in range(layer_count)])
         self.norm = nn.LayerNorm(config.hidden_size)
         self.dropout = nn.Dropout(config.dropout_rate)
 
@@ -444,13 +444,13 @@ class HybridBertBackbone(nn.Module):
         return self.norm(hidden_states)
 
 
-class HybridGptBackbone(nn.Module):
+class IntegratedGptBackbone(nn.Module):
     def __init__(self, config):
         super().__init__()
         layer_count = config.gpt_layers_num or config.encoder.num_hidden_layers + config.decoder.num_hidden_layers
         self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
         self.performance_query = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
-        self.layers = nn.ModuleList([HybridTransformerBlock(config, causal=True) for _ in range(layer_count)])
+        self.layers = nn.ModuleList([IntegratedTransformerBlock(config, causal=True) for _ in range(layer_count)])
         self.norm = nn.LayerNorm(config.hidden_size)
         self.dropout = nn.Dropout(config.dropout_rate)
 
@@ -473,19 +473,19 @@ class HybridGptBackbone(nn.Module):
         return hidden_states[:, seq_len:, :]
 
 
-class HybridPianoTransformer(nn.Module):
-    def __init__(self, config: HybridPianoT5GemmaConfig):
+class IntegratedPianoTransformer(nn.Module):
+    def __init__(self, config: IntegratedPianoT5GemmaConfig):
         super().__init__()
         self.config = config
-        self.note_encoder = HybridNoteEncoder(config)
-        self.continuous_decoder = HybridContinuousDecoder(config)
+        self.note_encoder = IntegratedNoteEncoder(config)
+        self.continuous_decoder = IntegratedContinuousDecoder(config)
         backbone_type = config.backbone_type.lower()
         if backbone_type == "bert":
-            self.backbone = HybridBertBackbone(config)
+            self.backbone = IntegratedBertBackbone(config)
         elif backbone_type == "gpt":
-            self.backbone = HybridGptBackbone(config)
+            self.backbone = IntegratedGptBackbone(config)
         else:
-            raise ValueError(f"HybridPianoTransformer supports bert/gpt, got {config.backbone_type}")
+            raise ValueError(f"IntegratedPianoTransformer supports bert/gpt, got {config.backbone_type}")
 
     def forward(
         self,
@@ -508,13 +508,13 @@ class HybridPianoTransformer(nn.Module):
 
         loss = None
         if labels_continuous is not None:
-            loss = _compute_hybrid_loss(self.config, continuous_pred, labels_continuous, attention_mask)
+            loss = _compute_integrated_loss(self.config, continuous_pred, labels_continuous, attention_mask)
 
         return Seq2SeqLMOutput(loss=loss, logits=continuous_pred)
 
 
-class HybridPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
-    config_class = HybridPianoT5GemmaConfig
+class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
+    config_class = IntegratedPianoT5GemmaConfig
     _tp_plan = {
         "continuous_decoder.timing_head.2": "colwise_rep",
         "continuous_decoder.velocity_head.2": "colwise_rep",
@@ -522,12 +522,12 @@ class HybridPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
     }
     _pp_plan = {"continuous_decoder": (["hidden_states"], ["continuous_pred"])}
 
-    def __init__(self, config: HybridPianoT5GemmaConfig):
+    def __init__(self, config: IntegratedPianoT5GemmaConfig):
         config.is_encoder_decoder = True
         super().__init__(config)
-        self.note_encoder = HybridNoteEncoder(config)
-        self.model = HybridPianoT5GemmaModel(config)
-        self.continuous_decoder = HybridContinuousDecoder(config)
+        self.note_encoder = IntegratedNoteEncoder(config)
+        self.model = IntegratedPianoT5GemmaModel(config)
+        self.continuous_decoder = IntegratedContinuousDecoder(config)
         self.post_init()
 
     def get_encoder(self):
@@ -602,7 +602,7 @@ class HybridPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
 
         loss = None
         if labels_continuous is not None:
-            loss = _compute_hybrid_loss(self.config, continuous_pred, labels_continuous, attention_mask)
+            loss = _compute_integrated_loss(self.config, continuous_pred, labels_continuous, attention_mask)
 
         return Seq2SeqLMOutput(
             loss=loss,
