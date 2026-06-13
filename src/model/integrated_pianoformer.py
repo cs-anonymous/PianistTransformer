@@ -41,6 +41,8 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         max_time_ms=10000.0,
         pedal_output_activation="sigmoid",
         task_type="epr",
+        input_feature_mode="legacy",
+        score_feature_dim=8,
         time_loss_type="huber",
         value_loss_type="mse",
         csr_grid_loss_type="huber",
@@ -68,6 +70,8 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.max_time_ms = max_time_ms
         self.pedal_output_activation = pedal_output_activation
         self.task_type = task_type
+        self.input_feature_mode = input_feature_mode
+        self.score_feature_dim = score_feature_dim
         self.time_loss_type = time_loss_type
         self.value_loss_type = value_loss_type
         self.csr_grid_loss_type = csr_grid_loss_type
@@ -96,15 +100,16 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
 
 
 class IntegratedNoteEncoder(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, continuous_dim=None):
         super().__init__()
+        continuous_dim = continuous_dim or config.input_continuous_dim
         self.pitch_embedding = nn.Embedding(
             config.pitch_vocab_size + 1,
             config.hidden_size,
             padding_idx=config.pitch_pad_id,
         )
         self.continuous_mlp = nn.Sequential(
-            nn.Linear(config.input_continuous_dim, config.hidden_size),
+            nn.Linear(continuous_dim, config.hidden_size),
             nn.GELU(),
             nn.Linear(config.hidden_size, config.hidden_size),
         )
@@ -157,6 +162,31 @@ class IntegratedContinuousDecoder(nn.Module):
         elif self.config.pedal_output_activation != "linear":
             raise ValueError(f"Unsupported pedal_output_activation: {self.config.pedal_output_activation}")
         return torch.cat([timing, velocity, pedal], dim=-1)
+
+
+def _shift_continuous_right(continuous, attention_mask):
+    shifted = torch.zeros_like(continuous)
+    if continuous.shape[1] > 1:
+        prev_values = continuous[:, :-1]
+        prev_mask = attention_mask[:, :-1].to(dtype=continuous.dtype).unsqueeze(-1)
+        shifted[:, 1:] = prev_values * prev_mask
+    shifted = shifted * attention_mask.to(dtype=continuous.dtype).unsqueeze(-1)
+    return shifted
+
+
+def _build_ar_note_continuous(labels_continuous, task_type, input_feature_mode="integrated"):
+    if input_feature_mode == "legacy":
+        return labels_continuous
+    batch_size, seq_len, _ = labels_continuous.shape
+    if task_type == "epr":
+        type_bits = labels_continuous.new_zeros(batch_size, seq_len, 2)
+        type_bits[..., 1] = 1.0
+    elif task_type == "csr":
+        type_bits = labels_continuous.new_zeros(batch_size, seq_len, 2)
+        type_bits[..., 0] = 1.0
+    else:
+        raise ValueError(f"Unsupported task_type for AR note build: {task_type}")
+    return torch.cat([type_bits, labels_continuous], dim=-1)
 
 
 class IntegratedT5GemmaEncoder(T5GemmaPreTrainedModel):
@@ -530,19 +560,24 @@ class IntegratedGptBackbone(nn.Module):
         self.norm = nn.LayerNorm(config.hidden_size)
         self.dropout = nn.Dropout(config.dropout_rate)
 
-    def forward(self, score_note_embeds, attention_mask):
+    def forward(self, score_note_embeds, attention_mask, performance_embeds=None, performance_attention_mask=None):
         batch_size, seq_len, _ = score_note_embeds.shape
-        total_len = seq_len * 2
+        if performance_embeds is None:
+            performance_embeds = self.performance_query.expand(batch_size, seq_len, -1)
+            performance_attention_mask = attention_mask
+        perf_len = performance_embeds.shape[1]
+        total_len = seq_len + perf_len
         if total_len > self.position_embeddings.num_embeddings:
             raise ValueError(f"GPT sequence length {total_len} exceeds max_position_embeddings")
 
-        perf_queries = self.performance_query.expand(batch_size, seq_len, -1)
-        hidden_states = torch.cat([score_note_embeds, perf_queries], dim=1)
+        hidden_states = torch.cat([score_note_embeds, performance_embeds], dim=1)
         position_ids = torch.arange(total_len, device=score_note_embeds.device).unsqueeze(0)
         hidden_states = hidden_states + self.position_embeddings(position_ids)
         hidden_states = self.dropout(hidden_states)
 
-        full_attention_mask = torch.cat([attention_mask, attention_mask], dim=1)
+        if performance_attention_mask is None:
+            performance_attention_mask = attention_mask[:, :perf_len]
+        full_attention_mask = torch.cat([attention_mask, performance_attention_mask], dim=1)
         for layer in self.layers:
             hidden_states = layer(hidden_states, attention_mask=full_attention_mask)
         hidden_states = self.norm(hidden_states)
@@ -554,8 +589,10 @@ class IntegratedPianoTransformer(nn.Module):
         super().__init__()
         self.config = config
         self.note_encoder = IntegratedNoteEncoder(config)
+        self.decoder_note_encoder = IntegratedNoteEncoder(config, continuous_dim=config.output_continuous_dim + 2)
         self.continuous_decoder = IntegratedContinuousDecoder(config)
         backbone_type = config.backbone_type.lower()
+        self.backbone_type = backbone_type
         if backbone_type == "bert":
             self.backbone = IntegratedBertBackbone(config)
         elif backbone_type == "gpt":
@@ -579,14 +616,71 @@ class IntegratedPianoTransformer(nn.Module):
             attention_mask = (pitch_ids != self.config.pitch_pad_id).long()
 
         score_note_embeds = self.note_encoder(pitch_ids, continuous)
-        hidden_states = self.backbone(score_note_embeds, attention_mask)
-        continuous_pred = self.continuous_decoder(hidden_states)
+        decoder_mode = self.config.decoder_input_mode.lower()
+        if decoder_mode == "score":
+            hidden_states = self.backbone(score_note_embeds, attention_mask)
+            continuous_pred = self.continuous_decoder(hidden_states)
+        elif decoder_mode == "ar":
+            if self.backbone_type != "gpt":
+                raise ValueError("decoder_input_mode='ar' is supported for gpt in IntegratedPianoTransformer")
+            if labels_continuous is not None:
+                decoder_target_continuous = _build_ar_note_continuous(
+                    labels_continuous,
+                    self.config.task_type,
+                    getattr(self.config, "input_feature_mode", "integrated"),
+                )
+                decoder_input_continuous = _shift_continuous_right(decoder_target_continuous, attention_mask)
+                performance_embeds = self.decoder_note_encoder(pitch_ids, decoder_input_continuous)
+                hidden_states = self.backbone(
+                    score_note_embeds,
+                    attention_mask,
+                    performance_embeds=performance_embeds,
+                    performance_attention_mask=attention_mask,
+                )
+                continuous_pred = self.continuous_decoder(hidden_states)
+            else:
+                continuous_pred = self._autoregressive_rollout_gpt(
+                    pitch_ids=pitch_ids,
+                    continuous=continuous,
+                    attention_mask=attention_mask,
+                )
+        else:
+            raise ValueError(f"Unsupported decoder_input_mode: {self.config.decoder_input_mode}")
 
         loss = None
         if labels_continuous is not None:
             loss = _compute_integrated_loss(self.config, continuous_pred, labels_continuous, attention_mask)
 
         return Seq2SeqLMOutput(loss=loss, logits=continuous_pred)
+
+    def _autoregressive_rollout_gpt(self, pitch_ids, continuous, attention_mask):
+        batch_size, seq_len = pitch_ids.shape
+        score_note_embeds = self.note_encoder(pitch_ids, continuous)
+        decoder_input_continuous = continuous.new_zeros(batch_size, seq_len, self.config.output_continuous_dim + 2)
+        predictions = []
+
+        for step in range(seq_len):
+            perf_prefix_embeds = self.decoder_note_encoder(
+                pitch_ids[:, : step + 1],
+                decoder_input_continuous[:, : step + 1],
+            )
+            perf_prefix_mask = attention_mask[:, : step + 1]
+            hidden_states = self.backbone(
+                score_note_embeds,
+                attention_mask,
+                performance_embeds=perf_prefix_embeds,
+                performance_attention_mask=perf_prefix_mask,
+            )
+            step_pred = self.continuous_decoder(hidden_states[:, -1:, :])
+            predictions.append(step_pred)
+            if step + 1 < seq_len:
+                if self.config.task_type == "epr":
+                    decoder_input_continuous[:, step + 1, 1] = 1.0
+                elif self.config.task_type == "csr":
+                    decoder_input_continuous[:, step + 1, 0] = 1.0
+                decoder_input_continuous[:, step + 1, 2:] = step_pred[:, 0, :]
+
+        return torch.cat(predictions, dim=1) if predictions else torch.zeros_like(continuous)
 
 
 class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
@@ -602,6 +696,7 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
         config.is_encoder_decoder = True
         super().__init__(config)
         self.note_encoder = IntegratedNoteEncoder(config)
+        self.decoder_note_encoder = IntegratedNoteEncoder(config, continuous_dim=config.output_continuous_dim + 2)
         self.model = IntegratedPianoT5GemmaModel(config)
         self.continuous_decoder = IntegratedContinuousDecoder(config)
         self.post_init()
@@ -617,10 +712,28 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
         incompatible = self.load_state_dict(source_model.state_dict(), strict=False)
         return incompatible
 
-    def _build_decoder_inputs(self, score_note_embeds, attention_mask):
-        if self.config.decoder_input_mode != "score":
-            raise ValueError(f"Unsupported decoder_input_mode: {self.config.decoder_input_mode}")
-        return score_note_embeds, attention_mask
+    def _build_decoder_inputs(
+        self,
+        pitch_ids,
+        score_note_embeds,
+        attention_mask,
+        labels_continuous=None,
+    ):
+        decoder_mode = self.config.decoder_input_mode.lower()
+        if decoder_mode == "score":
+            return score_note_embeds, attention_mask
+        if decoder_mode == "ar":
+            if labels_continuous is None:
+                return None, None
+            decoder_target_continuous = _build_ar_note_continuous(
+                labels_continuous,
+                self.config.task_type,
+                getattr(self.config, "input_feature_mode", "integrated"),
+            )
+            decoder_input_continuous = _shift_continuous_right(decoder_target_continuous, attention_mask)
+            decoder_inputs_embeds = self.decoder_note_encoder(pitch_ids, decoder_input_continuous)
+            return decoder_inputs_embeds, attention_mask
+        raise ValueError(f"Unsupported decoder_input_mode: {self.config.decoder_input_mode}")
 
     def forward(
         self,
@@ -656,7 +769,28 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
             attention_mask = (pitch_ids != self.config.pitch_pad_id).long()
 
         score_note_embeds = self.note_encoder(pitch_ids, continuous)
-        decoder_inputs_embeds, decoder_input_mask = self._build_decoder_inputs(score_note_embeds, attention_mask)
+        decoder_inputs_embeds, decoder_input_mask = self._build_decoder_inputs(
+            pitch_ids,
+            score_note_embeds,
+            attention_mask,
+            labels_continuous=labels_continuous,
+        )
+        if decoder_inputs_embeds is None:
+            continuous_pred = self._autoregressive_rollout(
+                pitch_ids=pitch_ids,
+                continuous=continuous,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                encoder_outputs=encoder_outputs,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
+            loss = None
+            if labels_continuous is not None:
+                loss = _compute_integrated_loss(self.config, continuous_pred, labels_continuous, attention_mask)
+            return Seq2SeqLMOutput(loss=loss, logits=continuous_pred)
         if decoder_attention_mask is None:
             decoder_attention_mask = decoder_input_mask
 
@@ -691,3 +825,56 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
             encoder_hidden_states=decoder_outputs.encoder_hidden_states,
             encoder_attentions=decoder_outputs.encoder_attentions,
         )
+
+    def _autoregressive_rollout(
+        self,
+        pitch_ids,
+        continuous,
+        attention_mask,
+        position_ids=None,
+        encoder_outputs=None,
+        past_key_values=None,
+        use_cache=None,
+        cache_position=None,
+        **kwargs,
+    ):
+        del past_key_values, use_cache, cache_position, kwargs
+        batch_size, seq_len = pitch_ids.shape
+        score_note_embeds = self.note_encoder(pitch_ids, continuous)
+        if encoder_outputs is None:
+            encoder_outputs = self.model.encoder(
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                inputs_embeds=score_note_embeds,
+            )
+
+        decoder_input_continuous = continuous.new_zeros(
+            continuous.shape[0],
+            continuous.shape[1],
+            self.config.output_continuous_dim + 2,
+        )
+        predictions = []
+
+        for step in range(seq_len):
+            decoder_inputs_embeds = self.decoder_note_encoder(
+                pitch_ids[:, : step + 1],
+                decoder_input_continuous[:, : step + 1],
+            )
+            decoder_attention_mask = attention_mask[:, : step + 1]
+            decoder_outputs = self.model(
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                decoder_attention_mask=decoder_attention_mask,
+                encoder_outputs=encoder_outputs,
+                decoder_inputs_embeds=decoder_inputs_embeds,
+            )
+            step_pred = self.continuous_decoder(decoder_outputs.last_hidden_state[:, -1:, :])
+            predictions.append(step_pred)
+            if step + 1 < seq_len:
+                if self.config.task_type == "epr":
+                    decoder_input_continuous[:, step + 1, 1] = 1.0
+                elif self.config.task_type == "csr":
+                    decoder_input_continuous[:, step + 1, 0] = 1.0
+                decoder_input_continuous[:, step + 1, 2:] = step_pred[:, 0, :]
+
+        return torch.cat(predictions, dim=1) if predictions else torch.zeros_like(continuous)

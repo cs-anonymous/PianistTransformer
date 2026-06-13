@@ -277,6 +277,13 @@ class PianoT5GemmaModel(T5GemmaPreTrainedModel):
             )
 
         encoder_hidden_states = encoder_outputs.last_hidden_state
+        # The encoder compresses every 8 token-level score events into 1 note-level state.
+        # Keep the cross-attention mask on the same note-level length for newer
+        # transformers attention implementations.
+        if attention_mask is not None and attention_mask.shape[1] != encoder_hidden_states.shape[1]:
+            B, L = attention_mask.shape
+            block_mask = attention_mask.view(B, L // 8, 8)
+            attention_mask = block_mask.any(dim=-1).long()
 
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
@@ -306,7 +313,7 @@ class PianoT5GemmaModel(T5GemmaPreTrainedModel):
 
 
 class PianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["model.decoder.embed_tokens.weight", "lm_head.out_proj.weight"]
+    _tied_weights_keys = {"lm_head.out_proj.weight": "model.decoder.embed_tokens.weight"}
     _tp_plan = {"lm_head.out_proj": "colwise_rep"}
     _pp_plan = {"lm_head.out_proj": (["hidden_states"], ["logits"])}
 
@@ -456,4 +463,3 @@ if __name__ == "__main__":
 
    
     #print(model(input_ids=toy_ids, decoder_input_ids=toy_ids).logits.shape)
-

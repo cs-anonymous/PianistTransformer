@@ -18,7 +18,12 @@ sys.path.insert(0, str(ROOT_DIR))
 from src.evaluate.epr_metrics import EPRMetrics, extract_features_from_continuous
 from src.evaluate.epr_metrics_extended import ExtendedEPRMetrics
 from src.evaluate.evaluate_integrated_node import load_model, predict_batch
-from src.train.sft_node import PianoCoReNodeSFTDataset, build_work_manifest, NodeSFTDataCollator
+from src.train.sft_node import (
+    PianoCoReNodeSFTDataset,
+    build_work_manifest,
+    NodeSFTDataCollator,
+    infer_input_feature_mode,
+)
 
 
 def get_subset_name(performance_dataset: str) -> str:
@@ -131,6 +136,7 @@ def main():
     test_dataset = PianoCoReNodeSFTDataset(
         test_manifest,
         split="test",
+        input_feature_mode=infer_input_feature_mode(config),
         shuffle=False,
         seed=config["seed"],
         max_performances_per_work=config.get("max_eval_performances_per_work"),

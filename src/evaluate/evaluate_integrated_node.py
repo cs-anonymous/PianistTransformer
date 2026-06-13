@@ -16,7 +16,13 @@ sys.path.insert(0, str(ROOT_DIR))
 
 from src.evaluate.epr_metrics import EPRMetrics, extract_features_from_continuous
 from src.model.integrated_pianoformer import IntegratedPianoT5Gemma, IntegratedPianoT5GemmaConfig, IntegratedPianoTransformer
-from src.train.sft_node import PianoCoReNodeSFTDataset, build_work_manifest, NodeSFTDataCollator
+from src.train.sft_node import (
+    PianoCoReNodeSFTDataset,
+    build_work_manifest,
+    NodeSFTDataCollator,
+    infer_input_feature_mode,
+    default_input_continuous_dim,
+)
 
 
 def load_model(checkpoint_path, config):
@@ -25,9 +31,11 @@ def load_model(checkpoint_path, config):
     print(f"Loading model from {checkpoint_path}")
 
     backbone_type = config.get('backbone_type', 't5').lower()
+    input_feature_mode = infer_input_feature_mode(config)
     model_config = IntegratedPianoT5GemmaConfig(
         backbone_type=backbone_type,
         continuous_dim=config.get('continuous_dim', 7),
+        output_continuous_dim=config.get('output_continuous_dim', config.get('continuous_dim', 7)),
         max_time_ms=config.get('max_time_ms', 10000.0),
         pedal_output_activation=config.get('pedal_output_activation', 'sigmoid'),
         pitch_pad_id=config.get('pitch_pad_id', 128),
@@ -42,6 +50,18 @@ def load_model(checkpoint_path, config):
         num_attention_heads=config.get('num_attention_heads', 8),
         num_key_value_heads=config.get('num_key_value_heads', 4),
         head_dim=config.get('head_dim', 128),
+        task_type=config.get('task_type', 'epr'),
+        decoder_input_mode=config.get('decoder_input_mode', 'score'),
+        input_feature_mode=input_feature_mode,
+        input_continuous_dim=config.get(
+            'input_continuous_dim',
+            default_input_continuous_dim(
+                config.get('task_type', 'epr').lower(),
+                input_feature_mode,
+                score_feature_dim=config.get('score_feature_dim', 8),
+                continuous_dim=config.get('continuous_dim', 7),
+            ),
+        ),
     )
 
     if backbone_type in {'t5', 't5gemma'}:
@@ -231,6 +251,7 @@ def main():
     test_dataset = PianoCoReNodeSFTDataset(
         test_manifest,
         split='test',
+        input_feature_mode=infer_input_feature_mode(config),
         shuffle=False,
         seed=config['seed'],
         max_performances_per_work=config.get('max_eval_performances_per_work'),

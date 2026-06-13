@@ -58,7 +58,7 @@
   "task_type": "epr",
   "experiment_name": "inr_epr_t5_6_6_h768_b512",
   "output_dir": "./models/inr_epr_t5_6_6_h768_b512/",
-  "input_continuous_dim": 3,
+  "input_continuous_dim": 13,
   "output_continuous_dim": 7,
   "decoder_input_mode": "score",
   "pedal_output_activation": "linear",
@@ -69,5 +69,7 @@
     "duration": 1.0,
     "velocity": 1.0,
     "pedal": 0.75
-  }
+  },
+  "input_feature_mode": "integrated",
+  "score_feature_dim": 8
 }

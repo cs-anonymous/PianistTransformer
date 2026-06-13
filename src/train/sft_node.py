@@ -90,6 +90,45 @@ def make_windows(total_notes, block_notes, overlap_ratio, min_notes):
     return deduped
 
 
+def default_input_continuous_dim(task_type, input_feature_mode, score_feature_dim=8, continuous_dim=7):
+    if input_feature_mode == "integrated":
+        if task_type == "epr":
+            return 2 + 3 + score_feature_dim
+        if task_type == "csr":
+            return 2 + continuous_dim
+    return continuous_dim
+
+
+def infer_input_feature_mode(config):
+    mode = config.get("input_feature_mode")
+    if mode is not None:
+        return str(mode).lower()
+    task_type = config.get("task_type", "epr").lower()
+    input_dim = config.get("input_continuous_dim")
+    if input_dim is not None:
+        if task_type == "epr" and int(input_dim) <= 3:
+            return "legacy"
+        if task_type == "csr" and int(input_dim) <= 7:
+            return "legacy"
+    return "integrated"
+
+
+def make_score_note_input(score_continuous, score_feature, has_score_feature, input_feature_mode):
+    if input_feature_mode == "legacy":
+        return score_continuous
+    rows = []
+    for shared, feature, has_feature in zip(score_continuous, score_feature, has_score_feature):
+        has_feature = 1.0 if bool(has_feature) else 0.0
+        rows.append([has_feature, 0.0] + list(shared[:3]) + [float(value) * has_feature for value in feature[:8]])
+    return rows
+
+
+def make_performance_note_input(label_continuous, input_feature_mode):
+    if input_feature_mode == "legacy":
+        return label_continuous
+    return [[0.0, 1.0] + list(row[:7]) for row in label_continuous]
+
+
 def distributed_info():
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_rank(), torch.distributed.get_world_size()
@@ -153,6 +192,7 @@ class PianoCoReNodeSFTDataset(Dataset):
         manifest,
         split,
         task_type="epr",
+        input_feature_mode="integrated",
         shuffle=True,
         seed=42,
         max_performances_per_work=None,
@@ -162,6 +202,7 @@ class PianoCoReNodeSFTDataset(Dataset):
         super().__init__()
         self.split = split
         self.task_type = task_type
+        self.input_feature_mode = input_feature_mode
         items = list(manifest)
         if shuffle:
             random.Random(seed).shuffle(items)
@@ -241,11 +282,16 @@ class PianoCoReNodeSFTDataset(Dataset):
         interpolated = perf["interpolated"]
         task_type = self.task_type.lower()
         if task_type == "epr":
-            continuous = score["score_continuous"][start:end]
+            continuous = make_score_note_input(
+                score["score_continuous"][start:end],
+                score.get("score_feature", [[0.0] * 8 for _ in score["pitch"][start:end]]),
+                score.get("has_score_feature", [0] * len(score["pitch"][start:end])),
+                self.input_feature_mode,
+            )
             labels_continuous = labels[start:end]
             label_mask = None
         elif task_type == "csr":
-            continuous = labels[start:end]
+            continuous = make_performance_note_input(labels[start:end], self.input_feature_mode)
             labels_continuous = score["score_feature"][start:end]
             label_mask = score["has_score_feature"][start:end]
         else:
@@ -362,6 +408,17 @@ def create_model(train_config):
     dtype = torch.bfloat16 if train_config.get("bf16", False) and torch.cuda.is_available() else torch.float32
     backbone_type = train_config.get("backbone_type", "t5").lower()
     task_type = train_config.get("task_type", "epr").lower()
+    input_feature_mode = infer_input_feature_mode(train_config)
+    score_feature_dim = train_config.get("score_feature_dim", 8)
+    input_continuous_dim = train_config.get(
+        "input_continuous_dim",
+        default_input_continuous_dim(
+            task_type,
+            input_feature_mode,
+            score_feature_dim=score_feature_dim,
+            continuous_dim=train_config.get("continuous_dim", 7),
+        ),
+    )
     model_config = IntegratedPianoT5GemmaConfig(
         backbone_type=backbone_type,
         hidden_size=train_config["hidden_size"],
@@ -376,8 +433,9 @@ def create_model(train_config):
         max_position_embeddings=train_config.get("max_position_embeddings", 4096),
         attention_dropout=train_config.get("attention_dropout", 0.0),
         continuous_dim=train_config["continuous_dim"],
-        input_continuous_dim=train_config.get("input_continuous_dim", train_config["continuous_dim"]),
+        input_continuous_dim=input_continuous_dim,
         output_continuous_dim=train_config.get("output_continuous_dim", train_config["continuous_dim"]),
+        score_feature_dim=score_feature_dim,
         max_time_ms=train_config["max_time_ms"],
         pedal_output_activation=train_config.get("pedal_output_activation", "sigmoid"),
         task_type=task_type,
@@ -388,6 +446,7 @@ def create_model(train_config):
         loss_weights=train_config["loss_weights"],
         csr_loss_weights=train_config.get("csr_loss_weights"),
         decoder_input_mode=train_config["decoder_input_mode"],
+        input_feature_mode=input_feature_mode,
         torch_dtype=dtype,
     )
 
@@ -465,6 +524,17 @@ def main():
     with open(args.config, "r", encoding="utf-8") as file:
         train_config = json.load(file)
     task_type = train_config.get("task_type", "epr").lower()
+    input_feature_mode = infer_input_feature_mode(train_config)
+    train_config["input_feature_mode"] = input_feature_mode
+    train_config.setdefault(
+        "input_continuous_dim",
+        default_input_continuous_dim(
+            task_type,
+            input_feature_mode,
+            score_feature_dim=train_config.get("score_feature_dim", 8),
+            continuous_dim=train_config.get("continuous_dim", 7),
+        ),
+    )
 
     if args.max_steps is not None:
         train_config["max_steps"] = args.max_steps
@@ -514,6 +584,7 @@ def main():
         train_manifest,
         split="train",
         task_type=task_type,
+        input_feature_mode=input_feature_mode,
         shuffle=True,
         seed=train_config["seed"],
         max_performances_per_work=train_config.get("max_performances_per_work"),
@@ -524,6 +595,7 @@ def main():
         eval_manifest,
         split="test",
         task_type=task_type,
+        input_feature_mode=input_feature_mode,
         shuffle=False,
         seed=train_config["seed"],
         max_performances_per_work=train_config.get("max_eval_performances_per_work"),

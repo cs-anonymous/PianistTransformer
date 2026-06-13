@@ -74,5 +74,7 @@
   "node_cache_size": 16,
   "remove_unused_columns": false,
   "ddp_find_unused_parameters": true,
-  "ddp_broadcast_buffers": false
+  "ddp_broadcast_buffers": false,
+  "input_feature_mode": "integrated",
+  "input_continuous_dim": 9
 }

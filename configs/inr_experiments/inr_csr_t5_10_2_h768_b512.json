@@ -58,7 +58,7 @@
   "task_type": "csr",
   "experiment_name": "inr_csr_t5_10_2_h768_b512",
   "output_dir": "./models/inr_csr_t5_10_2_h768_b512/",
-  "input_continuous_dim": 7,
+  "input_continuous_dim": 9,
   "output_continuous_dim": 8,
   "score_feature_dim": 8,
   "decoder_input_mode": "performance",
@@ -85,5 +85,6 @@
     "trill": 0.4,
     "grace": 0.4,
     "staccato": 0.3
-  }
+  },
+  "input_feature_mode": "integrated"
 }

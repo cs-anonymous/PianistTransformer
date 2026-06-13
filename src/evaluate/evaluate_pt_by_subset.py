@@ -5,6 +5,7 @@ Uses the correct Score → Performance generation method.
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from collections import defaultdict
@@ -12,16 +13,22 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.multiprocessing as mp
+from transformers import LogitsProcessorList
 from tqdm import tqdm
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT_DIR))
 
-PT_PATH = Path("/home/kaititech/EPR/third_party/epr/PianistTransformer")
-sys.path.insert(0, str(PT_PATH))
+DEFAULT_PT_ROOT = Path("/home/kaititech/EPR/third_party/epr/PianistTransformer")
+PT_PATH = Path(
+    os.environ.get("PT_ROOT", ROOT_DIR if (ROOT_DIR / "models" / "sft").exists() else DEFAULT_PT_ROOT)
+)
+if str(PT_PATH) not in sys.path:
+    sys.path.insert(0, str(PT_PATH))
 
 from src.evaluate.epr_metrics import EPRMetrics, extract_features_from_continuous
 from src.evaluate.epr_metrics_extended import ExtendedEPRMetrics
+from src.model.generate import BatchSparseForcedTokenProcessor
 
 
 def load_pt_model_and_config():
@@ -30,6 +37,12 @@ def load_pt_model_and_config():
 
     model_path = PT_PATH / "models/sft/model.safetensors"
     config_path = PT_PATH / "models/sft/config.json"
+
+    if not model_path.exists() or not config_path.exists():
+        raise FileNotFoundError(
+            f"PT fine-tuned model not found under {PT_PATH / 'models/sft'}. "
+            "Expected both config.json and model.safetensors."
+        )
 
     with open(config_path) as f:
         config_dict = json.load(f)
@@ -74,7 +87,11 @@ def should_include_sample(performance_dataset, source_filter):
 
 
 def create_score_input(pitch_ids, score_continuous, config):
-    """Create score input tokens from pitch and score_continuous."""
+    """Recover PT score tokens from JSON note features.
+
+    JSON timing values use log1p(ms) / log1p(max_time_ms). PT timing tokens use
+    1 ms units, so we denormalize and round back to integer milliseconds.
+    """
     score_tokens = []
     max_time_ms = 10000.0
 
@@ -83,12 +100,15 @@ def create_score_input(pitch_ids, score_continuous, config):
 
         cont = score_continuous[i]
         ioi_norm, dur_norm, vel_norm = cont[0], cont[1], cont[2]
-        pedal_norm = cont[3:7]
+        if len(cont) >= 7:
+            pedal_norm = cont[3:7]
+        else:
+            pedal_norm = [0.0, 0.0, 0.0, 0.0]
 
-        ioi_ms = int(np.clip(np.expm1(ioi_norm * np.log1p(max_time_ms)), 0, 4990))
-        dur_ms = int(np.clip(np.expm1(dur_norm * np.log1p(max_time_ms)), 0, 4990))
-        vel = int(np.clip(vel_norm * 127, 0, 127))
-        pedal_vals = np.clip((np.array(pedal_norm) * 127).astype(int), 0, 127)
+        ioi_ms = int(round(np.clip(np.expm1(ioi_norm * np.log1p(max_time_ms)), 0, 4990)))
+        dur_ms = int(round(np.clip(np.expm1(dur_norm * np.log1p(max_time_ms)), 0, 4990)))
+        vel = int(round(np.clip(vel_norm * 127, 0, 127)))
+        pedal_vals = np.clip(np.rint(np.array(pedal_norm) * 127).astype(int), 0, 127)
 
         ioi_token = np.clip(config.timing_start + ioi_ms, config.valid_id_range[1][0], config.valid_id_range[1][1] - 1)
         dur_token = np.clip(config.timing_start + dur_ms, config.valid_id_range[3][0], config.valid_id_range[3][1] - 1)
@@ -160,17 +180,31 @@ def worker_process(worker_id, gpu_id, sample_indices, dataset, config, source_fi
 
             score_input = create_score_input(pitch_ids, score_continuous, config)
             input_ids = torch.tensor([score_input], dtype=torch.long).to(device)
+            logits_processor = LogitsProcessorList([
+                BatchSparseForcedTokenProcessor(
+                    input_ids,
+                    config,
+                    target_len=len(pitch_ids) * 8,
+                    origin_len=0,
+                    already=0.0,
+                    weight=1.0,
+                    progress_callback=None,
+                )
+            ])
 
             with torch.no_grad():
                 generated_ids = model.generate(
                     input_ids=input_ids,
                     max_new_tokens=len(pitch_ids) * 8,
-                    do_sample=False,
+                    do_sample=True,
+                    logits_processor=logits_processor,
+                    temperature=1.0,
+                    top_p=0.95,
                     pad_token_id=config.pad_token_id,
                     eos_token_id=config.eos_token_id,
                 )
 
-            pred_tokens = generated_ids[0].cpu().numpy().tolist()
+            pred_tokens = generated_ids[0, 1:len(pitch_ids) * 8 + 1].cpu().numpy().tolist()
             pred_cont = pt_tokens_to_continuous_features(pred_tokens, config)
 
             target_cont = np.array(target_continuous)
@@ -210,10 +244,25 @@ def evaluate_pt_multiworker(model, config, dataset, source_filter=None,
     if source_filter:
         print(f"Filtering to {source_filter.upper()} samples only")
 
-    if max_samples and max_samples < len(dataset):
-        dataset = torch.utils.data.Subset(dataset, range(max_samples))
+    selected_indices = []
+    if source_filter is None:
+        selected_indices = list(range(len(dataset)))
+    else:
+        print("Pre-filtering sample indices before worker assignment...")
+        for idx in tqdm(range(len(dataset)), desc="Selecting samples"):
+            sample = dataset[idx]
+            performance_dataset = sample.get('performance_dataset', 'unknown')
+            if should_include_sample(performance_dataset, source_filter):
+                selected_indices.append(idx)
 
-    num_samples = len(dataset)
+    if max_samples is not None:
+        selected_indices = selected_indices[:max_samples]
+
+    num_samples = len(selected_indices)
+    print(f"Selected {num_samples} samples for evaluation")
+    if num_samples == 0:
+        raise ValueError("No samples selected for evaluation")
+
     samples_per_worker = (num_samples + total_workers - 1) // total_workers
 
     # Assign samples to workers
@@ -223,7 +272,7 @@ def evaluate_pt_multiworker(model, config, dataset, source_filter=None,
         start_idx = worker_id * samples_per_worker
         end_idx = min(start_idx + samples_per_worker, num_samples)
         if start_idx < num_samples:
-            indices = list(range(start_idx, end_idx))
+            indices = selected_indices[start_idx:end_idx]
             worker_assignments.append((worker_id, gpu_id, indices))
 
     print(f"Samples per worker: {[len(w[2]) for w in worker_assignments]}")
