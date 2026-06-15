@@ -140,19 +140,21 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-    print(f"Using device: {device}")
-
     with open(args.config, "r") as f:
         train_config = json.load(f)
     train_config["output_dir"] = os.path.join(train_config["output_dir"], outname)
     train_config["run_name"] = outname
     train_config["logging_dir"] = os.path.join(train_config["logging_dir"], outname)
+
+    training_args = filter_valid_args(train_config, TrainingArguments)
+
+    # Force DDP for multi-GPU instead of DataParallel.
+    if torch.cuda.device_count() > 1:
+        training_args["ddp_find_unused_parameters"] = True
+        training_args["ddp_broadcast_buffers"] = False
+
+    training_args = TrainingArguments(**training_args)
+    print(f"Using device: {training_args.device}")
     
     config = PianoT5GemmaConfig(
         encoder_layers_num=10,
@@ -160,37 +162,39 @@ if __name__ == "__main__":
         torch_dtype=torch.bfloat16   
     )
     
-    dataset = load_dataset("json", data_files=train_config["data_paths"])
-    dataset = dataset.shuffle(seed=42) 
-    
-    num_proc = 40
-    train_dataset = dataset.filter(lambda example: example['split'] == 'train', num_proc=num_proc)
-    valid_dataset = dataset.filter(lambda example: example['split'] == 'test', num_proc=num_proc)
+    with training_args.main_process_first(desc="dataset preparation"):
+        dataset = load_dataset("json", data_files=train_config["data_paths"])
+        dataset = dataset.shuffle(seed=42)
 
-    train_dataset = train_dataset.map(
-        group_ids,
-        fn_kwargs={
-            "block_size": train_config["block_size"],
-            "overlap_ratio": train_config["overlap_ratio"],
-        },
-        batched=True,
-        num_proc=num_proc,
-        remove_columns=['x', 'label', 'score_source', 'performance_source', 'cut', 'split']
-    )
-    valid_dataset = valid_dataset.map(
-        group_ids,
-        fn_kwargs={
-            "block_size": train_config["block_size"],
-            "overlap_ratio": train_config["overlap_ratio"],
-        },
-        batched=True,
-        num_proc=num_proc,
-        remove_columns=['x', 'label', 'score_source', 'performance_source', 'cut', 'split']
-    )
+        num_proc = min(40, os.cpu_count() or 1)
+        train_dataset = dataset.filter(lambda example: example['split'] == 'train', num_proc=num_proc)
+        valid_dataset = dataset.filter(lambda example: example['split'] == 'test', num_proc=num_proc)
+
+        train_dataset = train_dataset.map(
+            group_ids,
+            fn_kwargs={
+                "block_size": train_config["block_size"],
+                "overlap_ratio": train_config["overlap_ratio"],
+            },
+            batched=True,
+            num_proc=num_proc,
+            remove_columns=['x', 'label', 'score_source', 'performance_source', 'cut', 'split']
+        )
+        valid_dataset = valid_dataset.map(
+            group_ids,
+            fn_kwargs={
+                "block_size": train_config["block_size"],
+                "overlap_ratio": train_config["overlap_ratio"],
+            },
+            batched=True,
+            num_proc=num_proc,
+            remove_columns=['x', 'label', 'score_source', 'performance_source', 'cut', 'split']
+        )
 
     data_collator = DiffusionSFTDataCollator(config)
     if train_config["pretrained_model"] is None:
         model = PianoT5Gemma(config)
+        print("Training from scratch (no pretrained model)")
     else:
         model = PianoT5Gemma.from_pretrained(
             train_config["pretrained_model"],
@@ -198,16 +202,7 @@ if __name__ == "__main__":
         )
         print(f"Loaded pretrained model from {train_config['pretrained_model']}")
 
-    model.to(device)
-        
-    training_args = filter_valid_args(train_config, TrainingArguments)
-
-    # Force DDP for multi-GPU instead of DataParallel
-    if torch.cuda.device_count() > 1:
-        training_args["ddp_find_unused_parameters"] = True
-        training_args["ddp_broadcast_buffers"] = False
-
-    training_args = TrainingArguments(**training_args)
+    model.to(training_args.device)
 
     trainer = Trainer(
         model=model,

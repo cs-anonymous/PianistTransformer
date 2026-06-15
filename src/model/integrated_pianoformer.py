@@ -838,7 +838,7 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
         cache_position=None,
         **kwargs,
     ):
-        del past_key_values, use_cache, cache_position, kwargs
+        del kwargs
         batch_size, seq_len = pitch_ids.shape
         score_note_embeds = self.note_encoder(pitch_ids, continuous)
         if encoder_outputs is None:
@@ -855,21 +855,58 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
         )
         predictions = []
 
+        # Use KV cache for efficient autoregressive decoding
+        # Step 0: process first token with full prefix
+        # Steps 1+: process only the new token, reuse cached KV
+
+        cached_past_key_values = past_key_values
+
         for step in range(seq_len):
-            decoder_inputs_embeds = self.decoder_note_encoder(
-                pitch_ids[:, : step + 1],
-                decoder_input_continuous[:, : step + 1],
-            )
-            decoder_attention_mask = attention_mask[:, : step + 1]
-            decoder_outputs = self.model(
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                decoder_attention_mask=decoder_attention_mask,
-                encoder_outputs=encoder_outputs,
-                decoder_inputs_embeds=decoder_inputs_embeds,
-            )
+            if step == 0:
+                # First step: process prefix of length 1
+                decoder_inputs_embeds = self.decoder_note_encoder(
+                    pitch_ids[:, :1],
+                    decoder_input_continuous[:, :1],
+                )
+                decoder_attention_mask = attention_mask[:, :1]
+                decoder_outputs = self.model(
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    decoder_attention_mask=decoder_attention_mask,
+                    encoder_outputs=encoder_outputs,
+                    decoder_inputs_embeds=decoder_inputs_embeds,
+                    use_cache=True,
+                    past_key_values=cached_past_key_values,
+                )
+                cached_past_key_values = decoder_outputs.past_key_values
+            else:
+                # Subsequent steps: process only the new token
+                step_idx = step
+                decoder_inputs_embeds = self.decoder_note_encoder(
+                    pitch_ids[:, step_idx:step_idx+1],
+                    decoder_input_continuous[:, step_idx:step_idx+1],
+                )
+                # For incremental decoding, we need the full decoder attention mask
+                # but only the new token's embeddings
+                decoder_attention_mask = attention_mask[:, :step_idx+1]
+                cache_position_tensor = torch.tensor(
+                    [step_idx], device=pitch_ids.device, dtype=torch.long
+                )
+                decoder_outputs = self.model(
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    decoder_attention_mask=decoder_attention_mask,
+                    encoder_outputs=encoder_outputs,
+                    decoder_inputs_embeds=decoder_inputs_embeds,
+                    use_cache=True,
+                    past_key_values=cached_past_key_values,
+                    cache_position=cache_position_tensor,
+                )
+                cached_past_key_values = decoder_outputs.past_key_values
+
             step_pred = self.continuous_decoder(decoder_outputs.last_hidden_state[:, -1:, :])
             predictions.append(step_pred)
+
             if step + 1 < seq_len:
                 if self.config.task_type == "epr":
                     decoder_input_continuous[:, step + 1, 1] = 1.0
