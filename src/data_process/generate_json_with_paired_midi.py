@@ -14,11 +14,11 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src.utils.node_midi import CONTINUOUS_KEYS, midi_to_note_features, sorted_piano_notes
+from src.utils.inr_midi import CONTINUOUS_KEYS, midi_to_note_features, sorted_piano_notes
 
 
 SCHEMA_VERSION = "pianocore_node_work_v1"
-JSON_SUFFIX = ".node_a.json"
+JSON_SUFFIX = ".json"
 
 
 REQUIRED_COLUMNS = [

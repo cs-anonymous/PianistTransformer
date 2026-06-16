@@ -83,7 +83,7 @@ loss_csr = (
 
 ## Implementation Status
 
-These configs describe the intended 10-run matrix. The current `src/train/sft_node.py`
+These configs describe the intended 10-run matrix. The current `src/train/train_inr.py`
 implementation still mainly supports the older EPR continuous-regression baseline.
 Before launching this full matrix, the training code should be extended for:
 

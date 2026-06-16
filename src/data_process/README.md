@@ -13,7 +13,7 @@ MIDI, and PianoCoRe alignment files. It writes one work-level JSON beside each
 refined score MIDI:
 
 ```text
-data/pianocore/PianoCoRe/refined/**/*.node_a.json
+data/pianocore/PianoCoRe/refined/**/*.json
 ```
 
 The output contains:
@@ -29,7 +29,7 @@ The output contains:
 python src/data_process/update_json_score_feature_with_xml.py
 ```
 
-This stage reads the existing `*.node_a.json` files and projects XML/MXL score
+This stage reads the existing `*.json` INR files and projects XML/MXL score
 features onto the refined score notes. It updates each JSON in place to schema
 `pianocore_integrated_node_work_v2`.
 

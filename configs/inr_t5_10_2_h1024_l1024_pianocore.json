@@ -38,7 +38,7 @@
   "max_position_embeddings": 4096,
   "attention_dropout": 0.0,
   "seed": 42,
-  "output_dir": "./models/bench_sft_nodes_t5_10_2_h1024_l1024/",
+  "output_dir": "./models/bench_inr_models_t5_10_2_h1024_l1024/",
   "overwrite_output_dir": true,
   "num_train_epochs": 1,
   "save_steps": 1000000,

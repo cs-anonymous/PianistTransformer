@@ -1,5 +1,5 @@
 """
-Generate PT (PianistTransformer) SFT data from PianoCoRe node_a.json files (multi-process version).
+Generate PT (PianistTransformer) SFT data from PianoCoRe INR JSON files (multi-process version).
 """
 
 import argparse
@@ -16,7 +16,7 @@ from tqdm import tqdm
 def denormalize_time(value, max_time_ms, normalization):
     """Convert normalized node time to PT timing ticks.
 
-    PianoCoRe node JSON stores timing as log1p(ms) / log1p(max_time_ms).
+    PianoCoRe INR JSON stores timing as log1p(ms) / log1p(max_time_ms).
     PT timing tokens use integer ticks after MIDI normalization to 500 TPB at
     120 BPM, where one tick is effectively one millisecond.
     """
@@ -58,7 +58,7 @@ def continuous_to_pt_tokens(pitch, ioi, duration, velocity, pedals, config):
 
 
 def process_node_json(json_path, max_time_ms, time_normalization, config):
-    """Process a single node_a.json file."""
+    """Process a single INR JSON file."""
     try:
         with open(json_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
@@ -126,7 +126,7 @@ def process_node_json(json_path, max_time_ms, time_normalization, config):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate PT SFT data from node_a.json files (multi-process)")
+    parser = argparse.ArgumentParser(description="Generate PT SFT data from INR JSON files (multi-process)")
     parser.add_argument("--processed-dir", type=str, default="PianoCoRe/processed")
     parser.add_argument("--output-file", type=str, default="data/processed/sft/sft_pianocore_from_json.jsonl")
     parser.add_argument("--max-time-ms", type=float, default=10000.0)
@@ -148,11 +148,11 @@ def main():
     }
 
     processed_dir = Path(args.processed_dir)
-    json_files = list(processed_dir.rglob("*.node_a.json"))
+    json_files = list(processed_dir.rglob("*.json"))
     json_files = sorted(json_files)
     if args.max_files is not None:
         json_files = json_files[:args.max_files]
-    print(f"Found {len(json_files)} node_a.json files")
+    print(f"Found {len(json_files)} INR JSON files")
 
     output_path = Path(args.output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)

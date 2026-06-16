@@ -53,7 +53,7 @@ patch_music21_strip_ties_preserve_voices()
 
 from tokenizer import PARAMS, MultistreamTokenizer  # noqa: E402
 from score_utils import realize_spanners  # noqa: E402
-from src.utils.node_midi import sorted_piano_notes  # noqa: E402
+from src.utils.inr_midi import sorted_piano_notes  # noqa: E402
 
 
 class TimeoutError(RuntimeError):

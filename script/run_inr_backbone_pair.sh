@@ -40,7 +40,7 @@ PY
 
     echo "[$(date '+%F %T')] ${SESSION_NAME} ${task_name}: trying batch_size=${batch_size}" | tee -a "${log_path}"
     CUDA_VISIBLE_DEVICES="${GPU_ID}" PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-      python "${ROOT_DIR}/src/train/sft_node.py" --config "${tmp_config}" 2>&1 | tee -a "${log_path}"
+      python "${ROOT_DIR}/src/train/train_inr.py" --config "${tmp_config}" 2>&1 | tee -a "${log_path}"
     status=${PIPESTATUS[0]}
     if [ "${status}" -eq 0 ]; then
       echo "[$(date '+%F %T')] ${SESSION_NAME} ${task_name}: finished with batch_size=${batch_size}" | tee -a "${log_path}"

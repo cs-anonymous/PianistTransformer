@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render PianoCoRe node JSON files back to MusicXML/MXL scores.
+"""Render PianoCoRe INR JSON files back to MusicXML/MXL scores.
 
 The current JSON schema stores score-side timing and annotations, but not the
 MIDI2ScoreTransformer output streams for key signature, spelling accidental,
@@ -47,7 +47,7 @@ if str(TOKENIZER_ROOT) not in sys.path:
     sys.path.insert(0, str(TOKENIZER_ROOT))
 
 from score_utils import postprocess_score  # noqa: E402
-from src.utils.node_midi import sorted_piano_notes  # noqa: E402
+from src.utils.inr_midi import sorted_piano_notes  # noqa: E402
 
 
 SCORE_GRID = 1.0 / 24.0
@@ -623,7 +623,7 @@ def build_score(
 
 def output_path_for_json(json_path: Path, output_mode: str) -> Path:
     if output_mode == "basename":
-        name = json_path.name.replace(".node_a.json", ".extracted.mxl")
+        name = json_path.name.replace(".json", ".extracted.mxl")
         return json_path.with_name(name)
     if output_mode == "fixed":
         return json_path.with_name("extracted.mxl")
@@ -900,7 +900,7 @@ def main() -> None:
     parser.add_argument("--min-key-run-measures", type=int, default=4)
     args = parser.parse_args()
 
-    json_paths = sorted(path for path in args.json_root.rglob("*.node_a.json"))
+    json_paths = sorted(path for path in args.json_root.rglob("*.json"))
     if args.limit is not None:
         json_paths = json_paths[: args.limit]
     tasks = [

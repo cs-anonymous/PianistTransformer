@@ -11,25 +11,25 @@
 - paired MIDI 生成 JSON：[generate_json_with_paired_midi.py](/home/kaititech/EPR/PianistTransformer/src/data_process/generate_json_with_paired_midi.py)
 - XML 更新 score feature：[update_json_score_feature_with_xml.py](/home/kaititech/EPR/PianistTransformer/src/data_process/update_json_score_feature_with_xml.py)
 - XML/MIDI 对齐 helper：[score_xml_alignment.py](/home/kaititech/EPR/PianistTransformer/src/data_process/score_xml_alignment.py)
-- MIDI/node 工具：[src/utils/node_midi.py](/home/kaititech/EPR/PianistTransformer/src/utils/node_midi.py)
+- MIDI/node 工具：[src/utils/inr_midi.py](/home/kaititech/EPR/PianistTransformer/src/utils/inr_midi.py)
 - Integrated 模型：[src/model/integrated_pianoformer.py](/home/kaititech/EPR/PianistTransformer/src/model/integrated_pianoformer.py)
-- SFT 训练入口：[src/train/sft_node.py](/home/kaititech/EPR/PianistTransformer/src/train/sft_node.py)
-- 训练配置：[configs/sft_node_config_pianocore.json](/home/kaititech/EPR/PianistTransformer/configs/sft_node_config_pianocore.json)
-- 启动脚本：[script/sft_node.sh](/home/kaititech/EPR/PianistTransformer/script/sft_node.sh)
+- SFT 训练入口：[src/train/train_inr.py](/home/kaititech/EPR/PianistTransformer/src/train/train_inr.py)
+- 训练配置：[configs/inr_config_pianocore.json](/home/kaititech/EPR/PianistTransformer/configs/inr_config_pianocore.json)
+- 启动脚本：[script/train_inr.sh](/home/kaititech/EPR/PianistTransformer/script/train_inr.sh)
 
-数据格式已从原计划的 pair-level jsonl 改为 work-level JSON：每个作品一个 `*.node_a.json`，直接写在 refined score MIDI 旁边。第一步生成 paired MIDI JSON；第二步从 XML/MXL 投影 `score.score_feature` 与 `score.has_score_feature`，并在 `meta.xml_to_refined_score_alignment` 中记录 coverage。
+数据格式已从原计划的 pair-level jsonl 改为 work-level INR JSON：每个作品一个 `*.json`，直接写在 refined score MIDI 旁边。第一步生成 paired MIDI JSON；第二步从 XML/MXL 投影 `score.score_feature` 与 `score.has_score_feature`，并在 `meta.xml_to_refined_score_alignment` 中记录 coverage。
 
 当前已完成全量 PianoCoRe-A 处理：
 
 ```text
-output: data/pianocore/PianoCoRe/refined/**/*.node_a.json
+output: data/pianocore/PianoCoRe/refined/**/*.json
 summary: data/pianocore/PianoCoRe/refined/pianocore_a_node_summary.json
 works_total: 1936
 success_works: 1936
 success_performances: 157198
 failed_performances: 9
 failed reason: pitch_mismatch
-node JSON total size: ~16G
+INR JSON total size: ~16G
 score feature note-level coverage: 91.14%
 ```
 
@@ -41,11 +41,11 @@ score feature note-level coverage: 91.14%
 
 训练数据集已实现为 map-style Dataset，而不是 IterableDataset。样本索引映射到 `(work, performance, window)`，并使用每进程 LRU cache 缓存最近 work JSON；这样 DDP 的 DistributedSampler 可以稳定分片，避免 IterableDataset 在多卡下 batch dispatch 和尾部耗尽不一致的问题。
 
-当前本地已启动 3 卡 node SFT：
+当前本地已启动 3 卡 INR SFT：
 
 ```bash
-tmux attach -t sft_node
-tail -f logs/sft_node_*.log
+tmux attach -t inr
+tail -f logs/inr_*.log
 ```
 
 默认配置为 1000 steps，`block_notes=512`，3 卡训练，`per_device_train_batch_size=2`，`gradient_accumulation_steps=16`，每 500 step 保存 checkpoint。
@@ -230,7 +230,7 @@ df = df[df["refined_performance_midi_path"].notna()]
 
 需要区分两层 schema：
 
-- **Storage schema**: 磁盘上的 `*.node_a.json` / `*.node_integrated.json` 字段，优先保持简单、兼容旧数据。
+- **Storage schema**: 磁盘上的 `*.json` 字段统一视为 INR payload，优先保持简单、兼容旧数据。
 - **Model schema**: encoder / decoder 内部按统计性质拆分的 feature group。
 
 因此，文档中的 `timing`, `velocity`, `pedal`, `score_position`, `measure_structure`, `score_annotation` 是模型概念分组；落盘时统一合并为更紧凑的 `score_feature` 数组字段，并用 `has_score_feature` 标记该 note 是否成功投影到 XML-derived score feature。
@@ -527,12 +527,12 @@ src/data_process/generate_json_with_paired_midi.py
 src/data_process/update_json_score_feature_with_xml.py
 ```
 
-当前第一阶段已落地的数据写成 work-level `*.node_a.json`。第一步只依赖 paired refined MIDI 与 alignment；第二步在同一个 JSON 上补充 XML-derived score-side feature。独立的 `07_audit_score_xml_to_refined_alignment.py` 不再作为主流程入口保留，coverage 由第二步的 summary/details 直接输出。
+当前第一阶段已落地的数据写成 work-level `*.json`。第一步只依赖 paired refined MIDI 与 alignment；第二步在同一个 JSON 上补充 XML-derived score-side feature。独立的 `07_audit_score_xml_to_refined_alignment.py` 不再作为主流程入口保留，coverage 由第二步的 summary/details 直接输出。
 
 推荐输出：
 
 ```text
-data/pianocore/PianoCoRe/refined/**/*.node_a.json
+data/pianocore/PianoCoRe/refined/**/*.json
 ```
 
 ### 5.1 推荐的简化存储 schema
@@ -1470,7 +1470,7 @@ loss family 按目标类型分别设计
 新增或沿用训练脚本：
 
 ```text
-src/train/sft_node.py
+src/train/train_inr.py
 ```
 
 Data collator 输出：
@@ -1525,7 +1525,7 @@ return {"loss": loss, "continuous_pred": continuous_pred}
 新增：
 
 ```text
-configs/sft_node_config_pianocore.json
+configs/inr_config_pianocore.json
 ```
 
 建议第一版：
@@ -1549,7 +1549,7 @@ configs/sft_node_config_pianocore.json
   "head_dim": 128,
   "continuous_dim": 7,
   "attention_variant": "gqa",
-  "output_dir": "./models/sft_nodes/",
+  "output_dir": "./models/inr_models/",
   "overwrite_output_dir": true,
   "num_train_epochs": 1,
   "save_steps": 500,
@@ -1579,17 +1579,17 @@ configs/sft_node_config_pianocore.json
 不同 backbone 使用独立配置文件更清楚，例如：
 
 ```text
-configs/sft_node_t5_10_2_pianocore.json
-configs/sft_node_t5_6_6_pianocore.json
-configs/sft_node_gpt_17_pianocore.json
-configs/sft_node_bert_17_pianocore.json
+configs/inr_t5_10_2_pianocore.json
+configs/inr_t5_6_6_pianocore.json
+configs/inr_gpt_17_pianocore.json
+configs/inr_bert_17_pianocore.json
 ```
 
 除 `backbone_type` 和层数外，第一阶段配置应保持一致。
 
 ## 11. 运行步骤
 
-### 11.1 生成 node SFT 数据
+### 11.1 生成 INR SFT 数据
 
 ```bash
 python src/data_process/generate_json_with_paired_midi.py --overwrite
@@ -1599,7 +1599,7 @@ python src/data_process/update_json_score_feature_with_xml.py
 预期输出：
 
 ```text
-data/pianocore/PianoCoRe/refined/**/*.node_a.json
+data/pianocore/PianoCoRe/refined/**/*.json
 data/pianocore/PianoCoRe/refined/pianocore_a_node_summary.json
 data/pianocore/PianoCoRe/refined/pianocore_a_integrated_score_feature_update_summary.json
 data/pianocore/PianoCoRe/refined/pianocore_a_integrated_score_feature_update_details.jsonl
@@ -1635,7 +1635,7 @@ assert min(pitch) >= 0 and max(pitch) <= 127
 ### 11.2 训练
 
 ```bash
-python src/train/sft_node.py --config configs/sft_node_config_pianocore.json
+python src/train/train_inr.py --config configs/inr_config_pianocore.json
 ```
 
 多 GPU 沿用现有 deepspeed/DDP 流程即可。
@@ -1645,7 +1645,7 @@ python src/train/sft_node.py --config configs/sft_node_config_pianocore.json
 新增工具函数：
 
 ```text
-src/utils/node_midi.py
+src/utils/inr_midi.py
 ```
 
 核心函数：
@@ -1754,13 +1754,13 @@ Experiment E: INR-BERT
 需要新增：
 
 ```text
-src/utils/node_midi.py
+src/utils/inr_midi.py
 src/data_process/generate_json_with_paired_midi.py
 src/data_process/update_json_score_feature_with_xml.py
 src/data_process/score_xml_alignment.py
 src/model/integrated_pianoformer.py
-src/train/sft_node.py
-configs/sft_node_config_pianocore.json
+src/train/train_inr.py
+configs/inr_config_pianocore.json
 ```
 
 建议暂不修改：

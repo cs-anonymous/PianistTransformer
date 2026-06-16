@@ -62,7 +62,7 @@ def load_torch_state_dict(checkpoint_path):
 
 
 def score_json_path(refined_dir, score_rel_path):
-    return (Path(refined_dir) / score_rel_path).with_suffix(".node_a.json")
+    return (Path(refined_dir) / score_rel_path).with_suffix(".json")
 
 
 def make_windows(total_notes, block_notes, overlap_ratio, min_notes):
@@ -496,10 +496,10 @@ def enable_eval_best_checkpointing(train_config):
 
 def main():
     current_datetime = datetime.datetime.now()
-    outname = "sft_node_" + current_datetime.strftime("%Y-%m-%d-%H-%M-%S")
+    outname = "inr_" + current_datetime.strftime("%Y-%m-%d-%H-%M-%S")
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="configs/sft_node_config_pianocore.json")
+    parser.add_argument("--config", type=str, default="configs/inr_config_pianocore.json")
     parser.add_argument("--deepspeed", type=str, help="Path to DeepSpeed config")
     parser.add_argument("--local_rank", type=int, default=-1)
     parser.add_argument("--max_steps", type=int, default=None)

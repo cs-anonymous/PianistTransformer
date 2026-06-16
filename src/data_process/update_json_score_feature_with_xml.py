@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Update PianoCoRe-A node JSON files with XML-derived score features.
+"""Update PianoCoRe-A INR JSON files with XML-derived score features.
 
-The existing ``*.node_a.json`` files contain score pitch, score continuous
+The existing ``*.json`` files contain INR note objects with score pitch, score continuous
 features, and performance targets. This script adds the v2 score-side fields:
 
     score.score_feature       [mo, md, ml, first, staff, trill, grace, staccato]
@@ -37,7 +37,7 @@ from src.data_process import score_xml_alignment
 
 
 SCHEMA_VERSION = "pianocore_integrated_node_work_v2"
-JSON_SUFFIX = ".node_a.json"
+JSON_SUFFIX = ".json"
 FEATURE_WIDTH = 8
 
 WORKER_RAW_ZIP = None
@@ -343,7 +343,7 @@ def main() -> None:
         "--json-dir",
         type=Path,
         default=None,
-        help="Root directory containing mirrored *.node_a.json files. Defaults to the refined directory.",
+        help="Root directory containing mirrored *.json INR files. Defaults to the refined directory.",
     )
     parser.add_argument("--subset", choices=["a", "a_star", "all"], default="a")
     parser.add_argument("--num-proc", type=int, default=20)
