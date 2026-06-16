@@ -4,6 +4,7 @@ Generate PT (PianistTransformer) SFT data from PianoCoRe node_a.json files (mult
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 from multiprocessing import Pool, cpu_count
@@ -12,9 +13,20 @@ from functools import partial
 from tqdm import tqdm
 
 
-def denormalize_time(value, max_time_ms):
-    """Convert normalized time (0-1) to ticks (0-4990)."""
-    ticks = value * max_time_ms
+def denormalize_time(value, max_time_ms, normalization):
+    """Convert normalized node time to PT timing ticks.
+
+    PianoCoRe node JSON stores timing as log1p(ms) / log1p(max_time_ms).
+    PT timing tokens use integer ticks after MIDI normalization to 500 TPB at
+    120 BPM, where one tick is effectively one millisecond.
+    """
+    value = min(1.0, max(0.0, float(value)))
+    if normalization == "log1p":
+        ticks = math.expm1(value * math.log1p(float(max_time_ms)))
+    elif normalization == "linear":
+        ticks = value * max_time_ms
+    else:
+        raise ValueError(f"Unsupported time normalization: {normalization}")
     return int(round(ticks))
 
 
@@ -45,7 +57,7 @@ def continuous_to_pt_tokens(pitch, ioi, duration, velocity, pedals, config):
     return tokens
 
 
-def process_node_json(json_path, max_time_ms, config):
+def process_node_json(json_path, max_time_ms, time_normalization, config):
     """Process a single node_a.json file."""
     try:
         with open(json_path, 'r', encoding='utf-8') as f:
@@ -75,8 +87,8 @@ def process_node_json(json_path, max_time_ms, config):
                 pitch = score_pitch[note_idx]
                 score_ioi_norm, score_dur_norm, score_vel_norm = score_continuous[note_idx]
 
-                score_ioi = denormalize_time(score_ioi_norm, max_time_ms)
-                score_dur = denormalize_time(score_dur_norm, max_time_ms)
+                score_ioi = denormalize_time(score_ioi_norm, max_time_ms, time_normalization)
+                score_dur = denormalize_time(score_dur_norm, max_time_ms, time_normalization)
                 score_vel = denormalize_velocity(score_vel_norm)
 
                 x_pedals = [0, 0, 0, 0]
@@ -88,8 +100,8 @@ def process_node_json(json_path, max_time_ms, config):
                 perf_ioi_norm, perf_dur_norm, perf_vel_norm = label_continuous[note_idx][:3]
                 perf_pedals = label_continuous[note_idx][3:7]
 
-                perf_ioi = denormalize_time(perf_ioi_norm, max_time_ms)
-                perf_dur = denormalize_time(perf_dur_norm, max_time_ms)
+                perf_ioi = denormalize_time(perf_ioi_norm, max_time_ms, time_normalization)
+                perf_dur = denormalize_time(perf_dur_norm, max_time_ms, time_normalization)
                 perf_vel = denormalize_velocity(perf_vel_norm)
                 perf_pedals_denorm = [denormalize_pedal(p) for p in perf_pedals]
 
@@ -118,6 +130,8 @@ def main():
     parser.add_argument("--processed-dir", type=str, default="PianoCoRe/processed")
     parser.add_argument("--output-file", type=str, default="data/processed/sft/sft_pianocore_from_json.jsonl")
     parser.add_argument("--max-time-ms", type=float, default=10000.0)
+    parser.add_argument("--time-normalization", type=str, default="log1p", choices=["log1p", "linear"])
+    parser.add_argument("--max-files", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None, help="Number of worker processes (default: CPU count)")
     args = parser.parse_args()
 
@@ -135,6 +149,9 @@ def main():
 
     processed_dir = Path(args.processed_dir)
     json_files = list(processed_dir.rglob("*.node_a.json"))
+    json_files = sorted(json_files)
+    if args.max_files is not None:
+        json_files = json_files[:args.max_files]
     print(f"Found {len(json_files)} node_a.json files")
 
     output_path = Path(args.output_file)
@@ -144,7 +161,12 @@ def main():
     print(f"Using {num_workers} worker processes")
 
     # Process files in parallel
-    process_func = partial(process_node_json, max_time_ms=args.max_time_ms, config=config)
+    process_func = partial(
+        process_node_json,
+        max_time_ms=args.max_time_ms,
+        time_normalization=args.time_normalization,
+        config=config,
+    )
 
     total_performances = 0
     total_notes = 0
