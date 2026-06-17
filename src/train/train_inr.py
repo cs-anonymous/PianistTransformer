@@ -4,6 +4,8 @@ import datetime
 import json
 import os
 import random
+import shutil
+import re
 from collections import OrderedDict
 from pathlib import Path
 
@@ -62,7 +64,15 @@ def load_torch_state_dict(checkpoint_path):
 
 
 def score_json_path(refined_dir, score_rel_path):
-    return (Path(refined_dir) / score_rel_path).with_suffix(".json")
+    score_path = Path(refined_dir) / score_rel_path
+    candidates = [
+        score_path.with_suffix(".json"),
+        score_path.parent / f"{score_path.stem}.node_a.json",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
 
 
 def make_windows(total_notes, block_notes, overlap_ratio, min_notes):
@@ -366,6 +376,113 @@ class NodeSFTTrainer(Trainer):
         )
 
 
+
+    def _list_checkpoint_dirs(self):
+        out = Path(self.args.output_dir)
+        if not out.exists():
+            return []
+        dirs = [p for p in out.iterdir() if p.is_dir() and p.name.startswith("checkpoint-")]
+        # exclude checkpoint-best special folder
+        dirs = [d for d in dirs if d.name != "checkpoint-best"]
+        def step_of(d):
+            m = re.match(r"checkpoint-(\d+)$", d.name)
+            return int(m.group(1)) if m else -1
+        dirs.sort(key=step_of)
+        return dirs
+
+    def _cleanup_checkpoints(self, keep_paths):
+        out = Path(self.args.output_dir)
+        if not out.exists():
+            return
+        for p in out.iterdir():
+            if not p.is_dir():
+                continue
+            if p.name == "checkpoint-best":
+                # keep if requested
+                if str(p) in keep_paths:
+                    continue
+                # otherwise remove
+                shutil.rmtree(p)
+                continue
+            if p.name.startswith("checkpoint-"):
+                if str(p) in keep_paths:
+                    continue
+                shutil.rmtree(p)
+
+    def evaluate(self, *args, **kwargs):
+        # call base evaluate to get metrics
+        metrics = super().evaluate(*args, **kwargs)
+        if not self.is_world_process_zero():
+            return metrics
+
+        # determine metric key
+        metric_key = getattr(self.args, "metric_for_best_model", None)
+        if metric_key is None:
+            metric_key = "eval_loss"
+
+        # possible keys in returned metrics
+        candidate_keys = [metric_key, f"eval_{metric_key}", "loss", "eval_loss"]
+        metric_value = None
+        for k in candidate_keys:
+            if k in metrics:
+                metric_value = metrics[k]
+                break
+
+        # find latest checkpoint (highest step)
+        ckpts = self._list_checkpoint_dirs()
+        latest_ckpt = str(ckpts[-1]) if ckpts else None
+
+        # init best tracking
+        if not hasattr(self, "_best_metric"):
+            self._best_metric = None
+            self._best_ckpt = None
+
+        # compare metrics
+        is_better = False
+        if metric_value is not None:
+            greater_is_better = getattr(self.args, "greater_is_better", False)
+            if self._best_metric is None:
+                is_better = True
+            else:
+                if greater_is_better:
+                    is_better = metric_value > self._best_metric
+                else:
+                    is_better = metric_value < self._best_metric
+
+        # if we have a new best, copy latest checkpoint to checkpoint-best
+        out = Path(self.args.output_dir)
+        best_dir = out / "checkpoint-best"
+        if is_better and latest_ckpt is not None:
+            # remove previous best if exists and different
+            if self._best_ckpt and best_dir.exists():
+                try:
+                    shutil.rmtree(best_dir)
+                except Exception:
+                    pass
+            try:
+                # copy latest to checkpoint-best
+                if best_dir.exists():
+                    shutil.rmtree(best_dir)
+                shutil.copytree(latest_ckpt, best_dir)
+                self._best_metric = metric_value
+                self._best_ckpt = str(best_dir)
+            except Exception:
+                # fallback: just record path
+                self._best_metric = metric_value
+                self._best_ckpt = latest_ckpt
+
+        # determine keep paths: latest and best (if exist)
+        keep = set()
+        if latest_ckpt:
+            keep.add(str(latest_ckpt))
+        if self._best_ckpt:
+            keep.add(str(self._best_ckpt))
+
+        # cleanup other checkpoints
+        self._cleanup_checkpoints(keep_paths=keep)
+
+        return metrics
+
 class NodeSFTDataCollator:
     def __init__(self, pitch_pad_id=128, task_type="epr"):
         self.pitch_pad_id = pitch_pad_id
@@ -447,17 +564,27 @@ def create_model(train_config):
         csr_loss_weights=train_config.get("csr_loss_weights"),
         decoder_input_mode=train_config["decoder_input_mode"],
         input_feature_mode=input_feature_mode,
+        note_embedding_mode=train_config.get("note_embedding_mode", "fine"),
+        special_note_vocab_size=train_config.get("special_note_vocab_size", 5),
+        special_note_ids=train_config.get("special_note_ids"),
+        pine_partition_dims=train_config.get("pine_partition_dims"),
+        use_full_type_embedding=train_config.get("use_full_type_embedding", True),
+        use_group_presence_mask=train_config.get("use_group_presence_mask", True),
+        head_input_mode=train_config.get("head_input_mode", "full"),
+        embedding_depth=train_config.get("embedding_depth", 2),
+        head_depth=train_config.get("head_depth", 2),
+        head_activation=train_config.get("head_activation", "gelu"),
         torch_dtype=dtype,
     )
 
     resume_path = train_config.get("resume_path")
     if resume_path:
-        if backbone_type in {"t5", "t5gemma"}:
-            model = IntegratedPianoT5Gemma.from_pretrained(resume_path, torch_dtype=dtype)
-        else:
-            model = IntegratedPianoTransformer(model_config)
-            model.load_state_dict(load_torch_state_dict(resume_path))
-        print(f"Loaded Integrated {backbone_type} checkpoint from {resume_path}")
+        model = IntegratedPianoT5Gemma(model_config) if backbone_type in {"t5", "t5gemma"} else IntegratedPianoTransformer(model_config)
+        state_dict = load_torch_state_dict(resume_path)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        print(f"Loaded Integrated {backbone_type} weights from {resume_path}")
+        print(f"Missing keys: {len(missing)}")
+        print(f"Unexpected keys: {len(unexpected)}")
         return model
 
     if backbone_type in {"t5", "t5gemma"}:

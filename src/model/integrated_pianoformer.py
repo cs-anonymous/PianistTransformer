@@ -50,6 +50,16 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         loss_weights=None,
         csr_loss_weights=None,
         decoder_input_mode="score",
+        note_embedding_mode="fine",
+        special_note_vocab_size=5,
+        special_note_ids=None,
+        pine_partition_dims=None,
+        use_full_type_embedding=True,
+        use_group_presence_mask=True,
+        head_input_mode="full",
+        embedding_depth=2,
+        head_depth=2,
+        head_activation="gelu",
         gpt_layers_num=None,
         bert_layers_num=None,
         max_position_embeddings=4096,
@@ -93,33 +103,183 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
             "staccato": 0.3,
         }
         self.decoder_input_mode = decoder_input_mode
+        self.note_embedding_mode = note_embedding_mode
+        self.special_note_vocab_size = special_note_vocab_size
+        self.special_note_ids = special_note_ids or {
+            "pad": 0,
+            "mask": 1,
+            "bos": 2,
+            "eos": 3,
+            "play": 4,
+        }
+        self.pine_partition_dims = pine_partition_dims or {
+            "pitch": 128,
+            "shared": 256,
+            "score": 256,
+            "perf": 128,
+        }
+        self.use_full_type_embedding = use_full_type_embedding
+        self.use_group_presence_mask = use_group_presence_mask
+        self.head_input_mode = head_input_mode
+        self.embedding_depth = embedding_depth
+        self.head_depth = head_depth
+        self.head_activation = head_activation
         self.gpt_layers_num = gpt_layers_num
         self.bert_layers_num = bert_layers_num
         self.max_position_embeddings = max_position_embeddings
         self.attention_dropout = attention_dropout
 
 
+def _activation(name):
+    name = str(name).lower()
+    if name == "gelu":
+        return nn.GELU()
+    if name == "relu":
+        return nn.ReLU()
+    if name == "silu":
+        return nn.SiLU()
+    raise ValueError(f"Unsupported activation: {name}")
+
+
+def _make_mlp(input_dim, output_dim, hidden_dim, depth=2, activation="gelu"):
+    depth = int(depth)
+    if depth <= 1:
+        return nn.Linear(input_dim, output_dim)
+    layers = [nn.Linear(input_dim, hidden_dim), _activation(activation)]
+    for _ in range(depth - 2):
+        layers.extend([nn.Linear(hidden_dim, hidden_dim), _activation(activation)])
+    layers.append(nn.Linear(hidden_dim, output_dim))
+    return nn.Sequential(*layers)
+
+
 class IntegratedNoteEncoder(nn.Module):
     def __init__(self, config, continuous_dim=None):
         super().__init__()
+        self.config = config
         continuous_dim = continuous_dim or config.input_continuous_dim
-        self.pitch_embedding = nn.Embedding(
-            config.pitch_vocab_size + 1,
+        self.continuous_dim = continuous_dim
+        self.mode = getattr(config, "note_embedding_mode", "fine").lower()
+        self.special_note_embeddings = nn.Embedding(
+            config.special_note_vocab_size,
             config.hidden_size,
-            padding_idx=config.pitch_pad_id,
         )
-        self.continuous_mlp = nn.Sequential(
-            nn.Linear(continuous_dim, config.hidden_size),
-            nn.GELU(),
-            nn.Linear(config.hidden_size, config.hidden_size),
-        )
+        self.embedding_depth = getattr(config, "embedding_depth", 2)
+        self.activation = getattr(config, "head_activation", "gelu")
+
+        if self.mode == "pine":
+            dims = config.pine_partition_dims
+            self.pitch_dim = int(dims["pitch"])
+            self.shared_dim = int(dims["shared"])
+            self.score_dim = int(dims["score"])
+            self.perf_dim = int(dims["perf"])
+            partition_total = self.pitch_dim + self.shared_dim + self.score_dim + self.perf_dim
+            if partition_total != config.hidden_size:
+                raise ValueError(
+                    f"PINE partition dims must sum to hidden_size={config.hidden_size}, got {partition_total}"
+                )
+            self.pitch_embedding = nn.Embedding(
+                config.pitch_vocab_size + 1,
+                self.pitch_dim,
+                padding_idx=config.pitch_pad_id,
+            )
+            self.shared_projection = _make_mlp(3, self.shared_dim, self.shared_dim, self.embedding_depth, self.activation)
+            self.score_projection = _make_mlp(8, self.score_dim, self.score_dim, self.embedding_depth, self.activation)
+            self.pedal_projection = _make_mlp(4, self.perf_dim, self.perf_dim, self.embedding_depth, self.activation)
+        elif self.mode == "fine":
+            self.pitch_embedding = nn.Embedding(
+                config.pitch_vocab_size + 1,
+                config.hidden_size,
+                padding_idx=config.pitch_pad_id,
+            )
+            self.shared_projection = _make_mlp(3, config.hidden_size, config.hidden_size, self.embedding_depth, self.activation)
+            self.score_projection = _make_mlp(8, config.hidden_size, config.hidden_size, self.embedding_depth, self.activation)
+            self.pedal_projection = _make_mlp(4, config.hidden_size, config.hidden_size, self.embedding_depth, self.activation)
+            if getattr(config, "use_full_type_embedding", True):
+                self.type_projection = _make_mlp(2, config.hidden_size, config.hidden_size, self.embedding_depth, self.activation)
+            else:
+                self.type_projection = None
+        elif self.mode == "legacy":
+            self.pitch_embedding = nn.Embedding(
+                config.pitch_vocab_size + 1,
+                config.hidden_size,
+                padding_idx=config.pitch_pad_id,
+            )
+            self.continuous_mlp = _make_mlp(
+                continuous_dim,
+                config.hidden_size,
+                config.hidden_size,
+                self.embedding_depth,
+                self.activation,
+            )
+        else:
+            raise ValueError(f"Unsupported note_embedding_mode: {self.mode}")
         self.norm = nn.LayerNorm(config.hidden_size)
 
-    def forward(self, pitch_ids, continuous):
+    def _split_groups(self, continuous):
+        batch_size, seq_len, _ = continuous.shape
+        continuous_dim = continuous.shape[-1]
+        type_bits = continuous.new_zeros(batch_size, seq_len, 2)
+        shared = continuous.new_zeros(batch_size, seq_len, 3)
+        score = continuous.new_zeros(batch_size, seq_len, 8)
+        pedal = continuous.new_zeros(batch_size, seq_len, 4)
+
+        if continuous_dim >= 13:
+            type_bits = continuous[..., 0:2]
+            shared = continuous[..., 2:5]
+            score = continuous[..., 5:13]
+        elif continuous_dim >= 9:
+            type_bits = continuous[..., 0:2]
+            shared = continuous[..., 2:5]
+            pedal = continuous[..., 5:9]
+        elif continuous_dim >= 7:
+            type_bits[..., 1] = 1.0
+            shared = continuous[..., 0:3]
+            pedal = continuous[..., 3:7]
+        elif continuous_dim >= 3:
+            type_bits[..., 0] = 1.0
+            shared = continuous[..., 0:3]
+        else:
+            raise ValueError(f"Unsupported continuous_dim={continuous_dim}")
+
+        if getattr(self.config, "use_group_presence_mask", True):
+            score = score * type_bits[..., 0:1]
+            pedal = pedal * type_bits[..., 1:2]
+        return type_bits, shared, score, pedal
+
+    def forward(self, pitch_ids, continuous, special_note_ids=None):
+        if self.mode == "legacy":
+            pitch_embeds = self.pitch_embedding(pitch_ids)
+            continuous = continuous.to(dtype=self.continuous_mlp[0].weight.dtype if isinstance(self.continuous_mlp, nn.Sequential) else self.continuous_mlp.weight.dtype)
+            continuous_embeds = self.continuous_mlp(continuous)
+            embeddings = self.norm(pitch_embeds + continuous_embeds)
+            return self._apply_special_embeddings(embeddings, special_note_ids)
+
+        projection_dtype = next(self.parameters()).dtype
+        continuous = continuous.to(dtype=projection_dtype)
+        type_bits, shared, score, pedal = self._split_groups(continuous)
         pitch_embeds = self.pitch_embedding(pitch_ids)
-        continuous = continuous.to(dtype=self.continuous_mlp[0].weight.dtype)
-        continuous_embeds = self.continuous_mlp(continuous)
-        return self.norm(pitch_embeds + continuous_embeds)
+        shared_embeds = self.shared_projection(shared)
+        score_embeds = self.score_projection(score)
+        pedal_embeds = self.pedal_projection(pedal)
+
+        if self.mode == "pine":
+            embeddings = torch.cat([pitch_embeds, shared_embeds, score_embeds, pedal_embeds], dim=-1)
+        else:
+            embeddings = pitch_embeds + shared_embeds + score_embeds + pedal_embeds
+            if self.type_projection is not None:
+                embeddings = embeddings + self.type_projection(type_bits)
+        embeddings = self.norm(embeddings)
+        return self._apply_special_embeddings(embeddings, special_note_ids)
+
+    def _apply_special_embeddings(self, embeddings, special_note_ids):
+        if special_note_ids is None:
+            return embeddings
+        special_mask = special_note_ids >= 0
+        if not special_mask.any():
+            return embeddings
+        safe_ids = special_note_ids.clamp_min(0)
+        special_embeds = self.special_note_embeddings(safe_ids).to(dtype=embeddings.dtype)
+        return torch.where(special_mask.unsqueeze(-1), special_embeds, embeddings)
 
 
 class IntegratedContinuousDecoder(nn.Module):
@@ -127,41 +287,40 @@ class IntegratedContinuousDecoder(nn.Module):
         super().__init__()
         self.config = config
         self.output_dim = config.output_continuous_dim
-        self.timing_head = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size),
-            nn.GELU(),
-            nn.Linear(config.hidden_size, 2),
-        )
-        self.velocity_head = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size),
-            nn.GELU(),
-            nn.Linear(config.hidden_size, 1),
-        )
-        self.pedal_head = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size),
-            nn.GELU(),
-            nn.Linear(config.hidden_size, 4),
-        )
-        self.generic_head = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size),
-            nn.GELU(),
-            nn.Linear(config.hidden_size, self.output_dim),
-        )
+        self.mode = getattr(config, "note_embedding_mode", "fine").lower()
+        self.head_input_mode = getattr(config, "head_input_mode", "full").lower()
+        head_depth = getattr(config, "head_depth", 2)
+        activation = getattr(config, "head_activation", "gelu")
+
+        full_dim = config.hidden_size
+        if self.mode == "pine" and self.head_input_mode == "partitioned":
+            dims = config.pine_partition_dims
+            self.shared_slice = slice(int(dims["pitch"]), int(dims["pitch"]) + int(dims["shared"]))
+            self.score_slice = slice(self.shared_slice.stop, self.shared_slice.stop + int(dims["score"]))
+            self.perf_slice = slice(self.score_slice.stop, self.score_slice.stop + int(dims["perf"]))
+            shared_dim = int(dims["shared"])
+            score_dim = int(dims["score"])
+            perf_dim = int(dims["perf"])
+        else:
+            self.shared_slice = self.score_slice = self.perf_slice = slice(None)
+            shared_dim = score_dim = perf_dim = full_dim
+
+        self.shared_head = _make_mlp(shared_dim, 3, shared_dim, head_depth, activation)
+        self.pedal_head = _make_mlp(perf_dim, 4, perf_dim, head_depth, activation)
+        self.generic_head = _make_mlp(score_dim, self.output_dim, score_dim, head_depth, activation)
 
     def forward(self, hidden_states):
         if self.output_dim != 7:
-            return self.generic_head(hidden_states)
+            return self.generic_head(hidden_states[..., self.score_slice])
 
-        timing = self.timing_head(hidden_states)
-        velocity = self.velocity_head(hidden_states)
-        pedal = self.pedal_head(hidden_states)
-        timing = torch.sigmoid(timing)
-        velocity = torch.sigmoid(velocity)
+        shared = self.shared_head(hidden_states[..., self.shared_slice])
+        pedal = self.pedal_head(hidden_states[..., self.perf_slice])
+        shared = torch.sigmoid(shared)
         if self.config.pedal_output_activation == "sigmoid":
             pedal = torch.sigmoid(pedal)
         elif self.config.pedal_output_activation != "linear":
             raise ValueError(f"Unsupported pedal_output_activation: {self.config.pedal_output_activation}")
-        return torch.cat([timing, velocity, pedal], dim=-1)
+        return torch.cat([shared, pedal], dim=-1)
 
 
 def _shift_continuous_right(continuous, attention_mask):
@@ -172,6 +331,14 @@ def _shift_continuous_right(continuous, attention_mask):
         shifted[:, 1:] = prev_values * prev_mask
     shifted = shifted * attention_mask.to(dtype=continuous.dtype).unsqueeze(-1)
     return shifted
+
+
+def _build_ar_special_note_ids(config, attention_mask):
+    special_note_ids = attention_mask.new_full(attention_mask.shape, -1)
+    if special_note_ids.shape[1] > 0:
+        bos_id = int(config.special_note_ids.get("bos", 2))
+        special_note_ids[:, 0] = bos_id
+    return special_note_ids
 
 
 def _build_ar_note_continuous(labels_continuous, task_type, input_feature_mode="integrated"):
@@ -589,7 +756,10 @@ class IntegratedPianoTransformer(nn.Module):
         super().__init__()
         self.config = config
         self.note_encoder = IntegratedNoteEncoder(config)
-        self.decoder_note_encoder = IntegratedNoteEncoder(config, continuous_dim=config.output_continuous_dim + 2)
+        if getattr(config, "note_embedding_mode", "fine").lower() == "legacy":
+            self._decoder_note_encoder = IntegratedNoteEncoder(config, continuous_dim=config.output_continuous_dim + 2)
+        else:
+            self._decoder_note_encoder = None
         self.continuous_decoder = IntegratedContinuousDecoder(config)
         backbone_type = config.backbone_type.lower()
         self.backbone_type = backbone_type
@@ -599,6 +769,10 @@ class IntegratedPianoTransformer(nn.Module):
             self.backbone = IntegratedGptBackbone(config)
         else:
             raise ValueError(f"IntegratedPianoTransformer supports bert/gpt, got {config.backbone_type}")
+
+    @property
+    def decoder_note_encoder(self):
+        return self._decoder_note_encoder if self._decoder_note_encoder is not None else self.note_encoder
 
     def forward(
         self,
@@ -630,7 +804,12 @@ class IntegratedPianoTransformer(nn.Module):
                     getattr(self.config, "input_feature_mode", "integrated"),
                 )
                 decoder_input_continuous = _shift_continuous_right(decoder_target_continuous, attention_mask)
-                performance_embeds = self.decoder_note_encoder(pitch_ids, decoder_input_continuous)
+                special_note_ids = _build_ar_special_note_ids(self.config, attention_mask)
+                performance_embeds = self.decoder_note_encoder(
+                    pitch_ids,
+                    decoder_input_continuous,
+                    special_note_ids=special_note_ids,
+                )
                 hidden_states = self.backbone(
                     score_note_embeds,
                     attention_mask,
@@ -657,12 +836,16 @@ class IntegratedPianoTransformer(nn.Module):
         batch_size, seq_len = pitch_ids.shape
         score_note_embeds = self.note_encoder(pitch_ids, continuous)
         decoder_input_continuous = continuous.new_zeros(batch_size, seq_len, self.config.output_continuous_dim + 2)
+        special_note_ids = attention_mask.new_full((batch_size, seq_len), -1)
+        if seq_len > 0:
+            special_note_ids[:, 0] = int(self.config.special_note_ids.get("bos", 2))
         predictions = []
 
         for step in range(seq_len):
             perf_prefix_embeds = self.decoder_note_encoder(
                 pitch_ids[:, : step + 1],
                 decoder_input_continuous[:, : step + 1],
+                special_note_ids=special_note_ids[:, : step + 1],
             )
             perf_prefix_mask = attention_mask[:, : step + 1]
             hidden_states = self.backbone(
@@ -686,9 +869,8 @@ class IntegratedPianoTransformer(nn.Module):
 class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
     config_class = IntegratedPianoT5GemmaConfig
     _tp_plan = {
-        "continuous_decoder.timing_head.2": "colwise_rep",
-        "continuous_decoder.velocity_head.2": "colwise_rep",
-        "continuous_decoder.pedal_head.2": "colwise_rep",
+        "continuous_decoder.shared_head": "colwise_rep",
+        "continuous_decoder.pedal_head": "colwise_rep",
     }
     _pp_plan = {"continuous_decoder": (["hidden_states"], ["continuous_pred"])}
 
@@ -696,10 +878,17 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
         config.is_encoder_decoder = True
         super().__init__(config)
         self.note_encoder = IntegratedNoteEncoder(config)
-        self.decoder_note_encoder = IntegratedNoteEncoder(config, continuous_dim=config.output_continuous_dim + 2)
+        if getattr(config, "note_embedding_mode", "fine").lower() == "legacy":
+            self._decoder_note_encoder = IntegratedNoteEncoder(config, continuous_dim=config.output_continuous_dim + 2)
+        else:
+            self._decoder_note_encoder = None
         self.model = IntegratedPianoT5GemmaModel(config)
         self.continuous_decoder = IntegratedContinuousDecoder(config)
         self.post_init()
+
+    @property
+    def decoder_note_encoder(self):
+        return self._decoder_note_encoder if self._decoder_note_encoder is not None else self.note_encoder
 
     def get_encoder(self):
         return self.model.encoder
@@ -731,7 +920,12 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
                 getattr(self.config, "input_feature_mode", "integrated"),
             )
             decoder_input_continuous = _shift_continuous_right(decoder_target_continuous, attention_mask)
-            decoder_inputs_embeds = self.decoder_note_encoder(pitch_ids, decoder_input_continuous)
+            special_note_ids = _build_ar_special_note_ids(self.config, attention_mask)
+            decoder_inputs_embeds = self.decoder_note_encoder(
+                pitch_ids,
+                decoder_input_continuous,
+                special_note_ids=special_note_ids,
+            )
             return decoder_inputs_embeds, attention_mask
         raise ValueError(f"Unsupported decoder_input_mode: {self.config.decoder_input_mode}")
 
@@ -853,6 +1047,9 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
             continuous.shape[1],
             self.config.output_continuous_dim + 2,
         )
+        special_note_ids = attention_mask.new_full((batch_size, seq_len), -1)
+        if seq_len > 0:
+            special_note_ids[:, 0] = int(self.config.special_note_ids.get("bos", 2))
         predictions = []
 
         # Use KV cache for efficient autoregressive decoding
@@ -867,6 +1064,7 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
                 decoder_inputs_embeds = self.decoder_note_encoder(
                     pitch_ids[:, :1],
                     decoder_input_continuous[:, :1],
+                    special_note_ids=special_note_ids[:, :1],
                 )
                 decoder_attention_mask = attention_mask[:, :1]
                 decoder_outputs = self.model(
@@ -885,6 +1083,7 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
                 decoder_inputs_embeds = self.decoder_note_encoder(
                     pitch_ids[:, step_idx:step_idx+1],
                     decoder_input_continuous[:, step_idx:step_idx+1],
+                    special_note_ids=special_note_ids[:, step_idx:step_idx+1],
                 )
                 # For incremental decoding, we need the full decoder attention mask
                 # but only the new token's embeddings
