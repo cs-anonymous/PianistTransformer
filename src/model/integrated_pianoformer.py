@@ -64,6 +64,10 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         bert_layers_num=None,
         max_position_embeddings=4096,
         attention_dropout=0.0,
+        epr_distribution="point",
+        beta_eps=1e-5,
+        beta_kappa_min=1e-3,
+        prior_token_keep_prob=1.0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -128,6 +132,10 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.bert_layers_num = bert_layers_num
         self.max_position_embeddings = max_position_embeddings
         self.attention_dropout = attention_dropout
+        self.epr_distribution = epr_distribution
+        self.beta_eps = beta_eps
+        self.beta_kappa_min = beta_kappa_min
+        self.prior_token_keep_prob = prior_token_keep_prob
 
 
 def _activation(name):
@@ -261,6 +269,9 @@ class IntegratedNoteEncoder(nn.Module):
         shared_embeds = self.shared_projection(shared)
         score_embeds = self.score_projection(score)
         pedal_embeds = self.pedal_projection(pedal)
+        if getattr(self.config, "use_group_presence_mask", True):
+            score_embeds = score_embeds * type_bits[..., 0:1]
+            pedal_embeds = pedal_embeds * type_bits[..., 1:2]
 
         if self.mode == "pine":
             embeddings = torch.cat([pitch_embeds, shared_embeds, score_embeds, pedal_embeds], dim=-1)
@@ -289,6 +300,7 @@ class IntegratedContinuousDecoder(nn.Module):
         self.output_dim = config.output_continuous_dim
         self.mode = getattr(config, "note_embedding_mode", "fine").lower()
         self.head_input_mode = getattr(config, "head_input_mode", "full").lower()
+        self.epr_distribution = getattr(config, "epr_distribution", "point").lower()
         head_depth = getattr(config, "head_depth", 2)
         activation = getattr(config, "head_activation", "gelu")
 
@@ -305,8 +317,15 @@ class IntegratedContinuousDecoder(nn.Module):
             self.shared_slice = self.score_slice = self.perf_slice = slice(None)
             shared_dim = score_dim = perf_dim = full_dim
 
-        self.shared_head = _make_mlp(shared_dim, 3, shared_dim, head_depth, activation)
-        self.pedal_head = _make_mlp(perf_dim, 4, perf_dim, head_depth, activation)
+        if getattr(config, "task_type", "epr") == "epr" and self.epr_distribution == "beta_mu_kappa":
+            shared_output_dim = 6
+            pedal_output_dim = 8
+        else:
+            shared_output_dim = 3
+            pedal_output_dim = 4
+
+        self.shared_head = _make_mlp(shared_dim, shared_output_dim, shared_dim, head_depth, activation)
+        self.pedal_head = _make_mlp(perf_dim, pedal_output_dim, perf_dim, head_depth, activation)
         self.generic_head = _make_mlp(score_dim, self.output_dim, score_dim, head_depth, activation)
 
     def forward(self, hidden_states):
@@ -315,12 +334,63 @@ class IntegratedContinuousDecoder(nn.Module):
 
         shared = self.shared_head(hidden_states[..., self.shared_slice])
         pedal = self.pedal_head(hidden_states[..., self.perf_slice])
+        if self.epr_distribution == "beta_mu_kappa":
+            return torch.cat([shared, pedal], dim=-1)
+
         shared = torch.sigmoid(shared)
         if self.config.pedal_output_activation == "sigmoid":
             pedal = torch.sigmoid(pedal)
         elif self.config.pedal_output_activation != "linear":
             raise ValueError(f"Unsupported pedal_output_activation: {self.config.pedal_output_activation}")
         return torch.cat([shared, pedal], dim=-1)
+
+
+def _split_epr_distribution_params(raw_outputs):
+    return {
+        "shared_mu": raw_outputs[..., 0:3],
+        "shared_kappa": raw_outputs[..., 3:6],
+        "pedal_mu": raw_outputs[..., 6:10],
+        "pedal_kappa": raw_outputs[..., 10:14],
+    }
+
+
+def _beta_params(raw_mu, raw_kappa, eps=1e-5, kappa_min=1e-3):
+    mu = raw_mu.sigmoid()
+    kappa = F.softplus(raw_kappa) + kappa_min
+    alpha = mu * kappa + eps
+    beta = (1.0 - mu) * kappa + eps
+    return mu, kappa, alpha, beta
+
+
+def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean"):
+    if getattr(config, "epr_distribution", "point").lower() != "beta_mu_kappa":
+        return raw_outputs
+
+    params = _split_epr_distribution_params(raw_outputs)
+    shared_mu, _, shared_alpha, shared_beta = _beta_params(
+        params["shared_mu"],
+        params["shared_kappa"],
+        eps=getattr(config, "beta_eps", 1e-5),
+        kappa_min=getattr(config, "beta_kappa_min", 1e-3),
+    )
+    pedal_mu, _, pedal_alpha, pedal_beta = _beta_params(
+        params["pedal_mu"],
+        params["pedal_kappa"],
+        eps=getattr(config, "beta_eps", 1e-5),
+        kappa_min=getattr(config, "beta_kappa_min", 1e-3),
+    )
+
+    mode = str(sampling_strategy).lower()
+    if mode in {"mean", "deterministic", "mu"}:
+        shared = shared_mu
+        pedal = pedal_mu
+    elif mode in {"sample", "sampling", "stochastic"}:
+        shared = torch.distributions.Beta(shared_alpha, shared_beta).sample()
+        pedal = torch.distributions.Beta(pedal_alpha, pedal_beta).sample()
+    else:
+        raise ValueError(f"Unsupported sampling_strategy: {sampling_strategy}")
+
+    return torch.cat([shared, pedal], dim=-1).clamp_(0.0, 1.0)
 
 
 def _shift_continuous_right(continuous, attention_mask):
@@ -333,12 +403,60 @@ def _shift_continuous_right(continuous, attention_mask):
     return shifted
 
 
+def _apply_prior_note_dropout(config, decoder_input_continuous, attention_mask):
+    keep_prob = float(getattr(config, "prior_token_keep_prob", 1.0))
+    if keep_prob >= 1.0 or decoder_input_continuous.shape[1] <= 1:
+        return decoder_input_continuous
+
+    valid_mask = attention_mask[:, 1:].bool()
+    if not valid_mask.any():
+        return decoder_input_continuous
+
+    keep_mask = torch.rand(
+        decoder_input_continuous.shape[0],
+        decoder_input_continuous.shape[1] - 1,
+        1,
+        device=decoder_input_continuous.device,
+        dtype=decoder_input_continuous.dtype,
+    ) < keep_prob
+    keep_mask = keep_mask & valid_mask.unsqueeze(-1)
+
+    dropped = decoder_input_continuous.clone()
+    if dropped.shape[-1] > 2:
+        dropped[:, 1:, 2:] = dropped[:, 1:, 2:] * keep_mask.to(dtype=dropped.dtype)
+    else:
+        dropped[:, 1:] = dropped[:, 1:] * keep_mask.to(dtype=dropped.dtype)
+    return dropped
+
+
 def _build_ar_special_note_ids(config, attention_mask):
     special_note_ids = attention_mask.new_full(attention_mask.shape, -1)
     if special_note_ids.shape[1] > 0:
         bos_id = int(config.special_note_ids.get("bos", 2))
         special_note_ids[:, 0] = bos_id
     return special_note_ids
+
+
+def _build_prefilled_ar_note_inputs(config, attention_mask, output_dim, prefix_predictions=None):
+    batch_size, seq_len = attention_mask.shape
+    decoder_input_continuous = attention_mask.new_zeros((batch_size, seq_len, output_dim + 2), dtype=torch.float32)
+    special_note_ids = attention_mask.new_full((batch_size, seq_len), -1)
+    if seq_len > 0:
+        special_note_ids[:, 0] = int(config.special_note_ids.get("bos", 2))
+
+    prefix_len = 0
+    if prefix_predictions is not None:
+        prefix_len = int(prefix_predictions.shape[1])
+        if prefix_len > 0:
+            if config.task_type == "epr":
+                decoder_input_continuous[:, 1 : prefix_len + 1, 1] = 1.0
+            elif config.task_type == "csr":
+                decoder_input_continuous[:, 1 : prefix_len + 1, 0] = 1.0
+            decoder_input_continuous[:, 1 : prefix_len + 1, 2:] = prefix_predictions[:, :prefix_len].to(
+                dtype=decoder_input_continuous.dtype,
+                device=decoder_input_continuous.device,
+            )
+    return decoder_input_continuous, special_note_ids, prefix_len
 
 
 def _build_ar_note_continuous(labels_continuous, task_type, input_feature_mode="integrated"):
@@ -523,11 +641,66 @@ def _regression_loss(pred, target, mask, loss_type, huber_delta):
     return _masked_mean(values, mask)
 
 
+def _beta_nll_loss(raw_mu, raw_kappa, target, mask, eps, kappa_min):
+    target = target.float().clamp(eps, 1.0 - eps)
+    _, _, alpha, beta = _beta_params(raw_mu.float(), raw_kappa.float(), eps=eps, kappa_min=kappa_min)
+    values = -torch.distributions.Beta(alpha, beta).log_prob(target)
+    return _masked_mean(values, mask)
+
+
 def _compute_integrated_loss_components(config, continuous_pred, labels_continuous, attention_mask):
     if getattr(config, "task_type", "epr") == "csr":
         return _compute_csr_loss_components(config, continuous_pred, labels_continuous, attention_mask)
 
     mask = attention_mask.bool()
+    if getattr(config, "epr_distribution", "point").lower() == "beta_mu_kappa":
+        params = _split_epr_distribution_params(continuous_pred)
+        eps = getattr(config, "beta_eps", 1e-5)
+        kappa_min = getattr(config, "beta_kappa_min", 1e-3)
+        loss_ioi = _beta_nll_loss(
+            params["shared_mu"][..., 0],
+            params["shared_kappa"][..., 0],
+            labels_continuous[..., 0],
+            mask,
+            eps,
+            kappa_min,
+        )
+        loss_duration = _beta_nll_loss(
+            params["shared_mu"][..., 1],
+            params["shared_kappa"][..., 1],
+            labels_continuous[..., 1],
+            mask,
+            eps,
+            kappa_min,
+        )
+        loss_velocity = _beta_nll_loss(
+            params["shared_mu"][..., 2],
+            params["shared_kappa"][..., 2],
+            labels_continuous[..., 2],
+            mask,
+            eps,
+            kappa_min,
+        )
+        pedal_losses = []
+        for idx in range(4):
+            pedal_losses.append(
+                _beta_nll_loss(
+                    params["pedal_mu"][..., idx],
+                    params["pedal_kappa"][..., idx],
+                    labels_continuous[..., 3 + idx],
+                    mask,
+                    eps,
+                    kappa_min,
+                )
+            )
+        loss_pedal = torch.stack(pedal_losses).mean()
+        return {
+            "ioi": loss_ioi,
+            "duration": loss_duration,
+            "velocity": loss_velocity,
+            "pedal": loss_pedal,
+        }
+
     loss_ioi = _regression_loss(
         continuous_pred[..., 0],
         labels_continuous[..., 0],
@@ -781,6 +954,7 @@ class IntegratedPianoTransformer(nn.Module):
         attention_mask: Optional[torch.FloatTensor] = None,
         labels_continuous: Optional[torch.FloatTensor] = None,
         interpolated: Optional[torch.BoolTensor] = None,
+        continuous_sampling_strategy: str = "mean",
         **kwargs,
     ) -> Seq2SeqLMOutput:
         del interpolated, kwargs
@@ -804,6 +978,12 @@ class IntegratedPianoTransformer(nn.Module):
                     getattr(self.config, "input_feature_mode", "integrated"),
                 )
                 decoder_input_continuous = _shift_continuous_right(decoder_target_continuous, attention_mask)
+                if self.training:
+                    decoder_input_continuous = _apply_prior_note_dropout(
+                        self.config,
+                        decoder_input_continuous,
+                        attention_mask,
+                    )
                 special_note_ids = _build_ar_special_note_ids(self.config, attention_mask)
                 performance_embeds = self.decoder_note_encoder(
                     pitch_ids,
@@ -822,9 +1002,17 @@ class IntegratedPianoTransformer(nn.Module):
                     pitch_ids=pitch_ids,
                     continuous=continuous,
                     attention_mask=attention_mask,
+                    sampling_strategy=continuous_sampling_strategy,
                 )
         else:
             raise ValueError(f"Unsupported decoder_input_mode: {self.config.decoder_input_mode}")
+
+        if labels_continuous is None and self.config.task_type == "epr":
+            continuous_pred = _materialize_epr_prediction(
+                self.config,
+                continuous_pred,
+                sampling_strategy=continuous_sampling_strategy,
+            )
 
         loss = None
         if labels_continuous is not None:
@@ -832,16 +1020,49 @@ class IntegratedPianoTransformer(nn.Module):
 
         return Seq2SeqLMOutput(loss=loss, logits=continuous_pred)
 
-    def _autoregressive_rollout_gpt(self, pitch_ids, continuous, attention_mask):
+    def predict_performance_continuous(
+        self,
+        pitch_ids,
+        continuous,
+        attention_mask=None,
+        prefix_predictions=None,
+        sampling_strategy="mean",
+    ):
+        if attention_mask is None:
+            attention_mask = (pitch_ids != self.config.pitch_pad_id).long()
+        decoder_mode = self.config.decoder_input_mode.lower()
+        if decoder_mode != "ar":
+            outputs = self(
+                pitch_ids=pitch_ids,
+                continuous=continuous,
+                attention_mask=attention_mask,
+                continuous_sampling_strategy=sampling_strategy,
+            )
+            return outputs.logits
+        if self.backbone_type != "gpt":
+            raise ValueError("Prefix continuation is only implemented for AR GPT in IntegratedPianoTransformer")
+        return self._autoregressive_rollout_gpt(
+            pitch_ids=pitch_ids,
+            continuous=continuous,
+            attention_mask=attention_mask,
+            sampling_strategy=sampling_strategy,
+            prefix_predictions=prefix_predictions,
+        )
+
+    def _autoregressive_rollout_gpt(self, pitch_ids, continuous, attention_mask, sampling_strategy="mean", prefix_predictions=None):
         batch_size, seq_len = pitch_ids.shape
         score_note_embeds = self.note_encoder(pitch_ids, continuous)
-        decoder_input_continuous = continuous.new_zeros(batch_size, seq_len, self.config.output_continuous_dim + 2)
-        special_note_ids = attention_mask.new_full((batch_size, seq_len), -1)
-        if seq_len > 0:
-            special_note_ids[:, 0] = int(self.config.special_note_ids.get("bos", 2))
+        decoder_input_continuous, special_note_ids, prefix_len = _build_prefilled_ar_note_inputs(
+            self.config,
+            attention_mask,
+            self.config.output_continuous_dim,
+            prefix_predictions=prefix_predictions,
+        )
         predictions = []
+        if prefix_predictions is not None and prefix_len > 0:
+            predictions.extend(prefix_predictions[:, idx : idx + 1] for idx in range(prefix_len))
 
-        for step in range(seq_len):
+        for step in range(prefix_len, seq_len):
             perf_prefix_embeds = self.decoder_note_encoder(
                 pitch_ids[:, : step + 1],
                 decoder_input_continuous[:, : step + 1],
@@ -854,7 +1075,8 @@ class IntegratedPianoTransformer(nn.Module):
                 performance_embeds=perf_prefix_embeds,
                 performance_attention_mask=perf_prefix_mask,
             )
-            step_pred = self.continuous_decoder(hidden_states[:, -1:, :])
+            step_raw = self.continuous_decoder(hidden_states[:, -1:, :])
+            step_pred = _materialize_epr_prediction(self.config, step_raw, sampling_strategy=sampling_strategy)
             predictions.append(step_pred)
             if step + 1 < seq_len:
                 if self.config.task_type == "epr":
@@ -920,6 +1142,12 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
                 getattr(self.config, "input_feature_mode", "integrated"),
             )
             decoder_input_continuous = _shift_continuous_right(decoder_target_continuous, attention_mask)
+            if self.training:
+                decoder_input_continuous = _apply_prior_note_dropout(
+                    self.config,
+                    decoder_input_continuous,
+                    attention_mask,
+                )
             special_note_ids = _build_ar_special_note_ids(self.config, attention_mask)
             decoder_inputs_embeds = self.decoder_note_encoder(
                 pitch_ids,
@@ -943,6 +1171,7 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
         past_key_values: Optional[EncoderDecoderCache] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        continuous_sampling_strategy: str = "mean",
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple[torch.FloatTensor], Seq2SeqLMOutput]:
         del interpolated
@@ -974,6 +1203,7 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
                 pitch_ids=pitch_ids,
                 continuous=continuous,
                 attention_mask=attention_mask,
+                sampling_strategy=continuous_sampling_strategy,
                 position_ids=position_ids,
                 encoder_outputs=encoder_outputs,
                 past_key_values=past_key_values,
@@ -1003,6 +1233,12 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
         )
 
         continuous_pred = self.continuous_decoder(decoder_outputs.last_hidden_state)
+        if labels_continuous is None and self.config.task_type == "epr":
+            continuous_pred = _materialize_epr_prediction(
+                self.config,
+                continuous_pred,
+                sampling_strategy=continuous_sampling_strategy,
+            )
 
         loss = None
         if labels_continuous is not None:
@@ -1020,11 +1256,40 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
             encoder_attentions=decoder_outputs.encoder_attentions,
         )
 
+    def predict_performance_continuous(
+        self,
+        pitch_ids,
+        continuous,
+        attention_mask=None,
+        prefix_predictions=None,
+        sampling_strategy="mean",
+    ):
+        if attention_mask is None:
+            attention_mask = (pitch_ids != self.config.pitch_pad_id).long()
+        decoder_mode = self.config.decoder_input_mode.lower()
+        if decoder_mode == "ar":
+            return self._autoregressive_rollout(
+                pitch_ids=pitch_ids,
+                continuous=continuous,
+                attention_mask=attention_mask,
+                sampling_strategy=sampling_strategy,
+                prefix_predictions=prefix_predictions,
+            )
+        outputs = self(
+            pitch_ids=pitch_ids,
+            continuous=continuous,
+            attention_mask=attention_mask,
+            continuous_sampling_strategy=sampling_strategy,
+        )
+        return outputs.logits
+
     def _autoregressive_rollout(
         self,
         pitch_ids,
         continuous,
         attention_mask,
+        sampling_strategy="mean",
+        prefix_predictions=None,
         position_ids=None,
         encoder_outputs=None,
         past_key_values=None,
@@ -1042,24 +1307,46 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
                 inputs_embeds=score_note_embeds,
             )
 
-        decoder_input_continuous = continuous.new_zeros(
-            continuous.shape[0],
-            continuous.shape[1],
-            self.config.output_continuous_dim + 2,
+        decoder_input_continuous, special_note_ids, prefix_len = _build_prefilled_ar_note_inputs(
+            self.config,
+            attention_mask,
+            self.config.output_continuous_dim,
+            prefix_predictions=prefix_predictions,
         )
-        special_note_ids = attention_mask.new_full((batch_size, seq_len), -1)
-        if seq_len > 0:
-            special_note_ids[:, 0] = int(self.config.special_note_ids.get("bos", 2))
+        if prefix_len >= seq_len:
+            return prefix_predictions[:, :seq_len]
         predictions = []
+        if prefix_predictions is not None and prefix_len > 0:
+            predictions.extend(prefix_predictions[:, idx : idx + 1] for idx in range(prefix_len))
 
         # Use KV cache for efficient autoregressive decoding
         # Step 0: process first token with full prefix
         # Steps 1+: process only the new token, reuse cached KV
 
         cached_past_key_values = past_key_values
+        current_decoder_outputs = None
 
-        for step in range(seq_len):
-            if step == 0:
+        if prefix_len > 0:
+            prime_len = prefix_len + 1
+            decoder_inputs_embeds = self.decoder_note_encoder(
+                pitch_ids[:, :prime_len],
+                decoder_input_continuous[:, :prime_len],
+                special_note_ids=special_note_ids[:, :prime_len],
+            )
+            decoder_attention_mask = attention_mask[:, :prime_len]
+            current_decoder_outputs = self.model(
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                decoder_attention_mask=decoder_attention_mask,
+                encoder_outputs=encoder_outputs,
+                decoder_inputs_embeds=decoder_inputs_embeds,
+                use_cache=True,
+                past_key_values=cached_past_key_values,
+            )
+            cached_past_key_values = current_decoder_outputs.past_key_values
+
+        for step in range(prefix_len, seq_len):
+            if prefix_len == 0 and step == 0:
                 # First step: process prefix of length 1
                 decoder_inputs_embeds = self.decoder_note_encoder(
                     pitch_ids[:, :1],
@@ -1077,6 +1364,9 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
                     past_key_values=cached_past_key_values,
                 )
                 cached_past_key_values = decoder_outputs.past_key_values
+                current_decoder_outputs = decoder_outputs
+            elif step == prefix_len and current_decoder_outputs is not None:
+                decoder_outputs = current_decoder_outputs
             else:
                 # Subsequent steps: process only the new token
                 step_idx = step
@@ -1103,7 +1393,8 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
                 )
                 cached_past_key_values = decoder_outputs.past_key_values
 
-            step_pred = self.continuous_decoder(decoder_outputs.last_hidden_state[:, -1:, :])
+            step_raw = self.continuous_decoder(decoder_outputs.last_hidden_state[:, -1:, :])
+            step_pred = _materialize_epr_prediction(self.config, step_raw, sampling_strategy=sampling_strategy)
             predictions.append(step_pred)
 
             if step + 1 < seq_len:

@@ -155,6 +155,9 @@ def build_work_manifest(
     overlap_ratio,
     min_notes,
     max_works=None,
+    include_all_performance_dataset=None,
+    max_non_asap_performances_per_work=None,
+    selection_seed=42,
 ):
     columns = [
         "tier_a",
@@ -163,6 +166,7 @@ def build_work_manifest(
         "refined_performance_midi_path",
         "refined_alignment_path",
         "refined_score_note_count",
+        "performance_dataset",
     ]
     df = pd.read_csv(metadata_path, usecols=columns)
     df = df[df["tier_a"].fillna(False).astype(bool)]
@@ -174,6 +178,24 @@ def build_work_manifest(
 
     manifest = []
     for score_rel_path, group in df.groupby("refined_score_midi_path", sort=True):
+        selected_group = group
+        if (
+            include_all_performance_dataset is not None
+            and max_non_asap_performances_per_work is not None
+        ):
+            dataset = group["performance_dataset"].fillna("").astype(str)
+            always_mask = dataset == str(include_all_performance_dataset)
+            always = group[always_mask]
+            other = group[~always_mask]
+            if len(other) > max_non_asap_performances_per_work:
+                rng = random.Random(f"{selection_seed}:{score_rel_path}")
+                sampled_indices = rng.sample(list(other.index), max_non_asap_performances_per_work)
+                other = other.loc[sampled_indices]
+            selected_group = pd.concat([always, other], axis=0).sort_values(
+                ["refined_performance_midi_path"],
+                kind="stable",
+            )
+
         path = score_json_path(refined_dir, score_rel_path)
         if not path.exists():
             continue
@@ -181,14 +203,16 @@ def build_work_manifest(
         windows = make_windows(note_count, block_notes, overlap_ratio, min_notes)
         if not windows:
             continue
+        selected_sources = selected_group["refined_performance_midi_path"].tolist()
         manifest.append(
             {
                 "path": str(path),
                 "score_source": score_rel_path,
                 "note_count": note_count,
                 "windows": windows,
-                "estimated_performances": int(len(group)),
-                "estimated_examples": int(len(windows) * len(group)),
+                "selected_performance_sources": selected_sources,
+                "estimated_performances": int(len(selected_sources)),
+                "estimated_examples": int(len(windows) * len(selected_sources)),
             }
         )
     if max_works is not None:
@@ -224,14 +248,19 @@ class PianoCoReNodeSFTDataset(Dataset):
             windows = list(item["windows"])
             if max_windows_per_work is not None:
                 windows = windows[:max_windows_per_work]
-            performance_count = int(item["estimated_performances"])
+            selected_sources = item.get("selected_performance_sources")
+            performance_count = len(selected_sources) if selected_sources is not None else int(item["estimated_performances"])
             if max_performances_per_work is not None:
                 performance_count = min(performance_count, max_performances_per_work)
+                if selected_sources is not None:
+                    selected_sources = selected_sources[:performance_count]
             if not windows or performance_count <= 0:
                 continue
 
             item = dict(item)
             item["windows"] = windows
+            if selected_sources is not None:
+                item["selected_performance_sources"] = selected_sources
             item["effective_performances"] = performance_count
             item["effective_examples"] = performance_count * len(windows)
             self.items.append(item)
@@ -281,6 +310,10 @@ class PianoCoReNodeSFTDataset(Dataset):
             perf for perf in work["performances"]
             if perf.get("split", self.split) == self.split
         ]
+        selected_sources = item.get("selected_performance_sources")
+        if selected_sources is not None:
+            by_source = {perf.get("performance_source"): perf for perf in performances}
+            performances = [by_source[source] for source in selected_sources if source in by_source]
         if not performances:
             raise IndexError(f"No performances for split={self.split} in {item['path']}")
 
@@ -574,6 +607,7 @@ def create_model(train_config):
         embedding_depth=train_config.get("embedding_depth", 2),
         head_depth=train_config.get("head_depth", 2),
         head_activation=train_config.get("head_activation", "gelu"),
+        prior_token_keep_prob=train_config.get("prior_token_keep_prob", 1.0),
         torch_dtype=dtype,
     )
 
@@ -701,6 +735,9 @@ def main():
         overlap_ratio=train_config["overlap_ratio"],
         min_notes=train_config["min_notes"],
         max_works=train_config.get("max_eval_works"),
+        include_all_performance_dataset=train_config.get("eval_include_all_performance_dataset"),
+        max_non_asap_performances_per_work=train_config.get("max_eval_non_asap_performances_per_work"),
+        selection_seed=train_config.get("seed", 42),
     )
     print(f"Train works: {len(train_manifest)}")
     print(f"Eval works: {len(eval_manifest)}")

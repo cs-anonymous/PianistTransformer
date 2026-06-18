@@ -3,6 +3,7 @@ import argparse
 import datetime
 import os
 import random
+import shutil
 from pathlib import Path
 
 import torch
@@ -15,6 +16,52 @@ from src.model.pianoformer import PianoT5GemmaConfig, PianoT5Gemma
 from src.utils.func import filter_valid_args
 
 os.environ["WANDB_PROJECT"] = "pianist-transformer"
+
+
+class BestLastTrainer(Trainer):
+    def _cleanup_checkpoints(self, checkpoint_prefix="checkpoint", use_mtime=False):
+        if not self.args.should_save:
+            return
+        output_dir = Path(self.args.output_dir)
+        checkpoints = [p for p in output_dir.glob(f"{checkpoint_prefix}-*") if p.name != "checkpoint-best"]
+        keep = set()
+        if checkpoints:
+            key = (lambda p: p.stat().st_mtime) if use_mtime else (lambda p: int(p.name.split("-")[-1]))
+            keep.add(str(max(checkpoints, key=key)))
+        best_path = getattr(self.state, "best_model_checkpoint", None)
+        if best_path:
+            keep.add(str(Path(best_path)))
+        best_dir = output_dir / "checkpoint-best"
+        if best_dir.exists():
+            keep.add(str(best_dir))
+        for checkpoint in checkpoints:
+            if str(checkpoint) not in keep:
+                shutil.rmtree(checkpoint, ignore_errors=True)
+
+    def evaluate(self, *args, **kwargs):
+        metrics = super().evaluate(*args, **kwargs)
+        metric_key = getattr(self.args, "metric_for_best_model", None) or "eval_loss"
+        metric_value = None
+        for key in (metric_key, f"eval_{metric_key}", "loss", "eval_loss"):
+            if key in metrics:
+                metric_value = metrics[key]
+                break
+        output_dir = Path(self.args.output_dir)
+        checkpoints = sorted(
+            [p for p in output_dir.glob("checkpoint-*") if p.name != "checkpoint-best"],
+            key=lambda p: int(p.name.split("-")[-1]),
+        )
+        latest = checkpoints[-1] if checkpoints else None
+        if metric_value is not None and latest is not None:
+            if self.state.best_metric is None or metric_value < self.state.best_metric:
+                best_dir = output_dir / "checkpoint-best"
+                if best_dir.exists():
+                    shutil.rmtree(best_dir)
+                shutil.copytree(latest, best_dir)
+                self.state.best_metric = metric_value
+                self.state.best_model_checkpoint = str(best_dir)
+        self._cleanup_checkpoints()
+        return metrics
 
 
 def group_ids(examples, block_size, overlap_ratio):
@@ -107,7 +154,7 @@ class FastSFTDataset(Dataset):
 
 
 class DiffusionSFTDataCollator:
-    def __init__(self, config, transposition_range=(-3, 3)):
+    def __init__(self, config, transposition_range=(-3, 3), prior_token_keep_prob=1.0):
         self.mask_token_id = config.mask_token_id
         self.pad_token_id = config.pad_token_id
         self.bos_token_id = config.bos_token_id
@@ -117,16 +164,49 @@ class DiffusionSFTDataCollator:
 
         self.valid_id_range = config.valid_id_range
         self.transposition_range = transposition_range
+        self.prior_token_keep_prob = float(prior_token_keep_prob)
+
+    def _build_decoder_inputs(self, label_tensors):
+        original_padded = pad_sequence(label_tensors, batch_first=True, padding_value=self.pad_token_id)
+        decoder_input_ids = original_padded.new_full(original_padded.shape, self.pad_token_id)
+        decoder_input_ids[:, 0] = self.bos_token_id
+        if original_padded.shape[1] > 1:
+            decoder_input_ids[:, 1:] = original_padded[:, :-1]
+
+        decoder_attention_mask = (decoder_input_ids != self.pad_token_id)
+        if self.prior_token_keep_prob >= 1.0 or decoder_input_ids.shape[1] <= 1:
+            return decoder_input_ids, decoder_attention_mask.long()
+
+        positions = torch.arange(decoder_input_ids.shape[1], device=decoder_input_ids.device)
+        pitch_positions = positions.gt(0) & (((positions - 1) % 8) == 0)
+        keep_mask = torch.rand(
+            decoder_input_ids.shape,
+            device=decoder_input_ids.device,
+        ) < self.prior_token_keep_prob
+        keep_mask[:, 0] = True
+        keep_mask[:, pitch_positions] = True
+        keep_mask |= ~decoder_attention_mask
+
+        dropped_positions = decoder_attention_mask & ~keep_mask
+        decoder_input_ids = decoder_input_ids.masked_fill(dropped_positions, self.mask_token_id)
+        return decoder_input_ids, decoder_attention_mask.long()
 
     def __call__(self, examples):
         input_tensors = [torch.tensor(f["input_ids"]).long() for f in examples]
         label_tensors = [torch.tensor(f["labels"]).long() for f in examples]
         input_ids = pad_sequence(input_tensors, batch_first=True, padding_value=self.pad_token_id)
         label_ids = pad_sequence(label_tensors, batch_first=True, padding_value=-100)
+        decoder_input_ids, decoder_attention_mask = self._build_decoder_inputs(label_tensors)
 
         attention_mask = (input_ids != self.pad_token_id).long()
 
-        return {"input_ids": input_ids, "labels": label_ids, "attention_mask": attention_mask}
+        return {
+            "input_ids": input_ids,
+            "labels": label_ids,
+            "attention_mask": attention_mask,
+            "decoder_input_ids": decoder_input_ids,
+            "decoder_attention_mask": decoder_attention_mask,
+        }
 
 
 if __name__ == "__main__":
@@ -186,7 +266,10 @@ if __name__ == "__main__":
         overlap_ratio=train_config["overlap_ratio"]
     )
 
-    data_collator = DiffusionSFTDataCollator(config)
+    data_collator = DiffusionSFTDataCollator(
+        config,
+        prior_token_keep_prob=train_config.get("prior_token_keep_prob", 1.0),
+    )
 
     if train_config.get("pretrained_model") is None:
         model = PianoT5Gemma(config)
@@ -208,7 +291,7 @@ if __name__ == "__main__":
 
     training_args = TrainingArguments(**training_args)
 
-    trainer = Trainer(
+    trainer = BestLastTrainer(
         model=model,
         args=training_args,
         data_collator=data_collator,

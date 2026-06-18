@@ -44,7 +44,7 @@ def batch_performance_render(
         model, 
         score_midi_objs, 
         max_context_length=4096, 
-        overlap_ratio=0.5, 
+        overlap_ratio=0.125, 
         temperature=1.0,
         top_p=0.95,
         device="cpu",

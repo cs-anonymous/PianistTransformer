@@ -621,7 +621,7 @@ Node 方案直接以 note 为单位切片。第一版配置：
 ```json
 {
   "block_notes": 512,
-  "overlap_ratio": 0.5,
+  "overlap_ratio": 0.125,
   "min_notes": 64
 }
 ```
@@ -631,6 +631,7 @@ Node 方案直接以 note 为单位切片。第一版配置：
 ```python
 window_len = block_notes
 stride = int(block_notes * (1 - overlap_ratio))
+# With block_notes = 512 and overlap_ratio = 0.125, this yields stride = 448
 ```
 
 不足 `min_notes` 的片段丢弃。
@@ -1665,6 +1666,16 @@ step t > 0:
 
 这样生成过程更接近 PT 的逻辑：模型必须把已经生成的 target-side note object 回灌到 decoder，而不是每个位置都直接拿 score note embedding 做 parallel query。
 
+为了减轻 exposure bias，第一版在训练时还引入 `prior_token_keep_prob = 0.5` 的 decoder-side dropout：
+
+```text
+score / pitch 相关输入保留
+previous target-side continuous condition 按 0.5 概率保留
+其余 previous target-side condition 随机置空
+```
+
+也就是说，teacher forcing 仍然存在，但不会永远把“完整正确的历史”喂给 decoder。
+
 原 PT SFT 的 teacher forcing 是：
 
 ```text
@@ -2077,7 +2088,7 @@ configs/inr_config_pianocore.json
   "metadata_path": "data/pianocore/metadata.csv",
   "block_notes": 512,
   "min_notes": 64,
-  "overlap_ratio": 0.5,
+  "overlap_ratio": 0.125,
   "pretrained_model": null,
   "load_pianoformer_backbone": false,
   "backbone_type": "t5",
@@ -2343,6 +2354,50 @@ data/midis/node_sft_preview/
 
 建议每轮固定 20 个验证样本，便于横向比较。
 
+### 12.3 Testset protocol
+
+第一阶段 testset evaluation 分为两套协议：
+
+```text
+Protocol-Det: deterministic generation
+Protocol-Sample: stochastic generation / multi-sample evaluation
+```
+
+`Protocol-Det` 用于主表：
+
+- 每个 score 只生成 1 个 prediction。
+- prediction 与该 score 的多个 GT performance 分别计算指标。
+- score-level 指标最后再平均。
+
+`Protocol-Sample` 用于补充分析：
+
+- 每个 score 生成 `K` 个 samples。
+- prediction set 与 GT set 在 score level 上做多对多比较。
+- 重点衡量 one-to-many 能力，而不是单一最优样本。
+
+多对多聚合定义如下：
+
+```text
+E[MAE](x) = mean_{k,m} d(p_k, g_m)
+```
+
+其中 `p_k` 是第 `k` 个 prediction，`g_m` 是第 `m` 个 GT。
+
+Wasserstein 采用 pooled empirical distribution：
+
+```text
+W1(pool(predictions), pool(GT))
+```
+
+Sampling 版同时报告：
+
+- `expected_pairwise MAE/Wass`
+- `pooled distribution Wass`
+- `model-model diversity`
+- `human-human diversity`
+
+当前 INR 第一版已切换为 `Beta(mu/kappa)` probabilistic head；`Protocol-Det` 取 `mu` 作为确定性输出，`Protocol-Sample` 从 Beta 分布采样。
+
 ## 13. 第一阶段对照
 
 第一阶段至少比较：
@@ -2383,6 +2438,13 @@ src/data_process/score_xml_alignment.py
 src/model/integrated_pianoformer.py
 src/train/train_inr.py
 configs/inr_config_pianocore.json
+```
+
+新增 testset 工具：
+
+```text
+src/inference/infer_inr_testset.py
+src/evaluate/evaluate_inr_saved_midis.py
 ```
 
 建议暂不修改：

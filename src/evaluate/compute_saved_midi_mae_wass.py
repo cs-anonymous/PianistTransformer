@@ -50,7 +50,7 @@ def _cc_value_at_ms(cc_times_ms, cc_values, query_ms):
     return cc_values[idx - 1]
 
 
-def midi_to_note_features(midi_obj, normalize=False, force_monotonic_starts=False):
+def midi_to_note_features(midi_obj, normalize=False, force_monotonic_starts=False, max_time_ms=10000.0):
     notes = sorted_piano_notes(midi_obj)
     tick_to_ms = _tick_to_ms_mapping(midi_obj)
     pedal_controls = sorted_pedal_controls(midi_obj)
