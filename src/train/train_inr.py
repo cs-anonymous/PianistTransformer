@@ -6,6 +6,7 @@ import os
 import random
 import shutil
 import re
+import warnings
 from collections import OrderedDict
 from pathlib import Path
 
@@ -126,8 +127,18 @@ def infer_input_feature_mode(config):
 def make_score_note_input(score_continuous, score_feature, has_score_feature, input_feature_mode):
     if input_feature_mode == "legacy":
         return score_continuous
+    assert len(score_continuous) == len(score_feature), (
+        f"score_continuous/score_feature length mismatch: "
+        f"{len(score_continuous)} vs {len(score_feature)}"
+    )
+    assert len(score_continuous) == len(has_score_feature), (
+        f"score_continuous/has_score_feature length mismatch: "
+        f"{len(score_continuous)} vs {len(has_score_feature)}"
+    )
     rows = []
     for shared, feature, has_feature in zip(score_continuous, score_feature, has_score_feature):
+        assert len(shared) >= 3, f"score_continuous row too short: expected >=3, got {len(shared)}"
+        assert len(feature) >= 8, f"score_feature row too short: expected >=8, got {len(feature)}"
         has_feature = 1.0 if bool(has_feature) else 0.0
         rows.append([has_feature, 0.0] + list(shared[:3]) + [float(value) * has_feature for value in feature[:8]])
     return rows
@@ -136,6 +147,8 @@ def make_score_note_input(score_continuous, score_feature, has_score_feature, in
 def make_performance_note_input(label_continuous, input_feature_mode):
     if input_feature_mode == "legacy":
         return label_continuous
+    for row in label_continuous:
+        assert len(row) >= 7, f"label_continuous row too short: expected >=7, got {len(row)}"
     return [[0.0, 1.0] + list(row[:7]) for row in label_continuous]
 
 
@@ -325,10 +338,12 @@ class PianoCoReNodeSFTDataset(Dataset):
         interpolated = perf["interpolated"]
         task_type = self.task_type.lower()
         if task_type == "epr":
+            score_feature = score.get("score_feature", [[0.0] * 8 for _ in score["pitch"]])
+            has_score_feature = score.get("has_score_feature", [0] * len(score["pitch"]))
             continuous = make_score_note_input(
                 score["score_continuous"][start:end],
-                score.get("score_feature", [[0.0] * 8 for _ in score["pitch"][start:end]]),
-                score.get("has_score_feature", [0] * len(score["pitch"][start:end])),
+                score_feature[start:end],
+                has_score_feature[start:end],
                 self.input_feature_mode,
             )
             labels_continuous = labels[start:end]
@@ -559,6 +574,20 @@ def create_model(train_config):
     backbone_type = train_config.get("backbone_type", "t5").lower()
     task_type = train_config.get("task_type", "epr").lower()
     input_feature_mode = infer_input_feature_mode(train_config)
+    if task_type == "epr":
+        missing_beta_keys = [
+            key for key in ("epr_distribution", "beta_eps", "beta_kappa_min")
+            if key not in train_config
+        ]
+        if missing_beta_keys:
+            warnings.warn(
+                "EPR config is missing probabilistic-head keys "
+                f"{missing_beta_keys}. Falling back to defaults: "
+                f"epr_distribution={train_config.get('epr_distribution', 'point')}, "
+                f"beta_eps={train_config.get('beta_eps', 1e-5)}, "
+                f"beta_kappa_min={train_config.get('beta_kappa_min', 1e-3)}",
+                stacklevel=2,
+            )
     score_feature_dim = train_config.get("score_feature_dim", 8)
     input_continuous_dim = train_config.get(
         "input_continuous_dim",
@@ -607,6 +636,9 @@ def create_model(train_config):
         embedding_depth=train_config.get("embedding_depth", 2),
         head_depth=train_config.get("head_depth", 2),
         head_activation=train_config.get("head_activation", "gelu"),
+        epr_distribution=train_config.get("epr_distribution", "point"),
+        beta_eps=train_config.get("beta_eps", 1e-5),
+        beta_kappa_min=train_config.get("beta_kappa_min", 1e-3),
         prior_token_keep_prob=train_config.get("prior_token_keep_prob", 1.0),
         torch_dtype=dtype,
     )

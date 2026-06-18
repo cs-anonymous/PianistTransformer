@@ -1,7 +1,6 @@
 {
   "metadata_path": "../PianoCoRe/metadata.csv",
   "refined_dir": "../PianoCoRe/processed",
-  "resume_path": "models/pine_pianocore_full_bs64_gpu3/inr_2026-06-18-12-42-15/checkpoint-2000",
   "pretrained_model": null,
   "load_pianoformer_backbone": false,
   "backbone_type": "t5",
@@ -58,7 +57,7 @@
     "ioi": 1.0,
     "duration": 1.0,
     "velocity": 1.0,
-    "pedal": 1.0
+    "pedal": 0.2
   },
   "encoder_layers_num": 10,
   "decoder_layers_num": 2,
@@ -70,7 +69,7 @@
   "max_position_embeddings": 4096,
   "attention_dropout": 0.0,
   "seed": 42,
-  "output_dir": "./models/pine_pianocore_full_bs64_gpu3/",
+  "output_dir": "./models/pine_pianocore_full/",
   "overwrite_output_dir": true,
   "max_steps": -1,
   "num_train_epochs": 1,
