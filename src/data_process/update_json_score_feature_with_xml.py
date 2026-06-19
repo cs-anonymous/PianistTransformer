@@ -7,6 +7,9 @@ features, and performance targets. This script adds the v2 score-side fields:
     score.score_feature       [mo, md, ml, first, staff, trill, grace, staccato]
     score.has_score_feature   1 if the refined score note maps to an XML note
 
+The first three score feature values are stored in raw quarter-length units on
+the 1/24 grid, not normalized to [0, 1].
+
 Unmapped notes are kept in the sequence with zero score_feature rows and
 has_score_feature=0.
 """
@@ -276,6 +279,7 @@ def update_one(task: dict[str, Any]) -> dict[str, Any]:
         meta["old_score_continuous_dim"] = old_score_continuous_dim
         meta["score_continuous_keys"] = ["ioi", "duration", "velocity"]
         meta["score_feature_keys"] = ["mo", "md", "ml", "first", "staff", "trill", "grace", "staccato"]
+        meta["score_feature_unit"] = "quarter_length_raw_grid_1/24"
         meta["note_type_keys"] = ["has_score_feature", "has_pedal_feature"]
         meta["xml_to_refined_score_alignment"] = {
             "method": "midi2scoretransformer_parse_mxl + pitch_aware_monotonic_alignment",

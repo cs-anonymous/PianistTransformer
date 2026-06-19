@@ -67,6 +67,10 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         epr_distribution="point",
         beta_eps=1e-5,
         beta_kappa_min=1e-3,
+        epr_timing_bins=5000,
+        epr_value_bins=128,
+        soft_ce_tau=None,
+        timing_input_normalization="legacy_log1p",
         prior_token_keep_prob=1.0,
         **kwargs,
     ):
@@ -135,6 +139,15 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.epr_distribution = epr_distribution
         self.beta_eps = beta_eps
         self.beta_kappa_min = beta_kappa_min
+        self.epr_timing_bins = int(epr_timing_bins)
+        self.epr_value_bins = int(epr_value_bins)
+        self.soft_ce_tau = soft_ce_tau or {
+            "ioi": 10.0,
+            "duration": 30.0,
+            "velocity": 6.0,
+            "pedal": 2.0,
+        }
+        self.timing_input_normalization = timing_input_normalization
         self.prior_token_keep_prob = prior_token_keep_prob
 
 
@@ -317,7 +330,13 @@ class IntegratedContinuousDecoder(nn.Module):
             self.shared_slice = self.score_slice = self.perf_slice = slice(None)
             shared_dim = score_dim = perf_dim = full_dim
 
-        if getattr(config, "task_type", "epr") == "epr" and self.epr_distribution == "beta_mu_kappa":
+        if (
+            getattr(config, "task_type", "epr") == "epr"
+            and self.epr_distribution in {"categorical", "hard_categorical", "soft_categorical"}
+        ):
+            shared_output_dim = int(config.epr_timing_bins) * 2 + int(config.epr_value_bins)
+            pedal_output_dim = int(config.epr_value_bins) * 4
+        elif getattr(config, "task_type", "epr") == "epr" and self.epr_distribution == "beta_mu_kappa":
             shared_output_dim = 6
             pedal_output_dim = 8
         else:
@@ -334,7 +353,7 @@ class IntegratedContinuousDecoder(nn.Module):
 
         shared = self.shared_head(hidden_states[..., self.shared_slice])
         pedal = self.pedal_head(hidden_states[..., self.perf_slice])
-        if self.epr_distribution == "beta_mu_kappa":
+        if self.epr_distribution in {"beta_mu_kappa", "categorical", "hard_categorical", "soft_categorical"}:
             return torch.cat([shared, pedal], dim=-1)
 
         shared = torch.sigmoid(shared)
@@ -354,6 +373,22 @@ def _split_epr_distribution_params(raw_outputs):
     }
 
 
+def _split_epr_categorical_logits(config, raw_outputs):
+    timing_bins = int(config.epr_timing_bins)
+    value_bins = int(config.epr_value_bins)
+    ioi_end = timing_bins
+    duration_end = ioi_end + timing_bins
+    velocity_end = duration_end + value_bins
+    pedal_start = velocity_end
+    pedal_end = pedal_start + 4 * value_bins
+    return {
+        "ioi": raw_outputs[..., :ioi_end],
+        "duration": raw_outputs[..., ioi_end:duration_end],
+        "velocity": raw_outputs[..., duration_end:velocity_end],
+        "pedal": raw_outputs[..., pedal_start:pedal_end].reshape(*raw_outputs.shape[:-1], 4, value_bins),
+    }
+
+
 def _beta_params(raw_mu, raw_kappa, eps=1e-5, kappa_min=1e-3):
     mu = raw_mu.sigmoid()
     kappa = F.softplus(raw_kappa) + kappa_min
@@ -362,8 +397,59 @@ def _beta_params(raw_mu, raw_kappa, eps=1e-5, kappa_min=1e-3):
     return mu, kappa, alpha, beta
 
 
+def _categorical_sample_or_argmax(logits, sampling_strategy="mean"):
+    mode = str(sampling_strategy).lower()
+    if mode in {"mean", "deterministic", "mu", "argmax", "greedy"}:
+        return logits.float().argmax(dim=-1)
+    if mode in {"sample", "sampling", "stochastic"}:
+        probs = torch.softmax(logits.float(), dim=-1)
+        return torch.distributions.Categorical(probs=probs).sample()
+    raise ValueError(f"Unsupported sampling_strategy: {sampling_strategy}")
+
+
+def _epr_bins_to_normalized(config, ioi_bins, duration_bins, velocity_bins, pedal_bins):
+    timing_bins = max(1, int(config.epr_timing_bins))
+    value_bins = max(1, int(config.epr_value_bins))
+    value_scale = float(value_bins - 1) if value_bins > 1 else 1.0
+    timing_norm = str(getattr(config, "timing_input_normalization", "legacy_log1p")).lower()
+    ioi_ms = ioi_bins.to(dtype=torch.float32).clamp(0.0, float(timing_bins - 1))
+    duration_ms = duration_bins.to(dtype=torch.float32).clamp(0.0, float(timing_bins - 1))
+    if timing_norm in {"scaled_log_5000_s10", "log1p_x_over_10_5000"}:
+        denom = torch.log1p(ioi_ms.new_tensor(500.0))
+        ioi_norm = torch.log1p(ioi_ms.clamp(max=5000.0) / 10.0) / denom
+        duration_norm = torch.log1p(duration_ms.clamp(max=5000.0) / 10.0) / denom
+    elif timing_norm in {"legacy_log1p", "log1p", "log1p_10000"}:
+        max_time = float(getattr(config, "max_time_ms", 10000.0))
+        denom = torch.log1p(ioi_ms.new_tensor(max_time))
+        ioi_norm = torch.log1p(ioi_ms.clamp(max=max_time)) / denom
+        duration_norm = torch.log1p(duration_ms.clamp(max=max_time)) / denom
+    elif timing_norm in {"linear_5000", "raw_linear_5000"}:
+        ioi_norm = ioi_ms.clamp(max=5000.0) / 5000.0
+        duration_norm = duration_ms.clamp(max=5000.0) / 5000.0
+    else:
+        raise ValueError(f"Unsupported timing normalization: {timing_norm}")
+    return torch.cat(
+        [
+            ioi_norm.unsqueeze(-1),
+            duration_norm.unsqueeze(-1),
+            velocity_bins.to(dtype=torch.float32).unsqueeze(-1) / value_scale,
+            pedal_bins.to(dtype=torch.float32) / value_scale,
+        ],
+        dim=-1,
+    ).to(dtype=torch.float32)
+
+
 def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean"):
-    if getattr(config, "epr_distribution", "point").lower() != "beta_mu_kappa":
+    distribution = getattr(config, "epr_distribution", "point").lower()
+    if distribution in {"categorical", "hard_categorical", "soft_categorical"}:
+        logits = _split_epr_categorical_logits(config, raw_outputs)
+        ioi = _categorical_sample_or_argmax(logits["ioi"], sampling_strategy)
+        duration = _categorical_sample_or_argmax(logits["duration"], sampling_strategy)
+        velocity = _categorical_sample_or_argmax(logits["velocity"], sampling_strategy)
+        pedal = _categorical_sample_or_argmax(logits["pedal"], sampling_strategy)
+        return _epr_bins_to_normalized(config, ioi, duration, velocity, pedal).to(device=raw_outputs.device)
+
+    if distribution != "beta_mu_kappa":
         return raw_outputs
 
     params = _split_epr_distribution_params(raw_outputs)
@@ -648,11 +734,74 @@ def _beta_nll_loss(raw_mu, raw_kappa, target, mask, eps, kappa_min):
     return _masked_mean(values, mask)
 
 
-def _compute_integrated_loss_components(config, continuous_pred, labels_continuous, attention_mask):
+def _hard_categorical_loss(logits, target, mask):
+    values = F.cross_entropy(
+        logits.float().reshape(-1, logits.shape[-1]),
+        target.long().reshape(-1),
+        reduction="none",
+    ).view_as(target)
+    return _masked_mean(values, mask)
+
+
+def _soft_categorical_loss(logits, target, mask, tau, radius=None):
+    if radius is None:
+        radius = max(1, int(round(float(tau) * 4.0)))
+    offsets = torch.arange(-radius, radius + 1, device=logits.device, dtype=torch.long)
+    target = target.long()
+    candidate = (target.unsqueeze(-1) + offsets).clamp(0, logits.shape[-1] - 1)
+    distances = (candidate - target.unsqueeze(-1)).abs().to(dtype=torch.float32)
+    weights = torch.exp(-distances / max(float(tau), 1e-6))
+    weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    log_probs = F.log_softmax(logits.float(), dim=-1)
+    gathered = log_probs.gather(dim=-1, index=candidate)
+    values = -(weights * gathered).sum(dim=-1)
+    return _masked_mean(values, mask)
+
+
+def _compute_epr_categorical_loss_components(config, raw_outputs, labels_epr_bins, mask):
+    logits = _split_epr_categorical_logits(config, raw_outputs)
+    distribution = getattr(config, "epr_distribution", "point").lower()
+    soft = distribution == "soft_categorical"
+    tau = getattr(config, "soft_ce_tau", {}) or {}
+
+    def loss_one(name, feature_logits, target):
+        if soft:
+            return _soft_categorical_loss(
+                feature_logits,
+                target,
+                mask,
+                tau=float(tau.get(name, 1.0)),
+            )
+        return _hard_categorical_loss(feature_logits, target, mask)
+
+    pedal_losses = []
+    for idx in range(4):
+        pedal_losses.append(
+            loss_one(
+                "pedal",
+                logits["pedal"][..., idx, :],
+                labels_epr_bins[..., 3 + idx],
+            )
+        )
+    return {
+        "ioi": loss_one("ioi", logits["ioi"], labels_epr_bins[..., 0]),
+        "duration": loss_one("duration", logits["duration"], labels_epr_bins[..., 1]),
+        "velocity": loss_one("velocity", logits["velocity"], labels_epr_bins[..., 2]),
+        "pedal": torch.stack(pedal_losses).mean(),
+    }
+
+
+def _compute_integrated_loss_components(config, continuous_pred, labels_continuous, attention_mask, labels_epr_bins=None):
     if getattr(config, "task_type", "epr") == "csr":
         return _compute_csr_loss_components(config, continuous_pred, labels_continuous, attention_mask)
 
     mask = attention_mask.bool()
+    distribution = getattr(config, "epr_distribution", "point").lower()
+    if distribution in {"categorical", "hard_categorical", "soft_categorical"}:
+        if labels_epr_bins is None:
+            raise ValueError("Categorical EPR loss requires labels_epr_bins")
+        return _compute_epr_categorical_loss_components(config, continuous_pred, labels_epr_bins, mask)
+
     if getattr(config, "epr_distribution", "point").lower() == "beta_mu_kappa":
         params = _split_epr_distribution_params(continuous_pred)
         eps = getattr(config, "beta_eps", 1e-5)
@@ -778,12 +927,13 @@ def _compute_csr_loss_components(config, score_feature_logits, labels_score_feat
     }
 
 
-def _compute_integrated_loss(config, continuous_pred, labels_continuous, attention_mask):
+def _compute_integrated_loss(config, continuous_pred, labels_continuous, attention_mask, labels_epr_bins=None):
     components = _compute_integrated_loss_components(
         config,
         continuous_pred,
         labels_continuous,
         attention_mask,
+        labels_epr_bins=labels_epr_bins,
     )
     if getattr(config, "task_type", "epr") == "csr":
         weights = config.csr_loss_weights
@@ -953,6 +1103,7 @@ class IntegratedPianoTransformer(nn.Module):
         continuous: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         labels_continuous: Optional[torch.FloatTensor] = None,
+        labels_epr_bins: Optional[torch.LongTensor] = None,
         interpolated: Optional[torch.BoolTensor] = None,
         continuous_sampling_strategy: str = "mean",
         **kwargs,
@@ -1016,7 +1167,13 @@ class IntegratedPianoTransformer(nn.Module):
 
         loss = None
         if labels_continuous is not None:
-            loss = _compute_integrated_loss(self.config, continuous_pred, labels_continuous, attention_mask)
+            loss = _compute_integrated_loss(
+                self.config,
+                continuous_pred,
+                labels_continuous,
+                attention_mask,
+                labels_epr_bins=labels_epr_bins,
+            )
 
         return Seq2SeqLMOutput(loss=loss, logits=continuous_pred)
 
@@ -1163,6 +1320,7 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
         continuous: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         labels_continuous: Optional[torch.FloatTensor] = None,
+        labels_epr_bins: Optional[torch.LongTensor] = None,
         interpolated: Optional[torch.BoolTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         decoder_attention_mask: Optional[torch.BoolTensor] = None,
@@ -1213,7 +1371,13 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
             )
             loss = None
             if labels_continuous is not None:
-                loss = _compute_integrated_loss(self.config, continuous_pred, labels_continuous, attention_mask)
+                loss = _compute_integrated_loss(
+                    self.config,
+                    continuous_pred,
+                    labels_continuous,
+                    attention_mask,
+                    labels_epr_bins=labels_epr_bins,
+                )
             return Seq2SeqLMOutput(loss=loss, logits=continuous_pred)
         if decoder_attention_mask is None:
             decoder_attention_mask = decoder_input_mask
@@ -1242,7 +1406,13 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
 
         loss = None
         if labels_continuous is not None:
-            loss = _compute_integrated_loss(self.config, continuous_pred, labels_continuous, attention_mask)
+            loss = _compute_integrated_loss(
+                self.config,
+                continuous_pred,
+                labels_continuous,
+                attention_mask,
+                labels_epr_bins=labels_epr_bins,
+            )
 
         return Seq2SeqLMOutput(
             loss=loss,

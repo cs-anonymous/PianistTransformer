@@ -1,6 +1,6 @@
 {
   "metadata_path": "../PianoCoRe/metadata.csv",
-  "refined_dir": "../PianoCoRe/processed",
+  "refined_dir": "../PianoCoRe/processed_raw",
   "pretrained_model": null,
   "load_pianoformer_backbone": false,
   "backbone_type": "t5",
@@ -24,8 +24,8 @@
   "pitch_pad_id": 128,
   "max_time_ms": 10000.0,
   "decoder_input_mode": "ar",
-  "prior_token_keep_prob": 0.5,
-  "epr_distribution": "beta_mu_kappa",
+  "prior_token_keep_prob": 1.0,
+  "epr_distribution": "soft_categorical",
   "beta_eps": 1e-05,
   "beta_kappa_min": 0.001,
   "note_embedding_mode": "fine",
@@ -63,7 +63,7 @@
   "max_position_embeddings": 4096,
   "attention_dropout": 0.0,
   "seed": 42,
-  "output_dir": "./models/fine_pianocore_full/",
+  "output_dir": "./models/fine_pianocore_raw_softcat/",
   "overwrite_output_dir": true,
   "max_steps": -1,
   "num_train_epochs": 1,
@@ -72,7 +72,7 @@
   "eval_steps": 2000,
   "per_device_train_batch_size": 32,
   "per_device_eval_batch_size": 32,
-  "gradient_accumulation_steps": 2,
+  "gradient_accumulation_steps": 1,
   "lr_scheduler_type": "cosine",
   "learning_rate": 0.0003,
   "warmup_steps": 50,
@@ -94,5 +94,14 @@
   "ddp_broadcast_buffers": false,
   "load_best_model_at_end": true,
   "metric_for_best_model": "eval_loss",
-  "greater_is_better": false
+  "greater_is_better": false,
+  "timing_input_normalization": "scaled_log_5000_s10",
+  "epr_timing_bins": 5000,
+  "epr_value_bins": 128,
+  "soft_ce_tau": {
+    "ioi": 10.0,
+    "duration": 30.0,
+    "velocity": 6.0,
+    "pedal": 2.0
+  }
 }

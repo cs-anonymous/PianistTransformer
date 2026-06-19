@@ -33,6 +33,7 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--protocol", choices=["deterministic", "sampling"], default="sampling")
     parser.add_argument("--num-samples", type=int, default=1)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.95)
@@ -123,6 +124,7 @@ def render_one_entry(model, device, entry, args, midi_dir):
             overlap_ratio=args.overlap_ratio,
             temperature=args.temperature,
             top_p=args.top_p,
+            do_sample=args.protocol == "sampling",
             device=str(device),
         )[0]
         mapped = map_midi(score_midi, rendered)
@@ -235,6 +237,7 @@ def run_single_process(args, items, model):
                 overlap_ratio=args.overlap_ratio,
                 temperature=args.temperature,
                 top_p=args.top_p,
+                do_sample=args.protocol == "sampling",
                 device=str(device),
             )
             for entry_idx, (entry, rendered) in enumerate(zip(batch, rendered_batch)):
@@ -300,7 +303,7 @@ def main():
         "model_path": str(args.model_path.resolve()),
         "metadata": str(args.metadata.resolve()),
         "midi_root": str(args.midi_root.resolve()),
-        "protocol": "pt_sampling",
+        "protocol": f"pt_{args.protocol}",
         "split": args.split,
         "num_samples": args.num_samples,
         "num_workers": args.num_workers,

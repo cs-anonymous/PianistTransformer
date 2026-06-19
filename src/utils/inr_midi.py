@@ -16,6 +16,17 @@ CONTINUOUS_KEYS = (
 )
 
 
+RAW_CONTINUOUS_KEYS = (
+    "ioi_ms",
+    "duration_ms",
+    "velocity",
+    "pedal_0",
+    "pedal_25",
+    "pedal_50",
+    "pedal_75",
+)
+
+
 def sorted_piano_notes(midi_obj):
     notes = []
     for instrument in midi_obj.instruments:
@@ -40,6 +51,86 @@ def normalize_time_ms(time_ms, max_time_ms=10000.0):
 def denormalize_time_ms(time_norm, max_time_ms=10000.0):
     clipped = min(max(float(time_norm), 0.0), 1.0)
     return math.expm1(clipped * math.log1p(float(max_time_ms)))
+
+
+def normalize_time_ms_for_inr_input(time_ms, normalization="legacy_log1p", max_time_ms=10000.0):
+    normalization = str(normalization or "legacy_log1p").lower()
+    if normalization in {"legacy_log1p", "log1p", "log1p_10000"}:
+        return normalize_time_ms(time_ms, max_time_ms=max_time_ms)
+    if normalization in {"scaled_log_5000_s10", "log1p_x_over_10_5000"}:
+        clipped = min(max(float(time_ms), 0.0), 5000.0)
+        return math.log1p(clipped / 10.0) / math.log1p(500.0)
+    if normalization in {"linear_5000", "raw_linear_5000"}:
+        return min(max(float(time_ms), 0.0), 5000.0) / 5000.0
+    raise ValueError(f"Unsupported timing normalization: {normalization}")
+
+
+def denormalize_time_ms_from_inr_input(time_norm, normalization="legacy_log1p", max_time_ms=10000.0):
+    normalization = str(normalization or "legacy_log1p").lower()
+    clipped = min(max(float(time_norm), 0.0), 1.0)
+    if normalization in {"legacy_log1p", "log1p", "log1p_10000"}:
+        return denormalize_time_ms(clipped, max_time_ms=max_time_ms)
+    if normalization in {"scaled_log_5000_s10", "log1p_x_over_10_5000"}:
+        return math.expm1(clipped * math.log1p(500.0)) * 10.0
+    if normalization in {"linear_5000", "raw_linear_5000"}:
+        return clipped * 5000.0
+    raise ValueError(f"Unsupported timing normalization: {normalization}")
+
+
+def old_continuous_row_to_raw(row, max_time_ms=10000.0):
+    return [
+        denormalize_time_ms(row[0], max_time_ms=max_time_ms),
+        denormalize_time_ms(row[1], max_time_ms=max_time_ms),
+        min(max(float(row[2]), 0.0), 1.0) * 127.0,
+        *[min(max(float(value), 0.0), 1.0) * 127.0 for value in row[3:7]],
+    ]
+
+
+def raw_row_to_model_continuous(row, timing_normalization="legacy_log1p", max_time_ms=10000.0):
+    return [
+        normalize_time_ms_for_inr_input(
+            row[0],
+            normalization=timing_normalization,
+            max_time_ms=max_time_ms,
+        ),
+        normalize_time_ms_for_inr_input(
+            row[1],
+            normalization=timing_normalization,
+            max_time_ms=max_time_ms,
+        ),
+        min(max(float(row[2]), 0.0), 127.0) / 127.0,
+        *[min(max(float(value), 0.0), 127.0) / 127.0 for value in row[3:7]],
+    ]
+
+
+def raw_rows_to_model_continuous(rows, timing_normalization="legacy_log1p", max_time_ms=10000.0):
+    return [
+        raw_row_to_model_continuous(
+            row,
+            timing_normalization=timing_normalization,
+            max_time_ms=max_time_ms,
+        )
+        for row in rows
+    ]
+
+
+def old_continuous_rows_to_raw(rows, max_time_ms=10000.0):
+    return [old_continuous_row_to_raw(row, max_time_ms=max_time_ms) for row in rows]
+
+
+def raw_row_to_epr_bins(row, timing_bins=5000, value_bins=128):
+    timing_max = int(timing_bins) - 1
+    value_max = int(value_bins) - 1
+    return [
+        min(max(int(round(float(row[0]))), 0), timing_max),
+        min(max(int(round(float(row[1]))), 0), timing_max),
+        min(max(int(round(float(row[2]))), 0), value_max),
+        *[min(max(int(round(float(value))), 0), value_max) for value in row[3:7]],
+    ]
+
+
+def raw_rows_to_epr_bins(rows, timing_bins=5000, value_bins=128):
+    return [raw_row_to_epr_bins(row, timing_bins=timing_bins, value_bins=value_bins) for row in rows]
 
 
 def _tick_to_ms_mapping(midi_obj):
@@ -121,17 +212,21 @@ def midi_to_note_features(
         if normalize:
             ioi_value = normalize_time_ms(ioi_ms, max_time_ms=max_time_ms)
             duration_value = normalize_time_ms(duration_ms, max_time_ms=max_time_ms)
+            velocity_value = min(max(float(note.velocity) / 127.0, 0.0), 1.0)
+            pedal_values_out = [min(max(float(value) / 127.0, 0.0), 1.0) for value in pedal_samples]
         else:
             ioi_value = ioi_ms
             duration_value = duration_ms
+            velocity_value = min(max(float(note.velocity), 0.0), 127.0)
+            pedal_values_out = [min(max(float(value), 0.0), 127.0) for value in pedal_samples]
 
         pitches.append(int(note.pitch))
         continuous.append(
             [
                 ioi_value,
                 duration_value,
-                min(max(float(note.velocity) / 127.0, 0.0), 1.0),
-                *[min(max(float(value) / 127.0, 0.0), 1.0) for value in pedal_samples],
+                velocity_value,
+                *pedal_values_out,
             ]
         )
 
@@ -161,15 +256,27 @@ def note_features_to_midi(
 
     for row in continuous:
         if normalized:
-            ioi_ms = denormalize_time_ms(row[0], max_time_ms=max_time_ms)
-            duration_ms = denormalize_time_ms(row[1], max_time_ms=max_time_ms)
+            ioi_ms = denormalize_time_ms_from_inr_input(
+                row[0],
+                normalization=normalized if isinstance(normalized, str) else "legacy_log1p",
+                max_time_ms=max_time_ms,
+            )
+            duration_ms = denormalize_time_ms_from_inr_input(
+                row[1],
+                normalization=normalized if isinstance(normalized, str) else "legacy_log1p",
+                max_time_ms=max_time_ms,
+            )
+            velocity = int(round(min(max(float(row[2]), 0.0), 1.0) * 127.0))
+            pedals = [int(round(min(max(float(value), 0.0), 1.0) * 127.0)) for value in row[3:7]]
         else:
             ioi_ms = max(float(row[0]), 0.0)
             duration_ms = max(float(row[1]), 0.0)
+            velocity = int(round(min(max(float(row[2]), 0.0), 127.0)))
+            pedals = [int(round(min(max(float(value), 0.0), 127.0))) for value in row[3:7]]
         ioi_values.append(ioi_ms)
         duration_values.append(duration_ms)
-        velocity_values.append(int(round(min(max(float(row[2]), 0.0), 1.0) * 127.0)))
-        pedal_values.append([int(round(min(max(float(value), 0.0), 1.0) * 127.0)) for value in row[3:7]])
+        velocity_values.append(velocity)
+        pedal_values.append(pedals)
 
     for idx, pitch_value in enumerate(pitch):
         current_ms += ioi_values[idx]

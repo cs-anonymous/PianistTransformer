@@ -1,11 +1,13 @@
 import argparse
 import json
 import sys
+from multiprocessing import get_context
 from pathlib import Path
 
 import numpy as np
 from miditoolkit import MidiFile
 from scipy.stats import wasserstein_distance
+from tqdm import tqdm
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
@@ -127,10 +129,7 @@ def mae(pred: np.ndarray, target: np.ndarray) -> float:
     return float(np.mean(np.abs(pred - target))) if len(pred) else float("nan")
 
 
-def compute_pair_metrics(pred_path: Path, gt_path: Path):
-    pred = extract_note_arrays(pred_path)
-    gt = extract_note_arrays(gt_path)
-
+def compute_pair_metrics_from_arrays(pred, gt):
     pointwise = {}
     distro = {}
 
@@ -160,6 +159,12 @@ def compute_pair_metrics(pred_path: Path, gt_path: Path):
     }
 
 
+def compute_pair_metrics(pred_path: Path, gt_path: Path):
+    pred = extract_note_arrays(pred_path)
+    gt = extract_note_arrays(gt_path)
+    return compute_pair_metrics_from_arrays(pred, gt)
+
+
 def aggregate_metrics(rows):
     keys = [
         "ioi_mae",
@@ -182,32 +187,120 @@ def filter_to_gt_subset(evaluate_list, allowed_gt_paths):
     return [item for item in evaluate_list if str(Path(item["gt"]).resolve()) in allowed]
 
 
+def compute_pair_row(item):
+    pair_metrics = compute_pair_metrics(Path(item["pred"]), Path(item["gt"]))
+    return {
+        "gt": item["gt"],
+        "pred": item["pred"],
+        **pair_metrics,
+    }
+
+
+def extract_feature_row(path: str):
+    resolved = str(Path(path).resolve())
+    return resolved, extract_note_arrays(Path(resolved))
+
+
+def normalize_pair_paths(item):
+    return {
+        "pred": str(Path(item["pred"]).resolve()),
+        "gt": str(Path(item["gt"]).resolve()),
+    }
+
+
+def build_feature_cache(evaluate_list, num_workers):
+    unique_paths = sorted(
+        {item["pred"] for item in evaluate_list} | {item["gt"] for item in evaluate_list}
+    )
+    print(
+        f"Extracting note features for {len(unique_paths)} unique MIDI files "
+        f"with {num_workers} worker(s)",
+        flush=True,
+    )
+    if num_workers > 1:
+        ctx = get_context("spawn")
+        with ctx.Pool(processes=num_workers) as pool:
+            rows = list(
+                tqdm(
+                    pool.imap(extract_feature_row, unique_paths, chunksize=8),
+                    total=len(unique_paths),
+                    desc="MIDI feature cache",
+                )
+            )
+    else:
+        rows = [
+            extract_feature_row(path)
+            for path in tqdm(unique_paths, total=len(unique_paths), desc="MIDI feature cache")
+        ]
+    return dict(rows)
+
+
+def compute_pair_row_from_cache(item, feature_cache):
+    pair_metrics = compute_pair_metrics_from_arrays(
+        feature_cache[item["pred"]],
+        feature_cache[item["gt"]],
+    )
+    return {
+        "gt": item["gt"],
+        "pred": item["pred"],
+        **pair_metrics,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Compute MAE/Wasserstein from saved MIDI predictions.")
     parser.add_argument("--evaluate-list", type=Path, required=True)
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--subset-gt-list", type=Path, default=None,
                         help="Optional evaluate_list.json whose gt paths define the subset to keep.")
+    parser.add_argument("--num-workers", type=int, default=10)
+    parser.add_argument(
+        "--no-feature-cache",
+        action="store_true",
+        help="Disable two-stage MIDI feature caching and compute each pair by reading MIDI files directly.",
+    )
     args = parser.parse_args()
+    if args.num_workers < 1:
+        raise ValueError("--num-workers must be >= 1")
 
     evaluate_list = load_evaluate_list(args.evaluate_list)
     subset_reference = None
     if args.subset_gt_list is not None:
         subset_reference = load_evaluate_list(args.subset_gt_list)
         evaluate_list = filter_to_gt_subset(evaluate_list, [item["gt"] for item in subset_reference])
+    evaluate_list = [normalize_pair_paths(item) for item in evaluate_list]
 
-    pair_rows = []
-    for item in evaluate_list:
-        pair_metrics = compute_pair_metrics(Path(item["pred"]), Path(item["gt"]))
-        pair_rows.append({
-            "gt": item["gt"],
-            "pred": item["pred"],
-            **pair_metrics,
-        })
+    print(
+        f"Computing MIDI MAE/Wasserstein for {len(evaluate_list)} pairs "
+        f"with {args.num_workers} worker(s)",
+        flush=True,
+    )
+    if not args.no_feature_cache:
+        feature_cache = build_feature_cache(evaluate_list, args.num_workers)
+        pair_rows = [
+            compute_pair_row_from_cache(item, feature_cache)
+            for item in tqdm(evaluate_list, total=len(evaluate_list), desc="MIDI pair metrics")
+        ]
+    elif args.num_workers > 1:
+        ctx = get_context("spawn")
+        with ctx.Pool(processes=args.num_workers) as pool:
+            pair_rows = list(
+                tqdm(
+                    pool.imap(compute_pair_row, evaluate_list, chunksize=8),
+                    total=len(evaluate_list),
+                    desc="MIDI metrics",
+                )
+            )
+    else:
+        pair_rows = [
+            compute_pair_row(item)
+            for item in tqdm(evaluate_list, total=len(evaluate_list), desc="MIDI metrics")
+        ]
 
     output = {
         "evaluate_list": str(args.evaluate_list),
         "subset_gt_list": str(args.subset_gt_list) if args.subset_gt_list is not None else None,
+        "num_workers": args.num_workers,
         "num_pairs": len(pair_rows),
         "aggregate": aggregate_metrics(pair_rows),
         "pairs": pair_rows,

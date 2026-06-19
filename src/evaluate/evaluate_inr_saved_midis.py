@@ -2,6 +2,7 @@ import argparse
 import json
 import math
 import sys
+from multiprocessing import get_context
 from functools import lru_cache
 from pathlib import Path
 
@@ -42,6 +43,7 @@ def parse_args():
     parser.add_argument("--prediction-manifest", type=Path, required=True)
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--max-gt-per-score", type=int, default=None)
+    parser.add_argument("--num-workers", type=int, default=10)
     return parser.parse_args()
 
 
@@ -117,20 +119,41 @@ def score_level_metrics(item, max_gt_per_score=None):
     }
 
 
+def score_level_metrics_worker(args):
+    item, max_gt_per_score = args
+    return score_level_metrics(item, max_gt_per_score=max_gt_per_score)
+
+
 def aggregate_score_metrics(score_rows, section):
     if not score_rows:
         return {}
     keys = sorted(score_rows[0][section].keys())
-    return {key: float(np.mean([row[section][key] for row in score_rows])) for key in keys}
+    output = {}
+    for key in keys:
+        values = np.asarray([row[section][key] for row in score_rows], dtype=np.float64)
+        finite = values[np.isfinite(values)]
+        output[key] = float(np.mean(finite)) if len(finite) else float("nan")
+    return output
 
 
 def main():
     args = parse_args()
     manifest = json.loads(args.prediction_manifest.read_text())
-    score_rows = [
-        score_level_metrics(item, max_gt_per_score=args.max_gt_per_score)
-        for item in manifest["items"]
-    ]
+    if args.num_workers and args.num_workers > 1:
+        ctx = get_context("spawn")
+        with ctx.Pool(processes=args.num_workers) as pool:
+            score_rows = list(
+                pool.imap(
+                    score_level_metrics_worker,
+                    ((item, args.max_gt_per_score) for item in manifest["items"]),
+                    chunksize=1,
+                )
+            )
+    else:
+        score_rows = [
+            score_level_metrics(item, max_gt_per_score=args.max_gt_per_score)
+            for item in manifest["items"]
+        ]
 
     output = {
         "prediction_manifest": str(args.prediction_manifest.resolve()),

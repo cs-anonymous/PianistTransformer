@@ -29,6 +29,7 @@ from src.model.integrated_pianoformer import (
     _compute_integrated_loss_components,
 )
 from src.utils.func import filter_valid_args
+from src.utils.inr_midi import raw_rows_to_epr_bins, raw_rows_to_model_continuous
 
 
 os.environ["WANDB_PROJECT"] = "pianist-transformer"
@@ -122,6 +123,44 @@ def infer_input_feature_mode(config):
         if task_type == "csr" and int(input_dim) <= 7:
             return "legacy"
     return "integrated"
+
+
+def rows_to_model_continuous(rows, timing_normalization="legacy_log1p", max_time_ms=10000.0, rows_are_raw=False):
+    if rows_are_raw:
+        return raw_rows_to_model_continuous(
+            rows,
+            timing_normalization=timing_normalization,
+            max_time_ms=max_time_ms,
+        )
+    return rows
+
+
+def score_shared_rows(score, timing_normalization="legacy_log1p", max_time_ms=10000.0):
+    if "score_raw" in score:
+        return rows_to_model_continuous(
+            score["score_raw"],
+            timing_normalization=timing_normalization,
+            max_time_ms=max_time_ms,
+            rows_are_raw=True,
+        )
+    return score["score_continuous"]
+
+
+def performance_label_rows(perf, timing_normalization="legacy_log1p", max_time_ms=10000.0):
+    if "label_raw" in perf:
+        return rows_to_model_continuous(
+            perf["label_raw"],
+            timing_normalization=timing_normalization,
+            max_time_ms=max_time_ms,
+            rows_are_raw=True,
+        )
+    return perf["label_continuous"]
+
+
+def performance_label_bins(perf, timing_bins=5000, value_bins=128):
+    if "label_raw" not in perf:
+        return None
+    return raw_rows_to_epr_bins(perf["label_raw"], timing_bins=timing_bins, value_bins=value_bins)
 
 
 def make_score_note_input(score_continuous, score_feature, has_score_feature, input_feature_mode):
@@ -245,11 +284,19 @@ class PianoCoReNodeSFTDataset(Dataset):
         max_performances_per_work=None,
         max_windows_per_work=None,
         cache_size=2,
+        timing_normalization="legacy_log1p",
+        max_time_ms=10000.0,
+        epr_timing_bins=5000,
+        epr_value_bins=128,
     ):
         super().__init__()
         self.split = split
         self.task_type = task_type
         self.input_feature_mode = input_feature_mode
+        self.timing_normalization = timing_normalization
+        self.max_time_ms = max_time_ms
+        self.epr_timing_bins = epr_timing_bins
+        self.epr_value_bins = epr_value_bins
         items = list(manifest)
         if shuffle:
             random.Random(seed).shuffle(items)
@@ -334,23 +381,39 @@ class PianoCoReNodeSFTDataset(Dataset):
         # metadata counted one of those rows, wrap to a valid performance instead
         # of making DistributedSampler lengths uneven.
         perf = performances[int(perf_slot) % len(performances)]
-        labels = perf["label_continuous"]
+        labels = performance_label_rows(
+            perf,
+            timing_normalization=self.timing_normalization,
+            max_time_ms=self.max_time_ms,
+        )
+        label_bins = performance_label_bins(
+            perf,
+            timing_bins=self.epr_timing_bins,
+            value_bins=self.epr_value_bins,
+        )
         interpolated = perf["interpolated"]
         task_type = self.task_type.lower()
         if task_type == "epr":
             score_feature = score.get("score_feature", [[0.0] * 8 for _ in score["pitch"]])
             has_score_feature = score.get("has_score_feature", [0] * len(score["pitch"]))
+            score_shared = score_shared_rows(
+                score,
+                timing_normalization=self.timing_normalization,
+                max_time_ms=self.max_time_ms,
+            )
             continuous = make_score_note_input(
-                score["score_continuous"][start:end],
+                score_shared[start:end],
                 score_feature[start:end],
                 has_score_feature[start:end],
                 self.input_feature_mode,
             )
             labels_continuous = labels[start:end]
+            labels_epr_bins = label_bins[start:end] if label_bins is not None else None
             label_mask = None
         elif task_type == "csr":
             continuous = make_performance_note_input(labels[start:end], self.input_feature_mode)
             labels_continuous = score["score_feature"][start:end]
+            labels_epr_bins = None
             label_mask = score["has_score_feature"][start:end]
         else:
             raise ValueError(f"Unsupported task_type: {self.task_type}")
@@ -363,6 +426,8 @@ class PianoCoReNodeSFTDataset(Dataset):
             "performance_dataset": perf.get("performance_dataset", "unknown"),
             "performance_id": perf.get("performance_id", "unknown"),
         }
+        if labels_epr_bins is not None:
+            sample["labels_epr_bins"] = labels_epr_bins
         if label_mask is not None:
             sample["label_mask"] = label_mask
         return sample
@@ -382,6 +447,7 @@ class NodeSFTTrainer(Trainer):
             outputs.logits.detach(),
             inputs["labels_continuous"].detach(),
             inputs["attention_mask"].detach(),
+            labels_epr_bins=inputs.get("labels_epr_bins"),
         )
         if not getattr(self, "_loss_component_sums", None):
             self._loss_component_sums = {name: 0.0 for name in components}
@@ -547,6 +613,11 @@ class NodeSFTDataCollator:
         interpolated_tensors = [
             torch.tensor(example["interpolated"], dtype=torch.bool) for example in examples
         ]
+        labels_epr_bins_tensors = None
+        if all("labels_epr_bins" in example for example in examples):
+            labels_epr_bins_tensors = [
+                torch.tensor(example["labels_epr_bins"], dtype=torch.long) for example in examples
+            ]
 
         pitch_ids = pad_sequence(pitch_tensors, batch_first=True, padding_value=self.pitch_pad_id)
         continuous = pad_sequence(continuous_tensors, batch_first=True, padding_value=0.0)
@@ -560,13 +631,20 @@ class NodeSFTDataCollator:
             loss_mask = pad_sequence(label_mask_tensors, batch_first=True, padding_value=0)
             attention_mask = attention_mask * loss_mask
 
-        return {
+        batch = {
             "pitch_ids": pitch_ids,
             "continuous": continuous,
             "labels_continuous": labels_continuous,
             "attention_mask": attention_mask,
             "interpolated": interpolated,
         }
+        if labels_epr_bins_tensors is not None:
+            batch["labels_epr_bins"] = pad_sequence(
+                labels_epr_bins_tensors,
+                batch_first=True,
+                padding_value=0,
+            )
+        return batch
 
 
 def create_model(train_config):
@@ -639,6 +717,10 @@ def create_model(train_config):
         epr_distribution=train_config.get("epr_distribution", "point"),
         beta_eps=train_config.get("beta_eps", 1e-5),
         beta_kappa_min=train_config.get("beta_kappa_min", 1e-3),
+        epr_timing_bins=train_config.get("epr_timing_bins", 5000),
+        epr_value_bins=train_config.get("epr_value_bins", 128),
+        soft_ce_tau=train_config.get("soft_ce_tau"),
+        timing_input_normalization=train_config.get("timing_input_normalization", "legacy_log1p"),
         prior_token_keep_prob=train_config.get("prior_token_keep_prob", 1.0),
         torch_dtype=dtype,
     )
@@ -786,6 +868,10 @@ def main():
         max_performances_per_work=train_config.get("max_performances_per_work"),
         max_windows_per_work=train_config.get("max_windows_per_work"),
         cache_size=train_config.get("node_cache_size", 16),
+        timing_normalization=train_config.get("timing_input_normalization", "legacy_log1p"),
+        max_time_ms=train_config.get("max_time_ms", 10000.0),
+        epr_timing_bins=train_config.get("epr_timing_bins", 5000),
+        epr_value_bins=train_config.get("epr_value_bins", 128),
     )
     eval_dataset = PianoCoReNodeSFTDataset(
         eval_manifest,
@@ -797,6 +883,10 @@ def main():
         max_performances_per_work=train_config.get("max_eval_performances_per_work"),
         max_windows_per_work=train_config.get("max_eval_windows_per_work"),
         cache_size=train_config.get("node_cache_size", 16),
+        timing_normalization=train_config.get("timing_input_normalization", "legacy_log1p"),
+        max_time_ms=train_config.get("max_time_ms", 10000.0),
+        epr_timing_bins=train_config.get("epr_timing_bins", 5000),
+        epr_value_bins=train_config.get("epr_value_bins", 128),
     )
 
     model = create_model(train_config)

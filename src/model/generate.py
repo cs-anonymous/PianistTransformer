@@ -47,6 +47,7 @@ def batch_performance_render(
         overlap_ratio=0.125, 
         temperature=1.0,
         top_p=0.95,
+        do_sample=True,
         device="cpu",
         progress_callback=None
     ):
@@ -87,33 +88,44 @@ def batch_performance_render(
             )
         ])
         if i == 0:
+            generation_kwargs = {
+                "input_ids": input_ids[:,start:end],
+                "do_sample": do_sample,
+                "max_new_tokens": end-start,
+                "logits_processor": logits_processor,
+            }
+            if do_sample:
+                generation_kwargs["temperature"] = temperature
+                generation_kwargs["top_p"] = top_p
             output = model.generate(
-                input_ids[:,start:end], 
-                do_sample=True, 
-                max_new_tokens=end-start, 
-                logits_processor=logits_processor,
-                temperature=temperature,
-                top_p=top_p,
+                **generation_kwargs,
             )
-            res_tensor = output[:,1:]
+            generated_tokens = output[:, 1:]
+            res_tensor = generated_tokens
         else:
             last_start, last_end = windows[i-1]
-            length = int(((last_end-last_start) - (start-last_start)) * 0.2)
-            decoder_input_ids = output_list[i-1][:, start-last_start:last_end-last_start - length]
+            overlap_len = max(0, last_end - start)
+            decoder_input_ids = output_list[i-1][:, start - last_start:last_end - last_start]
             start_tensor = torch.tensor([[model.config.bos_token_id] for _ in range(input_ids.shape[0])], dtype=torch.long).to(device)
             decoder_input_ids = torch.cat([start_tensor, decoder_input_ids], dim=1)
             #print(decoder_input_ids.shape)
+            new_token_count = end - start - overlap_len
+            generation_kwargs = {
+                "input_ids": input_ids[:,start:end],
+                "decoder_input_ids": decoder_input_ids,
+                "do_sample": do_sample,
+                "max_new_tokens": new_token_count,
+                "logits_processor": logits_processor,
+            }
+            if do_sample:
+                generation_kwargs["temperature"] = temperature
+                generation_kwargs["top_p"] = top_p
             output = model.generate(
-                input_ids[:,start:end], 
-                decoder_input_ids=decoder_input_ids,
-                do_sample=True, 
-                max_new_tokens=end-last_end+length, 
-                logits_processor=logits_processor,
-                temperature=temperature,
-                top_p=top_p,
+                **generation_kwargs,
             )
-            res_tensor = torch.cat([res_tensor[:,:-length], output[:,-(end-last_end+length):]], dim=1)
-        output_list.append(output)
+            generated_tokens = output[:, 1:]
+            res_tensor = torch.cat([res_tensor, generated_tokens[:, -new_token_count:]], dim=1)
+        output_list.append(generated_tokens)
     res_tensor = res_tensor.cpu().numpy().tolist()
     #print(res_tensor)
     res = []

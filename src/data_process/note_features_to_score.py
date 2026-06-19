@@ -98,7 +98,12 @@ def quantize(value: float, grid: float = SCORE_GRID) -> float:
     return round(float(value) / grid) * grid
 
 
-def denorm_score_feature(row: list[float]) -> tuple[float, float, float]:
+def denorm_score_feature(row: list[float], raw_grid: bool = False) -> tuple[float, float, float]:
+    if raw_grid:
+        mo = quantize(clamp(row[0], 0.0, 6.0))
+        md = quantize(clamp(row[1], 0.0, 4.0))
+        ml = quantize(clamp(row[2], 0.0, 6.0))
+        return mo, md, ml
     mo = quantize(clamp(row[0], 0.0, 1.0) * 6.0)
     md = quantize(clamp(row[1], 0.0, 1.0) * 4.0)
     ml = quantize(clamp(row[2], 0.0, 1.0) * 6.0)
@@ -290,6 +295,7 @@ def events_from_score_feature(payload: dict[str, Any]) -> tuple[list[NoteEvent],
     pitches = [int(value) for value in score["pitch"]]
     features = score.get("score_feature") or []
     has = score.get("has_score_feature") or [1] * len(pitches)
+    raw_grid = (payload.get("meta") or {}).get("score_feature_unit") == "quarter_length_raw_grid_1/24"
 
     events: list[NoteEvent] = []
     measure_infos: list[MeasureInfo] = []
@@ -298,7 +304,7 @@ def events_from_score_feature(payload: dict[str, Any]) -> tuple[list[NoteEvent],
     current_length = 4.0
     for idx, pitch_value in enumerate(pitches):
         row = features[idx] if idx < len(features) else [0.0] * 8
-        mo, md, ml = denorm_score_feature(row)
+        mo, md, ml = denorm_score_feature(row, raw_grid=raw_grid)
         has_feature = idx < len(has) and bool(has[idx])
         starts_new_measure = idx > 0 and has_feature and ml > 0 and (row[3] >= 0.5 or mo <= prev_offset + 1e-6)
         if starts_new_measure:

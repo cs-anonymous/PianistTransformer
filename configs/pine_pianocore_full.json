@@ -57,7 +57,7 @@
     "ioi": 1.0,
     "duration": 1.0,
     "velocity": 1.0,
-    "pedal": 0.2
+    "pedal": 1.0
   },
   "encoder_layers_num": 10,
   "decoder_layers_num": 2,

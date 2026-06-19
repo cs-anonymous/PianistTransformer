@@ -137,6 +137,12 @@ def normalize_affine(value: float, minimum: float, maximum: float) -> float:
     return clamp01((float(value) - minimum) / (maximum - minimum))
 
 
+def clamp_score_grid_value(value: float, minimum: float, maximum: float) -> float:
+    if math.isnan(value):
+        return minimum
+    return min(max(float(value), minimum), maximum)
+
+
 def safe_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -470,9 +476,9 @@ def parse_xml_features(raw_zip: ZipResolver, score_xml_path: str, timeout_sec: f
         score_continuous.append([clamp01(float(velocities[idx]) / 127.0)])
         score_structure.append(
             [
-                normalize_affine(offsets[idx], PARAMS["offset"]["min"], PARAMS["offset"]["max"]),
-                normalize_affine(durations[idx], PARAMS["duration"]["min"], PARAMS["duration"]["max"]),
-                normalize_affine(ml_raw, 0.0, PARAMS["downbeat"]["max"]),
+                clamp_score_grid_value(offsets[idx], PARAMS["offset"]["min"], PARAMS["offset"]["max"]),
+                clamp_score_grid_value(durations[idx], PARAMS["duration"]["min"], PARAMS["duration"]["max"]),
+                clamp_score_grid_value(ml_raw, 0.0, PARAMS["downbeat"]["max"]),
                 first,
             ]
         )

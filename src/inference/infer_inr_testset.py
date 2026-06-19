@@ -1,6 +1,7 @@
 import argparse
 import json
 import math
+import multiprocessing as mp
 import random
 import sys
 from collections import defaultdict
@@ -20,6 +21,7 @@ from src.train.train_inr import (
     create_model,
     infer_input_feature_mode,
     make_score_note_input,
+    score_shared_rows,
 )
 from src.utils.inr_midi import note_features_to_midi
 
@@ -35,10 +37,13 @@ def parse_args():
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--max-works", type=int, default=None)
     parser.add_argument("--batch-size-windows", type=int, default=8)
+    parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-gt-per-score", type=int, default=None)
+    parser.add_argument("--performance-dataset", type=str, default=None,
+                        help="Optional performance_dataset filter, e.g. ASAP. Restricts scores and GT refs.")
     parser.add_argument("--merge-mode", choices=["continuation", "average"], default="continuation")
-    parser.add_argument("--continuation-drop-ratio", type=float, default=0.2)
+    parser.add_argument("--continuation-drop-ratio", type=float, default=0.0)
     return parser.parse_args()
 
 
@@ -66,12 +71,19 @@ def score_midi_dir_from_processed(refined_dir: str) -> Path:
     return refined_path.parent / "refined"
 
 
-def list_gt_midis(metadata_path: str, score_source: str, split: str, limit: int | None = None):
+def list_gt_midis(
+    metadata_path: str,
+    score_source: str,
+    split: str,
+    limit: int | None = None,
+    performance_dataset: str | None = None,
+):
     df = pd.read_csv(
         metadata_path,
         usecols=[
             "tier_a",
             "split",
+            "performance_dataset",
             "refined_score_midi_path",
             "refined_performance_midi_path",
         ],
@@ -80,19 +92,26 @@ def list_gt_midis(metadata_path: str, score_source: str, split: str, limit: int 
     df = df[df["split"] == split]
     df = df[df["refined_score_midi_path"] == score_source]
     df = df[df["refined_performance_midi_path"].notna()]
+    if performance_dataset is not None:
+        df = df[df["performance_dataset"].fillna("").astype(str) == str(performance_dataset)]
     paths = sorted(df["refined_performance_midi_path"].unique().tolist())
     if limit is not None:
         paths = paths[:limit]
     return paths
 
 
-def load_score_from_node(path: Path, input_feature_mode: str):
+def load_score_from_node(path: Path, input_feature_mode: str, timing_normalization="legacy_log1p", max_time_ms=10000.0):
     with open(path, "r", encoding="utf-8") as file:
         work = json.load(file)
     score = work["score"]
     pitch = score["pitch"]
+    score_shared = score_shared_rows(
+        score,
+        timing_normalization=timing_normalization,
+        max_time_ms=max_time_ms,
+    )
     continuous = make_score_note_input(
-        score["score_continuous"],
+        score_shared,
         score.get("score_feature", [[0.0] * 8 for _ in pitch]),
         score.get("has_score_feature", [0] * len(pitch)),
         input_feature_mode,
@@ -181,7 +200,7 @@ def continuation_window_predictions(
             overlap_len = max(0, last_end - start)
             keep_prefix_len = max(0, overlap_len - int(overlap_len * drop_ratio))
             if keep_prefix_len > 0:
-                prefix_predictions = window_predictions[-1][:, overlap_len - keep_prefix_len : overlap_len]
+                prefix_predictions = window_predictions[-1][:, overlap_len - keep_prefix_len : overlap_len].to(device)
 
         with torch.no_grad():
             pred = model.predict_performance_continuous(
@@ -215,18 +234,212 @@ def maybe_warn_sampling(protocol: str, num_samples: int, checkpoint: str | None)
         print(f"Loading checkpoint: {checkpoint}")
 
 
+def load_model(config, device):
+    model = create_model(config)
+    model.to(device)
+    model.eval()
+    return model
+
+
+def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir):
+    score_source = work["score_source"]
+    pitch, continuous = load_score_from_node(
+        Path(work["path"]),
+        config["input_feature_mode"],
+        timing_normalization=config.get("timing_input_normalization", "legacy_log1p"),
+        max_time_ms=config.get("max_time_ms", 10000.0),
+    )
+    windows = build_windows(len(pitch), config["block_notes"], config["overlap_ratio"])
+    gt_rel_paths = list_gt_midis(
+        config["metadata_path"],
+        score_source=score_source,
+        split=args.split,
+        limit=args.max_gt_per_score,
+        performance_dataset=args.performance_dataset,
+    )
+
+    prediction_paths = []
+    for sample_idx in range(args.num_samples):
+        sample_seed = args.seed + sample_idx
+        random.seed(sample_seed)
+        torch.manual_seed(sample_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(sample_seed)
+
+        pred_continuous = batch_window_predictions(
+            model=model,
+            pitch=pitch,
+            continuous=continuous,
+            windows=windows,
+            pitch_pad_id=config["pitch_pad_id"],
+            device=device,
+            batch_size=args.batch_size_windows,
+        ) if args.merge_mode == "average" else continuation_window_predictions(
+            model=model,
+            pitch=pitch,
+            continuous=continuous,
+            windows=windows,
+            pitch_pad_id=config["pitch_pad_id"],
+            device=device,
+            sampling_strategy="sample" if args.protocol == "sampling" else "mean",
+            drop_ratio=args.continuation_drop_ratio,
+        )
+        midi_obj = note_features_to_midi(
+            pitch=pitch,
+            continuous=pred_continuous.tolist(),
+            target_ticks_per_beat=500,
+            target_tempo=120,
+            max_time_ms=config["max_time_ms"],
+            normalized=config.get("timing_input_normalization", "legacy_log1p"),
+        )
+        pred_path = midi_dir / f"{Path(score_source).with_suffix('').as_posix().replace('/', '__')}__sample_{sample_idx:03d}.mid"
+        pred_path.parent.mkdir(parents=True, exist_ok=True)
+        midi_obj.dump(str(pred_path))
+        prediction_paths.append(str(pred_path.resolve()))
+
+    score_midi_path = score_midi_dir / score_source
+    gt_paths = [str((score_midi_dir / gt_rel).resolve()) for gt_rel in gt_rel_paths]
+    return {
+        "score_source": score_source,
+        "score_midi": str(score_midi_path.resolve()),
+        "prediction_paths": prediction_paths,
+        "ground_truth_paths": gt_paths,
+        "note_count": len(pitch),
+        "num_windows": len(windows),
+    }
+
+
+def worker_loop(worker_idx, args, config, score_midi_dir, job_queue, result_queue):
+    random.seed(args.seed + worker_idx)
+    torch.manual_seed(args.seed + worker_idx)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed + worker_idx)
+    device = select_device(args.device)
+    print(f"Worker {worker_idx} using device: {device}", flush=True)
+    model = load_model(config, device)
+    midi_dir = args.output_dir / "midis"
+    midi_dir.mkdir(parents=True, exist_ok=True)
+
+    while True:
+        job = job_queue.get()
+        if job is None:
+            break
+        job_idx, work = job
+        try:
+            item = predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir)
+            result_queue.put((job_idx, item, None))
+        except Exception as exc:  # noqa: BLE001
+            result_queue.put((job_idx, None, repr(exc)))
+
+
+def run_dynamic_pool(args, config, manifest, score_midi_dir):
+    ctx = mp.get_context("spawn")
+    job_queue = ctx.Queue()
+    result_queue = ctx.Queue()
+    workers = [
+        ctx.Process(target=worker_loop, args=(idx, args, config, score_midi_dir, job_queue, result_queue))
+        for idx in range(args.num_workers)
+    ]
+    for worker in workers:
+        worker.start()
+    for job_idx, work in enumerate(manifest):
+        job_queue.put((job_idx, work))
+    for _ in workers:
+        job_queue.put(None)
+
+    items_by_idx = {}
+    with tqdm(total=len(manifest), desc=f"INR inference pool ({args.protocol})") as progress:
+        for _ in range(len(manifest)):
+            job_idx, item, error = result_queue.get()
+            if error is not None:
+                for worker in workers:
+                    worker.terminate()
+                raise RuntimeError(f"Worker failed on job {job_idx}: {error}")
+            items_by_idx[job_idx] = item
+            progress.update(1)
+
+    for worker in workers:
+        worker.join()
+        if worker.exitcode != 0:
+            raise RuntimeError(f"Worker {worker.pid} exited with code {worker.exitcode}")
+
+    return [items_by_idx[idx] for idx in range(len(manifest))]
+
+
+def run_single_process(args, config, manifest, score_midi_dir):
+    device = select_device(args.device)
+    print(f"Using device: {device}")
+    model = load_model(config, device)
+    midi_dir = args.output_dir / "midis"
+    midi_dir.mkdir(parents=True, exist_ok=True)
+
+    items = []
+    iterator = tqdm(manifest, desc=f"INR inference ({args.protocol})")
+    for work in iterator:
+        items.append(predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir))
+    return items
+
+
+def build_pair_list(items):
+    return [
+        {"pred": pred_path, "gt": gt_path}
+        for item in items
+        for pred_path in item["prediction_paths"]
+        for gt_path in item["ground_truth_paths"]
+    ]
+
+
+def filter_manifest_by_performance_dataset(manifest, metadata_path, split, performance_dataset):
+    if performance_dataset is None:
+        return manifest
+    df = pd.read_csv(
+        metadata_path,
+        usecols=[
+            "tier_a",
+            "split",
+            "performance_dataset",
+            "refined_score_midi_path",
+            "refined_performance_midi_path",
+        ],
+    )
+    df = df[df["tier_a"].fillna(False).astype(bool)]
+    df = df[df["split"] == split]
+    df = df[df["performance_dataset"].fillna("").astype(str) == str(performance_dataset)]
+    df = df[df["refined_score_midi_path"].notna()]
+    df = df[df["refined_performance_midi_path"].notna()]
+    allowed_scores = set(df["refined_score_midi_path"].unique())
+    filtered = []
+    for item in manifest:
+        if item["score_source"] not in allowed_scores:
+            continue
+        allowed_sources = set(
+            df.loc[
+                df["refined_score_midi_path"] == item["score_source"],
+                "refined_performance_midi_path",
+            ]
+        )
+        copied = dict(item)
+        copied["selected_performance_sources"] = [
+            source for source in item.get("selected_performance_sources", [])
+            if source in allowed_sources
+        ]
+        copied["estimated_performances"] = len(copied["selected_performance_sources"])
+        copied["estimated_examples"] = len(copied["windows"]) * len(copied["selected_performance_sources"])
+        filtered.append(copied)
+    return filtered
+
+
 def main():
     args = parse_args()
     random.seed(args.seed)
     torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    if args.num_workers < 1:
+        raise ValueError("--num-workers must be >= 1")
 
     config = load_config(args.config, args.checkpoint)
     maybe_warn_sampling(args.protocol, args.num_samples, args.checkpoint)
-
-    device = select_device(args.device)
-    model = create_model(config)
-    model.to(device)
-    model.eval()
 
     manifest = build_work_manifest(
         metadata_path=config["metadata_path"],
@@ -237,81 +450,35 @@ def main():
         min_notes=config["min_notes"],
         max_works=args.max_works,
     )
+    manifest = filter_manifest_by_performance_dataset(
+        manifest,
+        metadata_path=config["metadata_path"],
+        split=args.split,
+        performance_dataset=args.performance_dataset,
+    )
     score_midi_dir = score_midi_dir_from_processed(config["refined_dir"])
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    midi_dir = args.output_dir / "midis"
-    midi_dir.mkdir(parents=True, exist_ok=True)
-
-    items = []
-    iterator = tqdm(manifest, desc=f"INR inference ({args.protocol})")
-    for work in iterator:
-        score_source = work["score_source"]
-        pitch, continuous = load_score_from_node(Path(work["path"]), config["input_feature_mode"])
-        windows = build_windows(len(pitch), config["block_notes"], config["overlap_ratio"])
-        gt_rel_paths = list_gt_midis(
-            config["metadata_path"],
-            score_source=score_source,
-            split=args.split,
-            limit=args.max_gt_per_score,
-        )
-
-        prediction_paths = []
-        for sample_idx in range(args.num_samples):
-            pred_continuous = batch_window_predictions(
-                model=model,
-                pitch=pitch,
-                continuous=continuous,
-                windows=windows,
-                pitch_pad_id=config["pitch_pad_id"],
-                device=device,
-                batch_size=args.batch_size_windows,
-            ) if args.merge_mode == "average" else continuation_window_predictions(
-                model=model,
-                pitch=pitch,
-                continuous=continuous,
-                windows=windows,
-                pitch_pad_id=config["pitch_pad_id"],
-                device=device,
-                sampling_strategy="sample" if args.protocol == "sampling" else "mean",
-                drop_ratio=args.continuation_drop_ratio,
-            )
-            midi_obj = note_features_to_midi(
-                pitch=pitch,
-                continuous=pred_continuous.tolist(),
-                target_ticks_per_beat=500,
-                target_tempo=120,
-                max_time_ms=config["max_time_ms"],
-                normalized=True,
-            )
-            pred_path = midi_dir / f"{Path(score_source).with_suffix('').as_posix().replace('/', '__')}__sample_{sample_idx:03d}.mid"
-            pred_path.parent.mkdir(parents=True, exist_ok=True)
-            midi_obj.dump(str(pred_path))
-            prediction_paths.append(str(pred_path.resolve()))
-
-        score_midi_path = score_midi_dir / score_source
-        gt_paths = [str((score_midi_dir / gt_rel).resolve()) for gt_rel in gt_rel_paths]
-        items.append(
-            {
-                "score_source": score_source,
-                "score_midi": str(score_midi_path.resolve()),
-                "prediction_paths": prediction_paths,
-                "ground_truth_paths": gt_paths,
-                "note_count": len(pitch),
-                "num_windows": len(windows),
-            }
-        )
+    if args.num_workers > 1:
+        items = run_dynamic_pool(args, config, manifest, score_midi_dir)
+    else:
+        items = run_single_process(args, config, manifest, score_midi_dir)
 
     manifest_path = args.output_dir / "prediction_manifest.json"
+    pair_list_path = args.output_dir / "evaluate_list.json"
     manifest_payload = {
         "config": str(args.config.resolve()),
         "checkpoint": args.checkpoint or config.get("resume_path"),
         "protocol": args.protocol,
         "num_samples": args.num_samples,
+        "num_workers": args.num_workers,
         "split": args.split,
         "items": items,
     }
+    pair_list = build_pair_list(items)
     manifest_path.write_text(json.dumps(manifest_payload, indent=2, ensure_ascii=False))
+    pair_list_path.write_text(json.dumps(pair_list, indent=2, ensure_ascii=False))
     print(f"Saved prediction manifest to {manifest_path}")
+    print(f"Saved pair list to {pair_list_path}")
 
 
 if __name__ == "__main__":

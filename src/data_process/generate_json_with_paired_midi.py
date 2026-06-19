@@ -14,10 +14,10 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src.utils.inr_midi import CONTINUOUS_KEYS, midi_to_note_features, sorted_piano_notes
+from src.utils.inr_midi import RAW_CONTINUOUS_KEYS, midi_to_note_features, sorted_piano_notes
 
 
-SCHEMA_VERSION = "pianocore_node_work_v1"
+SCHEMA_VERSION = "pianocore_node_work_raw_v2"
 JSON_SUFFIX = ".json"
 
 
@@ -81,10 +81,18 @@ def optional_value(record, key):
     return value
 
 
-def round_continuous(rows, precision):
-    if precision is None:
-        return rows
-    return [[round(float(value), precision) for value in row] for row in rows]
+def raw_rows_to_int(rows):
+    output = []
+    for row in rows:
+        output.append(
+            [
+                max(0, int(round(float(row[0])))),
+                max(0, int(round(float(row[1])))),
+                min(max(int(round(float(row[2]))), 0), 127),
+                *[min(max(int(round(float(value))), 0), 127) for value in row[3:7]],
+            ]
+        )
+    return output
 
 
 def output_path_for_score(refined_dir, output_dir, score_rel_path):
@@ -110,19 +118,19 @@ def build_score_payload(score_midi, max_time_ms, float_precision):
         score_midi,
         notes=score_notes,
         max_time_ms=max_time_ms,
-        normalize=True,
+        normalize=False,
     )
 
     pitch = score_features["pitch"]
-    score_continuous = score_features["continuous"]
-    if len(pitch) != len(score_continuous):
+    score_raw = score_features["continuous"]
+    if len(pitch) != len(score_raw):
         raise ValueError("score_feature_length_mismatch")
     if pitch and (min(pitch) < 0 or max(pitch) > 127):
         raise ValueError("score_pitch_out_of_range")
 
     return {
         "pitch": pitch,
-        "score_continuous": round_continuous(score_continuous, float_precision),
+        "score_raw": raw_rows_to_int(score_raw),
         "note_count": len(pitch),
     }
 
@@ -172,7 +180,7 @@ def build_performance_payload(row, refined_dir, score_pitch, max_time_ms, float_
         performance_midi,
         notes=performance_notes,
         max_time_ms=max_time_ms,
-        normalize=True,
+        normalize=False,
         force_monotonic_starts=True,
     )
 
@@ -188,7 +196,7 @@ def build_performance_payload(row, refined_dir, score_pitch, max_time_ms, float_
         "alignment_source": alignment_rel_path,
         "split": optional_value(row, "split"),
         "tier_a_star": bool(optional_value(row, "tier_a_star")),
-        "label_continuous": round_continuous(performance_features["continuous"], float_precision),
+        "label_raw": raw_rows_to_int(performance_features["continuous"]),
         "interpolated": interpolated,
     }
 
@@ -212,10 +220,12 @@ def build_work_meta(first_row, score_rel_path, performance_count, max_time_ms, f
         "schema": SCHEMA_VERSION,
         "score_source": score_rel_path,
         "performance_count": performance_count,
-        "continuous_keys": list(CONTINUOUS_KEYS),
-        "max_time_ms": max_time_ms,
+        "raw_keys": list(RAW_CONTINUOUS_KEYS),
+        "timing_unit": "ms",
+        "velocity_range": [0, 127],
+        "pedal_range": [0, 127],
         "float_precision": float_precision,
-        "time_normalization": "log1p(ms)/log1p(max_time_ms)",
+        "time_normalization": "raw_ms",
     }
 
     for key in (
