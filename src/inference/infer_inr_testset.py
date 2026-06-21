@@ -23,6 +23,7 @@ from src.train.train_inr import (
     make_score_note_input,
     score_shared_rows,
 )
+from src.model.integrated_pianoformer import canonicalize_start_ctrl_sequence
 from src.utils.inr_midi import note_features_to_midi
 
 
@@ -258,7 +259,11 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
         performance_dataset=args.performance_dataset,
     )
 
+    raw_dir = args.output_dir / "raw_outputs"
+    raw_dir.mkdir(parents=True, exist_ok=True)
     prediction_paths = []
+    raw_output_paths = []
+    score_stem = Path(score_source).with_suffix("").as_posix().replace("/", "__")
     for sample_idx in range(args.num_samples):
         sample_seed = args.seed + sample_idx
         random.seed(sample_seed)
@@ -284,6 +289,9 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
             sampling_strategy="sample" if args.protocol == "sampling" else "mean",
             drop_ratio=args.continuation_drop_ratio,
         )
+        pred_start_ctrl = None
+        if str(config.get("pedal_representation", "continuous_4")).lower() == "start_ctrl":
+            pred_start_ctrl = canonicalize_start_ctrl_sequence(pred_continuous.unsqueeze(0)).squeeze(0)
         midi_obj = note_features_to_midi(
             pitch=pitch,
             continuous=pred_continuous.tolist(),
@@ -292,7 +300,25 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
             max_time_ms=config["max_time_ms"],
             normalized=config.get("timing_input_normalization", "legacy_log1p"),
         )
-        pred_path = midi_dir / f"{Path(score_source).with_suffix('').as_posix().replace('/', '__')}__sample_{sample_idx:03d}.mid"
+        raw_path = raw_dir / f"{score_stem}__sample_{sample_idx:03d}.json"
+        raw_payload = {
+            "score_source": score_source,
+            "protocol": args.protocol,
+            "sample_idx": sample_idx,
+            "seed": sample_seed,
+            "timing_normalization": config.get("timing_input_normalization", "legacy_log1p"),
+            "pitch": [int(value) for value in pitch],
+            "predicted_continuous": pred_continuous.tolist(),
+            "predicted_continuous_start_ctrl": pred_start_ctrl[..., [0, 1, 2, 3, 4]].tolist()
+            if pred_start_ctrl is not None
+            else None,
+            "ground_truth_paths": gt_rel_paths,
+        }
+        raw_path.parent.mkdir(parents=True, exist_ok=True)
+        raw_path.write_text(json.dumps(raw_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        raw_output_paths.append(str(raw_path.resolve()))
+
+        pred_path = midi_dir / f"{score_stem}__sample_{sample_idx:03d}.mid"
         pred_path.parent.mkdir(parents=True, exist_ok=True)
         midi_obj.dump(str(pred_path))
         prediction_paths.append(str(pred_path.resolve()))
@@ -303,6 +329,7 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
         "score_source": score_source,
         "score_midi": str(score_midi_path.resolve()),
         "prediction_paths": prediction_paths,
+        "raw_output_paths": raw_output_paths,
         "ground_truth_paths": gt_paths,
         "note_count": len(pitch),
         "num_windows": len(windows),
@@ -448,7 +475,8 @@ def main():
         block_notes=config["block_notes"],
         overlap_ratio=config["overlap_ratio"],
         min_notes=config["min_notes"],
-        max_works=args.max_works,
+        max_works=None if args.performance_dataset is not None else args.max_works,
+        skip_work_paths=config.get("skip_work_paths"),
     )
     manifest = filter_manifest_by_performance_dataset(
         manifest,
@@ -456,6 +484,8 @@ def main():
         split=args.split,
         performance_dataset=args.performance_dataset,
     )
+    if args.performance_dataset is not None and args.max_works is not None:
+        manifest = manifest[: args.max_works]
     score_midi_dir = score_midi_dir_from_processed(config["refined_dir"])
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.num_workers > 1:

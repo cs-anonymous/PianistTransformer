@@ -236,10 +236,11 @@ def update_one(task: dict[str, Any]) -> dict[str, Any]:
         score = payload["score"]
         pitch = [int(value) for value in score["pitch"]]
         old_score_continuous_dim = len(score["score_continuous"][0]) if score.get("score_continuous") else 0
-        score["score_continuous"] = normalize_existing_score_continuous(
-            score["score_continuous"],
-            args.float_precision,
-        )
+        if "score_continuous" in score:
+            score["score_continuous"] = normalize_existing_score_continuous(
+                score["score_continuous"],
+                args.float_precision,
+            )
 
         try:
             feature_payload = build_score_features(
@@ -277,7 +278,10 @@ def update_one(task: dict[str, Any]) -> dict[str, Any]:
         meta["score_xml_source"] = task["score_xml_path"]
         meta["score_midi_source"] = task["score_midi_path"]
         meta["old_score_continuous_dim"] = old_score_continuous_dim
-        meta["score_continuous_keys"] = ["ioi", "duration", "velocity"]
+        if "score_raw" in score:
+            meta["score_raw_keys"] = ["ioi_ms", "duration_ms", "velocity", "pedal_0", "pedal_25", "pedal_50", "pedal_75"]
+        if "score_continuous" in score:
+            meta["score_continuous_keys"] = ["ioi", "duration", "velocity"]
         meta["score_feature_keys"] = ["mo", "md", "ml", "first", "staff", "trill", "grace", "staccato"]
         meta["score_feature_unit"] = "quarter_length_raw_grid_1/24"
         meta["note_type_keys"] = ["has_score_feature", "has_pedal_feature"]
@@ -360,12 +364,12 @@ def main() -> None:
     parser.add_argument(
         "--summary-path",
         type=Path,
-        default=Path("data/pianocore/PianoCoRe/refined/pianocore_a_integrated_score_feature_update_summary.json"),
+        default=Path("data/pianocore/PianoCoRe/refined/processed_score_feature_update_summary.json"),
     )
     parser.add_argument(
         "--details-path",
         type=Path,
-        default=Path("data/pianocore/PianoCoRe/refined/pianocore_a_integrated_score_feature_update_details.jsonl"),
+        default=Path("data/pianocore/PianoCoRe/refined/processed_score_feature_update_details.jsonl"),
     )
     args = parser.parse_args()
 

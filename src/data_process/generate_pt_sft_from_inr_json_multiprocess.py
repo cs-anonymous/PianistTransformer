@@ -23,6 +23,10 @@ def denormalize_time(value, max_time_ms, normalization):
     value = min(1.0, max(0.0, float(value)))
     if normalization == "log1p":
         ticks = math.expm1(value * math.log1p(float(max_time_ms)))
+    elif normalization == "log1p_x10":
+        ticks = 10.0 * math.expm1(value * math.log1p(float(max_time_ms) / 10.0))
+    elif normalization == "raw":
+        ticks = value
     elif normalization == "linear":
         ticks = value * max_time_ms
     else:
@@ -57,7 +61,14 @@ def continuous_to_pt_tokens(pitch, ioi, duration, velocity, pedals, config):
     return tokens
 
 
-def process_node_json(json_path, max_time_ms, time_normalization, config):
+def process_node_json(
+    json_path,
+    max_time_ms,
+    time_normalization,
+    config,
+    performance_dataset=None,
+    split=None,
+):
     """Process a single INR JSON file."""
     try:
         with open(json_path, 'r', encoding='utf-8') as f:
@@ -72,9 +83,13 @@ def process_node_json(json_path, max_time_ms, time_normalization, config):
         results = []
 
         for perf in data['performances']:
-            perf_id = perf['performance_id']
             perf_source = perf.get('performance_source', '')
-            split = perf.get('split', 'train')
+            perf_dataset = str(perf.get('performance_dataset', ''))
+            perf_split = perf.get('split', 'train')
+            if performance_dataset is not None and perf_dataset != performance_dataset:
+                continue
+            if split is not None and perf_split != split:
+                continue
             label_continuous = perf['label_continuous']
 
             if len(label_continuous) != note_count:
@@ -115,8 +130,9 @@ def process_node_json(json_path, max_time_ms, time_normalization, config):
                 "label": label_tokens,
                 "score_source": score_source,
                 "performance_source": perf_source,
+                "performance_dataset": perf_dataset,
                 "cut": 0,
-                "split": split
+                "split": perf_split
             })
 
         return results
@@ -130,7 +146,9 @@ def main():
     parser.add_argument("--processed-dir", type=str, default="PianoCoRe/processed")
     parser.add_argument("--output-file", type=str, default="data/processed/sft/sft_pianocore_from_json.jsonl")
     parser.add_argument("--max-time-ms", type=float, default=10000.0)
-    parser.add_argument("--time-normalization", type=str, default="log1p", choices=["log1p", "linear"])
+    parser.add_argument("--time-normalization", type=str, default="log1p", choices=["log1p", "log1p_x10", "linear", "raw"])
+    parser.add_argument("--performance-dataset", type=str, default=None, help="Optional performance_dataset filter, e.g. ASAP")
+    parser.add_argument("--split", type=str, default=None, help="Optional split filter, e.g. train or test")
     parser.add_argument("--max-files", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None, help="Number of worker processes (default: CPU count)")
     args = parser.parse_args()
@@ -166,6 +184,8 @@ def main():
         max_time_ms=args.max_time_ms,
         time_normalization=args.time_normalization,
         config=config,
+        performance_dataset=args.performance_dataset,
+        split=args.split,
     )
 
     total_performances = 0

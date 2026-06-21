@@ -65,13 +65,26 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         max_position_embeddings=4096,
         attention_dropout=0.0,
         epr_distribution="point",
+        epr_mixture_components=1,
+        epr_distribution_eps=None,
+        logistic_normal_sigma_min=1e-3,
+        logistic_normal_sigma_max=10.0,
         beta_eps=1e-5,
         beta_kappa_min=1e-3,
+        beta_alpha_min=1e-4,
+        epr_inflated_features=None,
         epr_timing_bins=5000,
         epr_value_bins=128,
         soft_ce_tau=None,
         timing_input_normalization="legacy_log1p",
         prior_token_keep_prob=1.0,
+        prior_token_dropout_mode="mask",
+        pitch_onehot_dim=88,
+        feature_embedding_dim=680,
+        piano_pitch_min=21,
+        pedal_representation="continuous_4",
+        pedal_start_loss_weight=1.0,
+        pedal_ctrl_loss_weight=1.0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -137,8 +150,17 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.max_position_embeddings = max_position_embeddings
         self.attention_dropout = attention_dropout
         self.epr_distribution = epr_distribution
+        self.epr_mixture_components = int(epr_mixture_components)
+        self.epr_distribution_eps = beta_eps if epr_distribution_eps is None else epr_distribution_eps
+        self.logistic_normal_sigma_min = logistic_normal_sigma_min
+        self.logistic_normal_sigma_max = logistic_normal_sigma_max
         self.beta_eps = beta_eps
         self.beta_kappa_min = beta_kappa_min
+        self.beta_alpha_min = beta_alpha_min
+        self.epr_inflated_features = epr_inflated_features or {
+            "ioi": "zero",
+            "pedal": "zero_one",
+        }
         self.epr_timing_bins = int(epr_timing_bins)
         self.epr_value_bins = int(epr_value_bins)
         self.soft_ce_tau = soft_ce_tau or {
@@ -149,6 +171,13 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         }
         self.timing_input_normalization = timing_input_normalization
         self.prior_token_keep_prob = prior_token_keep_prob
+        self.prior_token_dropout_mode = prior_token_dropout_mode
+        self.pitch_onehot_dim = int(pitch_onehot_dim)
+        self.feature_embedding_dim = int(feature_embedding_dim)
+        self.piano_pitch_min = int(piano_pitch_min)
+        self.pedal_representation = str(pedal_representation).lower()
+        self.pedal_start_loss_weight = float(pedal_start_loss_weight)
+        self.pedal_ctrl_loss_weight = float(pedal_ctrl_loss_weight)
 
 
 def _activation(name):
@@ -174,11 +203,12 @@ def _make_mlp(input_dim, output_dim, hidden_dim, depth=2, activation="gelu"):
 
 
 class IntegratedNoteEncoder(nn.Module):
-    def __init__(self, config, continuous_dim=None):
+    def __init__(self, config, continuous_dim=None, role="score"):
         super().__init__()
         self.config = config
         continuous_dim = continuous_dim or config.input_continuous_dim
         self.continuous_dim = continuous_dim
+        self.role = str(role).lower()
         self.mode = getattr(config, "note_embedding_mode", "fine").lower()
         self.special_note_embeddings = nn.Embedding(
             config.special_note_vocab_size,
@@ -187,7 +217,31 @@ class IntegratedNoteEncoder(nn.Module):
         self.embedding_depth = getattr(config, "embedding_depth", 2)
         self.activation = getattr(config, "head_activation", "gelu")
 
-        if self.mode == "pine":
+        if self.mode in {"score_perf", "score_perf_split"}:
+            self.pitch_dim = int(getattr(config, "pitch_onehot_dim", 88))
+            self.feature_dim = int(getattr(config, "feature_embedding_dim", config.hidden_size - self.pitch_dim))
+            if self.pitch_dim + self.feature_dim != config.hidden_size:
+                raise ValueError(
+                    "score_perf embedding requires pitch_onehot_dim + feature_embedding_dim "
+                    f"to equal hidden_size={config.hidden_size}, got {self.pitch_dim}+{self.feature_dim}"
+                )
+            if self.pitch_dim != 88:
+                raise ValueError(f"score_perf embedding currently expects pitch_onehot_dim=88, got {self.pitch_dim}")
+            if self.role == "score":
+                feature_input_dim = 11
+            elif self.role in {"perf", "performance", "decoder"}:
+                feature_input_dim = 7
+            else:
+                raise ValueError(f"Unsupported score_perf encoder role: {self.role}")
+            self.feature_projection = _make_mlp(
+                feature_input_dim,
+                self.feature_dim,
+                self.feature_dim,
+                self.embedding_depth,
+                self.activation,
+            )
+            self.feature_norm = nn.LayerNorm(self.feature_dim)
+        elif self.mode == "pine":
             dims = config.pine_partition_dims
             self.pitch_dim = int(dims["pitch"])
             self.shared_dim = int(dims["shared"])
@@ -236,6 +290,17 @@ class IntegratedNoteEncoder(nn.Module):
             raise ValueError(f"Unsupported note_embedding_mode: {self.mode}")
         self.norm = nn.LayerNorm(config.hidden_size)
 
+    def _pitch_one_hot(self, pitch_ids):
+        pitch_min = int(getattr(self.config, "piano_pitch_min", 21))
+        pitch_index = pitch_ids.long() - pitch_min
+        valid = (pitch_index >= 0) & (pitch_index < self.pitch_dim)
+        safe_index = pitch_index.clamp(0, self.pitch_dim - 1)
+        one_hot = F.one_hot(safe_index, num_classes=self.pitch_dim).to(
+            dtype=self.special_note_embeddings.weight.dtype,
+            device=pitch_ids.device,
+        )
+        return one_hot * valid.unsqueeze(-1).to(dtype=one_hot.dtype)
+
     def _split_groups(self, continuous):
         batch_size, seq_len, _ = continuous.shape
         continuous_dim = continuous.shape[-1]
@@ -268,6 +333,26 @@ class IntegratedNoteEncoder(nn.Module):
         return type_bits, shared, score, pedal
 
     def forward(self, pitch_ids, continuous, special_note_ids=None):
+        if self.mode in {"score_perf", "score_perf_split"}:
+            projection_dtype = self.feature_norm.weight.dtype
+            continuous = continuous.to(dtype=projection_dtype)
+            if self.role == "score":
+                _, shared, score, _ = self._split_groups(continuous)
+                features = torch.cat([shared, score], dim=-1)
+            else:
+                if continuous.shape[-1] >= 9:
+                    _, shared, _, pedal = self._split_groups(continuous)
+                elif continuous.shape[-1] >= 7:
+                    shared = continuous[..., 0:3]
+                    pedal = continuous[..., 3:7]
+                else:
+                    raise ValueError(f"Perf score_perf encoder requires at least 7 continuous dims, got {continuous.shape[-1]}")
+                features = torch.cat([shared, pedal], dim=-1)
+            pitch_embeds = self._pitch_one_hot(pitch_ids).to(dtype=projection_dtype)
+            feature_embeds = self.feature_norm(self.feature_projection(features))
+            embeddings = torch.cat([pitch_embeds, feature_embeds], dim=-1)
+            return self._apply_special_embeddings(embeddings, special_note_ids)
+
         if self.mode == "legacy":
             pitch_embeds = self.pitch_embedding(pitch_ids)
             continuous = continuous.to(dtype=self.continuous_mlp[0].weight.dtype if isinstance(self.continuous_mlp, nn.Sequential) else self.continuous_mlp.weight.dtype)
@@ -318,7 +403,17 @@ class IntegratedContinuousDecoder(nn.Module):
         activation = getattr(config, "head_activation", "gelu")
 
         full_dim = config.hidden_size
-        if self.mode == "pine" and self.head_input_mode == "partitioned":
+        if self.mode in {"score_perf", "score_perf_split"} and self.head_input_mode in {"feature", "partitioned"}:
+            pitch_dim = int(getattr(config, "pitch_onehot_dim", 88))
+            feature_dim = int(getattr(config, "feature_embedding_dim", config.hidden_size - pitch_dim))
+            if pitch_dim + feature_dim != config.hidden_size:
+                raise ValueError(
+                    "score_perf head requires pitch_onehot_dim + feature_embedding_dim "
+                    f"to equal hidden_size={config.hidden_size}, got {pitch_dim}+{feature_dim}"
+                )
+            self.shared_slice = self.score_slice = self.perf_slice = slice(pitch_dim, pitch_dim + feature_dim)
+            shared_dim = score_dim = perf_dim = feature_dim
+        elif self.mode == "pine" and self.head_input_mode == "partitioned":
             dims = config.pine_partition_dims
             self.shared_slice = slice(int(dims["pitch"]), int(dims["pitch"]) + int(dims["shared"]))
             self.score_slice = slice(self.shared_slice.stop, self.shared_slice.stop + int(dims["score"]))
@@ -339,9 +434,43 @@ class IntegratedContinuousDecoder(nn.Module):
         elif getattr(config, "task_type", "epr") == "epr" and self.epr_distribution == "beta_mu_kappa":
             shared_output_dim = 6
             pedal_output_dim = 8
+        elif (
+            getattr(config, "task_type", "epr") == "epr"
+            and self.epr_distribution in {
+                "logistic_normal",
+                "mixture_logistic_normal",
+                "inflated_mixture_logistic_normal",
+                "mixture_beta",
+            }
+        ):
+            components = int(getattr(config, "epr_mixture_components", 1))
+            if components < 1:
+                raise ValueError(f"epr_mixture_components must be >= 1, got {components}")
+            per_feature_dim = components * 3
+            shared_output_dim = per_feature_dim * 3
+            pedal_output_dim = per_feature_dim * 4
+            if self.epr_distribution == "inflated_mixture_logistic_normal":
+                shared_output_dim += 2
+                pedal_output_dim += 3 * 4
         else:
             shared_output_dim = 3
             pedal_output_dim = 4
+
+        self.pedal_representation = str(getattr(config, "pedal_representation", "continuous_4")).lower()
+        if getattr(config, "task_type", "epr") == "epr" and self.pedal_representation == "start_ctrl":
+            if self.epr_distribution in {"categorical", "hard_categorical", "soft_categorical"}:
+                raise ValueError("pedal_representation=start_ctrl is not implemented for categorical EPR heads")
+            if self.epr_distribution == "beta_mu_kappa":
+                pedal_output_dim = 4
+            elif self.epr_distribution in {
+                "logistic_normal",
+                "mixture_logistic_normal",
+                "inflated_mixture_logistic_normal",
+                "mixture_beta",
+            }:
+                pedal_output_dim = int(getattr(config, "epr_mixture_components", 1)) * 3 * 2
+            else:
+                pedal_output_dim = 2
 
         self.shared_head = _make_mlp(shared_dim, shared_output_dim, shared_dim, head_depth, activation)
         self.pedal_head = _make_mlp(perf_dim, pedal_output_dim, perf_dim, head_depth, activation)
@@ -353,7 +482,29 @@ class IntegratedContinuousDecoder(nn.Module):
 
         shared = self.shared_head(hidden_states[..., self.shared_slice])
         pedal = self.pedal_head(hidden_states[..., self.perf_slice])
-        if self.epr_distribution in {"beta_mu_kappa", "categorical", "hard_categorical", "soft_categorical"}:
+        if self.pedal_representation == "start_ctrl":
+            if self.epr_distribution in {
+                "beta_mu_kappa",
+                "categorical",
+                "hard_categorical",
+                "soft_categorical",
+                "logistic_normal",
+                "mixture_logistic_normal",
+                "inflated_mixture_logistic_normal",
+                "mixture_beta",
+            }:
+                return torch.cat([shared, pedal], dim=-1)
+            return torch.cat([torch.sigmoid(shared), pedal], dim=-1)
+        if self.epr_distribution in {
+            "beta_mu_kappa",
+            "categorical",
+            "hard_categorical",
+            "soft_categorical",
+            "logistic_normal",
+            "mixture_logistic_normal",
+            "inflated_mixture_logistic_normal",
+            "mixture_beta",
+        }:
             return torch.cat([shared, pedal], dim=-1)
 
         shared = torch.sigmoid(shared)
@@ -397,9 +548,283 @@ def _beta_params(raw_mu, raw_kappa, eps=1e-5, kappa_min=1e-3):
     return mu, kappa, alpha, beta
 
 
+def _epr_mixture_components(config):
+    components = int(getattr(config, "epr_mixture_components", 1))
+    if components < 1:
+        raise ValueError(f"epr_mixture_components must be >= 1, got {components}")
+    return components
+
+
+def _split_epr_mixture_params(config, raw_outputs):
+    components = _epr_mixture_components(config)
+    per_feature_dim = components * 3
+    shared_base_dim = per_feature_dim * 3
+    pedal_base_dim = per_feature_dim * 4
+    shared_base = raw_outputs[..., :shared_base_dim].reshape(*raw_outputs.shape[:-1], 3, 3, components)
+    distribution = getattr(config, "epr_distribution", "point").lower()
+    pedal_representation = str(getattr(config, "pedal_representation", "continuous_4")).lower()
+    params = {
+        "shared_logits": shared_base[..., 0, :],
+        "shared_a": shared_base[..., 1, :],
+        "shared_b": shared_base[..., 2, :],
+    }
+    if pedal_representation == "start_ctrl":
+        if distribution == "inflated_mixture_logistic_normal":
+            params["ioi_mode_logits"] = raw_outputs[..., shared_base_dim : shared_base_dim + 2]
+        return params
+
+    pedal_start = shared_base_dim
+    if distribution == "inflated_mixture_logistic_normal":
+        pedal_start += 2
+    pedal_end = pedal_start + pedal_base_dim
+    pedal_base = raw_outputs[..., pedal_start:pedal_end].reshape(*raw_outputs.shape[:-1], 4, 3, components)
+    params["pedal_logits"] = pedal_base[..., 0, :]
+    params["pedal_a"] = pedal_base[..., 1, :]
+    params["pedal_b"] = pedal_base[..., 2, :]
+    if distribution == "inflated_mixture_logistic_normal":
+        params["ioi_mode_logits"] = raw_outputs[..., shared_base_dim : shared_base_dim + 2]
+        params["pedal_mode_logits"] = raw_outputs[..., pedal_end : pedal_end + 12].reshape(*raw_outputs.shape[:-1], 4, 3)
+    return params
+
+
+def _pedal_start_ctrl_scalar_dim(config):
+    distribution = getattr(config, "epr_distribution", "point").lower()
+    if distribution == "beta_mu_kappa":
+        return 2
+    if distribution in {
+        "logistic_normal",
+        "mixture_logistic_normal",
+        "inflated_mixture_logistic_normal",
+        "mixture_beta",
+    }:
+        return int(getattr(config, "epr_mixture_components", 1)) * 3
+    return 1
+
+
+def _split_start_ctrl_from_outputs(config, raw_outputs):
+    scalar_dim = _pedal_start_ctrl_scalar_dim(config)
+    pedal_raw = raw_outputs[..., -(2 * scalar_dim):]
+    return {
+        "start_raw": pedal_raw[..., :scalar_dim],
+        "ctrl_raw": pedal_raw[..., scalar_dim:],
+    }
+
+
+def _pedal_start_ctrl_targets(pedal_values, attention_mask=None):
+    values = pedal_values.float().clamp(0.0, 1.0)
+    start = values[..., 0]
+    if start.shape[-1] > 1:
+        raw_next_start = torch.cat([start[..., 1:], start[..., -1:]], dim=-1)
+        if attention_mask is not None:
+            next_valid = torch.cat(
+                [
+                    attention_mask[..., 1:].bool(),
+                    attention_mask[..., -1:].new_zeros(attention_mask[..., -1:].shape, dtype=torch.bool),
+                ],
+                dim=-1,
+            )
+            next_start = torch.where(next_valid, raw_next_start, start)
+        else:
+            next_start = raw_next_start
+    else:
+        next_start = start
+    candidates = values[..., 1:4]
+    lower = torch.minimum(start, next_start).unsqueeze(-1)
+    upper = torch.maximum(start, next_start).unsqueeze(-1)
+    outside_distance = (lower - candidates).clamp_min(0.0) + (candidates - upper).clamp_min(0.0)
+    outside_idx = outside_distance.argmax(dim=-1, keepdim=True)
+    middle_idx = outside_idx.new_full(outside_idx.shape, 1)
+    ctrl_idx = torch.where(outside_distance.max(dim=-1, keepdim=True).values > 0.0, outside_idx, middle_idx)
+    ctrl = candidates.gather(dim=-1, index=ctrl_idx).squeeze(-1)
+    return start, ctrl
+
+
+def materialize_start_ctrl_sequence(predictions, attention_mask=None):
+    predictions = predictions.float().clamp(0.0, 1.0)
+    if predictions.shape[-1] < 7:
+        raise ValueError(f"Expected predictions with 7 continuous dims, got {predictions.shape[-1]}")
+    shared = predictions[..., :3]
+    start = predictions[..., 3].clamp(0.0, 1.0)
+    ctrl = predictions[..., 4].clamp(0.0, 1.0)
+    if start.shape[-1] > 1:
+        raw_next_start = torch.cat([start[..., 1:], start[..., -1:]], dim=-1)
+        if attention_mask is not None:
+            next_valid = torch.cat(
+                [
+                    attention_mask[..., 1:].bool(),
+                    attention_mask[..., -1:].new_zeros(attention_mask[..., -1:].shape, dtype=torch.bool),
+                ],
+                dim=-1,
+            )
+            next_start = torch.where(next_valid, raw_next_start, start)
+        else:
+            next_start = raw_next_start
+    else:
+        next_start = start
+    pedal = torch.stack(
+        [
+            start,
+            (start + ctrl) * 0.5,
+            ctrl,
+            (ctrl + next_start) * 0.5,
+        ],
+        dim=-1,
+    )
+    return torch.cat([shared, pedal.clamp(0.0, 1.0)], dim=-1)
+
+
+def canonicalize_start_ctrl_sequence(predictions):
+    predictions = predictions.float().clamp(0.0, 1.0)
+    if predictions.shape[-1] < 7:
+        raise ValueError(f"Expected predictions with 7 continuous dims, got {predictions.shape[-1]}")
+    shared = predictions[..., :3]
+    start = predictions[..., 3]
+    ctrl = predictions[..., 5]
+    return _pack_start_ctrl_prediction(shared, start, ctrl)
+
+
+def _pack_start_ctrl_prediction(shared, start, ctrl):
+    pedal = torch.stack([start, ctrl, ctrl, start], dim=-1)
+    return torch.cat([shared, pedal], dim=-1).clamp_(0.0, 1.0)
+
+
+def _logistic_normal_params(raw_mu, raw_log_sigma, sigma_min=1e-3, sigma_max=10.0):
+    log_min = torch.log(raw_log_sigma.new_tensor(float(sigma_min)))
+    log_max = torch.log(raw_log_sigma.new_tensor(float(sigma_max)))
+    sigma = torch.exp(raw_log_sigma.float().clamp(min=log_min.item(), max=log_max.item()))
+    return raw_mu.float(), sigma
+
+
+def _mixture_logistic_normal_log_prob(logits, raw_mu, raw_log_sigma, target, eps, sigma_min, sigma_max):
+    target = target.float().clamp(float(eps), 1.0 - float(eps))
+    z = torch.logit(target, eps=float(eps)).unsqueeze(-1)
+    mu, sigma = _logistic_normal_params(raw_mu, raw_log_sigma, sigma_min=sigma_min, sigma_max=sigma_max)
+    log_pi = F.log_softmax(logits.float(), dim=-1)
+    log_normal = torch.distributions.Normal(mu, sigma).log_prob(z)
+    log_jacobian = -torch.log(target).unsqueeze(-1) - torch.log1p(-target).unsqueeze(-1)
+    return torch.logsumexp(log_pi + log_normal + log_jacobian, dim=-1)
+
+
+def _mixture_logistic_normal_nll(logits, raw_mu, raw_log_sigma, target, mask, eps, sigma_min, sigma_max):
+    values = -_mixture_logistic_normal_log_prob(
+        logits,
+        raw_mu,
+        raw_log_sigma,
+        target,
+        eps,
+        sigma_min,
+        sigma_max,
+    )
+    return _masked_mean(values, mask)
+
+
+def _mixture_beta_params(raw_alpha, raw_beta, alpha_min=1e-4):
+    alpha = F.softplus(raw_alpha.float()) + float(alpha_min)
+    beta = F.softplus(raw_beta.float()) + float(alpha_min)
+    mean = alpha / (alpha + beta).clamp_min(1e-12)
+    return alpha, beta, mean
+
+
+def _mixture_beta_log_prob(logits, raw_alpha, raw_beta, target, eps, alpha_min):
+    target = target.float().clamp(float(eps), 1.0 - float(eps)).unsqueeze(-1)
+    alpha, beta, _ = _mixture_beta_params(raw_alpha, raw_beta, alpha_min=alpha_min)
+    log_pi = F.log_softmax(logits.float(), dim=-1)
+    log_beta = torch.distributions.Beta(alpha, beta).log_prob(target)
+    return torch.logsumexp(log_pi + log_beta, dim=-1)
+
+
+def _mixture_beta_nll(logits, raw_alpha, raw_beta, target, mask, eps, alpha_min):
+    values = -_mixture_beta_log_prob(logits, raw_alpha, raw_beta, target, eps, alpha_min)
+    return _masked_mean(values, mask)
+
+
+def _mixture_logistic_normal_mean_or_sample(config, logits, raw_mu, raw_log_sigma, sampling_strategy="mean"):
+    mode = str(sampling_strategy).lower()
+    mu, sigma = _logistic_normal_params(
+        raw_mu,
+        raw_log_sigma,
+        sigma_min=getattr(config, "logistic_normal_sigma_min", 1e-3),
+        sigma_max=getattr(config, "logistic_normal_sigma_max", 10.0),
+    )
+    probs = torch.softmax(logits.float(), dim=-1)
+    if mode in {"mean", "deterministic", "mu", "expected", "expectation"}:
+        return torch.sum(probs * torch.sigmoid(mu), dim=-1)
+    if mode in {"argmax", "greedy"}:
+        index = probs.argmax(dim=-1, keepdim=True)
+        return torch.sigmoid(mu.gather(dim=-1, index=index).squeeze(-1))
+    if mode in {"sample", "sampling", "stochastic"}:
+        index = torch.distributions.Categorical(probs=probs).sample().unsqueeze(-1)
+        sampled_mu = mu.gather(dim=-1, index=index).squeeze(-1)
+        sampled_sigma = sigma.gather(dim=-1, index=index).squeeze(-1)
+        return torch.sigmoid(torch.distributions.Normal(sampled_mu, sampled_sigma).sample())
+    raise ValueError(f"Unsupported sampling_strategy: {sampling_strategy}")
+
+
+def _mixture_beta_mean_or_sample(config, logits, raw_alpha, raw_beta, sampling_strategy="mean"):
+    mode = str(sampling_strategy).lower()
+    alpha, beta, mean = _mixture_beta_params(
+        raw_alpha,
+        raw_beta,
+        alpha_min=getattr(config, "beta_alpha_min", 1e-4),
+    )
+    probs = torch.softmax(logits.float(), dim=-1)
+    if mode in {"mean", "deterministic", "mu", "expected", "expectation"}:
+        return torch.sum(probs * mean, dim=-1)
+    if mode in {"argmax", "greedy"}:
+        index = probs.argmax(dim=-1, keepdim=True)
+        return mean.gather(dim=-1, index=index).squeeze(-1)
+    if mode in {"sample", "sampling", "stochastic"}:
+        index = torch.distributions.Categorical(probs=probs).sample().unsqueeze(-1)
+        sampled_alpha = alpha.gather(dim=-1, index=index).squeeze(-1)
+        sampled_beta = beta.gather(dim=-1, index=index).squeeze(-1)
+        return torch.distributions.Beta(sampled_alpha, sampled_beta).sample()
+    raise ValueError(f"Unsupported sampling_strategy: {sampling_strategy}")
+
+
+def _inflated_logistic_normal_nll(config, logits, raw_mu, raw_log_sigma, mode_logits, target, mask, inflation):
+    eps = float(getattr(config, "epr_distribution_eps", getattr(config, "beta_eps", 1e-5)))
+    continuous_log_prob = _mixture_logistic_normal_log_prob(
+        logits,
+        raw_mu,
+        raw_log_sigma,
+        target,
+        eps,
+        getattr(config, "logistic_normal_sigma_min", 1e-3),
+        getattr(config, "logistic_normal_sigma_max", 10.0),
+    )
+    mode_log_probs = F.log_softmax(mode_logits.float(), dim=-1)
+    target = target.float()
+    if inflation == "zero":
+        zero_mask = target <= eps
+        values = torch.where(zero_mask, -mode_log_probs[..., 0], -(mode_log_probs[..., 1] + continuous_log_prob))
+    elif inflation == "zero_one":
+        zero_mask = target <= eps
+        one_mask = target >= 1.0 - eps
+        cont_values = -(mode_log_probs[..., 2] + continuous_log_prob)
+        values = torch.where(zero_mask, -mode_log_probs[..., 0], cont_values)
+        values = torch.where(one_mask, -mode_log_probs[..., 1], values)
+    else:
+        raise ValueError(f"Unsupported inflation mode: {inflation}")
+    return _masked_mean(values, mask)
+
+
 def _categorical_sample_or_argmax(logits, sampling_strategy="mean"):
     mode = str(sampling_strategy).lower()
     if mode in {"mean", "deterministic", "mu", "argmax", "greedy"}:
+        return logits.float().argmax(dim=-1)
+    if mode in {"sample", "sampling", "stochastic"}:
+        probs = torch.softmax(logits.float(), dim=-1)
+        return torch.distributions.Categorical(probs=probs).sample()
+    raise ValueError(f"Unsupported sampling_strategy: {sampling_strategy}")
+
+
+def _soft_categorical_sample_or_expected(logits, sampling_strategy="mean"):
+    mode = str(sampling_strategy).lower()
+    if mode in {"mean", "deterministic", "mu", "expected", "expectation"}:
+        probs = torch.softmax(logits.float(), dim=-1)
+        values = torch.arange(logits.shape[-1], device=logits.device, dtype=probs.dtype)
+        return torch.sum(probs * values, dim=-1)
+    if mode in {"argmax", "greedy"}:
         return logits.float().argmax(dim=-1)
     if mode in {"sample", "sampling", "stochastic"}:
         probs = torch.softmax(logits.float(), dim=-1)
@@ -441,16 +866,157 @@ def _epr_bins_to_normalized(config, ioi_bins, duration_bins, velocity_bins, peda
 
 def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean"):
     distribution = getattr(config, "epr_distribution", "point").lower()
+    pedal_representation = str(getattr(config, "pedal_representation", "continuous_4")).lower()
     if distribution in {"categorical", "hard_categorical", "soft_categorical"}:
         logits = _split_epr_categorical_logits(config, raw_outputs)
-        ioi = _categorical_sample_or_argmax(logits["ioi"], sampling_strategy)
-        duration = _categorical_sample_or_argmax(logits["duration"], sampling_strategy)
-        velocity = _categorical_sample_or_argmax(logits["velocity"], sampling_strategy)
-        pedal = _categorical_sample_or_argmax(logits["pedal"], sampling_strategy)
+        decode = (
+            _soft_categorical_sample_or_expected
+            if distribution == "soft_categorical"
+            else _categorical_sample_or_argmax
+        )
+        ioi = decode(logits["ioi"], sampling_strategy)
+        duration = decode(logits["duration"], sampling_strategy)
+        velocity = decode(logits["velocity"], sampling_strategy)
+        pedal = decode(logits["pedal"], sampling_strategy)
         return _epr_bins_to_normalized(config, ioi, duration, velocity, pedal).to(device=raw_outputs.device)
 
+    if pedal_representation == "start_ctrl":
+        pedal_params = _split_start_ctrl_from_outputs(config, raw_outputs)
+        if distribution == "beta_mu_kappa":
+            def decode_beta(raw):
+                mu, _, alpha, beta = _beta_params(
+                    raw[..., 0],
+                    raw[..., 1],
+                    eps=getattr(config, "beta_eps", 1e-5),
+                    kappa_min=getattr(config, "beta_kappa_min", 1e-3),
+                )
+                mode_name = str(sampling_strategy).lower()
+                if mode_name in {"sample", "sampling", "stochastic"}:
+                    return torch.distributions.Beta(alpha, beta).sample()
+                return mu
+
+            start = decode_beta(pedal_params["start_raw"])
+            ctrl = decode_beta(pedal_params["ctrl_raw"])
+        elif distribution in {
+            "logistic_normal",
+            "mixture_logistic_normal",
+            "inflated_mixture_logistic_normal",
+            "mixture_beta",
+        }:
+            components = int(getattr(config, "epr_mixture_components", 1))
+
+            def decode_mixture(raw):
+                base = raw.reshape(*raw.shape[:-1], 3, components)
+                if distribution == "mixture_beta":
+                    return _mixture_beta_mean_or_sample(
+                        config,
+                        base[..., 0, :],
+                        base[..., 1, :],
+                        base[..., 2, :],
+                        sampling_strategy=sampling_strategy,
+                    )
+                return _mixture_logistic_normal_mean_or_sample(
+                    config,
+                    base[..., 0, :],
+                    base[..., 1, :],
+                    base[..., 2, :],
+                    sampling_strategy=sampling_strategy,
+                )
+
+            start = decode_mixture(pedal_params["start_raw"])
+            ctrl = decode_mixture(pedal_params["ctrl_raw"])
+        else:
+            start = torch.sigmoid(pedal_params["start_raw"].squeeze(-1))
+            ctrl = torch.sigmoid(pedal_params["ctrl_raw"].squeeze(-1))
+
+        if distribution not in {
+            "logistic_normal",
+            "mixture_logistic_normal",
+            "inflated_mixture_logistic_normal",
+            "mixture_beta",
+            "beta_mu_kappa",
+        }:
+            shared = raw_outputs[..., :3].clamp(0.0, 1.0)
+        elif distribution == "beta_mu_kappa":
+            params = _split_epr_distribution_params(raw_outputs)
+            shared_mu, _, shared_alpha, shared_beta = _beta_params(
+                params["shared_mu"],
+                params["shared_kappa"],
+                eps=getattr(config, "beta_eps", 1e-5),
+                kappa_min=getattr(config, "beta_kappa_min", 1e-3),
+            )
+            mode_name = str(sampling_strategy).lower()
+            shared = (
+                torch.distributions.Beta(shared_alpha, shared_beta).sample()
+                if mode_name in {"sample", "sampling", "stochastic"}
+                else shared_mu
+            )
+        else:
+            params = _split_epr_mixture_params(config, raw_outputs)
+            decode = _mixture_beta_mean_or_sample if distribution == "mixture_beta" else _mixture_logistic_normal_mean_or_sample
+            shared = decode(
+                config,
+                params["shared_logits"],
+                params["shared_a"],
+                params["shared_b"],
+                sampling_strategy=sampling_strategy,
+            )
+        return _pack_start_ctrl_prediction(shared, start, ctrl)
+
     if distribution != "beta_mu_kappa":
-        return raw_outputs
+        if distribution not in {
+            "logistic_normal",
+            "mixture_logistic_normal",
+            "inflated_mixture_logistic_normal",
+            "mixture_beta",
+        }:
+            return raw_outputs
+
+        params = _split_epr_mixture_params(config, raw_outputs)
+        if distribution in {"logistic_normal", "mixture_logistic_normal", "inflated_mixture_logistic_normal"}:
+            decode = _mixture_logistic_normal_mean_or_sample
+        else:
+            decode = _mixture_beta_mean_or_sample
+
+        shared = decode(
+            config,
+            params["shared_logits"],
+            params["shared_a"],
+            params["shared_b"],
+            sampling_strategy=sampling_strategy,
+        )
+        pedal = decode(
+            config,
+            params["pedal_logits"],
+            params["pedal_a"],
+            params["pedal_b"],
+            sampling_strategy=sampling_strategy,
+        )
+
+        if distribution == "inflated_mixture_logistic_normal":
+            mode = str(sampling_strategy).lower()
+            ioi_mode_probs = torch.softmax(params["ioi_mode_logits"].float(), dim=-1)
+            pedal_mode_probs = torch.softmax(params["pedal_mode_logits"].float(), dim=-1)
+            if mode in {"mean", "deterministic", "mu", "expected", "expectation"}:
+                shared_ioi = ioi_mode_probs[..., 1] * shared[..., 0]
+                pedal = pedal_mode_probs[..., 1] + pedal_mode_probs[..., 2] * pedal
+            elif mode in {"argmax", "greedy"}:
+                ioi_mode = ioi_mode_probs.argmax(dim=-1)
+                shared_ioi = torch.where(ioi_mode == 0, shared[..., 0].new_zeros(()), shared[..., 0])
+                pedal_mode = pedal_mode_probs.argmax(dim=-1)
+                pedal = torch.where(pedal_mode == 0, pedal.new_zeros(()), pedal)
+                pedal = torch.where(pedal_mode == 1, pedal.new_ones(()), pedal)
+            elif mode in {"sample", "sampling", "stochastic"}:
+                ioi_mode = torch.distributions.Categorical(probs=ioi_mode_probs).sample()
+                shared_ioi = torch.where(ioi_mode == 0, shared[..., 0].new_zeros(()), shared[..., 0])
+                pedal_mode = torch.distributions.Categorical(probs=pedal_mode_probs).sample()
+                pedal = torch.where(pedal_mode == 0, pedal.new_zeros(()), pedal)
+                pedal = torch.where(pedal_mode == 1, pedal.new_ones(()), pedal)
+            else:
+                raise ValueError(f"Unsupported sampling_strategy: {sampling_strategy}")
+            shared = torch.cat([shared_ioi.unsqueeze(-1), shared[..., 1:3]], dim=-1)
+
+        return torch.cat([shared, pedal], dim=-1).clamp_(0.0, 1.0)
 
     params = _split_epr_distribution_params(raw_outputs)
     shared_mu, _, shared_alpha, shared_beta = _beta_params(
@@ -489,30 +1055,62 @@ def _shift_continuous_right(continuous, attention_mask):
     return shifted
 
 
-def _apply_prior_note_dropout(config, decoder_input_continuous, attention_mask):
+def _shift_pitch_right(config, pitch_ids, attention_mask):
+    shifted = pitch_ids.new_full(pitch_ids.shape, int(config.pitch_pad_id))
+    if pitch_ids.shape[1] > 1:
+        shifted[:, 1:] = pitch_ids[:, :-1]
+        prev_mask = attention_mask[:, :-1].bool()
+        shifted[:, 1:] = torch.where(
+            prev_mask,
+            shifted[:, 1:],
+            shifted[:, 1:].new_full(shifted[:, 1:].shape, int(config.pitch_pad_id)),
+        )
+    shifted = torch.where(
+        attention_mask.bool(),
+        shifted,
+        shifted.new_full(shifted.shape, int(config.pitch_pad_id)),
+    )
+    return shifted
+
+
+def _apply_prior_note_dropout(config, decoder_input_continuous, special_note_ids, attention_mask):
     keep_prob = float(getattr(config, "prior_token_keep_prob", 1.0))
     if keep_prob >= 1.0 or decoder_input_continuous.shape[1] <= 1:
-        return decoder_input_continuous
+        return decoder_input_continuous, special_note_ids
 
     valid_mask = attention_mask[:, 1:].bool()
     if not valid_mask.any():
-        return decoder_input_continuous
+        return decoder_input_continuous, special_note_ids
 
     keep_mask = torch.rand(
         decoder_input_continuous.shape[0],
         decoder_input_continuous.shape[1] - 1,
-        1,
         device=decoder_input_continuous.device,
-        dtype=decoder_input_continuous.dtype,
     ) < keep_prob
-    keep_mask = keep_mask & valid_mask.unsqueeze(-1)
+    drop_mask = (~keep_mask) & valid_mask
 
-    dropped = decoder_input_continuous.clone()
-    if dropped.shape[-1] > 2:
-        dropped[:, 1:, 2:] = dropped[:, 1:, 2:] * keep_mask.to(dtype=dropped.dtype)
+    dropout_mode = str(getattr(config, "prior_token_dropout_mode", "mask")).lower()
+    if dropout_mode == "mask":
+        masked_special_note_ids = special_note_ids.clone()
+        mask_id = int(config.special_note_ids.get("mask", 1))
+        masked_special_note_ids[:, 1:] = torch.where(
+            drop_mask,
+            masked_special_note_ids[:, 1:].new_full(masked_special_note_ids[:, 1:].shape, mask_id),
+            masked_special_note_ids[:, 1:],
+        )
+        return decoder_input_continuous, masked_special_note_ids
+    if dropout_mode in {"zero", "feature_zero"}:
+        dropped = decoder_input_continuous.clone()
+        keep_mask = keep_mask & valid_mask
+        if dropped.shape[-1] > 2:
+            dropped[:, 1:, 2:] = dropped[:, 1:, 2:] * keep_mask.unsqueeze(-1).to(dtype=dropped.dtype)
+        else:
+            dropped[:, 1:] = dropped[:, 1:] * keep_mask.unsqueeze(-1).to(dtype=dropped.dtype)
+        return dropped, special_note_ids
+    if dropout_mode in {"none", "off"}:
+        return decoder_input_continuous, special_note_ids
     else:
-        dropped[:, 1:] = dropped[:, 1:] * keep_mask.to(dtype=dropped.dtype)
-    return dropped
+        raise ValueError(f"Unsupported prior_token_dropout_mode: {dropout_mode}")
 
 
 def _build_ar_special_note_ids(config, attention_mask):
@@ -802,6 +1400,255 @@ def _compute_integrated_loss_components(config, continuous_pred, labels_continuo
             raise ValueError("Categorical EPR loss requires labels_epr_bins")
         return _compute_epr_categorical_loss_components(config, continuous_pred, labels_epr_bins, mask)
 
+    pedal_representation = str(getattr(config, "pedal_representation", "continuous_4")).lower()
+    if pedal_representation == "start_ctrl":
+        start_ctrl = _split_start_ctrl_from_outputs(config, continuous_pred)
+        start_target, ctrl_target = _pedal_start_ctrl_targets(labels_continuous[..., 3:7], mask)
+
+        if distribution in {
+            "logistic_normal",
+            "mixture_logistic_normal",
+            "inflated_mixture_logistic_normal",
+            "mixture_beta",
+        }:
+            params = _split_epr_mixture_params(config, continuous_pred)
+            eps = getattr(config, "epr_distribution_eps", getattr(config, "beta_eps", 1e-5))
+            sigma_min = getattr(config, "logistic_normal_sigma_min", 1e-3)
+            sigma_max = getattr(config, "logistic_normal_sigma_max", 10.0)
+            alpha_min = getattr(config, "beta_alpha_min", 1e-4)
+
+            if distribution == "mixture_beta":
+                def loss_one(logits, raw_a, raw_b, target):
+                    return _mixture_beta_nll(logits, raw_a, raw_b, target, mask, eps, alpha_min)
+            else:
+                def loss_one(logits, raw_a, raw_b, target):
+                    return _mixture_logistic_normal_nll(
+                        logits,
+                        raw_a,
+                        raw_b,
+                        target,
+                        mask,
+                        eps,
+                        sigma_min,
+                        sigma_max,
+                    )
+
+            loss_ioi = loss_one(
+                params["shared_logits"][..., 0, :],
+                params["shared_a"][..., 0, :],
+                params["shared_b"][..., 0, :],
+                labels_continuous[..., 0],
+            )
+            loss_duration = loss_one(
+                params["shared_logits"][..., 1, :],
+                params["shared_a"][..., 1, :],
+                params["shared_b"][..., 1, :],
+                labels_continuous[..., 1],
+            )
+            loss_velocity = loss_one(
+                params["shared_logits"][..., 2, :],
+                params["shared_a"][..., 2, :],
+                params["shared_b"][..., 2, :],
+                labels_continuous[..., 2],
+            )
+            components = int(getattr(config, "epr_mixture_components", 1))
+            start_base = start_ctrl["start_raw"].reshape(*start_ctrl["start_raw"].shape[:-1], 3, components)
+            ctrl_base = start_ctrl["ctrl_raw"].reshape(*start_ctrl["ctrl_raw"].shape[:-1], 3, components)
+            loss_pedal_start = loss_one(
+                start_base[..., 0, :],
+                start_base[..., 1, :],
+                start_base[..., 2, :],
+                start_target,
+            )
+            loss_pedal_ctrl = loss_one(
+                ctrl_base[..., 0, :],
+                ctrl_base[..., 1, :],
+                ctrl_base[..., 2, :],
+                ctrl_target,
+            )
+        elif distribution == "beta_mu_kappa":
+            params = _split_epr_distribution_params(continuous_pred)
+            eps = getattr(config, "beta_eps", 1e-5)
+            kappa_min = getattr(config, "beta_kappa_min", 1e-3)
+            loss_ioi = _beta_nll_loss(
+                params["shared_mu"][..., 0],
+                params["shared_kappa"][..., 0],
+                labels_continuous[..., 0],
+                mask,
+                eps,
+                kappa_min,
+            )
+            loss_duration = _beta_nll_loss(
+                params["shared_mu"][..., 1],
+                params["shared_kappa"][..., 1],
+                labels_continuous[..., 1],
+                mask,
+                eps,
+                kappa_min,
+            )
+            loss_velocity = _beta_nll_loss(
+                params["shared_mu"][..., 2],
+                params["shared_kappa"][..., 2],
+                labels_continuous[..., 2],
+                mask,
+                eps,
+                kappa_min,
+            )
+            loss_pedal_start = _beta_nll_loss(
+                start_ctrl["start_raw"][..., 0],
+                start_ctrl["start_raw"][..., 1],
+                start_target,
+                mask,
+                eps,
+                kappa_min,
+            )
+            loss_pedal_ctrl = _beta_nll_loss(
+                start_ctrl["ctrl_raw"][..., 0],
+                start_ctrl["ctrl_raw"][..., 1],
+                ctrl_target,
+                mask,
+                eps,
+                kappa_min,
+            )
+        else:
+            loss_ioi = _regression_loss(
+                continuous_pred[..., 0],
+                labels_continuous[..., 0],
+                mask,
+                config.time_loss_type,
+                config.huber_delta,
+            )
+            loss_duration = _regression_loss(
+                continuous_pred[..., 1],
+                labels_continuous[..., 1],
+                mask,
+                config.time_loss_type,
+                config.huber_delta,
+            )
+            loss_velocity = _regression_loss(
+                continuous_pred[..., 2],
+                labels_continuous[..., 2],
+                mask,
+                config.value_loss_type,
+                config.huber_delta,
+            )
+            loss_pedal_start = _regression_loss(
+                torch.sigmoid(start_ctrl["start_raw"].squeeze(-1)),
+                start_target,
+                mask,
+                config.value_loss_type,
+                config.huber_delta,
+            )
+            loss_pedal_ctrl = _regression_loss(
+                torch.sigmoid(start_ctrl["ctrl_raw"].squeeze(-1)),
+                ctrl_target,
+                mask,
+                config.value_loss_type,
+                config.huber_delta,
+            )
+        start_weight = float(getattr(config, "pedal_start_loss_weight", 1.0))
+        ctrl_weight = float(getattr(config, "pedal_ctrl_loss_weight", 1.0))
+        loss_pedal = (start_weight * loss_pedal_start + ctrl_weight * loss_pedal_ctrl) / max(
+            start_weight + ctrl_weight,
+            1e-12,
+        )
+        return {
+            "ioi": loss_ioi,
+            "duration": loss_duration,
+            "velocity": loss_velocity,
+            "pedal": loss_pedal,
+        }
+
+    if distribution in {
+        "logistic_normal",
+        "mixture_logistic_normal",
+        "inflated_mixture_logistic_normal",
+        "mixture_beta",
+    }:
+        params = _split_epr_mixture_params(config, continuous_pred)
+        eps = getattr(config, "epr_distribution_eps", getattr(config, "beta_eps", 1e-5))
+        sigma_min = getattr(config, "logistic_normal_sigma_min", 1e-3)
+        sigma_max = getattr(config, "logistic_normal_sigma_max", 10.0)
+        alpha_min = getattr(config, "beta_alpha_min", 1e-4)
+
+        if distribution == "mixture_beta":
+            def loss_one(logits, raw_a, raw_b, target):
+                return _mixture_beta_nll(logits, raw_a, raw_b, target, mask, eps, alpha_min)
+        else:
+            def loss_one(logits, raw_a, raw_b, target):
+                return _mixture_logistic_normal_nll(
+                    logits,
+                    raw_a,
+                    raw_b,
+                    target,
+                    mask,
+                    eps,
+                    sigma_min,
+                    sigma_max,
+                )
+
+        if distribution == "inflated_mixture_logistic_normal":
+            loss_ioi = _inflated_logistic_normal_nll(
+                config,
+                params["shared_logits"][..., 0, :],
+                params["shared_a"][..., 0, :],
+                params["shared_b"][..., 0, :],
+                params["ioi_mode_logits"],
+                labels_continuous[..., 0],
+                mask,
+                "zero",
+            )
+        else:
+            loss_ioi = loss_one(
+                params["shared_logits"][..., 0, :],
+                params["shared_a"][..., 0, :],
+                params["shared_b"][..., 0, :],
+                labels_continuous[..., 0],
+            )
+
+        loss_duration = loss_one(
+            params["shared_logits"][..., 1, :],
+            params["shared_a"][..., 1, :],
+            params["shared_b"][..., 1, :],
+            labels_continuous[..., 1],
+        )
+        loss_velocity = loss_one(
+            params["shared_logits"][..., 2, :],
+            params["shared_a"][..., 2, :],
+            params["shared_b"][..., 2, :],
+            labels_continuous[..., 2],
+        )
+        pedal_losses = []
+        for idx in range(4):
+            if distribution == "inflated_mixture_logistic_normal":
+                pedal_losses.append(
+                    _inflated_logistic_normal_nll(
+                        config,
+                        params["pedal_logits"][..., idx, :],
+                        params["pedal_a"][..., idx, :],
+                        params["pedal_b"][..., idx, :],
+                        params["pedal_mode_logits"][..., idx, :],
+                        labels_continuous[..., 3 + idx],
+                        mask,
+                        "zero_one",
+                    )
+                )
+            else:
+                pedal_losses.append(
+                    loss_one(
+                        params["pedal_logits"][..., idx, :],
+                        params["pedal_a"][..., idx, :],
+                        params["pedal_b"][..., idx, :],
+                        labels_continuous[..., 3 + idx],
+                    )
+                )
+        return {
+            "ioi": loss_ioi,
+            "duration": loss_duration,
+            "velocity": loss_velocity,
+            "pedal": torch.stack(pedal_losses).mean(),
+        }
+
     if getattr(config, "epr_distribution", "point").lower() == "beta_mu_kappa":
         params = _split_epr_distribution_params(continuous_pred)
         eps = getattr(config, "beta_eps", 1e-5)
@@ -1078,9 +1925,14 @@ class IntegratedPianoTransformer(nn.Module):
     def __init__(self, config: IntegratedPianoT5GemmaConfig):
         super().__init__()
         self.config = config
-        self.note_encoder = IntegratedNoteEncoder(config)
-        if getattr(config, "note_embedding_mode", "fine").lower() == "legacy":
-            self._decoder_note_encoder = IntegratedNoteEncoder(config, continuous_dim=config.output_continuous_dim + 2)
+        self.note_encoder = IntegratedNoteEncoder(config, role="score")
+        embedding_mode = getattr(config, "note_embedding_mode", "fine").lower()
+        if embedding_mode in {"legacy", "score_perf", "score_perf_split"}:
+            self._decoder_note_encoder = IntegratedNoteEncoder(
+                config,
+                continuous_dim=config.output_continuous_dim + 2,
+                role="perf",
+            )
         else:
             self._decoder_note_encoder = None
         self.continuous_decoder = IntegratedContinuousDecoder(config)
@@ -1129,15 +1981,17 @@ class IntegratedPianoTransformer(nn.Module):
                     getattr(self.config, "input_feature_mode", "integrated"),
                 )
                 decoder_input_continuous = _shift_continuous_right(decoder_target_continuous, attention_mask)
+                special_note_ids = _build_ar_special_note_ids(self.config, attention_mask)
                 if self.training:
-                    decoder_input_continuous = _apply_prior_note_dropout(
+                    decoder_input_continuous, special_note_ids = _apply_prior_note_dropout(
                         self.config,
                         decoder_input_continuous,
+                        special_note_ids,
                         attention_mask,
                     )
-                special_note_ids = _build_ar_special_note_ids(self.config, attention_mask)
+                decoder_pitch_ids = _shift_pitch_right(self.config, pitch_ids, attention_mask)
                 performance_embeds = self.decoder_note_encoder(
-                    pitch_ids,
+                    decoder_pitch_ids,
                     decoder_input_continuous,
                     special_note_ids=special_note_ids,
                 )
@@ -1164,6 +2018,8 @@ class IntegratedPianoTransformer(nn.Module):
                 continuous_pred,
                 sampling_strategy=continuous_sampling_strategy,
             )
+            if str(getattr(self.config, "pedal_representation", "continuous_4")).lower() == "start_ctrl":
+                continuous_pred = materialize_start_ctrl_sequence(continuous_pred, attention_mask)
 
         loss = None
         if labels_continuous is not None:
@@ -1213,15 +2069,22 @@ class IntegratedPianoTransformer(nn.Module):
             self.config,
             attention_mask,
             self.config.output_continuous_dim,
-            prefix_predictions=prefix_predictions,
+            prefix_predictions=canonicalize_start_ctrl_sequence(prefix_predictions)
+            if (
+                prefix_predictions is not None
+                and self.config.task_type == "epr"
+                and str(getattr(self.config, "pedal_representation", "continuous_4")).lower() == "start_ctrl"
+            )
+            else prefix_predictions,
         )
+        decoder_pitch_ids = _shift_pitch_right(self.config, pitch_ids, attention_mask)
         predictions = []
         if prefix_predictions is not None and prefix_len > 0:
             predictions.extend(prefix_predictions[:, idx : idx + 1] for idx in range(prefix_len))
 
         for step in range(prefix_len, seq_len):
             perf_prefix_embeds = self.decoder_note_encoder(
-                pitch_ids[:, : step + 1],
+                decoder_pitch_ids[:, : step + 1],
                 decoder_input_continuous[:, : step + 1],
                 special_note_ids=special_note_ids[:, : step + 1],
             )
@@ -1242,7 +2105,10 @@ class IntegratedPianoTransformer(nn.Module):
                     decoder_input_continuous[:, step + 1, 0] = 1.0
                 decoder_input_continuous[:, step + 1, 2:] = step_pred[:, 0, :]
 
-        return torch.cat(predictions, dim=1) if predictions else torch.zeros_like(continuous)
+        output = torch.cat(predictions, dim=1) if predictions else torch.zeros_like(continuous)
+        if str(getattr(self.config, "pedal_representation", "continuous_4")).lower() == "start_ctrl":
+            output = materialize_start_ctrl_sequence(output, attention_mask)
+        return output
 
 
 class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
@@ -1256,9 +2122,14 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
     def __init__(self, config: IntegratedPianoT5GemmaConfig):
         config.is_encoder_decoder = True
         super().__init__(config)
-        self.note_encoder = IntegratedNoteEncoder(config)
-        if getattr(config, "note_embedding_mode", "fine").lower() == "legacy":
-            self._decoder_note_encoder = IntegratedNoteEncoder(config, continuous_dim=config.output_continuous_dim + 2)
+        self.note_encoder = IntegratedNoteEncoder(config, role="score")
+        embedding_mode = getattr(config, "note_embedding_mode", "fine").lower()
+        if embedding_mode in {"legacy", "score_perf", "score_perf_split"}:
+            self._decoder_note_encoder = IntegratedNoteEncoder(
+                config,
+                continuous_dim=config.output_continuous_dim + 2,
+                role="perf",
+            )
         else:
             self._decoder_note_encoder = None
         self.model = IntegratedPianoT5GemmaModel(config)
@@ -1299,15 +2170,17 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
                 getattr(self.config, "input_feature_mode", "integrated"),
             )
             decoder_input_continuous = _shift_continuous_right(decoder_target_continuous, attention_mask)
+            special_note_ids = _build_ar_special_note_ids(self.config, attention_mask)
             if self.training:
-                decoder_input_continuous = _apply_prior_note_dropout(
+                decoder_input_continuous, special_note_ids = _apply_prior_note_dropout(
                     self.config,
                     decoder_input_continuous,
+                    special_note_ids,
                     attention_mask,
                 )
-            special_note_ids = _build_ar_special_note_ids(self.config, attention_mask)
+            decoder_pitch_ids = _shift_pitch_right(self.config, pitch_ids, attention_mask)
             decoder_inputs_embeds = self.decoder_note_encoder(
-                pitch_ids,
+                decoder_pitch_ids,
                 decoder_input_continuous,
                 special_note_ids=special_note_ids,
             )
@@ -1403,6 +2276,8 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
                 continuous_pred,
                 sampling_strategy=continuous_sampling_strategy,
             )
+            if str(getattr(self.config, "pedal_representation", "continuous_4")).lower() == "start_ctrl":
+                continuous_pred = materialize_start_ctrl_sequence(continuous_pred, attention_mask)
 
         loss = None
         if labels_continuous is not None:
@@ -1481,8 +2356,15 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
             self.config,
             attention_mask,
             self.config.output_continuous_dim,
-            prefix_predictions=prefix_predictions,
+            prefix_predictions=canonicalize_start_ctrl_sequence(prefix_predictions)
+            if (
+                prefix_predictions is not None
+                and self.config.task_type == "epr"
+                and str(getattr(self.config, "pedal_representation", "continuous_4")).lower() == "start_ctrl"
+            )
+            else prefix_predictions,
         )
+        decoder_pitch_ids = _shift_pitch_right(self.config, pitch_ids, attention_mask)
         if prefix_len >= seq_len:
             return prefix_predictions[:, :seq_len]
         predictions = []
@@ -1499,7 +2381,7 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
         if prefix_len > 0:
             prime_len = prefix_len + 1
             decoder_inputs_embeds = self.decoder_note_encoder(
-                pitch_ids[:, :prime_len],
+                decoder_pitch_ids[:, :prime_len],
                 decoder_input_continuous[:, :prime_len],
                 special_note_ids=special_note_ids[:, :prime_len],
             )
@@ -1519,7 +2401,7 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
             if prefix_len == 0 and step == 0:
                 # First step: process prefix of length 1
                 decoder_inputs_embeds = self.decoder_note_encoder(
-                    pitch_ids[:, :1],
+                    decoder_pitch_ids[:, :1],
                     decoder_input_continuous[:, :1],
                     special_note_ids=special_note_ids[:, :1],
                 )
@@ -1541,7 +2423,7 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
                 # Subsequent steps: process only the new token
                 step_idx = step
                 decoder_inputs_embeds = self.decoder_note_encoder(
-                    pitch_ids[:, step_idx:step_idx+1],
+                    decoder_pitch_ids[:, step_idx:step_idx+1],
                     decoder_input_continuous[:, step_idx:step_idx+1],
                     special_note_ids=special_note_ids[:, step_idx:step_idx+1],
                 )
@@ -1574,4 +2456,7 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
                     decoder_input_continuous[:, step + 1, 0] = 1.0
                 decoder_input_continuous[:, step + 1, 2:] = step_pred[:, 0, :]
 
-        return torch.cat(predictions, dim=1) if predictions else torch.zeros_like(continuous)
+        output = torch.cat(predictions, dim=1) if predictions else torch.zeros_like(continuous)
+        if str(getattr(self.config, "pedal_representation", "continuous_4")).lower() == "start_ctrl":
+            output = materialize_start_ctrl_sequence(output, attention_mask)
+        return output

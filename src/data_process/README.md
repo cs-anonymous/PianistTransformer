@@ -10,18 +10,25 @@ python src/data_process/generate_json_with_paired_midi.py --overwrite
 
 This stage reads PianoCoRe-A metadata, refined score MIDI, refined performance
 MIDI, and PianoCoRe alignment files. It writes one work-level JSON beside each
-refined score MIDI:
+refined score MIDI, or mirrors the refined tree under `--output-dir`.
 
 ```text
 data/pianocore/PianoCoRe/refined/**/*.json
 ```
 
-The output contains:
+The raw v3 output contains:
 
 - `score.pitch`
-- `score.score_continuous`
-- `performances[].label_continuous`
+- `score.score_raw`
+- `performances[].label_shared_raw`
+- `performances[].label_pedal4_raw`
+- `performances[].label_pedal2_raw`
 - `performances[].interpolated`
+
+`label_shared_raw` stores `ioi_ms`, `duration_ms`, and `velocity`.
+`label_pedal4_raw` stores the PT-style four sampled pedal values.
+`label_pedal2_raw` stores the native start/control pedal representation
+extracted directly from MIDI CC64 curves, not converted from `label_pedal4_raw`.
 
 ## 2. Update JSON Score Feature With XML
 

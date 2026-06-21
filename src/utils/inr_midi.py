@@ -26,6 +26,24 @@ RAW_CONTINUOUS_KEYS = (
     "pedal_75",
 )
 
+RAW_SHARED_KEYS = (
+    "ioi_ms",
+    "duration_ms",
+    "velocity",
+)
+
+RAW_PEDAL4_KEYS = (
+    "pedal_0",
+    "pedal_25",
+    "pedal_50",
+    "pedal_75",
+)
+
+RAW_PEDAL2_KEYS = (
+    "pedal_start",
+    "pedal_ctrl",
+)
+
 
 def sorted_piano_notes(midi_obj):
     notes = []
@@ -153,6 +171,28 @@ def _cc_value_at_ms(cc_times_ms, cc_values, query_ms):
     return cc_values[idx - 1]
 
 
+def _cc_extreme_value_between_ms(cc_times_ms, cc_values, start_ms, end_ms, start_value, next_start_value):
+    if end_ms <= start_ms:
+        return start_value
+    lower = min(start_value, next_start_value)
+    upper = max(start_value, next_start_value)
+    left = bisect.bisect_right(cc_times_ms, start_ms)
+    right = bisect.bisect_right(cc_times_ms, end_ms)
+    values = [next_start_value]
+    values.extend(cc_values[left:right])
+
+    best_value = _cc_value_at_ms(cc_times_ms, cc_values, start_ms + (end_ms - start_ms) * 0.5)
+    best_distance = -1.0
+    for value in values:
+        distance = max(lower - value, 0.0, value - upper)
+        if distance > best_distance:
+            best_distance = distance
+            best_value = value
+    if best_distance <= 0.0:
+        return _cc_value_at_ms(cc_times_ms, cc_values, start_ms + (end_ms - start_ms) * 0.5)
+    return best_value
+
+
 def _deduplicate_controls(control_changes):
     output = []
     last_value = None
@@ -169,6 +209,7 @@ def midi_to_note_features(
     max_time_ms=10000.0,
     normalize=True,
     force_monotonic_starts=False,
+    include_pedal2=False,
 ):
     """Convert a MIDI object to note-level pitch and continuous features.
 
@@ -191,6 +232,7 @@ def midi_to_note_features(
 
     pitches = []
     continuous = []
+    pedal2 = []
     last_start_ms = 0.0
 
     for idx, note in enumerate(notes):
@@ -208,17 +250,35 @@ def midi_to_note_features(
             _cc_value_at_ms(pedal_times_ms, pedal_values, start_ms + next_ioi_ms * 0.50),
             _cc_value_at_ms(pedal_times_ms, pedal_values, start_ms + next_ioi_ms * 0.75),
         ]
+        pedal_start = pedal_samples[0]
+        next_pedal_start = _cc_value_at_ms(pedal_times_ms, pedal_values, next_start_ms)
+        pedal_ctrl = _cc_extreme_value_between_ms(
+            pedal_times_ms,
+            pedal_values,
+            start_ms,
+            next_start_ms,
+            pedal_start,
+            next_pedal_start,
+        )
 
         if normalize:
             ioi_value = normalize_time_ms(ioi_ms, max_time_ms=max_time_ms)
             duration_value = normalize_time_ms(duration_ms, max_time_ms=max_time_ms)
             velocity_value = min(max(float(note.velocity) / 127.0, 0.0), 1.0)
             pedal_values_out = [min(max(float(value) / 127.0, 0.0), 1.0) for value in pedal_samples]
+            pedal2_values_out = [
+                min(max(float(pedal_start) / 127.0, 0.0), 1.0),
+                min(max(float(pedal_ctrl) / 127.0, 0.0), 1.0),
+            ]
         else:
             ioi_value = ioi_ms
             duration_value = duration_ms
             velocity_value = min(max(float(note.velocity), 0.0), 127.0)
             pedal_values_out = [min(max(float(value), 0.0), 127.0) for value in pedal_samples]
+            pedal2_values_out = [
+                min(max(float(pedal_start), 0.0), 127.0),
+                min(max(float(pedal_ctrl), 0.0), 127.0),
+            ]
 
         pitches.append(int(note.pitch))
         continuous.append(
@@ -229,11 +289,17 @@ def midi_to_note_features(
                 *pedal_values_out,
             ]
         )
+        pedal2.append(pedal2_values_out)
 
-    return {
+    result = {
         "pitch": pitches,
         "continuous": continuous,
     }
+    if include_pedal2:
+        result["shared"] = [row[:3] for row in continuous]
+        result["pedal4"] = [row[3:7] for row in continuous]
+        result["pedal2"] = pedal2
+    return result
 
 
 def note_features_to_midi(

@@ -26,11 +26,15 @@ from miditoolkit import MidiFile
 warnings.filterwarnings("ignore", message="The pynvml package is deprecated.*", category=FutureWarning)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-TOKENIZER_ROOT = REPO_ROOT / "MIDI2ScoreTransformer" / "midi2scoretransformer"
+TOKENIZER_ROOTS = [
+    REPO_ROOT / "MIDI2ScoreTransformer" / "midi2scoretransformer",
+    REPO_ROOT / "backup" / "MIDI2ScoreTransformer" / "midi2scoretransformer",
+]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-if str(TOKENIZER_ROOT) not in sys.path:
-    sys.path.insert(0, str(TOKENIZER_ROOT))
+for tokenizer_root in reversed(TOKENIZER_ROOTS):
+    if tokenizer_root.exists() and str(tokenizer_root) not in sys.path:
+        sys.path.insert(0, str(tokenizer_root))
 
 
 def patch_music21_strip_ties_preserve_voices() -> None:

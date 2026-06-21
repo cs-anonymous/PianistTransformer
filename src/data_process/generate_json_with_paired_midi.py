@@ -14,10 +14,17 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src.utils.inr_midi import RAW_CONTINUOUS_KEYS, midi_to_note_features, sorted_piano_notes
+from src.utils.inr_midi import (
+    RAW_CONTINUOUS_KEYS,
+    RAW_PEDAL2_KEYS,
+    RAW_PEDAL4_KEYS,
+    RAW_SHARED_KEYS,
+    midi_to_note_features,
+    sorted_piano_notes,
+)
 
 
-SCHEMA_VERSION = "pianocore_node_work_raw_v2"
+SCHEMA_VERSION = "pianocore_node_work_raw_v3"
 JSON_SUFFIX = ".json"
 
 
@@ -51,6 +58,7 @@ OPTIONAL_COLUMNS = [
 
 def find_refined_dir(pianocore_dir):
     candidates = [
+        Path(pianocore_dir) / "refined",
         Path(pianocore_dir) / "PianoCoRe" / "refined",
         Path(pianocore_dir) / "PianoCoRe-1.0" / "refined",
     ]
@@ -90,6 +98,29 @@ def raw_rows_to_int(rows):
                 max(0, int(round(float(row[1])))),
                 min(max(int(round(float(row[2]))), 0), 127),
                 *[min(max(int(round(float(value))), 0), 127) for value in row[3:7]],
+            ]
+        )
+    return output
+
+
+def value_rows_to_int(rows, width):
+    output = []
+    for row in rows:
+        values = list(row)
+        if len(values) < width:
+            raise ValueError(f"value_row_width_mismatch: expected {width}, got {len(values)}")
+        output.append([min(max(int(round(float(value))), 0), 127) for value in values[:width]])
+    return output
+
+
+def shared_rows_to_int(rows):
+    output = []
+    for row in rows:
+        output.append(
+            [
+                max(0, int(round(float(row[0])))),
+                max(0, int(round(float(row[1])))),
+                min(max(int(round(float(row[2]))), 0), 127),
             ]
         )
     return output
@@ -182,12 +213,15 @@ def build_performance_payload(row, refined_dir, score_pitch, max_time_ms, float_
         max_time_ms=max_time_ms,
         normalize=False,
         force_monotonic_starts=True,
+        include_pedal2=True,
     )
 
     if performance_features["pitch"] != score_pitch:
         raise ValueError("pitch_mismatch")
     if len(performance_features["continuous"]) != len(score_pitch):
         raise ValueError("performance_feature_length_mismatch")
+    if len(performance_features["pedal2"]) != len(score_pitch):
+        raise ValueError("performance_pedal2_length_mismatch")
 
     payload = {
         "id": optional_value(row, "id"),
@@ -196,7 +230,9 @@ def build_performance_payload(row, refined_dir, score_pitch, max_time_ms, float_
         "alignment_source": alignment_rel_path,
         "split": optional_value(row, "split"),
         "tier_a_star": bool(optional_value(row, "tier_a_star")),
-        "label_raw": raw_rows_to_int(performance_features["continuous"]),
+        "label_shared_raw": shared_rows_to_int(performance_features["shared"]),
+        "label_pedal4_raw": value_rows_to_int(performance_features["pedal4"], 4),
+        "label_pedal2_raw": value_rows_to_int(performance_features["pedal2"], 2),
         "interpolated": interpolated,
     }
 
@@ -220,7 +256,9 @@ def build_work_meta(first_row, score_rel_path, performance_count, max_time_ms, f
         "schema": SCHEMA_VERSION,
         "score_source": score_rel_path,
         "performance_count": performance_count,
-        "raw_keys": list(RAW_CONTINUOUS_KEYS),
+        "label_shared_raw_keys": list(RAW_SHARED_KEYS),
+        "label_pedal4_raw_keys": list(RAW_PEDAL4_KEYS),
+        "label_pedal2_raw_keys": list(RAW_PEDAL2_KEYS),
         "timing_unit": "ms",
         "velocity_range": [0, 127],
         "pedal_range": [0, 127],
@@ -428,7 +466,7 @@ def main():
     summary_path = (
         Path(args.summary_path)
         if args.summary_path
-        else (output_dir / "summary.json" if output_dir else refined_dir / "pianocore_a_node_summary.json")
+        else (output_dir / "summary.json" if output_dir else refined_dir / "processed_raw_summary.json")
     )
     summary_path.parent.mkdir(parents=True, exist_ok=True)
 

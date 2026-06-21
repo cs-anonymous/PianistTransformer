@@ -6,7 +6,6 @@ import os
 import random
 import shutil
 import re
-import warnings
 from collections import OrderedDict
 from pathlib import Path
 
@@ -14,7 +13,6 @@ import pandas as pd
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
-from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data.sampler import SequentialSampler
 from transformers import Trainer, TrainingArguments
 
@@ -146,21 +144,96 @@ def score_shared_rows(score, timing_normalization="legacy_log1p", max_time_ms=10
     return score["score_continuous"]
 
 
-def performance_label_rows(perf, timing_normalization="legacy_log1p", max_time_ms=10000.0):
-    if "label_raw" in perf:
-        return rows_to_model_continuous(
-            perf["label_raw"],
+def _raw_value_rows(perf, *keys):
+    for key in keys:
+        if key in perf:
+            return perf[key]
+    return None
+
+
+def _compose_label_raw_rows(perf, pedal_representation="continuous_4"):
+    representation = str(pedal_representation or "continuous_4").lower()
+    shared_rows = perf.get("label_shared_raw")
+    if shared_rows is None:
+        if "label_raw" in perf:
+            shared_rows = [row[:3] for row in perf["label_raw"]]
+        else:
+            return None
+
+    if representation == "start_ctrl":
+        pedal_rows = _raw_value_rows(perf, "label_pedal2_raw", "pedal2_raw")
+        if pedal_rows is None:
+            if "label_raw" in perf:
+                pedal_rows = [[row[3], row[5]] for row in perf["label_raw"]]
+            else:
+                return None
+        if len(shared_rows) != len(pedal_rows):
+            raise ValueError(f"label_shared_raw/label_pedal2_raw length mismatch: {len(shared_rows)} vs {len(pedal_rows)}")
+        return [
+            list(shared[:3]) + [pedal[0], pedal[1], pedal[1], pedal[0]]
+            for shared, pedal in zip(shared_rows, pedal_rows)
+        ]
+
+    pedal_rows = _raw_value_rows(perf, "label_pedal4_raw", "pedal4_raw")
+    if pedal_rows is None:
+        if "label_raw" in perf:
+            pedal_rows = [row[3:7] for row in perf["label_raw"]]
+        else:
+            return None
+    if len(shared_rows) != len(pedal_rows):
+        raise ValueError(f"label_shared_raw/label_pedal4_raw length mismatch: {len(shared_rows)} vs {len(pedal_rows)}")
+    return [
+        list(shared[:3]) + list(pedal[:4])
+        for shared, pedal in zip(shared_rows, pedal_rows)
+    ]
+
+
+def performance_label_rows_for_representation(
+    perf,
+    pedal_representation="continuous_4",
+    timing_normalization="legacy_log1p",
+    max_time_ms=10000.0,
+):
+    raw_rows = _compose_label_raw_rows(perf, pedal_representation=pedal_representation)
+    if raw_rows is not None:
+        return raw_rows_to_model_continuous(
+            raw_rows,
             timing_normalization=timing_normalization,
             max_time_ms=max_time_ms,
-            rows_are_raw=True,
         )
+    if str(pedal_representation or "continuous_4").lower() != "continuous_4":
+        raise KeyError(f"Missing raw labels for pedal_representation={pedal_representation}")
     return perf["label_continuous"]
 
 
-def performance_label_bins(perf, timing_bins=5000, value_bins=128):
-    if "label_raw" not in perf:
+def performance_label_bins_for_representation(
+    perf,
+    pedal_representation="continuous_4",
+    timing_bins=5000,
+    value_bins=128,
+):
+    raw_rows = _compose_label_raw_rows(perf, pedal_representation=pedal_representation)
+    if raw_rows is None:
         return None
-    return raw_rows_to_epr_bins(perf["label_raw"], timing_bins=timing_bins, value_bins=value_bins)
+    return raw_rows_to_epr_bins(raw_rows, timing_bins=timing_bins, value_bins=value_bins)
+
+
+def performance_label_rows(perf, timing_normalization="legacy_log1p", max_time_ms=10000.0):
+    return performance_label_rows_for_representation(
+        perf,
+        pedal_representation="continuous_4",
+        timing_normalization=timing_normalization,
+        max_time_ms=max_time_ms,
+    )
+
+
+def performance_label_bins(perf, timing_bins=5000, value_bins=128):
+    return performance_label_bins_for_representation(
+        perf,
+        pedal_representation="continuous_4",
+        timing_bins=timing_bins,
+        value_bins=value_bins,
+    )
 
 
 def make_score_note_input(score_continuous, score_feature, has_score_feature, input_feature_mode):
@@ -210,6 +283,7 @@ def build_work_manifest(
     include_all_performance_dataset=None,
     max_non_asap_performances_per_work=None,
     selection_seed=42,
+    skip_work_paths=None,
 ):
     columns = [
         "tier_a",
@@ -229,6 +303,7 @@ def build_work_manifest(
     df = df.sort_values(["refined_score_midi_path", "refined_performance_midi_path"], kind="stable")
 
     manifest = []
+    skip_work_paths = set(skip_work_paths or [])
     for score_rel_path, group in df.groupby("refined_score_midi_path", sort=True):
         selected_group = group
         if (
@@ -250,6 +325,9 @@ def build_work_manifest(
 
         path = score_json_path(refined_dir, score_rel_path)
         if not path.exists():
+            continue
+        if str(path) in skip_work_paths or score_rel_path in skip_work_paths:
+            print(f"Skipping configured work JSON: {path}", flush=True)
             continue
         note_count = int(group["refined_score_note_count"].iloc[0])
         windows = make_windows(note_count, block_notes, overlap_ratio, min_notes)
@@ -288,6 +366,7 @@ class PianoCoReNodeSFTDataset(Dataset):
         max_time_ms=10000.0,
         epr_timing_bins=5000,
         epr_value_bins=128,
+        pedal_representation="continuous_4",
     ):
         super().__init__()
         self.split = split
@@ -297,6 +376,7 @@ class PianoCoReNodeSFTDataset(Dataset):
         self.max_time_ms = max_time_ms
         self.epr_timing_bins = epr_timing_bins
         self.epr_value_bins = epr_value_bins
+        self.pedal_representation = pedal_representation
         items = list(manifest)
         if shuffle:
             random.Random(seed).shuffle(items)
@@ -330,6 +410,7 @@ class PianoCoReNodeSFTDataset(Dataset):
         self.total_examples = total
         self.cache_size = cache_size
         self._cache = OrderedDict()
+        self._prepared_cache = OrderedDict()
 
     def __len__(self):
         return self.total_examples
@@ -344,8 +425,92 @@ class PianoCoReNodeSFTDataset(Dataset):
         self._cache[path] = work
         self._cache.move_to_end(path)
         while len(self._cache) > self.cache_size:
-            self._cache.popitem(last=False)
+            evicted_path, _ = self._cache.popitem(last=False)
+            self._prepared_cache.pop(evicted_path, None)
         return work
+
+    def _prepare_work(self, path, work):
+        if path in self._prepared_cache:
+            self._prepared_cache.move_to_end(path)
+            return self._prepared_cache[path]
+
+        score = work["score"]
+        performances = [
+            perf for perf in work["performances"]
+            if perf.get("split", self.split) == self.split
+        ]
+        by_source = {perf.get("performance_source"): perf for perf in performances}
+
+        # Cache score inputs and raw-label conversions per dataloader worker.
+        # The new raw schema would otherwise rebuild the same score/performance
+        # tensors for every overlapping window.
+        prepared = {
+            "score": score,
+            "performances": performances,
+            "performances_by_source": by_source,
+            "label_cache": {},
+        }
+
+        task_type = self.task_type.lower()
+        if task_type == "epr":
+            score_feature = score.get("score_feature", [[0.0] * 8 for _ in score["pitch"]])
+            has_score_feature = score.get("has_score_feature", [0] * len(score["pitch"]))
+            score_shared = score_shared_rows(
+                score,
+                timing_normalization=self.timing_normalization,
+                max_time_ms=self.max_time_ms,
+            )
+            prepared["score_input"] = make_score_note_input(
+                score_shared,
+                score_feature,
+                has_score_feature,
+                self.input_feature_mode,
+            )
+        elif task_type == "csr":
+            prepared["score_feature"] = score["score_feature"]
+            prepared["has_score_feature"] = score["has_score_feature"]
+
+        self._prepared_cache[path] = prepared
+        self._prepared_cache.move_to_end(path)
+        while len(self._prepared_cache) > self.cache_size:
+            evicted_path, _ = self._prepared_cache.popitem(last=False)
+            self._cache.pop(evicted_path, None)
+        return prepared
+
+    def _selected_performances(self, prepared, item):
+        selected_sources = item.get("selected_performance_sources")
+        if selected_sources is None:
+            return prepared["performances"]
+        by_source = prepared["performances_by_source"]
+        return [by_source[source] for source in selected_sources if source in by_source]
+
+    def _performance_cache_key(self, perf):
+        return (
+            perf.get("performance_source")
+            or perf.get("performance_id")
+            or id(perf)
+        )
+
+    def _performance_labels(self, prepared, perf):
+        label_cache = prepared["label_cache"]
+        cache_key = self._performance_cache_key(perf)
+        if cache_key in label_cache:
+            return label_cache[cache_key]
+
+        labels = performance_label_rows_for_representation(
+            perf,
+            pedal_representation=self.pedal_representation,
+            timing_normalization=self.timing_normalization,
+            max_time_ms=self.max_time_ms,
+        )
+        label_bins = performance_label_bins_for_representation(
+            perf,
+            pedal_representation=self.pedal_representation,
+            timing_bins=self.epr_timing_bins,
+            value_bins=self.epr_value_bins,
+        )
+        label_cache[cache_key] = (labels, label_bins)
+        return labels, label_bins
 
     def __getitem__(self, index):
         if index < 0:
@@ -365,15 +530,9 @@ class PianoCoReNodeSFTDataset(Dataset):
         start, end = windows[window_slot]
 
         work = self._load_work(item["path"])
-        score = work["score"]
-        performances = [
-            perf for perf in work["performances"]
-            if perf.get("split", self.split) == self.split
-        ]
-        selected_sources = item.get("selected_performance_sources")
-        if selected_sources is not None:
-            by_source = {perf.get("performance_source"): perf for perf in performances}
-            performances = [by_source[source] for source in selected_sources if source in by_source]
+        prepared = self._prepare_work(item["path"], work)
+        score = prepared["score"]
+        performances = self._selected_performances(prepared, item)
         if not performances:
             raise IndexError(f"No performances for split={self.split} in {item['path']}")
 
@@ -381,40 +540,19 @@ class PianoCoReNodeSFTDataset(Dataset):
         # metadata counted one of those rows, wrap to a valid performance instead
         # of making DistributedSampler lengths uneven.
         perf = performances[int(perf_slot) % len(performances)]
-        labels = performance_label_rows(
-            perf,
-            timing_normalization=self.timing_normalization,
-            max_time_ms=self.max_time_ms,
-        )
-        label_bins = performance_label_bins(
-            perf,
-            timing_bins=self.epr_timing_bins,
-            value_bins=self.epr_value_bins,
-        )
+        labels, label_bins = self._performance_labels(prepared, perf)
         interpolated = perf["interpolated"]
         task_type = self.task_type.lower()
         if task_type == "epr":
-            score_feature = score.get("score_feature", [[0.0] * 8 for _ in score["pitch"]])
-            has_score_feature = score.get("has_score_feature", [0] * len(score["pitch"]))
-            score_shared = score_shared_rows(
-                score,
-                timing_normalization=self.timing_normalization,
-                max_time_ms=self.max_time_ms,
-            )
-            continuous = make_score_note_input(
-                score_shared[start:end],
-                score_feature[start:end],
-                has_score_feature[start:end],
-                self.input_feature_mode,
-            )
+            continuous = prepared["score_input"][start:end]
             labels_continuous = labels[start:end]
             labels_epr_bins = label_bins[start:end] if label_bins is not None else None
             label_mask = None
         elif task_type == "csr":
             continuous = make_performance_note_input(labels[start:end], self.input_feature_mode)
-            labels_continuous = score["score_feature"][start:end]
+            labels_continuous = prepared["score_feature"][start:end]
             labels_epr_bins = None
-            label_mask = score["has_score_feature"][start:end]
+            label_mask = prepared["has_score_feature"][start:end]
         else:
             raise ValueError(f"Unsupported task_type: {self.task_type}")
 
@@ -479,17 +617,10 @@ class NodeSFTTrainer(Trainer):
         train_dataset = train_dataset if train_dataset is not None else self.train_dataset
         if train_dataset is None or not hasattr(train_dataset, "__len__"):
             return None
-        if self.args.world_size <= 1:
-            return SequentialSampler(train_dataset)
-        return DistributedSampler(
-            train_dataset,
-            num_replicas=self.args.world_size,
-            rank=self.args.process_index,
-            shuffle=False,
-            drop_last=self.args.dataloader_drop_last,
-        )
-
-
+        # Let Trainer/Accelerate shard this sampler for DDP. Returning a
+        # DistributedSampler here causes a second split and silently halves the
+        # epoch length.
+        return SequentialSampler(train_dataset)
 
     def _list_checkpoint_dirs(self):
         out = Path(self.args.output_dir)
@@ -653,19 +784,68 @@ def create_model(train_config):
     task_type = train_config.get("task_type", "epr").lower()
     input_feature_mode = infer_input_feature_mode(train_config)
     if task_type == "epr":
-        missing_beta_keys = [
-            key for key in ("epr_distribution", "beta_eps", "beta_kappa_min")
-            if key not in train_config
-        ]
-        if missing_beta_keys:
-            warnings.warn(
-                "EPR config is missing probabilistic-head keys "
-                f"{missing_beta_keys}. Falling back to defaults: "
-                f"epr_distribution={train_config.get('epr_distribution', 'point')}, "
-                f"beta_eps={train_config.get('beta_eps', 1e-5)}, "
-                f"beta_kappa_min={train_config.get('beta_kappa_min', 1e-3)}",
-                stacklevel=2,
-            )
+        if "epr_distribution" not in train_config:
+            raise ValueError("EPR config must set epr_distribution explicitly")
+        distribution = str(train_config["epr_distribution"]).lower()
+        supported_distributions = {
+            "point",
+            "huber",
+            "deterministic_huber",
+            "beta_mu_kappa",
+            "categorical",
+            "hard_categorical",
+            "soft_categorical",
+            "logistic_normal",
+            "mixture_logistic_normal",
+            "inflated_mixture_logistic_normal",
+            "mixture_beta",
+        }
+        if distribution not in supported_distributions:
+            raise ValueError(f"Unsupported epr_distribution={distribution}")
+        mixture_distributions = {
+            "logistic_normal",
+            "mixture_logistic_normal",
+            "inflated_mixture_logistic_normal",
+            "mixture_beta",
+        }
+        if distribution in mixture_distributions:
+            missing_keys = [
+                key
+                for key in (
+                    "epr_mixture_components",
+                    "epr_distribution_eps",
+                    "logistic_normal_sigma_min",
+                    "logistic_normal_sigma_max",
+                )
+                if key not in train_config
+            ]
+            if distribution == "mixture_beta":
+                missing_keys.append("beta_alpha_min") if "beta_alpha_min" not in train_config else None
+            if distribution == "inflated_mixture_logistic_normal" and "epr_inflated_features" not in train_config:
+                missing_keys.append("epr_inflated_features")
+            if missing_keys:
+                raise ValueError(f"EPR {distribution} config is missing required keys: {missing_keys}")
+            components = int(train_config["epr_mixture_components"])
+            if components < 1:
+                raise ValueError(f"epr_mixture_components must be >= 1, got {components}")
+            if distribution == "logistic_normal" and components != 1:
+                raise ValueError("epr_distribution=logistic_normal requires epr_mixture_components=1")
+            if distribution in {"mixture_logistic_normal", "inflated_mixture_logistic_normal", "mixture_beta"} and components < 2:
+                raise ValueError(f"epr_distribution={distribution} requires epr_mixture_components >= 2")
+            if distribution == "inflated_mixture_logistic_normal":
+                expected = {"ioi": "zero", "pedal": "zero_one"}
+                if train_config.get("epr_inflated_features") != expected:
+                    raise ValueError(
+                        "inflated_mixture_logistic_normal currently requires "
+                        f"epr_inflated_features={expected}"
+                    )
+        if distribution == "beta_mu_kappa":
+            missing_beta_keys = [
+                key for key in ("beta_eps", "beta_kappa_min")
+                if key not in train_config
+            ]
+            if missing_beta_keys:
+                raise ValueError(f"EPR beta_mu_kappa config is missing required keys: {missing_beta_keys}")
     score_feature_dim = train_config.get("score_feature_dim", 8)
     input_continuous_dim = train_config.get(
         "input_continuous_dim",
@@ -715,13 +895,26 @@ def create_model(train_config):
         head_depth=train_config.get("head_depth", 2),
         head_activation=train_config.get("head_activation", "gelu"),
         epr_distribution=train_config.get("epr_distribution", "point"),
+        epr_mixture_components=train_config.get("epr_mixture_components", 1),
+        epr_distribution_eps=train_config.get("epr_distribution_eps"),
+        logistic_normal_sigma_min=train_config.get("logistic_normal_sigma_min", 1e-3),
+        logistic_normal_sigma_max=train_config.get("logistic_normal_sigma_max", 10.0),
         beta_eps=train_config.get("beta_eps", 1e-5),
         beta_kappa_min=train_config.get("beta_kappa_min", 1e-3),
+        beta_alpha_min=train_config.get("beta_alpha_min", 1e-4),
+        epr_inflated_features=train_config.get("epr_inflated_features"),
         epr_timing_bins=train_config.get("epr_timing_bins", 5000),
         epr_value_bins=train_config.get("epr_value_bins", 128),
         soft_ce_tau=train_config.get("soft_ce_tau"),
         timing_input_normalization=train_config.get("timing_input_normalization", "legacy_log1p"),
         prior_token_keep_prob=train_config.get("prior_token_keep_prob", 1.0),
+        prior_token_dropout_mode=train_config.get("prior_token_dropout_mode", "mask"),
+        pitch_onehot_dim=train_config.get("pitch_onehot_dim", 88),
+        feature_embedding_dim=train_config.get("feature_embedding_dim", 680),
+        piano_pitch_min=train_config.get("piano_pitch_min", 21),
+        pedal_representation=train_config.get("pedal_representation", "continuous_4"),
+        pedal_start_loss_weight=train_config.get("pedal_start_loss_weight", 1.0),
+        pedal_ctrl_loss_weight=train_config.get("pedal_ctrl_loss_weight", 1.0),
         torch_dtype=dtype,
     )
 
@@ -840,6 +1033,7 @@ def main():
         overlap_ratio=train_config["overlap_ratio"],
         min_notes=train_config["min_notes"],
         max_works=train_config.get("max_train_works"),
+        skip_work_paths=train_config.get("skip_work_paths"),
     )
     eval_manifest = build_work_manifest(
         metadata_path=train_config["metadata_path"],
@@ -852,6 +1046,7 @@ def main():
         include_all_performance_dataset=train_config.get("eval_include_all_performance_dataset"),
         max_non_asap_performances_per_work=train_config.get("max_eval_non_asap_performances_per_work"),
         selection_seed=train_config.get("seed", 42),
+        skip_work_paths=train_config.get("skip_work_paths"),
     )
     print(f"Train works: {len(train_manifest)}")
     print(f"Eval works: {len(eval_manifest)}")
@@ -872,6 +1067,7 @@ def main():
         max_time_ms=train_config.get("max_time_ms", 10000.0),
         epr_timing_bins=train_config.get("epr_timing_bins", 5000),
         epr_value_bins=train_config.get("epr_value_bins", 128),
+        pedal_representation=train_config.get("pedal_representation", "continuous_4"),
     )
     eval_dataset = PianoCoReNodeSFTDataset(
         eval_manifest,
@@ -887,6 +1083,7 @@ def main():
         max_time_ms=train_config.get("max_time_ms", 10000.0),
         epr_timing_bins=train_config.get("epr_timing_bins", 5000),
         epr_value_bins=train_config.get("epr_value_bins", 128),
+        pedal_representation=train_config.get("pedal_representation", "continuous_4"),
     )
 
     model = create_model(train_config)
@@ -898,6 +1095,11 @@ def main():
         training_args_dict["deepspeed"] = args.deepspeed
     if "accelerator_config" in train_config:
         training_args_dict["accelerator_config"] = train_config["accelerator_config"]
+    if int(train_config.get("dataloader_num_workers", 0) or 0) > 0:
+        # Keep workers alive after dataloader warmup; this reduces CPU/input
+        # stalls for the bs32/acc1 DDP recipe used by the pedal2 experiments.
+        training_args_dict.setdefault("dataloader_persistent_workers", True)
+    training_args_dict.setdefault("dataloader_pin_memory", torch.cuda.is_available())
     if torch.cuda.device_count() > 1:
         training_args_dict.setdefault("ddp_find_unused_parameters", True)
         training_args_dict.setdefault("ddp_broadcast_buffers", False)

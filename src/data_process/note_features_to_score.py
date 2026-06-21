@@ -40,11 +40,15 @@ from tqdm import tqdm
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-TOKENIZER_ROOT = REPO_ROOT / "MIDI2ScoreTransformer" / "midi2scoretransformer"
+TOKENIZER_ROOTS = [
+    REPO_ROOT / "MIDI2ScoreTransformer" / "midi2scoretransformer",
+    REPO_ROOT / "backup" / "MIDI2ScoreTransformer" / "midi2scoretransformer",
+]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-if str(TOKENIZER_ROOT) not in sys.path:
-    sys.path.insert(0, str(TOKENIZER_ROOT))
+for tokenizer_root in reversed(TOKENIZER_ROOTS):
+    if tokenizer_root.exists() and str(tokenizer_root) not in sys.path:
+        sys.path.insert(0, str(tokenizer_root))
 
 from score_utils import postprocess_score  # noqa: E402
 from src.utils.inr_midi import sorted_piano_notes  # noqa: E402
@@ -629,7 +633,11 @@ def build_score(
 
 def output_path_for_json(json_path: Path, output_mode: str) -> Path:
     if output_mode == "basename":
-        name = json_path.name.replace(".json", ".extracted.mxl")
+        name = json_path.name
+        if name.endswith(".node_a.json"):
+            name = name[: -len(".node_a.json")] + ".extracted.mxl"
+        else:
+            name = name.replace(".json", ".extracted.mxl")
         return json_path.with_name(name)
     if output_mode == "fixed":
         return json_path.with_name("extracted.mxl")
@@ -843,11 +851,16 @@ def convert_one(task: dict[str, Any]) -> dict[str, Any]:
     try:
         payload = json.load(json_path.open(encoding="utf-8"))
         input_note_count = len(payload.get("score", {}).get("pitch") or [])
-        source = "midi"
-        built = events_from_midi(payload, json_path, refined_dir)
-        if built is None:
-            source = "score_feature"
+        source = "score_feature"
+        built = None
+        score = payload.get("score") or {}
+        if score.get("score_feature"):
             built = events_from_score_feature(payload)
+        if built is None:
+            source = "midi"
+            built = events_from_midi(payload, json_path, refined_dir)
+        if built is None:
+            raise ValueError("could_not_build_events_from_score_feature_or_midi")
         events, measure_infos = built
         key_fifths = infer_key_fifths_by_measure(events, len(measure_infos), key_complexity, change_penalty, min_key_run)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -895,8 +908,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--json-root", type=Path, default=Path("PianoCoRe/processed"))
     parser.add_argument("--refined-dir", type=Path, default=Path("PianoCoRe/refined"))
-    parser.add_argument("--summary-path", type=Path, default=Path("PianoCoRe/processed/pianocore_a_extracted_mxl_summary.json"))
-    parser.add_argument("--details-path", type=Path, default=Path("PianoCoRe/processed/pianocore_a_extracted_mxl_details.jsonl"))
+    parser.add_argument("--summary-path", type=Path, default=Path("PianoCoRe/processed/processed_extracted_mxl_summary.json"))
+    parser.add_argument("--details-path", type=Path, default=Path("PianoCoRe/processed/processed_extracted_mxl_details.jsonl"))
     parser.add_argument("--num-proc", type=int, default=30)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")

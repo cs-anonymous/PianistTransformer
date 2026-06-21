@@ -40,6 +40,12 @@ def parse_args():
     parser.add_argument("--overlap-ratio", type=float, default=0.125)
     parser.add_argument("--max-context-length", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--performance-dataset",
+        type=str,
+        default=None,
+        help="Optional performance_dataset filter, e.g. ASAP. Restricts scores and GT refs.",
+    )
     return parser.parse_args()
 
 
@@ -53,10 +59,11 @@ def select_device(device_arg):
     return torch.device("cpu")
 
 
-def collect_test_items(metadata_path, midi_root, split):
+def collect_test_items(metadata_path, midi_root, split, performance_dataset=None):
     columns = [
         "tier_a",
         "split",
+        "performance_dataset",
         "refined_score_midi_path",
         "refined_performance_midi_path",
     ]
@@ -65,6 +72,8 @@ def collect_test_items(metadata_path, midi_root, split):
     df = df[df["split"] == split]
     df = df[df["refined_score_midi_path"].notna()]
     df = df[df["refined_performance_midi_path"].notna()]
+    if performance_dataset is not None:
+        df = df[df["performance_dataset"].fillna("").astype(str) == str(performance_dataset)]
     df = df.sort_values(["refined_score_midi_path", "refined_performance_midi_path"], kind="stable")
 
     items = []
@@ -276,6 +285,7 @@ def main():
         metadata_path=args.metadata,
         midi_root=args.midi_root,
         split=args.split,
+        performance_dataset=args.performance_dataset,
     )
     if args.num_shards < 1:
         raise ValueError("--num-shards must be >= 1")

@@ -304,7 +304,7 @@ if __name__ == "__main__":
             },
             batched=True,
             num_proc=num_proc,
-            remove_columns=['x', 'label', 'score_source', 'performance_source', 'cut', 'split']
+            remove_columns=train_dataset["train"].column_names,
         )
         valid_dataset = valid_dataset.map(
             group_ids,
@@ -315,7 +315,7 @@ if __name__ == "__main__":
             },
             batched=True,
             num_proc=num_proc,
-            remove_columns=['x', 'label', 'score_source', 'performance_source', 'cut', 'split']
+            remove_columns=valid_dataset["train"].column_names,
         )
 
     data_collator = DiffusionSFTDataCollator(
