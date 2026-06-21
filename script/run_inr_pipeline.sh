@@ -18,7 +18,8 @@ MERGE_MODE="continuation"
 CONTINUATION_DROP_RATIO=0.0
 
 # Run layout
-RUN_NAME="run_$(date +%Y%m%d_%H%M%S)"
+RUN_NAME="${CONFIG##*/}"                # basename only, no .json
+RUN_NAME="${RUN_NAME%.json}_$(date +%Y%m%d_%H%M%S)"
 RUN_DIR="results/inr_pipeline/${RUN_NAME}"
 TRAIN_LOG="${RUN_DIR}/train.log"
 EVALUATE_LOG="${RUN_DIR}/evaluate.log"
@@ -40,6 +41,9 @@ TRAIN_GPU_COUNT=${#GPU_LIST[@]}
 DET_GPU="${GPU_LIST[0]}"
 SAMPLING_GPU="${GPU_LIST[1]:-${GPU_LIST[0]}}"
 
+# Auto-pick a free port for DDP master (avoids conflicts between concurrent DDP jobs)
+MASTER_PORT=$(python -c "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()")
+
 # Materialize config (rewrite output/logging dirs into the run dir)
 python - "${CONFIG}" "${RUN_CONFIG}" "${TRAIN_ROOT}" "${TF_LOG_ROOT}" <<'PY'
 import json, sys
@@ -54,6 +58,7 @@ PY
   echo "START $(date '+%F %T')"
   echo "CONFIG ${CONFIG}"
   echo "CUDA_VISIBLE_DEVICES ${CUDA_VISIBLE_DEVICES}"
+  echo "MASTER_PORT ${MASTER_PORT}"
   echo "RUN_DIR ${RUN_DIR}"
 } | tee -a "${EVALUATE_LOG}"
 
@@ -62,11 +67,12 @@ TRAIN_MARKER="${TMP_DIR}/train_start.marker"
 touch "${TRAIN_MARKER}"
 if [[ "${TRAIN_GPU_COUNT}" -gt 1 ]]; then
   echo "[$(date '+%F %T')] train: DDP start, GPUs=${CUDA_VISIBLE_DEVICES}, nproc=${TRAIN_GPU_COUNT}" | tee -a "${EVALUATE_LOG}"
-  PYTHONUNBUFFERED=1 \
+  MASTER_PORT="${MASTER_PORT}" PYTHONUNBUFFERED=1 \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     NCCL_IB_DISABLE=1 NCCL_SOCKET_IFNAME=lo GLOO_SOCKET_IFNAME=lo \
     TORCH_NCCL_BLOCKING_WAIT=1 NCCL_DEBUG=WARN \
     torchrun --nnodes=1 --nproc_per_node="${TRAIN_GPU_COUNT}" \
+      --master_addr=127.0.0.1 --master_port="${MASTER_PORT}" \
       src/train/train_inr.py --config "${RUN_CONFIG}" 2>&1 | tee -a "${TRAIN_LOG}"
 else
   echo "[$(date '+%F %T')] train: single GPU start, GPU=${CUDA_VISIBLE_DEVICES}" | tee -a "${EVALUATE_LOG}"
