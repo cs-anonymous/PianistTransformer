@@ -284,6 +284,8 @@ def build_work_manifest(
     max_non_asap_performances_per_work=None,
     selection_seed=42,
     skip_work_paths=None,
+    performance_dataset=None,
+    exclude_performance_dataset=None,
 ):
     columns = [
         "tier_a",
@@ -300,6 +302,12 @@ def build_work_manifest(
     df = df[df["refined_score_midi_path"].notna()]
     df = df[df["refined_performance_midi_path"].notna()]
     df = df[df["refined_alignment_path"].notna()]
+    dataset = df["performance_dataset"].fillna("").astype(str)
+    if performance_dataset is not None:
+        df = df[dataset == str(performance_dataset)]
+        dataset = df["performance_dataset"].fillna("").astype(str)
+    if exclude_performance_dataset is not None:
+        df = df[dataset != str(exclude_performance_dataset)]
     df = df.sort_values(["refined_score_midi_path", "refined_performance_midi_path"], kind="stable")
 
     manifest = []
@@ -1034,11 +1042,13 @@ def main():
         min_notes=train_config["min_notes"],
         max_works=train_config.get("max_train_works"),
         skip_work_paths=train_config.get("skip_work_paths"),
+        performance_dataset=train_config.get("train_performance_dataset"),
+        exclude_performance_dataset=train_config.get("train_exclude_performance_dataset"),
     )
     eval_manifest = build_work_manifest(
         metadata_path=train_config["metadata_path"],
         refined_dir=train_config["refined_dir"],
-        split="test",
+        split=train_config.get("eval_split", "test"),
         block_notes=train_config["block_notes"],
         overlap_ratio=train_config["overlap_ratio"],
         min_notes=train_config["min_notes"],
@@ -1047,6 +1057,8 @@ def main():
         max_non_asap_performances_per_work=train_config.get("max_eval_non_asap_performances_per_work"),
         selection_seed=train_config.get("seed", 42),
         skip_work_paths=train_config.get("skip_work_paths"),
+        performance_dataset=train_config.get("eval_performance_dataset"),
+        exclude_performance_dataset=train_config.get("eval_exclude_performance_dataset"),
     )
     print(f"Train works: {len(train_manifest)}")
     print(f"Eval works: {len(eval_manifest)}")
@@ -1071,7 +1083,7 @@ def main():
     )
     eval_dataset = PianoCoReNodeSFTDataset(
         eval_manifest,
-        split="test",
+        split=train_config.get("eval_split", "test"),
         task_type=task_type,
         input_feature_mode=input_feature_mode,
         shuffle=False,
@@ -1117,7 +1129,8 @@ def main():
     )
 
     resume_path = train_config.get("resume_path")
-    trainer.train(resume_from_checkpoint=resume_path if resume_path else None)
+    resume_trainer_state = bool(train_config.get("resume_trainer_state", True))
+    trainer.train(resume_from_checkpoint=resume_path if resume_path and resume_trainer_state else None)
     trainer.save_model()
 
 

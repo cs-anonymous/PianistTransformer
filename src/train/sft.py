@@ -7,6 +7,7 @@ import shutil
 from pathlib import Path
 
 from datasets import load_dataset
+from datasets import DatasetDict
 import pandas as pd
 import torch
 from transformers import Trainer, TrainingArguments
@@ -279,8 +280,24 @@ if __name__ == "__main__":
         dataset = dataset.shuffle(seed=42)
 
         num_proc = int(train_config.get("dataset_num_proc", min(40, os.cpu_count() or 1)))
-        train_dataset = dataset.filter(lambda example: example['split'] == 'train', num_proc=num_proc)
-        valid_dataset = dataset.filter(lambda example: example['split'] == 'test', num_proc=num_proc)
+        if train_config.get("train_on_all_splits", False):
+            train_dataset = dataset
+            valid_dataset = dataset.filter(lambda example: example['split'] == 'test', num_proc=num_proc)
+        else:
+            train_dataset = dataset.filter(lambda example: example['split'] == 'train', num_proc=num_proc)
+            valid_dataset = dataset.filter(lambda example: example['split'] == 'test', num_proc=num_proc)
+        if len(valid_dataset["train"]) == 0:
+            print(
+                "No rows with split == 'test' found in PT SFT data; "
+                "creating an internal validation split from train rows.",
+                flush=True,
+            )
+            split_dataset = train_dataset["train"].train_test_split(
+                test_size=train_config.get("test_size", 0.05),
+                seed=train_config.get("seed", 42),
+            )
+            train_dataset = DatasetDict({"train": split_dataset["train"]})
+            valid_dataset = DatasetDict({"train": split_dataset["test"]})
         eval_pair_set = None
         if train_config.get("max_eval_non_asap_performances_per_work") is not None:
             eval_pair_set = build_eval_pair_set(

@@ -94,10 +94,8 @@ def compute_manifest_metrics(manifest, max_gt_per_score=None, num_workers=1):
         "num_samples": manifest["num_samples"],
         "num_scores": len(score_rows),
         "aggregate": {
-            "expected_pairwise": aggregate_score_metrics(score_rows, "expected_pairwise"),
-            "pooled_distribution": aggregate_score_metrics(score_rows, "pooled_distribution"),
-            "model_model_diversity": aggregate_score_metrics(score_rows, "model_model_diversity"),
-            "human_human_diversity": aggregate_score_metrics(score_rows, "human_human_diversity"),
+            "pn_wass": aggregate_score_metrics(score_rows, "pn_wass"),
+            "pp_wass": aggregate_score_metrics(score_rows, "pp_wass"),
         },
         "scores": score_rows,
     }
@@ -311,7 +309,8 @@ def main():
         "distribution_plot": str(args.output_plot.resolve()),
         "dataset": {
             "split": det_manifest.get("split"),
-            "performance_dataset": "ASAP",
+            "performance_dataset": det_manifest.get("performance_dataset"),
+            "exclude_performance_dataset": det_manifest.get("exclude_performance_dataset"),
             "timing_normalization": timing_normalization,
             **plot_summary,
         },

@@ -44,6 +44,14 @@ def denormalize_pedal(value):
     return int(round(value * 127))
 
 
+def raw_time(value):
+    return int(round(float(value)))
+
+
+def raw_value(value):
+    return int(round(float(value)))
+
+
 def continuous_to_pt_tokens(pitch, ioi, duration, velocity, pedals, config):
     """Convert continuous values to PT's 8-token format."""
     pitch = min(config['valid_id_range'][0][1] - 1, max(config['valid_id_range'][0][0], pitch + config['pitch_start']))
@@ -76,9 +84,12 @@ def process_node_json(
 
         score = data['score']
         score_pitch = score['pitch']
-        score_continuous = score['score_continuous']
+        score_continuous = score.get('score_continuous')
+        score_raw = score.get('score_raw')
         score_source = score.get('score_source', '')
         note_count = score['note_count']
+        note_count = int(note_count)
+        use_raw_schema = score_raw is not None
 
         results = []
 
@@ -90,9 +101,13 @@ def process_node_json(
                 continue
             if split is not None and perf_split != split:
                 continue
-            label_continuous = perf['label_continuous']
+            label_continuous = perf.get('label_continuous')
+            label_raw = perf.get('label_raw')
 
-            if len(label_continuous) != note_count:
+            if use_raw_schema:
+                if label_raw is None or len(label_raw) != note_count:
+                    continue
+            elif score_continuous is None or label_continuous is None or len(label_continuous) != note_count:
                 continue
 
             x_tokens = []
@@ -100,11 +115,16 @@ def process_node_json(
 
             for note_idx in range(note_count):
                 pitch = score_pitch[note_idx]
-                score_ioi_norm, score_dur_norm, score_vel_norm = score_continuous[note_idx]
-
-                score_ioi = denormalize_time(score_ioi_norm, max_time_ms, time_normalization)
-                score_dur = denormalize_time(score_dur_norm, max_time_ms, time_normalization)
-                score_vel = denormalize_velocity(score_vel_norm)
+                if use_raw_schema:
+                    score_ioi, score_dur, score_vel = score_raw[note_idx][:3]
+                    score_ioi = raw_time(score_ioi)
+                    score_dur = raw_time(score_dur)
+                    score_vel = raw_value(score_vel)
+                else:
+                    score_ioi_norm, score_dur_norm, score_vel_norm = score_continuous[note_idx]
+                    score_ioi = denormalize_time(score_ioi_norm, max_time_ms, time_normalization)
+                    score_dur = denormalize_time(score_dur_norm, max_time_ms, time_normalization)
+                    score_vel = denormalize_velocity(score_vel_norm)
 
                 x_pedals = [0, 0, 0, 0]
                 x_note_tokens = continuous_to_pt_tokens(
@@ -112,13 +132,20 @@ def process_node_json(
                 )
                 x_tokens.extend(x_note_tokens)
 
-                perf_ioi_norm, perf_dur_norm, perf_vel_norm = label_continuous[note_idx][:3]
-                perf_pedals = label_continuous[note_idx][3:7]
-
-                perf_ioi = denormalize_time(perf_ioi_norm, max_time_ms, time_normalization)
-                perf_dur = denormalize_time(perf_dur_norm, max_time_ms, time_normalization)
-                perf_vel = denormalize_velocity(perf_vel_norm)
-                perf_pedals_denorm = [denormalize_pedal(p) for p in perf_pedals]
+                if use_raw_schema:
+                    perf_ioi, perf_dur, perf_vel = label_raw[note_idx][:3]
+                    perf_pedals = label_raw[note_idx][3:7]
+                    perf_ioi = raw_time(perf_ioi)
+                    perf_dur = raw_time(perf_dur)
+                    perf_vel = raw_value(perf_vel)
+                    perf_pedals_denorm = [raw_value(p) for p in perf_pedals]
+                else:
+                    perf_ioi_norm, perf_dur_norm, perf_vel_norm = label_continuous[note_idx][:3]
+                    perf_pedals = label_continuous[note_idx][3:7]
+                    perf_ioi = denormalize_time(perf_ioi_norm, max_time_ms, time_normalization)
+                    perf_dur = denormalize_time(perf_dur_norm, max_time_ms, time_normalization)
+                    perf_vel = denormalize_velocity(perf_vel_norm)
+                    perf_pedals_denorm = [denormalize_pedal(p) for p in perf_pedals]
 
                 label_note_tokens = continuous_to_pt_tokens(
                     pitch, perf_ioi, perf_dur, perf_vel, perf_pedals_denorm, config

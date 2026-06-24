@@ -12,20 +12,9 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src.evaluate.compute_saved_midi_mae_wass import compute_pair_metrics, extract_note_arrays
+from src.evaluate.compute_saved_midi_mae_wass import extract_note_arrays
 from scipy.stats import wasserstein_distance
 
-
-PAIRWISE_KEYS = [
-    "ioi_mae",
-    "ioi_wass",
-    "duration_mae",
-    "duration_wass",
-    "velocity_mae",
-    "velocity_wass",
-    "pedal_mae",
-    "pedal_wass",
-]
 
 FEATURE_KEYS = [
     ("ioi", "ioi"),
@@ -48,22 +37,27 @@ def parse_args():
 
 
 @lru_cache(maxsize=4096)
-def cached_pair_metrics(pred_path: str, gt_path: str):
-    return compute_pair_metrics(Path(pred_path), Path(gt_path))
-
-
-@lru_cache(maxsize=4096)
 def cached_note_arrays(path: str):
     return extract_note_arrays(Path(path))
 
 
-def mean_dict(rows, keys):
-    if not rows:
-        return {key: float("nan") for key in keys}
-    return {key: float(np.mean([row[key] for row in rows])) for key in keys}
+def finite_mean(values):
+    values = np.asarray(values, dtype=np.float64)
+    finite = values[np.isfinite(values)]
+    return float(np.mean(finite)) if len(finite) else float("nan")
 
 
-def pooled_distribution_metrics(prediction_paths, gt_paths):
+def feature_wasserstein(pred_values, gt_values):
+    pred_values = np.asarray(pred_values, dtype=np.float64)
+    gt_values = np.asarray(gt_values, dtype=np.float64)
+    pred_values = pred_values[np.isfinite(pred_values)]
+    gt_values = gt_values[np.isfinite(gt_values)]
+    if len(pred_values) == 0 or len(gt_values) == 0:
+        return float("nan")
+    return float(wasserstein_distance(pred_values, gt_values))
+
+
+def pp_wass_metrics(prediction_paths, gt_paths):
     pred_arrays = [cached_note_arrays(path) for path in prediction_paths]
     gt_arrays = [cached_note_arrays(path) for path in gt_paths]
 
@@ -71,30 +65,33 @@ def pooled_distribution_metrics(prediction_paths, gt_paths):
     for metric_name, feature_name in FEATURE_KEYS:
         pred_pool = np.concatenate([item[feature_name] for item in pred_arrays]) if pred_arrays else np.asarray([], dtype=np.float64)
         gt_pool = np.concatenate([item[feature_name] for item in gt_arrays]) if gt_arrays else np.asarray([], dtype=np.float64)
-        if len(pred_pool) == 0 or len(gt_pool) == 0:
-            output[f"{metric_name}_pooled_wass"] = float("nan")
-        else:
-            output[f"{metric_name}_pooled_wass"] = float(wasserstein_distance(pred_pool, gt_pool))
+        output[f"{metric_name}_wass"] = feature_wasserstein(pred_pool, gt_pool)
 
-    pedal_keys = [f"{name}_pooled_wass" for name in ("pedal_0", "pedal_25", "pedal_50", "pedal_75")]
-    output["pedal_pooled_wass"] = float(np.mean([output[key] for key in pedal_keys]))
+    pedal_keys = [f"{name}_wass" for name in ("pedal_0", "pedal_25", "pedal_50", "pedal_75")]
+    output["pedal_wass"] = finite_mean([output[key] for key in pedal_keys])
     return output
 
 
-def pairwise_expected_metrics(prediction_paths, gt_paths):
-    rows = []
-    for pred_path in prediction_paths:
-        for gt_path in gt_paths:
-            rows.append(cached_pair_metrics(pred_path, gt_path))
-    return mean_dict(rows, PAIRWISE_KEYS)
+def pn_wass_metrics(prediction_paths, gt_paths):
+    pred_arrays = [cached_note_arrays(path) for path in prediction_paths]
+    gt_arrays = [cached_note_arrays(path) for path in gt_paths]
+    all_arrays = pred_arrays + gt_arrays
 
+    output = {}
+    for metric_name, feature_name in FEATURE_KEYS:
+        usable = min((len(item[feature_name]) for item in all_arrays), default=0)
+        note_wass = [
+            feature_wasserstein(
+                [item[feature_name][note_idx] for item in pred_arrays],
+                [item[feature_name][note_idx] for item in gt_arrays],
+            )
+            for note_idx in range(usable)
+        ]
+        output[f"{metric_name}_wass"] = finite_mean(note_wass)
 
-def self_pairwise_metrics(paths):
-    rows = []
-    for idx in range(len(paths)):
-        for jdx in range(idx + 1, len(paths)):
-            rows.append(cached_pair_metrics(paths[idx], paths[jdx]))
-    return mean_dict(rows, PAIRWISE_KEYS)
+    pedal_keys = [f"{name}_wass" for name in ("pedal_0", "pedal_25", "pedal_50", "pedal_75")]
+    output["pedal_wass"] = finite_mean([output[key] for key in pedal_keys])
+    return output
 
 
 def score_level_metrics(item, max_gt_per_score=None):
@@ -103,19 +100,15 @@ def score_level_metrics(item, max_gt_per_score=None):
     if max_gt_per_score is not None:
         gt_paths = gt_paths[:max_gt_per_score]
 
-    pairwise = pairwise_expected_metrics(prediction_paths, gt_paths)
-    pooled = pooled_distribution_metrics(prediction_paths, gt_paths)
-    model_model = self_pairwise_metrics(prediction_paths)
-    human_human = self_pairwise_metrics(gt_paths)
+    pn_wass = pn_wass_metrics(prediction_paths, gt_paths)
+    pp_wass = pp_wass_metrics(prediction_paths, gt_paths)
 
     return {
         "score_source": item["score_source"],
         "num_predictions": len(prediction_paths),
         "num_ground_truth": len(gt_paths),
-        "expected_pairwise": pairwise,
-        "pooled_distribution": pooled,
-        "model_model_diversity": model_model,
-        "human_human_diversity": human_human,
+        "pn_wass": pn_wass,
+        "pp_wass": pp_wass,
     }
 
 
@@ -161,10 +154,8 @@ def main():
         "num_samples": manifest["num_samples"],
         "num_scores": len(score_rows),
         "aggregate": {
-            "expected_pairwise": aggregate_score_metrics(score_rows, "expected_pairwise"),
-            "pooled_distribution": aggregate_score_metrics(score_rows, "pooled_distribution"),
-            "model_model_diversity": aggregate_score_metrics(score_rows, "model_model_diversity"),
-            "human_human_diversity": aggregate_score_metrics(score_rows, "human_human_diversity"),
+            "pn_wass": aggregate_score_metrics(score_rows, "pn_wass"),
+            "pp_wass": aggregate_score_metrics(score_rows, "pp_wass"),
         },
         "scores": score_rows,
     }

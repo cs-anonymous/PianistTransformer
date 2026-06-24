@@ -43,6 +43,8 @@ def parse_args():
     parser.add_argument("--max-gt-per-score", type=int, default=None)
     parser.add_argument("--performance-dataset", type=str, default=None,
                         help="Optional performance_dataset filter, e.g. ASAP. Restricts scores and GT refs.")
+    parser.add_argument("--exclude-performance-dataset", type=str, default=None,
+                        help="Optional performance_dataset exclusion, e.g. ASAP for non-ASAP evaluation.")
     parser.add_argument("--merge-mode", choices=["continuation", "average"], default="continuation")
     parser.add_argument("--continuation-drop-ratio", type=float, default=0.0)
     return parser.parse_args()
@@ -78,6 +80,7 @@ def list_gt_midis(
     split: str,
     limit: int | None = None,
     performance_dataset: str | None = None,
+    exclude_performance_dataset: str | None = None,
 ):
     df = pd.read_csv(
         metadata_path,
@@ -95,6 +98,8 @@ def list_gt_midis(
     df = df[df["refined_performance_midi_path"].notna()]
     if performance_dataset is not None:
         df = df[df["performance_dataset"].fillna("").astype(str) == str(performance_dataset)]
+    if exclude_performance_dataset is not None:
+        df = df[df["performance_dataset"].fillna("").astype(str) != str(exclude_performance_dataset)]
     paths = sorted(df["refined_performance_midi_path"].unique().tolist())
     if limit is not None:
         paths = paths[:limit]
@@ -257,6 +262,7 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
         split=args.split,
         limit=args.max_gt_per_score,
         performance_dataset=args.performance_dataset,
+        exclude_performance_dataset=args.exclude_performance_dataset,
     )
 
     raw_dir = args.output_dir / "raw_outputs"
@@ -416,8 +422,14 @@ def build_pair_list(items):
     ]
 
 
-def filter_manifest_by_performance_dataset(manifest, metadata_path, split, performance_dataset):
-    if performance_dataset is None:
+def filter_manifest_by_performance_dataset(
+    manifest,
+    metadata_path,
+    split,
+    performance_dataset,
+    exclude_performance_dataset=None,
+):
+    if performance_dataset is None and exclude_performance_dataset is None:
         return manifest
     df = pd.read_csv(
         metadata_path,
@@ -431,7 +443,12 @@ def filter_manifest_by_performance_dataset(manifest, metadata_path, split, perfo
     )
     df = df[df["tier_a"].fillna(False).astype(bool)]
     df = df[df["split"] == split]
-    df = df[df["performance_dataset"].fillna("").astype(str) == str(performance_dataset)]
+    dataset = df["performance_dataset"].fillna("").astype(str)
+    if performance_dataset is not None:
+        df = df[dataset == str(performance_dataset)]
+        dataset = df["performance_dataset"].fillna("").astype(str)
+    if exclude_performance_dataset is not None:
+        df = df[dataset != str(exclude_performance_dataset)]
     df = df[df["refined_score_midi_path"].notna()]
     df = df[df["refined_performance_midi_path"].notna()]
     allowed_scores = set(df["refined_score_midi_path"].unique())
@@ -475,7 +492,7 @@ def main():
         block_notes=config["block_notes"],
         overlap_ratio=config["overlap_ratio"],
         min_notes=config["min_notes"],
-        max_works=None if args.performance_dataset is not None else args.max_works,
+        max_works=None if (args.performance_dataset is not None or args.exclude_performance_dataset is not None) else args.max_works,
         skip_work_paths=config.get("skip_work_paths"),
     )
     manifest = filter_manifest_by_performance_dataset(
@@ -483,8 +500,9 @@ def main():
         metadata_path=config["metadata_path"],
         split=args.split,
         performance_dataset=args.performance_dataset,
+        exclude_performance_dataset=args.exclude_performance_dataset,
     )
-    if args.performance_dataset is not None and args.max_works is not None:
+    if (args.performance_dataset is not None or args.exclude_performance_dataset is not None) and args.max_works is not None:
         manifest = manifest[: args.max_works]
     score_midi_dir = score_midi_dir_from_processed(config["refined_dir"])
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -502,6 +520,8 @@ def main():
         "num_samples": args.num_samples,
         "num_workers": args.num_workers,
         "split": args.split,
+        "performance_dataset": args.performance_dataset,
+        "exclude_performance_dataset": args.exclude_performance_dataset,
         "items": items,
     }
     pair_list = build_pair_list(items)
