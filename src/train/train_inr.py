@@ -103,9 +103,9 @@ def make_windows(total_notes, block_notes, overlap_ratio, min_notes):
 def default_input_continuous_dim(task_type, input_feature_mode, score_feature_dim=8, continuous_dim=7):
     if input_feature_mode == "integrated":
         if task_type == "epr":
-            return 2 + 3 + score_feature_dim
+            return 26
         if task_type == "csr":
-            return 2 + continuous_dim
+            return 26
     return continuous_dim
 
 
@@ -113,17 +113,23 @@ def infer_input_feature_mode(config):
     mode = config.get("input_feature_mode")
     if mode is not None:
         return str(mode).lower()
-    task_type = config.get("task_type", "epr").lower()
-    input_dim = config.get("input_continuous_dim")
-    if input_dim is not None:
-        if task_type == "epr" and int(input_dim) <= 3:
-            return "legacy"
-        if task_type == "csr" and int(input_dim) <= 7:
-            return "legacy"
     return "integrated"
 
 
-def rows_to_model_continuous(rows, timing_normalization="legacy_log1p", max_time_ms=10000.0, rows_are_raw=False):
+def integrated_epr_input_dim(use_timing_scale_bit=True):
+    control_dim = 5 if bool(use_timing_scale_bit) else 3
+    musical_dim = 12
+    dev_dim = 2
+    pedal_dim = 2
+    mask_dim = 5
+    return control_dim + dev_dim + pedal_dim + musical_dim + mask_dim
+
+
+def integrated_csr_output_dim():
+    return 12
+
+
+def rows_to_model_continuous(rows, timing_normalization="scaled_log_5000_s10", max_time_ms=10000.0, rows_are_raw=False):
     if rows_are_raw:
         return raw_rows_to_model_continuous(
             rows,
@@ -133,7 +139,7 @@ def rows_to_model_continuous(rows, timing_normalization="legacy_log1p", max_time
     return rows
 
 
-def score_shared_rows(score, timing_normalization="legacy_log1p", max_time_ms=10000.0):
+def score_shared_rows(score, timing_normalization="scaled_log_5000_s10", max_time_ms=10000.0):
     if "score_raw" in score:
         return rows_to_model_continuous(
             score["score_raw"],
@@ -191,7 +197,7 @@ def _compose_label_raw_rows(perf, pedal_representation="continuous_4"):
 def performance_label_rows_for_representation(
     perf,
     pedal_representation="continuous_4",
-    timing_normalization="legacy_log1p",
+    timing_normalization="scaled_log_5000_s10",
     max_time_ms=10000.0,
 ):
     raw_rows = _compose_label_raw_rows(perf, pedal_representation=pedal_representation)
@@ -218,7 +224,7 @@ def performance_label_bins_for_representation(
     return raw_rows_to_epr_bins(raw_rows, timing_bins=timing_bins, value_bins=value_bins)
 
 
-def performance_label_rows(perf, timing_normalization="legacy_log1p", max_time_ms=10000.0):
+def performance_label_rows(perf, timing_normalization="scaled_log_5000_s10", max_time_ms=10000.0):
     return performance_label_rows_for_representation(
         perf,
         pedal_representation="continuous_4",
@@ -236,32 +242,192 @@ def performance_label_bins(perf, timing_bins=5000, value_bins=128):
     )
 
 
-def make_score_note_input(score_continuous, score_feature, has_score_feature, input_feature_mode):
-    if input_feature_mode == "legacy":
-        return score_continuous
-    assert len(score_continuous) == len(score_feature), (
-        f"score_continuous/score_feature length mismatch: "
-        f"{len(score_continuous)} vs {len(score_feature)}"
-    )
-    assert len(score_continuous) == len(has_score_feature), (
-        f"score_continuous/has_score_feature length mismatch: "
-        f"{len(score_continuous)} vs {len(has_score_feature)}"
-    )
+def normalize_ioi_dev(score_ioi_ms, perf_ioi_ms):
+    dev_ms = float(perf_ioi_ms) - float(score_ioi_ms)
+    return min(max((dev_ms + 500.0) / 1000.0, 0.0), 1.0)
+
+
+def normalize_duration_ratio(score_duration_ms, perf_duration_ms, eps=1e-6):
+    ratio = float(perf_duration_ms) / max(float(score_duration_ms), float(eps))
+    return min(max(ratio / 5.0, 0.0), 1.0)
+
+
+def performance_dev_velocity_pedal2_rows(perf, score_shared_raw):
+    shared_rows = perf.get("label_shared_raw")
+    pedal_rows = _raw_value_rows(perf, "label_pedal2_raw", "pedal2_raw")
+    if shared_rows is None or pedal_rows is None:
+        if "label_raw" not in perf:
+            return None
+        shared_rows = [row[:3] for row in perf["label_raw"]]
+        pedal_rows = [[row[3], row[5]] for row in perf["label_raw"]]
+
+    if len(score_shared_raw) != len(shared_rows):
+        raise ValueError(
+            f"score_raw/label_shared_raw length mismatch: {len(score_shared_raw)} vs {len(shared_rows)}"
+        )
+    if len(shared_rows) != len(pedal_rows):
+        raise ValueError(
+            f"label_shared_raw/label_pedal2_raw length mismatch: {len(shared_rows)} vs {len(pedal_rows)}"
+        )
+
     rows = []
-    for shared, feature, has_feature in zip(score_continuous, score_feature, has_score_feature):
-        assert len(shared) >= 3, f"score_continuous row too short: expected >=3, got {len(shared)}"
-        assert len(feature) >= 8, f"score_feature row too short: expected >=8, got {len(feature)}"
-        has_feature = 1.0 if bool(has_feature) else 0.0
-        rows.append([has_feature, 0.0] + list(shared[:3]) + [float(value) * has_feature for value in feature[:8]])
+    for score_row, perf_row, pedal_row in zip(score_shared_raw, shared_rows, pedal_rows):
+        rows.append(
+            [
+                normalize_ioi_dev(score_row[0], perf_row[0]),
+                normalize_duration_ratio(score_row[1], perf_row[1]),
+                min(max(float(perf_row[2]), 0.0), 127.0) / 127.0,
+                min(max(float(pedal_row[0]), 0.0), 127.0) / 127.0,
+                min(max(float(pedal_row[1]), 0.0), 127.0) / 127.0,
+            ]
+        )
     return rows
 
 
-def make_performance_note_input(label_continuous, input_feature_mode):
-    if input_feature_mode == "legacy":
-        return label_continuous
-    for row in label_continuous:
-        assert len(row) >= 7, f"label_continuous row too short: expected >=7, got {len(row)}"
-    return [[0.0, 1.0] + list(row[:7]) for row in label_continuous]
+def normalize_piecewise_time_value(time_ms):
+    value = min(max(float(time_ms), 0.0), 5000.0)
+    if value <= 500.0:
+        return value / 500.0
+    return value / 5000.0
+
+
+def encode_shared_control_row(raw_shared_row, use_timing_scale_bit=True):
+    ioi_ms = float(raw_shared_row[0])
+    duration_ms = float(raw_shared_row[1])
+    velocity = min(max(float(raw_shared_row[2]), 0.0), 127.0) / 127.0
+    if bool(use_timing_scale_bit):
+        return [
+            1.0 if ioi_ms > 500.0 else 0.0,
+            normalize_piecewise_time_value(ioi_ms),
+            1.0 if duration_ms > 500.0 else 0.0,
+            normalize_piecewise_time_value(duration_ms),
+            velocity,
+        ]
+    return [
+        normalize_piecewise_time_value(ioi_ms),
+        normalize_piecewise_time_value(duration_ms),
+        velocity,
+    ]
+
+
+def build_score_musical_rows(score):
+    score_feature = score.get("score_feature", [])
+    has_score_feature = score.get("has_score_feature", [0] * len(score.get("pitch", [])))
+    score_raw = score.get("score_raw", [])
+
+    rows = []
+    measure_start = 0.0
+    current_measure_length = 4.0
+    prev_q = None
+    prev_tempo = 500.0
+    seen_any_measure = False
+
+    for idx, has_feature in enumerate(has_score_feature):
+        if not bool(has_feature):
+            rows.append([0.0] * 12)
+            continue
+
+        feature = score_feature[idx]
+        mo = float(feature[0]) if len(feature) > 0 else 0.0
+        md = float(feature[1]) if len(feature) > 1 else 0.0
+        ml = float(feature[2]) if len(feature) > 2 else current_measure_length
+        first = 1.0 if len(feature) > 3 and float(feature[3]) >= 0.5 else 0.0
+        hand = 1.0 if len(feature) > 4 and float(feature[4]) >= 0.5 else 0.0
+        trill = 1.0 if len(feature) > 5 and float(feature[5]) >= 0.5 else 0.0
+        grace = 1.0 if len(feature) > 6 and float(feature[6]) >= 0.5 else 0.0
+        stacc = 1.0 if len(feature) > 7 and float(feature[7]) >= 0.5 else 0.0
+        stem_code = int(round(float(feature[8]))) if len(feature) > 8 else 0
+
+        if not seen_any_measure:
+            seen_any_measure = True
+            if ml > 0.0:
+                current_measure_length = ml
+        elif first >= 0.5:
+            measure_start += max(current_measure_length, 0.0)
+            if ml > 0.0:
+                current_measure_length = ml
+
+        q = measure_start + mo
+        mioi = 0.0 if prev_q is None else max(q - prev_q, 0.0)
+        prev_q = q
+
+        candidates = []
+        if idx < len(score_raw):
+            score_ioi_ms = float(score_raw[idx][0])
+            score_duration_ms = float(score_raw[idx][1])
+            if mioi > 1e-6:
+                candidates.append(score_ioi_ms / mioi)
+            if md > 1e-6:
+                candidates.append(score_duration_ms / md)
+        if candidates:
+            prev_tempo = sum(candidates) / len(candidates)
+        tempo = min(max(prev_tempo, 0.0), 2000.0)
+
+        rows.append(
+            [
+                min(max(mo / 6.0, 0.0), 1.0),
+                min(max(mioi / 6.0, 0.0), 1.0),
+                min(max(md / 6.0, 0.0), 1.0),
+                min(max(ml / 6.0, 0.0), 1.0),
+                tempo / 2000.0,
+                first,
+                grace,
+                hand,
+                trill,
+                stacc,
+                1.0 if stem_code == 1 else 0.0,
+                1.0 if stem_code == 2 else 0.0,
+            ]
+        )
+    return rows
+
+
+def build_epr_score_input_rows(score, use_timing_scale_bit=True):
+    score_raw = score["score_raw"]
+    has_score_feature = score.get("has_score_feature", [0] * len(score["pitch"]))
+    musical_rows = build_score_musical_rows(score)
+    rows = []
+    for raw_shared, musical, has_feature in zip(score_raw, musical_rows, has_score_feature):
+        control_is_perf = 0.0
+        masks = [1.0, 0.0, 0.0, 1.0 if bool(has_feature) else 0.0, control_is_perf]
+        rows.append(
+            encode_shared_control_row(raw_shared[:3], use_timing_scale_bit=use_timing_scale_bit)
+            + [0.0, 0.0]
+            + [0.0, 0.0]
+            + [value * masks[3] for value in musical]
+            + masks
+        )
+    return rows
+
+
+def build_csr_performance_input_rows(perf, use_timing_scale_bit=True):
+    shared_rows = perf.get("label_shared_raw")
+    pedal_rows = _raw_value_rows(perf, "label_pedal2_raw", "pedal2_raw")
+    if shared_rows is None or pedal_rows is None:
+        if "label_raw" not in perf:
+            return None
+        shared_rows = [row[:3] for row in perf["label_raw"]]
+        pedal_rows = [[row[3], row[5]] for row in perf["label_raw"]]
+    if len(shared_rows) != len(pedal_rows):
+        raise ValueError(
+            f"label_shared_raw/label_pedal2_raw length mismatch: {len(shared_rows)} vs {len(pedal_rows)}"
+        )
+
+    rows = []
+    for raw_shared, pedal in zip(shared_rows, pedal_rows):
+        control_is_perf = 1.0
+        masks = [1.0, 0.0, 1.0, 0.0, control_is_perf]
+        rows.append(
+            encode_shared_control_row(raw_shared[:3], use_timing_scale_bit=use_timing_scale_bit)
+            + [0.0, 0.0]
+            + [
+                min(max(float(pedal[0]), 0.0), 127.0) / 127.0,
+                min(max(float(pedal[1]), 0.0), 127.0) / 127.0,
+            ]
+            + [0.0] * 12
+            + masks
+        )
+    return rows
 
 
 def distributed_info():
@@ -370,11 +536,13 @@ class PianoCoReNodeSFTDataset(Dataset):
         max_performances_per_work=None,
         max_windows_per_work=None,
         cache_size=2,
-        timing_normalization="legacy_log1p",
+        timing_normalization="scaled_log_5000_s10",
         max_time_ms=10000.0,
         epr_timing_bins=5000,
         epr_value_bins=128,
         pedal_representation="continuous_4",
+        epr_timing_target="absolute",
+        use_timing_scale_bit=True,
     ):
         super().__init__()
         self.split = split
@@ -385,6 +553,8 @@ class PianoCoReNodeSFTDataset(Dataset):
         self.epr_timing_bins = epr_timing_bins
         self.epr_value_bins = epr_value_bins
         self.pedal_representation = pedal_representation
+        self.epr_timing_target = str(epr_timing_target or "absolute").lower()
+        self.use_timing_scale_bit = bool(use_timing_scale_bit)
         items = list(manifest)
         if shuffle:
             random.Random(seed).shuffle(items)
@@ -461,21 +631,12 @@ class PianoCoReNodeSFTDataset(Dataset):
 
         task_type = self.task_type.lower()
         if task_type == "epr":
-            score_feature = score.get("score_feature", [[0.0] * 8 for _ in score["pitch"]])
-            has_score_feature = score.get("has_score_feature", [0] * len(score["pitch"]))
-            score_shared = score_shared_rows(
+            prepared["score_input"] = build_epr_score_input_rows(
                 score,
-                timing_normalization=self.timing_normalization,
-                max_time_ms=self.max_time_ms,
-            )
-            prepared["score_input"] = make_score_note_input(
-                score_shared,
-                score_feature,
-                has_score_feature,
-                self.input_feature_mode,
+                use_timing_scale_bit=self.use_timing_scale_bit,
             )
         elif task_type == "csr":
-            prepared["score_feature"] = score["score_feature"]
+            prepared["score_musical"] = build_score_musical_rows(score)
             prepared["has_score_feature"] = score["has_score_feature"]
 
         self._prepared_cache[path] = prepared
@@ -504,6 +665,22 @@ class PianoCoReNodeSFTDataset(Dataset):
         cache_key = self._performance_cache_key(perf)
         if cache_key in label_cache:
             return label_cache[cache_key]
+
+        if self.task_type.lower() == "epr" and self.epr_timing_target in {"deviation_ratio", "dev_ratio"}:
+            labels = performance_dev_velocity_pedal2_rows(perf, prepared["score"]["score_raw"])
+            if labels is None:
+                raise KeyError("Missing score_raw/label_shared_raw/label_pedal2_raw for deviation_ratio EPR targets")
+            label_cache[cache_key] = (labels, None)
+            return labels, None
+        if self.task_type.lower() == "csr":
+            labels = build_csr_performance_input_rows(
+                perf,
+                use_timing_scale_bit=self.use_timing_scale_bit,
+            )
+            if labels is None:
+                raise KeyError("Missing label_shared_raw/label_pedal2_raw for CSR inputs")
+            label_cache[cache_key] = (labels, None)
+            return labels, None
 
         labels = performance_label_rows_for_representation(
             perf,
@@ -557,8 +734,8 @@ class PianoCoReNodeSFTDataset(Dataset):
             labels_epr_bins = label_bins[start:end] if label_bins is not None else None
             label_mask = None
         elif task_type == "csr":
-            continuous = make_performance_note_input(labels[start:end], self.input_feature_mode)
-            labels_continuous = prepared["score_feature"][start:end]
+            continuous = labels[start:end]
+            labels_continuous = prepared["score_musical"][start:end]
             labels_epr_bins = None
             label_mask = prepared["has_score_feature"][start:end]
         else:
@@ -568,6 +745,7 @@ class PianoCoReNodeSFTDataset(Dataset):
             "pitch_ids": score["pitch"][start:end],
             "continuous": continuous,
             "labels_continuous": labels_continuous,
+            "score_shared_raw": [row[:3] for row in score["score_raw"][start:end]],
             "interpolated": interpolated[start:end],
             "performance_dataset": perf.get("performance_dataset", "unknown"),
             "performance_id": perf.get("performance_id", "unknown"),
@@ -588,11 +766,12 @@ class NodeSFTTrainer(Trainer):
             return
         if "labels_continuous" not in inputs or "attention_mask" not in inputs:
             return
+        loss_mask = inputs.get("label_mask", inputs["attention_mask"]).detach()
         components = _compute_integrated_loss_components(
             self._model_config(model),
             outputs.logits.detach(),
             inputs["labels_continuous"].detach(),
-            inputs["attention_mask"].detach(),
+            loss_mask,
             labels_epr_bins=inputs.get("labels_epr_bins"),
         )
         if not getattr(self, "_loss_component_sums", None):
@@ -749,6 +928,9 @@ class NodeSFTDataCollator:
         label_tensors = [
             torch.tensor(example["labels_continuous"], dtype=torch.float32) for example in examples
         ]
+        score_shared_raw_tensors = [
+            torch.tensor(example["score_shared_raw"], dtype=torch.float32) for example in examples
+        ]
         interpolated_tensors = [
             torch.tensor(example["interpolated"], dtype=torch.bool) for example in examples
         ]
@@ -761,22 +943,26 @@ class NodeSFTDataCollator:
         pitch_ids = pad_sequence(pitch_tensors, batch_first=True, padding_value=self.pitch_pad_id)
         continuous = pad_sequence(continuous_tensors, batch_first=True, padding_value=0.0)
         labels_continuous = pad_sequence(label_tensors, batch_first=True, padding_value=0.0)
+        score_shared_raw = pad_sequence(score_shared_raw_tensors, batch_first=True, padding_value=0.0)
         interpolated = pad_sequence(interpolated_tensors, batch_first=True, padding_value=False)
         attention_mask = (pitch_ids != self.pitch_pad_id).long()
+        label_mask = None
         if self.task_type == "csr":
             label_mask_tensors = [
                 torch.tensor(example["label_mask"], dtype=torch.long) for example in examples
             ]
-            loss_mask = pad_sequence(label_mask_tensors, batch_first=True, padding_value=0)
-            attention_mask = attention_mask * loss_mask
+            label_mask = pad_sequence(label_mask_tensors, batch_first=True, padding_value=0)
 
         batch = {
             "pitch_ids": pitch_ids,
             "continuous": continuous,
             "labels_continuous": labels_continuous,
+            "score_shared_raw": score_shared_raw,
             "attention_mask": attention_mask,
             "interpolated": interpolated,
         }
+        if label_mask is not None:
+            batch["label_mask"] = label_mask
         if labels_epr_bins_tensors is not None:
             batch["labels_epr_bins"] = pad_sequence(
                 labels_epr_bins_tensors,
@@ -791,6 +977,13 @@ def create_model(train_config):
     backbone_type = train_config.get("backbone_type", "t5").lower()
     task_type = train_config.get("task_type", "epr").lower()
     input_feature_mode = infer_input_feature_mode(train_config)
+    epr_timing_target = str(train_config.get("epr_timing_target", "absolute")).lower()
+    use_timing_scale_bit = bool(train_config.get("use_timing_scale_bit", True))
+    note_embedding_mode = str(train_config.get("note_embedding_mode", "sine")).lower()
+    if input_feature_mode != "integrated":
+        raise ValueError(f"INR0624 only supports input_feature_mode=integrated, got {input_feature_mode}")
+    if note_embedding_mode not in {"sine", "cine"}:
+        raise ValueError(f"INR0624 only supports note_embedding_mode in {{'sine', 'cine'}}, got {note_embedding_mode}")
     if task_type == "epr":
         if "epr_distribution" not in train_config:
             raise ValueError("EPR config must set epr_distribution explicitly")
@@ -854,16 +1047,50 @@ def create_model(train_config):
             ]
             if missing_beta_keys:
                 raise ValueError(f"EPR beta_mu_kappa config is missing required keys: {missing_beta_keys}")
+        if epr_timing_target in {"deviation_ratio", "dev_ratio"}:
+            if int(train_config.get("output_continuous_dim", train_config["continuous_dim"])) != 5:
+                raise ValueError("deviation_ratio EPR requires output_continuous_dim=5")
+            if str(train_config.get("pedal_representation", "continuous_4")).lower() != "start_ctrl":
+                raise ValueError("deviation_ratio EPR currently requires pedal_representation=start_ctrl")
+            if distribution not in {
+                "point",
+                "huber",
+                "deterministic_huber",
+                "logistic_normal",
+                "mixture_logistic_normal",
+                "beta_mu_kappa",
+                "mixture_beta",
+            }:
+                raise ValueError(
+                    "deviation_ratio EPR currently supports point/huber, mln, mln3, beta, and mixture_beta, "
+                    f"got epr_distribution={distribution}"
+                )
+    elif task_type == "csr":
+        expected_output_dim = integrated_csr_output_dim()
+        actual_output_dim = int(train_config.get("output_continuous_dim", train_config["continuous_dim"]))
+        if actual_output_dim != expected_output_dim:
+            raise ValueError(
+                f"Integrated INR0624 CSR expects output_continuous_dim={expected_output_dim}, got {actual_output_dim}"
+            )
     score_feature_dim = train_config.get("score_feature_dim", 8)
     input_continuous_dim = train_config.get(
         "input_continuous_dim",
-        default_input_continuous_dim(
+        integrated_epr_input_dim(use_timing_scale_bit=use_timing_scale_bit)
+        if task_type == "epr" and input_feature_mode == "integrated"
+        else default_input_continuous_dim(
             task_type,
             input_feature_mode,
             score_feature_dim=score_feature_dim,
             continuous_dim=train_config.get("continuous_dim", 7),
         ),
     )
+    if task_type in {"epr", "csr"} and input_feature_mode == "integrated":
+        expected_input_dim = integrated_epr_input_dim(use_timing_scale_bit=use_timing_scale_bit)
+        if int(input_continuous_dim) != expected_input_dim:
+            raise ValueError(
+                f"Integrated INR0624 {task_type.upper()} expects input_continuous_dim={expected_input_dim} "
+                f"for use_timing_scale_bit={use_timing_scale_bit}, got {input_continuous_dim}"
+            )
     model_config = IntegratedPianoT5GemmaConfig(
         backbone_type=backbone_type,
         hidden_size=train_config["hidden_size"],
@@ -892,10 +1119,9 @@ def create_model(train_config):
         csr_loss_weights=train_config.get("csr_loss_weights"),
         decoder_input_mode=train_config["decoder_input_mode"],
         input_feature_mode=input_feature_mode,
-        note_embedding_mode=train_config.get("note_embedding_mode", "fine"),
+        note_embedding_mode=note_embedding_mode,
         special_note_vocab_size=train_config.get("special_note_vocab_size", 5),
         special_note_ids=train_config.get("special_note_ids"),
-        pine_partition_dims=train_config.get("pine_partition_dims"),
         use_full_type_embedding=train_config.get("use_full_type_embedding", True),
         use_group_presence_mask=train_config.get("use_group_presence_mask", True),
         head_input_mode=train_config.get("head_input_mode", "full"),
@@ -913,12 +1139,12 @@ def create_model(train_config):
         epr_inflated_features=train_config.get("epr_inflated_features"),
         epr_timing_bins=train_config.get("epr_timing_bins", 5000),
         epr_value_bins=train_config.get("epr_value_bins", 128),
+        epr_timing_target=epr_timing_target,
+        use_timing_scale_bit=use_timing_scale_bit,
         soft_ce_tau=train_config.get("soft_ce_tau"),
-        timing_input_normalization=train_config.get("timing_input_normalization", "legacy_log1p"),
+        timing_input_normalization=train_config.get("timing_input_normalization", "scaled_log_5000_s10"),
         prior_token_keep_prob=train_config.get("prior_token_keep_prob", 1.0),
         prior_token_dropout_mode=train_config.get("prior_token_dropout_mode", "mask"),
-        pitch_onehot_dim=train_config.get("pitch_onehot_dim", 88),
-        feature_embedding_dim=train_config.get("feature_embedding_dim", 680),
         piano_pitch_min=train_config.get("piano_pitch_min", 21),
         pedal_representation=train_config.get("pedal_representation", "continuous_4"),
         pedal_start_loss_weight=train_config.get("pedal_start_loss_weight", 1.0),
@@ -1004,13 +1230,17 @@ def main():
     train_config["input_feature_mode"] = input_feature_mode
     train_config.setdefault(
         "input_continuous_dim",
-        default_input_continuous_dim(
+        integrated_epr_input_dim(use_timing_scale_bit=train_config.get("use_timing_scale_bit", True))
+        if task_type in {"epr", "csr"} and input_feature_mode == "integrated"
+        else default_input_continuous_dim(
             task_type,
             input_feature_mode,
             score_feature_dim=train_config.get("score_feature_dim", 8),
             continuous_dim=train_config.get("continuous_dim", 7),
         ),
     )
+    if task_type == "csr":
+        train_config.setdefault("output_continuous_dim", integrated_csr_output_dim())
 
     if args.max_steps is not None:
         train_config["max_steps"] = args.max_steps
@@ -1075,11 +1305,13 @@ def main():
         max_performances_per_work=train_config.get("max_performances_per_work"),
         max_windows_per_work=train_config.get("max_windows_per_work"),
         cache_size=train_config.get("node_cache_size", 16),
-        timing_normalization=train_config.get("timing_input_normalization", "legacy_log1p"),
+        timing_normalization=train_config.get("timing_input_normalization", "scaled_log_5000_s10"),
         max_time_ms=train_config.get("max_time_ms", 10000.0),
         epr_timing_bins=train_config.get("epr_timing_bins", 5000),
         epr_value_bins=train_config.get("epr_value_bins", 128),
         pedal_representation=train_config.get("pedal_representation", "continuous_4"),
+        epr_timing_target=train_config.get("epr_timing_target", "absolute"),
+        use_timing_scale_bit=train_config.get("use_timing_scale_bit", True),
     )
     eval_dataset = PianoCoReNodeSFTDataset(
         eval_manifest,
@@ -1091,11 +1323,13 @@ def main():
         max_performances_per_work=train_config.get("max_eval_performances_per_work"),
         max_windows_per_work=train_config.get("max_eval_windows_per_work"),
         cache_size=train_config.get("node_cache_size", 16),
-        timing_normalization=train_config.get("timing_input_normalization", "legacy_log1p"),
+        timing_normalization=train_config.get("timing_input_normalization", "scaled_log_5000_s10"),
         max_time_ms=train_config.get("max_time_ms", 10000.0),
         epr_timing_bins=train_config.get("epr_timing_bins", 5000),
         epr_value_bins=train_config.get("epr_value_bins", 128),
         pedal_representation=train_config.get("pedal_representation", "continuous_4"),
+        epr_timing_target=train_config.get("epr_timing_target", "absolute"),
+        use_timing_scale_bit=train_config.get("use_timing_scale_bit", True),
     )
 
     model = create_model(train_config)
@@ -1107,6 +1341,9 @@ def main():
         training_args_dict["deepspeed"] = args.deepspeed
     if "accelerator_config" in train_config:
         training_args_dict["accelerator_config"] = train_config["accelerator_config"]
+    # Integrated INR uses custom continuous labels instead of the standard
+    # `labels` field. Tell Trainer explicitly so eval computes `eval_loss`.
+    training_args_dict.setdefault("label_names", ["labels_continuous"])
     if int(train_config.get("dataloader_num_workers", 0) or 0) > 0:
         # Keep workers alive after dataloader warmup; this reduces CPU/input
         # stalls for the bs32/acc1 DDP recipe used by the pedal2 experiments.

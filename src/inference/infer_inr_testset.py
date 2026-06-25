@@ -18,12 +18,11 @@ if str(ROOT_DIR) not in sys.path:
 
 from src.train.train_inr import (
     build_work_manifest,
+    build_epr_score_input_rows,
     create_model,
     infer_input_feature_mode,
-    make_score_note_input,
-    score_shared_rows,
 )
-from src.model.integrated_pianoformer import canonicalize_start_ctrl_sequence
+from src.model.integrated_pianoformer import _target5_to_raw7
 from src.utils.inr_midi import note_features_to_midi
 
 
@@ -106,23 +105,20 @@ def list_gt_midis(
     return paths
 
 
-def load_score_from_node(path: Path, input_feature_mode: str, timing_normalization="legacy_log1p", max_time_ms=10000.0):
+def load_score_from_node(
+    path: Path,
+    use_timing_scale_bit=True,
+):
     with open(path, "r", encoding="utf-8") as file:
         work = json.load(file)
     score = work["score"]
     pitch = score["pitch"]
-    score_shared = score_shared_rows(
+    continuous = build_epr_score_input_rows(
         score,
-        timing_normalization=timing_normalization,
-        max_time_ms=max_time_ms,
+        use_timing_scale_bit=use_timing_scale_bit,
     )
-    continuous = make_score_note_input(
-        score_shared,
-        score.get("score_feature", [[0.0] * 8 for _ in pitch]),
-        score.get("has_score_feature", [0] * len(pitch)),
-        input_feature_mode,
-    )
-    return pitch, continuous
+    score_shared_raw = [row[:3] for row in score["score_raw"]]
+    return pitch, continuous, score_shared_raw
 
 
 def build_windows(total_notes: int, block_notes: int, overlap_ratio: float):
@@ -145,40 +141,47 @@ def build_windows(total_notes: int, block_notes: int, overlap_ratio: float):
     return deduped
 
 
-def batch_window_predictions(model, pitch, continuous, windows, pitch_pad_id, device, batch_size):
+def batch_window_predictions(model, pitch, continuous, score_shared_raw, windows, pitch_pad_id, device, batch_size):
     total_notes = len(pitch)
-    output_dim = model.config.output_continuous_dim
-    pred_sum = torch.zeros(total_notes, output_dim, dtype=torch.float32)
+    pred_sum = None
     pred_count = torch.zeros(total_notes, 1, dtype=torch.float32)
 
     for batch_start in range(0, len(windows), batch_size):
         batch_windows = windows[batch_start : batch_start + batch_size]
         pitch_tensors = []
         continuous_tensors = []
+        score_shared_raw_tensors = []
         lengths = []
 
         for start, end in batch_windows:
             pitch_tensors.append(torch.tensor(pitch[start:end], dtype=torch.long))
             continuous_tensors.append(torch.tensor(continuous[start:end], dtype=torch.float32))
+            score_shared_raw_tensors.append(torch.tensor(score_shared_raw[start:end], dtype=torch.float32))
             lengths.append(end - start)
 
         pitch_ids = pad_sequence(pitch_tensors, batch_first=True, padding_value=pitch_pad_id).to(device)
         continuous_tensor = pad_sequence(continuous_tensors, batch_first=True, padding_value=0.0).to(device)
+        score_shared_raw_tensor = pad_sequence(score_shared_raw_tensors, batch_first=True, padding_value=0.0).to(device)
         attention_mask = (pitch_ids != pitch_pad_id).long()
 
         with torch.no_grad():
             outputs = model(
                 pitch_ids=pitch_ids,
                 continuous=continuous_tensor,
+                score_shared_raw=score_shared_raw_tensor,
                 attention_mask=attention_mask,
             )
         logits = outputs.logits.detach().float().cpu()
+        if pred_sum is None:
+            pred_sum = torch.zeros(total_notes, logits.shape[-1], dtype=torch.float32)
 
         for idx, (start, end) in enumerate(batch_windows):
             length = lengths[idx]
             pred_sum[start:end] += logits[idx, :length]
             pred_count[start:end] += 1.0
 
+    if pred_sum is None:
+        raise ValueError("No windows were processed during batch_window_predictions")
     return pred_sum / pred_count.clamp_min(1.0)
 
 
@@ -186,6 +189,7 @@ def continuation_window_predictions(
     model,
     pitch,
     continuous,
+    score_shared_raw,
     windows,
     pitch_pad_id,
     device,
@@ -198,6 +202,7 @@ def continuation_window_predictions(
     for window_idx, (start, end) in enumerate(windows):
         pitch_ids = torch.tensor(pitch[start:end], dtype=torch.long, device=device).unsqueeze(0)
         continuous_tensor = torch.tensor(continuous[start:end], dtype=torch.float32, device=device).unsqueeze(0)
+        score_shared_raw_tensor = torch.tensor(score_shared_raw[start:end], dtype=torch.float32, device=device).unsqueeze(0)
         attention_mask = (pitch_ids != pitch_pad_id).long()
 
         prefix_predictions = None
@@ -212,6 +217,7 @@ def continuation_window_predictions(
             pred = model.predict_performance_continuous(
                 pitch_ids=pitch_ids,
                 continuous=continuous_tensor,
+                score_shared_raw=score_shared_raw_tensor,
                 attention_mask=attention_mask,
                 prefix_predictions=prefix_predictions,
                 sampling_strategy=sampling_strategy,
@@ -249,11 +255,9 @@ def load_model(config, device):
 
 def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir):
     score_source = work["score_source"]
-    pitch, continuous = load_score_from_node(
+    pitch, continuous, score_shared_raw = load_score_from_node(
         Path(work["path"]),
-        config["input_feature_mode"],
-        timing_normalization=config.get("timing_input_normalization", "legacy_log1p"),
-        max_time_ms=config.get("max_time_ms", 10000.0),
+        use_timing_scale_bit=config.get("use_timing_scale_bit", True),
     )
     windows = build_windows(len(pitch), config["block_notes"], config["overlap_ratio"])
     gt_rel_paths = list_gt_midis(
@@ -281,6 +285,7 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
             model=model,
             pitch=pitch,
             continuous=continuous,
+            score_shared_raw=score_shared_raw,
             windows=windows,
             pitch_pad_id=config["pitch_pad_id"],
             device=device,
@@ -289,22 +294,25 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
             model=model,
             pitch=pitch,
             continuous=continuous,
+            score_shared_raw=score_shared_raw,
             windows=windows,
             pitch_pad_id=config["pitch_pad_id"],
             device=device,
             sampling_strategy="sample" if args.protocol == "sampling" else "mean",
             drop_ratio=args.continuation_drop_ratio,
         )
-        pred_start_ctrl = None
-        if str(config.get("pedal_representation", "continuous_4")).lower() == "start_ctrl":
-            pred_start_ctrl = canonicalize_start_ctrl_sequence(pred_continuous.unsqueeze(0)).squeeze(0)
+        pred_target = pred_continuous
+        raw_rows = _target5_to_raw7(
+            torch.tensor(score_shared_raw, dtype=torch.float32),
+            pred_target.float().cpu(),
+        )
         midi_obj = note_features_to_midi(
             pitch=pitch,
-            continuous=pred_continuous.tolist(),
+            continuous=raw_rows.tolist(),
             target_ticks_per_beat=500,
             target_tempo=120,
             max_time_ms=config["max_time_ms"],
-            normalized=config.get("timing_input_normalization", "legacy_log1p"),
+            normalized=False,
         )
         raw_path = raw_dir / f"{score_stem}__sample_{sample_idx:03d}.json"
         raw_payload = {
@@ -312,12 +320,10 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
             "protocol": args.protocol,
             "sample_idx": sample_idx,
             "seed": sample_seed,
-            "timing_normalization": config.get("timing_input_normalization", "legacy_log1p"),
+            "timing_representation": "target5_dev_velocity_pedal2",
             "pitch": [int(value) for value in pitch],
-            "predicted_continuous": pred_continuous.tolist(),
-            "predicted_continuous_start_ctrl": pred_start_ctrl[..., [0, 1, 2, 3, 4]].tolist()
-            if pred_start_ctrl is not None
-            else None,
+            "predicted_target5": pred_target.tolist(),
+            "reconstructed_raw7": raw_rows.tolist(),
             "ground_truth_paths": gt_rel_paths,
         }
         raw_path.parent.mkdir(parents=True, exist_ok=True)

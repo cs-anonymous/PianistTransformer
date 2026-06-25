@@ -41,7 +41,7 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         max_time_ms=10000.0,
         pedal_output_activation="sigmoid",
         task_type="epr",
-        input_feature_mode="legacy",
+        input_feature_mode="integrated",
         score_feature_dim=8,
         time_loss_type="huber",
         value_loss_type="mse",
@@ -50,10 +50,9 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         loss_weights=None,
         csr_loss_weights=None,
         decoder_input_mode="score",
-        note_embedding_mode="fine",
+        note_embedding_mode="sine",
         special_note_vocab_size=5,
         special_note_ids=None,
-        pine_partition_dims=None,
         use_full_type_embedding=True,
         use_group_presence_mask=True,
         head_input_mode="full",
@@ -75,12 +74,12 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         epr_inflated_features=None,
         epr_timing_bins=5000,
         epr_value_bins=128,
+        epr_timing_target="absolute",
+        use_timing_scale_bit=True,
         soft_ce_tau=None,
-        timing_input_normalization="legacy_log1p",
+        timing_input_normalization="scaled_log_5000_s10",
         prior_token_keep_prob=1.0,
         prior_token_dropout_mode="mask",
-        pitch_onehot_dim=88,
-        feature_embedding_dim=680,
         piano_pitch_min=21,
         pedal_representation="continuous_4",
         pedal_start_loss_weight=1.0,
@@ -115,13 +114,16 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         }
         self.csr_loss_weights = csr_loss_weights or {
             "mo": 1.0,
+            "mioi": 1.0,
             "md": 1.0,
-            "first": 1.0,
             "ml": 1.0,
-            "staff": 0.5,
-            "trill": 0.4,
+            "tempo": 1.0,
+            "first": 1.0,
             "grace": 0.4,
-            "staccato": 0.3,
+            "hand": 0.5,
+            "trill": 0.4,
+            "stacc": 0.3,
+            "stem": 0.2,
         }
         self.decoder_input_mode = decoder_input_mode
         self.note_embedding_mode = note_embedding_mode
@@ -132,12 +134,6 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
             "bos": 2,
             "eos": 3,
             "play": 4,
-        }
-        self.pine_partition_dims = pine_partition_dims or {
-            "pitch": 128,
-            "shared": 256,
-            "score": 256,
-            "perf": 128,
         }
         self.use_full_type_embedding = use_full_type_embedding
         self.use_group_presence_mask = use_group_presence_mask
@@ -163,6 +159,13 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         }
         self.epr_timing_bins = int(epr_timing_bins)
         self.epr_value_bins = int(epr_value_bins)
+        self.epr_timing_target = str(epr_timing_target).lower()
+        self.use_timing_scale_bit = bool(use_timing_scale_bit)
+        self.control_feature_dim = 5 if self.use_timing_scale_bit else 3
+        self.dev_feature_dim = 2
+        self.pedal_feature_dim = 2
+        self.musical_feature_dim = 12
+        self.mask_feature_dim = 5
         self.soft_ce_tau = soft_ce_tau or {
             "ioi": 10.0,
             "duration": 30.0,
@@ -172,8 +175,6 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.timing_input_normalization = timing_input_normalization
         self.prior_token_keep_prob = prior_token_keep_prob
         self.prior_token_dropout_mode = prior_token_dropout_mode
-        self.pitch_onehot_dim = int(pitch_onehot_dim)
-        self.feature_embedding_dim = int(feature_embedding_dim)
         self.piano_pitch_min = int(piano_pitch_min)
         self.pedal_representation = str(pedal_representation).lower()
         self.pedal_start_loss_weight = float(pedal_start_loss_weight)
@@ -209,174 +210,140 @@ class IntegratedNoteEncoder(nn.Module):
         continuous_dim = continuous_dim or config.input_continuous_dim
         self.continuous_dim = continuous_dim
         self.role = str(role).lower()
-        self.mode = getattr(config, "note_embedding_mode", "fine").lower()
+        self.mode = getattr(config, "note_embedding_mode", "sine").lower()
         self.special_note_embeddings = nn.Embedding(
             config.special_note_vocab_size,
             config.hidden_size,
         )
         self.embedding_depth = getattr(config, "embedding_depth", 2)
         self.activation = getattr(config, "head_activation", "gelu")
+        self.pitch_factor_dim = 20
+        self.control_dim = int(getattr(config, "control_feature_dim", 5))
+        self.dev_dim = int(getattr(config, "dev_feature_dim", 2))
+        self.pedal_dim = int(getattr(config, "pedal_feature_dim", 2))
+        self.musical_dim = int(getattr(config, "musical_feature_dim", 12))
+        self.mask_dim = int(getattr(config, "mask_feature_dim", 5))
 
-        if self.mode in {"score_perf", "score_perf_split"}:
-            self.pitch_dim = int(getattr(config, "pitch_onehot_dim", 88))
-            self.feature_dim = int(getattr(config, "feature_embedding_dim", config.hidden_size - self.pitch_dim))
-            if self.pitch_dim + self.feature_dim != config.hidden_size:
-                raise ValueError(
-                    "score_perf embedding requires pitch_onehot_dim + feature_embedding_dim "
-                    f"to equal hidden_size={config.hidden_size}, got {self.pitch_dim}+{self.feature_dim}"
-                )
-            if self.pitch_dim != 88:
-                raise ValueError(f"score_perf embedding currently expects pitch_onehot_dim=88, got {self.pitch_dim}")
-            if self.role == "score":
-                feature_input_dim = 11
-            elif self.role in {"perf", "performance", "decoder"}:
-                feature_input_dim = 7
-            else:
-                raise ValueError(f"Unsupported score_perf encoder role: {self.role}")
-            self.feature_projection = _make_mlp(
-                feature_input_dim,
-                self.feature_dim,
-                self.feature_dim,
+        if self.mode == "sine":
+            self.pitch_projection = _make_mlp(
+                self.pitch_factor_dim,
+                config.hidden_size,
+                config.hidden_size,
                 self.embedding_depth,
                 self.activation,
             )
-            self.feature_norm = nn.LayerNorm(self.feature_dim)
-        elif self.mode == "pine":
-            dims = config.pine_partition_dims
-            self.pitch_dim = int(dims["pitch"])
-            self.shared_dim = int(dims["shared"])
-            self.score_dim = int(dims["score"])
-            self.perf_dim = int(dims["perf"])
-            partition_total = self.pitch_dim + self.shared_dim + self.score_dim + self.perf_dim
-            if partition_total != config.hidden_size:
-                raise ValueError(
-                    f"PINE partition dims must sum to hidden_size={config.hidden_size}, got {partition_total}"
-                )
-            self.pitch_embedding = nn.Embedding(
-                config.pitch_vocab_size + 1,
-                self.pitch_dim,
-                padding_idx=config.pitch_pad_id,
-            )
-            self.shared_projection = _make_mlp(3, self.shared_dim, self.shared_dim, self.embedding_depth, self.activation)
-            self.score_projection = _make_mlp(8, self.score_dim, self.score_dim, self.embedding_depth, self.activation)
-            self.pedal_projection = _make_mlp(4, self.perf_dim, self.perf_dim, self.embedding_depth, self.activation)
-        elif self.mode == "fine":
-            self.pitch_embedding = nn.Embedding(
-                config.pitch_vocab_size + 1,
+            self.control_projection = _make_mlp(
+                self.control_dim + 1,
                 config.hidden_size,
-                padding_idx=config.pitch_pad_id,
-            )
-            self.shared_projection = _make_mlp(3, config.hidden_size, config.hidden_size, self.embedding_depth, self.activation)
-            self.score_projection = _make_mlp(8, config.hidden_size, config.hidden_size, self.embedding_depth, self.activation)
-            self.pedal_projection = _make_mlp(4, config.hidden_size, config.hidden_size, self.embedding_depth, self.activation)
-            if getattr(config, "use_full_type_embedding", True):
-                self.type_projection = _make_mlp(2, config.hidden_size, config.hidden_size, self.embedding_depth, self.activation)
-            else:
-                self.type_projection = None
-        elif self.mode == "legacy":
-            self.pitch_embedding = nn.Embedding(
-                config.pitch_vocab_size + 1,
                 config.hidden_size,
-                padding_idx=config.pitch_pad_id,
+                self.embedding_depth,
+                self.activation,
             )
+            self.dev_projection = _make_mlp(
+                self.dev_dim,
+                config.hidden_size,
+                config.hidden_size,
+                self.embedding_depth,
+                self.activation,
+            )
+            self.pedal_projection = _make_mlp(
+                self.pedal_dim,
+                config.hidden_size,
+                config.hidden_size,
+                self.embedding_depth,
+                self.activation,
+            )
+            self.musical_projection = _make_mlp(
+                self.musical_dim,
+                config.hidden_size,
+                config.hidden_size,
+                self.embedding_depth,
+                self.activation,
+            )
+            self.mask_projection = _make_mlp(
+                self.mask_dim,
+                config.hidden_size,
+                config.hidden_size,
+                self.embedding_depth,
+                self.activation,
+            )
+        elif self.mode == "cine":
+            flat_dim = self.pitch_factor_dim + self.control_dim + self.dev_dim + self.pedal_dim + self.musical_dim + self.mask_dim
             self.continuous_mlp = _make_mlp(
-                continuous_dim,
+                flat_dim,
                 config.hidden_size,
                 config.hidden_size,
                 self.embedding_depth,
                 self.activation,
             )
         else:
-            raise ValueError(f"Unsupported note_embedding_mode: {self.mode}")
+            raise ValueError(f"Unsupported note_embedding_mode: {self.mode}. Expected one of: sine, cine")
         self.norm = nn.LayerNorm(config.hidden_size)
 
-    def _pitch_one_hot(self, pitch_ids):
+    def _pitch_factors(self, pitch_ids):
+        pitch_value = pitch_ids.long()
         pitch_min = int(getattr(self.config, "piano_pitch_min", 21))
-        pitch_index = pitch_ids.long() - pitch_min
-        valid = (pitch_index >= 0) & (pitch_index < self.pitch_dim)
-        safe_index = pitch_index.clamp(0, self.pitch_dim - 1)
-        one_hot = F.one_hot(safe_index, num_classes=self.pitch_dim).to(
+        register_index = (pitch_value - pitch_min).clamp(min=0) // 12
+        valid_register = (register_index >= 0) & (register_index < 8)
+        register_index = register_index.clamp(0, 7)
+        pitch_class = torch.remainder(pitch_value, 12).clamp(0, 11)
+        valid_pitch = pitch_value != int(self.config.pitch_pad_id)
+        pitch_class_one_hot = F.one_hot(pitch_class, num_classes=12).to(
             dtype=self.special_note_embeddings.weight.dtype,
             device=pitch_ids.device,
         )
-        return one_hot * valid.unsqueeze(-1).to(dtype=one_hot.dtype)
+        register_one_hot = F.one_hot(register_index, num_classes=8).to(
+            dtype=pitch_class_one_hot.dtype,
+            device=pitch_ids.device,
+        )
+        return torch.cat(
+            [
+                pitch_class_one_hot * valid_pitch.unsqueeze(-1).to(dtype=pitch_class_one_hot.dtype),
+                register_one_hot * valid_register.unsqueeze(-1).to(dtype=register_one_hot.dtype),
+            ],
+            dim=-1,
+        )
 
-    def _split_groups(self, continuous):
-        batch_size, seq_len, _ = continuous.shape
-        continuous_dim = continuous.shape[-1]
-        type_bits = continuous.new_zeros(batch_size, seq_len, 2)
-        shared = continuous.new_zeros(batch_size, seq_len, 3)
-        score = continuous.new_zeros(batch_size, seq_len, 8)
-        pedal = continuous.new_zeros(batch_size, seq_len, 4)
-
-        if continuous_dim >= 13:
-            type_bits = continuous[..., 0:2]
-            shared = continuous[..., 2:5]
-            score = continuous[..., 5:13]
-        elif continuous_dim >= 9:
-            type_bits = continuous[..., 0:2]
-            shared = continuous[..., 2:5]
-            pedal = continuous[..., 5:9]
-        elif continuous_dim >= 7:
-            type_bits[..., 1] = 1.0
-            shared = continuous[..., 0:3]
-            pedal = continuous[..., 3:7]
-        elif continuous_dim >= 3:
-            type_bits[..., 0] = 1.0
-            shared = continuous[..., 0:3]
-        else:
-            raise ValueError(f"Unsupported continuous_dim={continuous_dim}")
-
-        if getattr(self.config, "use_group_presence_mask", True):
-            score = score * type_bits[..., 0:1]
-            pedal = pedal * type_bits[..., 1:2]
-        return type_bits, shared, score, pedal
+    def _split_inr0624(self, continuous):
+        start = 0
+        control = continuous[..., start : start + self.control_dim]
+        start += self.control_dim
+        dev = continuous[..., start : start + self.dev_dim]
+        start += self.dev_dim
+        pedal = continuous[..., start : start + self.pedal_dim]
+        start += self.pedal_dim
+        musical = continuous[..., start : start + self.musical_dim]
+        start += self.musical_dim
+        masks = continuous[..., start : start + self.mask_dim]
+        if continuous.shape[-1] != start + self.mask_dim:
+            raise ValueError(
+                f"Unexpected INR0624 continuous dim {continuous.shape[-1]}, expected {start + self.mask_dim}"
+            )
+        return control, dev, pedal, musical, masks
 
     def forward(self, pitch_ids, continuous, special_note_ids=None):
-        if self.mode in {"score_perf", "score_perf_split"}:
-            projection_dtype = self.feature_norm.weight.dtype
-            continuous = continuous.to(dtype=projection_dtype)
-            if self.role == "score":
-                _, shared, score, _ = self._split_groups(continuous)
-                features = torch.cat([shared, score], dim=-1)
-            else:
-                if continuous.shape[-1] >= 9:
-                    _, shared, _, pedal = self._split_groups(continuous)
-                elif continuous.shape[-1] >= 7:
-                    shared = continuous[..., 0:3]
-                    pedal = continuous[..., 3:7]
-                else:
-                    raise ValueError(f"Perf score_perf encoder requires at least 7 continuous dims, got {continuous.shape[-1]}")
-                features = torch.cat([shared, pedal], dim=-1)
-            pitch_embeds = self._pitch_one_hot(pitch_ids).to(dtype=projection_dtype)
-            feature_embeds = self.feature_norm(self.feature_projection(features))
-            embeddings = torch.cat([pitch_embeds, feature_embeds], dim=-1)
-            return self._apply_special_embeddings(embeddings, special_note_ids)
-
-        if self.mode == "legacy":
-            pitch_embeds = self.pitch_embedding(pitch_ids)
-            continuous = continuous.to(dtype=self.continuous_mlp[0].weight.dtype if isinstance(self.continuous_mlp, nn.Sequential) else self.continuous_mlp.weight.dtype)
-            continuous_embeds = self.continuous_mlp(continuous)
-            embeddings = self.norm(pitch_embeds + continuous_embeds)
-            return self._apply_special_embeddings(embeddings, special_note_ids)
-
         projection_dtype = next(self.parameters()).dtype
         continuous = continuous.to(dtype=projection_dtype)
-        type_bits, shared, score, pedal = self._split_groups(continuous)
-        pitch_embeds = self.pitch_embedding(pitch_ids)
-        shared_embeds = self.shared_projection(shared)
-        score_embeds = self.score_projection(score)
-        pedal_embeds = self.pedal_projection(pedal)
-        if getattr(self.config, "use_group_presence_mask", True):
-            score_embeds = score_embeds * type_bits[..., 0:1]
-            pedal_embeds = pedal_embeds * type_bits[..., 1:2]
+        control, dev, pedal, musical, masks = self._split_inr0624(continuous)
+        pitch_factors = self._pitch_factors(pitch_ids).to(dtype=projection_dtype)
 
-        if self.mode == "pine":
-            embeddings = torch.cat([pitch_embeds, shared_embeds, score_embeds, pedal_embeds], dim=-1)
+        if self.mode == "cine":
+            embeddings = self.continuous_mlp(
+                torch.cat([pitch_factors, control, dev, pedal, musical, masks], dim=-1)
+            )
         else:
-            embeddings = pitch_embeds + shared_embeds + score_embeds + pedal_embeds
-            if self.type_projection is not None:
-                embeddings = embeddings + self.type_projection(type_bits)
+            m_c = masks[..., 0:1]
+            m_dev = masks[..., 1:2]
+            m_pedal = masks[..., 2:3]
+            m_m = masks[..., 3:4]
+            control_is_perf = masks[..., 4:5]
+            pitch_embeds = self.pitch_projection(pitch_factors)
+            control_embeds = self.control_projection(torch.cat([control, control_is_perf], dim=-1)) * m_c
+            dev_embeds = self.dev_projection(dev) * m_dev
+            pedal_embeds = self.pedal_projection(pedal) * m_pedal
+            musical_embeds = self.musical_projection(musical) * m_m
+            mask_embeds = self.mask_projection(masks)
+            embeddings = pitch_embeds + control_embeds + dev_embeds + pedal_embeds + musical_embeds + mask_embeds
         embeddings = self.norm(embeddings)
         return self._apply_special_embeddings(embeddings, special_note_ids)
 
@@ -396,34 +363,12 @@ class IntegratedContinuousDecoder(nn.Module):
         super().__init__()
         self.config = config
         self.output_dim = config.output_continuous_dim
-        self.mode = getattr(config, "note_embedding_mode", "fine").lower()
-        self.head_input_mode = getattr(config, "head_input_mode", "full").lower()
         self.epr_distribution = getattr(config, "epr_distribution", "point").lower()
         head_depth = getattr(config, "head_depth", 2)
         activation = getattr(config, "head_activation", "gelu")
-
         full_dim = config.hidden_size
-        if self.mode in {"score_perf", "score_perf_split"} and self.head_input_mode in {"feature", "partitioned"}:
-            pitch_dim = int(getattr(config, "pitch_onehot_dim", 88))
-            feature_dim = int(getattr(config, "feature_embedding_dim", config.hidden_size - pitch_dim))
-            if pitch_dim + feature_dim != config.hidden_size:
-                raise ValueError(
-                    "score_perf head requires pitch_onehot_dim + feature_embedding_dim "
-                    f"to equal hidden_size={config.hidden_size}, got {pitch_dim}+{feature_dim}"
-                )
-            self.shared_slice = self.score_slice = self.perf_slice = slice(pitch_dim, pitch_dim + feature_dim)
-            shared_dim = score_dim = perf_dim = feature_dim
-        elif self.mode == "pine" and self.head_input_mode == "partitioned":
-            dims = config.pine_partition_dims
-            self.shared_slice = slice(int(dims["pitch"]), int(dims["pitch"]) + int(dims["shared"]))
-            self.score_slice = slice(self.shared_slice.stop, self.shared_slice.stop + int(dims["score"]))
-            self.perf_slice = slice(self.score_slice.stop, self.score_slice.stop + int(dims["perf"]))
-            shared_dim = int(dims["shared"])
-            score_dim = int(dims["score"])
-            perf_dim = int(dims["perf"])
-        else:
-            self.shared_slice = self.score_slice = self.perf_slice = slice(None)
-            shared_dim = score_dim = perf_dim = full_dim
+        self.shared_slice = self.score_slice = self.perf_slice = slice(None)
+        shared_dim = score_dim = perf_dim = full_dim
 
         if (
             getattr(config, "task_type", "epr") == "epr"
@@ -477,6 +422,24 @@ class IntegratedContinuousDecoder(nn.Module):
         self.generic_head = _make_mlp(score_dim, self.output_dim, score_dim, head_depth, activation)
 
     def forward(self, hidden_states):
+        if _uses_deviation_ratio_targets(self.config):
+            shared = self.shared_head(hidden_states[..., self.shared_slice])
+            pedal = self.pedal_head(hidden_states[..., self.perf_slice])
+            if self.epr_distribution in {
+                "beta_mu_kappa",
+                "logistic_normal",
+                "mixture_logistic_normal",
+                "inflated_mixture_logistic_normal",
+                "mixture_beta",
+            }:
+                return torch.cat([shared, pedal], dim=-1)
+            shared = torch.sigmoid(shared)
+            if self.config.pedal_output_activation == "sigmoid":
+                pedal = torch.sigmoid(pedal)
+            elif self.config.pedal_output_activation != "linear":
+                raise ValueError(f"Unsupported pedal_output_activation: {self.config.pedal_output_activation}")
+            return torch.cat([shared, pedal], dim=-1)
+
         if self.output_dim != 7:
             return self.generic_head(hidden_states[..., self.score_slice])
 
@@ -688,6 +651,77 @@ def _pack_start_ctrl_prediction(shared, start, ctrl):
     return torch.cat([shared, pedal], dim=-1).clamp_(0.0, 1.0)
 
 
+def _uses_deviation_ratio_targets(config):
+    return (
+        getattr(config, "task_type", "epr") == "epr"
+        and str(getattr(config, "epr_timing_target", "absolute")).lower() in {"deviation_ratio", "dev_ratio"}
+    )
+
+
+def _torch_piecewise_time_code(time_ms, use_scale_bit=True):
+    value = time_ms.float().clamp(0.0, 5000.0)
+    if bool(use_scale_bit):
+        scale_bit = (value > 500.0).to(dtype=value.dtype)
+        cont = torch.where(value > 500.0, value / 5000.0, value / 500.0)
+        return torch.stack([scale_bit, cont], dim=-1)
+    return torch.stack(
+        [
+            torch.where(value > 500.0, value / 5000.0, value / 500.0),
+        ],
+        dim=-1,
+    )
+
+
+def _target5_to_raw7(score_shared_raw, target_predictions):
+    score_shared_raw = score_shared_raw.float()
+    target_predictions = target_predictions.float().clamp(0.0, 1.0)
+    perf_ioi_ms = (score_shared_raw[..., 0] + (target_predictions[..., 0] * 1000.0 - 500.0)).clamp_min(0.0)
+    perf_duration_ms = (score_shared_raw[..., 1] * (target_predictions[..., 1] * 5.0)).clamp_min(0.0)
+    velocity = target_predictions[..., 2] * 127.0
+    pedal_start = target_predictions[..., 3] * 127.0
+    pedal_ctrl = target_predictions[..., 4] * 127.0
+    next_start = torch.cat([pedal_start[..., 1:], pedal_start[..., -1:]], dim=-1)
+    return torch.stack(
+        [
+            perf_ioi_ms,
+            perf_duration_ms,
+            velocity,
+            pedal_start,
+            (pedal_start + pedal_ctrl) * 0.5,
+            pedal_ctrl,
+            (pedal_ctrl + next_start) * 0.5,
+        ],
+        dim=-1,
+    )
+
+
+def _build_epr_decoder_rows(config, score_shared_raw, target_predictions):
+    raw_perf = _target5_to_raw7(score_shared_raw, target_predictions)
+    shared = _torch_piecewise_time_code(raw_perf[..., 0], getattr(config, "use_timing_scale_bit", True))
+    duration = _torch_piecewise_time_code(raw_perf[..., 1], getattr(config, "use_timing_scale_bit", True))
+    velocity = (raw_perf[..., 2] / 127.0).unsqueeze(-1)
+    control = torch.cat([shared, duration, velocity], dim=-1)
+    dev = target_predictions[..., 0:2].float().clamp(0.0, 1.0)
+    pedal = (raw_perf[..., 3:5] / 127.0).float().clamp(0.0, 1.0)
+    musical = target_predictions.new_zeros(*target_predictions.shape[:-1], getattr(config, "musical_feature_dim", 12))
+    control_is_perf = 1.0
+    masks = target_predictions.new_tensor([1.0, 1.0, 1.0, 0.0, control_is_perf]).expand(*target_predictions.shape[:-1], 5)
+    return torch.cat([control, dev, pedal, musical, masks], dim=-1)
+
+
+def _build_csr_decoder_rows(config, musical_predictions):
+    del config
+    musical = musical_predictions.float().clamp(0.0, 1.0)
+    zeros = musical.new_zeros(*musical.shape[:-1], 5 + 2 + 2)
+    control_is_perf = 0.0
+    masks = musical.new_tensor([0.0, 0.0, 0.0, 1.0, control_is_perf]).expand(*musical.shape[:-1], 5)
+    return torch.cat([zeros, musical, masks], dim=-1)
+
+
+def _materialize_csr_prediction(raw_outputs):
+    return torch.sigmoid(raw_outputs)
+
+
 def _logistic_normal_params(raw_mu, raw_log_sigma, sigma_min=1e-3, sigma_max=10.0):
     log_min = torch.log(raw_log_sigma.new_tensor(float(sigma_min)))
     log_max = torch.log(raw_log_sigma.new_tensor(float(sigma_max)))
@@ -836,7 +870,7 @@ def _epr_bins_to_normalized(config, ioi_bins, duration_bins, velocity_bins, peda
     timing_bins = max(1, int(config.epr_timing_bins))
     value_bins = max(1, int(config.epr_value_bins))
     value_scale = float(value_bins - 1) if value_bins > 1 else 1.0
-    timing_norm = str(getattr(config, "timing_input_normalization", "legacy_log1p")).lower()
+    timing_norm = str(getattr(config, "timing_input_normalization", "scaled_log_5000_s10")).lower()
     ioi_ms = ioi_bins.to(dtype=torch.float32).clamp(0.0, float(timing_bins - 1))
     duration_ms = duration_bins.to(dtype=torch.float32).clamp(0.0, float(timing_bins - 1))
     if timing_norm in {"scaled_log_5000_s10", "log1p_x_over_10_5000"}:
@@ -865,6 +899,78 @@ def _epr_bins_to_normalized(config, ioi_bins, duration_bins, velocity_bins, peda
 
 
 def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean"):
+    if _uses_deviation_ratio_targets(config):
+        distribution = getattr(config, "epr_distribution", "point").lower()
+        if distribution == "beta_mu_kappa":
+            params = _split_epr_distribution_params(raw_outputs)
+            shared_mu, _, shared_alpha, shared_beta = _beta_params(
+                params["shared_mu"],
+                params["shared_kappa"],
+                eps=getattr(config, "beta_eps", 1e-5),
+                kappa_min=getattr(config, "beta_kappa_min", 1e-3),
+            )
+            pedal_params = _split_start_ctrl_from_outputs(config, raw_outputs)
+
+            def decode_beta_scalar(raw):
+                mu, _, alpha, beta = _beta_params(
+                    raw[..., 0],
+                    raw[..., 1],
+                    eps=getattr(config, "beta_eps", 1e-5),
+                    kappa_min=getattr(config, "beta_kappa_min", 1e-3),
+                )
+                mode_name = str(sampling_strategy).lower()
+                if mode_name in {"sample", "sampling", "stochastic"}:
+                    return torch.distributions.Beta(alpha, beta).sample()
+                return mu
+
+            mode_name = str(sampling_strategy).lower()
+            shared = (
+                torch.distributions.Beta(shared_alpha, shared_beta).sample()
+                if mode_name in {"sample", "sampling", "stochastic"}
+                else shared_mu
+            )
+            start = decode_beta_scalar(pedal_params["start_raw"])
+            ctrl = decode_beta_scalar(pedal_params["ctrl_raw"])
+            return torch.cat([shared, start.unsqueeze(-1), ctrl.unsqueeze(-1)], dim=-1)
+
+        if distribution in {
+            "logistic_normal",
+            "mixture_logistic_normal",
+            "inflated_mixture_logistic_normal",
+            "mixture_beta",
+        }:
+            params = _split_epr_mixture_params(config, raw_outputs)
+            pedal_params = _split_start_ctrl_from_outputs(config, raw_outputs)
+            decode = (
+                _mixture_beta_mean_or_sample
+                if distribution == "mixture_beta"
+                else _mixture_logistic_normal_mean_or_sample
+            )
+            shared = decode(
+                config,
+                params["shared_logits"],
+                params["shared_a"],
+                params["shared_b"],
+                sampling_strategy=sampling_strategy,
+            )
+            components = int(getattr(config, "epr_mixture_components", 1))
+
+            def decode_scalar(raw):
+                base = raw.reshape(*raw.shape[:-1], 3, components)
+                return decode(
+                    config,
+                    base[..., 0, :],
+                    base[..., 1, :],
+                    base[..., 2, :],
+                    sampling_strategy=sampling_strategy,
+                )
+
+            start = decode_scalar(pedal_params["start_raw"])
+            ctrl = decode_scalar(pedal_params["ctrl_raw"])
+            return torch.cat([shared, start.unsqueeze(-1), ctrl.unsqueeze(-1)], dim=-1)
+
+        return raw_outputs[..., :5].clamp(0.0, 1.0)
+
     distribution = getattr(config, "epr_distribution", "point").lower()
     pedal_representation = str(getattr(config, "pedal_representation", "continuous_4")).lower()
     if distribution in {"categorical", "hard_categorical", "soft_categorical"}:
@@ -1121,9 +1227,19 @@ def _build_ar_special_note_ids(config, attention_mask):
     return special_note_ids
 
 
-def _build_prefilled_ar_note_inputs(config, attention_mask, output_dim, prefix_predictions=None):
+def _build_prefilled_ar_note_inputs(
+    config,
+    attention_mask,
+    output_dim,
+    prefix_predictions=None,
+    score_shared_raw=None,
+):
     batch_size, seq_len = attention_mask.shape
-    decoder_input_continuous = attention_mask.new_zeros((batch_size, seq_len, output_dim + 2), dtype=torch.float32)
+    if _uses_deviation_ratio_targets(config) or getattr(config, "task_type", "epr") == "csr":
+        decoder_dim = int(getattr(config, "input_continuous_dim"))
+    else:
+        decoder_dim = output_dim + 2
+    decoder_input_continuous = attention_mask.new_zeros((batch_size, seq_len, decoder_dim), dtype=torch.float32)
     special_note_ids = attention_mask.new_full((batch_size, seq_len), -1)
     if seq_len > 0:
         special_note_ids[:, 0] = int(config.special_note_ids.get("bos", 2))
@@ -1132,27 +1248,56 @@ def _build_prefilled_ar_note_inputs(config, attention_mask, output_dim, prefix_p
     if prefix_predictions is not None:
         prefix_len = int(prefix_predictions.shape[1])
         if prefix_len > 0:
-            if config.task_type == "epr":
-                decoder_input_continuous[:, 1 : prefix_len + 1, 1] = 1.0
+            if _uses_deviation_ratio_targets(config):
+                if score_shared_raw is None:
+                    raise ValueError("score_shared_raw is required for deviation_ratio AR prefix inputs")
+                decoder_input_continuous[:, 1 : prefix_len + 1] = _build_epr_decoder_rows(
+                    config,
+                    score_shared_raw[:, :prefix_len].to(
+                        dtype=decoder_input_continuous.dtype,
+                        device=decoder_input_continuous.device,
+                    ),
+                    prefix_predictions[:, :prefix_len].to(
+                        dtype=decoder_input_continuous.dtype,
+                        device=decoder_input_continuous.device,
+                    ),
+                )
             elif config.task_type == "csr":
-                decoder_input_continuous[:, 1 : prefix_len + 1, 0] = 1.0
-            decoder_input_continuous[:, 1 : prefix_len + 1, 2:] = prefix_predictions[:, :prefix_len].to(
-                dtype=decoder_input_continuous.dtype,
-                device=decoder_input_continuous.device,
-            )
+                decoder_input_continuous[:, 1 : prefix_len + 1] = _build_csr_decoder_rows(
+                    config,
+                    prefix_predictions[:, :prefix_len].to(
+                        dtype=decoder_input_continuous.dtype,
+                        device=decoder_input_continuous.device,
+                    ),
+                )
+            else:
+                if config.task_type == "epr":
+                    decoder_input_continuous[:, 1 : prefix_len + 1, 1] = 1.0
+                elif config.task_type == "csr":
+                    decoder_input_continuous[:, 1 : prefix_len + 1, 0] = 1.0
+                decoder_input_continuous[:, 1 : prefix_len + 1, 2:] = prefix_predictions[:, :prefix_len].to(
+                    dtype=decoder_input_continuous.dtype,
+                    device=decoder_input_continuous.device,
+                )
     return decoder_input_continuous, special_note_ids, prefix_len
 
 
-def _build_ar_note_continuous(labels_continuous, task_type, input_feature_mode="integrated"):
-    if input_feature_mode == "legacy":
-        return labels_continuous
+def _build_ar_note_continuous(
+    config,
+    labels_continuous,
+    score_shared_raw=None,
+    task_type="epr",
+):
+    if _uses_deviation_ratio_targets(config):
+        if score_shared_raw is None:
+            raise ValueError("score_shared_raw is required for deviation_ratio AR note construction")
+        return _build_epr_decoder_rows(config, score_shared_raw, labels_continuous)
+    if task_type == "csr":
+        return _build_csr_decoder_rows(config, labels_continuous)
     batch_size, seq_len, _ = labels_continuous.shape
     if task_type == "epr":
         type_bits = labels_continuous.new_zeros(batch_size, seq_len, 2)
         type_bits[..., 1] = 1.0
-    elif task_type == "csr":
-        type_bits = labels_continuous.new_zeros(batch_size, seq_len, 2)
-        type_bits[..., 0] = 1.0
     else:
         raise ValueError(f"Unsupported task_type for AR note build: {task_type}")
     return torch.cat([type_bits, labels_continuous], dim=-1)
@@ -1394,6 +1539,159 @@ def _compute_integrated_loss_components(config, continuous_pred, labels_continuo
         return _compute_csr_loss_components(config, continuous_pred, labels_continuous, attention_mask)
 
     mask = attention_mask.bool()
+    if _uses_deviation_ratio_targets(config):
+        distribution = getattr(config, "epr_distribution", "point").lower()
+        if distribution in {
+            "logistic_normal",
+            "mixture_logistic_normal",
+            "inflated_mixture_logistic_normal",
+            "mixture_beta",
+        }:
+            params = _split_epr_mixture_params(config, continuous_pred)
+            pedal_params = _split_start_ctrl_from_outputs(config, continuous_pred)
+            eps = getattr(config, "epr_distribution_eps", getattr(config, "beta_eps", 1e-5))
+            sigma_min = getattr(config, "logistic_normal_sigma_min", 1e-3)
+            sigma_max = getattr(config, "logistic_normal_sigma_max", 10.0)
+            alpha_min = getattr(config, "beta_alpha_min", 1e-4)
+
+            if distribution == "mixture_beta":
+                def loss_one(logits, raw_a, raw_b, target):
+                    return _mixture_beta_nll(logits, raw_a, raw_b, target, mask, eps, alpha_min)
+            else:
+                def loss_one(logits, raw_a, raw_b, target):
+                    return _mixture_logistic_normal_nll(
+                        logits,
+                        raw_a,
+                        raw_b,
+                        target,
+                        mask,
+                        eps,
+                        sigma_min,
+                        sigma_max,
+                    )
+
+            loss_ioi = loss_one(
+                params["shared_logits"][..., 0, :],
+                params["shared_a"][..., 0, :],
+                params["shared_b"][..., 0, :],
+                labels_continuous[..., 0],
+            )
+            loss_duration = loss_one(
+                params["shared_logits"][..., 1, :],
+                params["shared_a"][..., 1, :],
+                params["shared_b"][..., 1, :],
+                labels_continuous[..., 1],
+            )
+            loss_velocity = loss_one(
+                params["shared_logits"][..., 2, :],
+                params["shared_a"][..., 2, :],
+                params["shared_b"][..., 2, :],
+                labels_continuous[..., 2],
+            )
+            components = int(getattr(config, "epr_mixture_components", 1))
+            start_base = pedal_params["start_raw"].reshape(*pedal_params["start_raw"].shape[:-1], 3, components)
+            ctrl_base = pedal_params["ctrl_raw"].reshape(*pedal_params["ctrl_raw"].shape[:-1], 3, components)
+            pedal_start = loss_one(
+                start_base[..., 0, :],
+                start_base[..., 1, :],
+                start_base[..., 2, :],
+                labels_continuous[..., 3],
+            )
+            pedal_ctrl = loss_one(
+                ctrl_base[..., 0, :],
+                ctrl_base[..., 1, :],
+                ctrl_base[..., 2, :],
+                labels_continuous[..., 4],
+            )
+        elif distribution == "beta_mu_kappa":
+            params = _split_epr_distribution_params(continuous_pred)
+            pedal_params = _split_start_ctrl_from_outputs(config, continuous_pred)
+            eps = getattr(config, "beta_eps", 1e-5)
+            kappa_min = getattr(config, "beta_kappa_min", 1e-3)
+            loss_ioi = _beta_nll_loss(
+                params["shared_mu"][..., 0],
+                params["shared_kappa"][..., 0],
+                labels_continuous[..., 0],
+                mask,
+                eps,
+                kappa_min,
+            )
+            loss_duration = _beta_nll_loss(
+                params["shared_mu"][..., 1],
+                params["shared_kappa"][..., 1],
+                labels_continuous[..., 1],
+                mask,
+                eps,
+                kappa_min,
+            )
+            loss_velocity = _beta_nll_loss(
+                params["shared_mu"][..., 2],
+                params["shared_kappa"][..., 2],
+                labels_continuous[..., 2],
+                mask,
+                eps,
+                kappa_min,
+            )
+            pedal_start = _beta_nll_loss(
+                pedal_params["start_raw"][..., 0],
+                pedal_params["start_raw"][..., 1],
+                labels_continuous[..., 3],
+                mask,
+                eps,
+                kappa_min,
+            )
+            pedal_ctrl = _beta_nll_loss(
+                pedal_params["ctrl_raw"][..., 0],
+                pedal_params["ctrl_raw"][..., 1],
+                labels_continuous[..., 4],
+                mask,
+                eps,
+                kappa_min,
+            )
+        else:
+            pred = continuous_pred[..., :5]
+            loss_ioi = _regression_loss(
+                pred[..., 0],
+                labels_continuous[..., 0],
+                mask,
+                config.time_loss_type,
+                config.huber_delta,
+            )
+            loss_duration = _regression_loss(
+                pred[..., 1],
+                labels_continuous[..., 1],
+                mask,
+                config.time_loss_type,
+                config.huber_delta,
+            )
+            loss_velocity = _regression_loss(
+                pred[..., 2],
+                labels_continuous[..., 2],
+                mask,
+                config.value_loss_type,
+                config.huber_delta,
+            )
+            pedal_start = _regression_loss(
+                pred[..., 3],
+                labels_continuous[..., 3],
+                mask,
+                config.value_loss_type,
+                config.huber_delta,
+            )
+            pedal_ctrl = _regression_loss(
+                pred[..., 4],
+                labels_continuous[..., 4],
+                mask,
+                config.value_loss_type,
+                config.huber_delta,
+            )
+        return {
+            "ioi": loss_ioi,
+            "duration": loss_duration,
+            "velocity": loss_velocity,
+            "pedal": 0.5 * (pedal_start + pedal_ctrl),
+        }
+
     distribution = getattr(config, "epr_distribution", "point").lower()
     if distribution in {"categorical", "hard_categorical", "soft_categorical"}:
         if labels_epr_bins is None:
@@ -1738,39 +2036,57 @@ def _bce_loss(logits, target, mask):
     return _masked_mean(values, mask)
 
 
-def _compute_csr_loss_components(config, score_feature_logits, labels_score_feature, score_feature_mask):
-    score_mask = score_feature_mask.bool()
-    first_target = labels_score_feature[..., 3].float()
+def _compute_csr_loss_components(config, musical_logits, labels_musical, musical_mask):
+    score_mask = musical_mask.bool()
+    first_target = labels_musical[..., 5].float()
     ml_mask = score_mask & (first_target >= 0.5)
     grid_loss_type = getattr(config, "csr_grid_loss_type", "huber")
 
     return {
         "mo": _regression_loss(
-            torch.sigmoid(score_feature_logits[..., 0]),
-            labels_score_feature[..., 0],
+            torch.sigmoid(musical_logits[..., 0]),
+            labels_musical[..., 0],
+            score_mask,
+            grid_loss_type,
+            config.huber_delta,
+        ),
+        "mioi": _regression_loss(
+            torch.sigmoid(musical_logits[..., 1]),
+            labels_musical[..., 1],
             score_mask,
             grid_loss_type,
             config.huber_delta,
         ),
         "md": _regression_loss(
-            torch.sigmoid(score_feature_logits[..., 1]),
-            labels_score_feature[..., 1],
+            torch.sigmoid(musical_logits[..., 2]),
+            labels_musical[..., 2],
             score_mask,
             grid_loss_type,
             config.huber_delta,
         ),
-        "first": _bce_loss(score_feature_logits[..., 3], labels_score_feature[..., 3], score_mask),
         "ml": _regression_loss(
-            torch.sigmoid(score_feature_logits[..., 2]),
-            labels_score_feature[..., 2],
+            torch.sigmoid(musical_logits[..., 3]),
+            labels_musical[..., 3],
             ml_mask,
             grid_loss_type,
             config.huber_delta,
         ),
-        "staff": _bce_loss(score_feature_logits[..., 4], labels_score_feature[..., 4], score_mask),
-        "trill": _bce_loss(score_feature_logits[..., 5], labels_score_feature[..., 5], score_mask),
-        "grace": _bce_loss(score_feature_logits[..., 6], labels_score_feature[..., 6], score_mask),
-        "staccato": _bce_loss(score_feature_logits[..., 7], labels_score_feature[..., 7], score_mask),
+        "tempo": _regression_loss(
+            torch.sigmoid(musical_logits[..., 4]),
+            labels_musical[..., 4],
+            score_mask,
+            grid_loss_type,
+            config.huber_delta,
+        ),
+        "first": _bce_loss(musical_logits[..., 5], labels_musical[..., 5], score_mask),
+        "grace": _bce_loss(musical_logits[..., 6], labels_musical[..., 6], score_mask),
+        "hand": _bce_loss(musical_logits[..., 7], labels_musical[..., 7], score_mask),
+        "trill": _bce_loss(musical_logits[..., 8], labels_musical[..., 8], score_mask),
+        "stacc": _bce_loss(musical_logits[..., 9], labels_musical[..., 9], score_mask),
+        "stem": 0.5 * (
+            _bce_loss(musical_logits[..., 10], labels_musical[..., 10], score_mask)
+            + _bce_loss(musical_logits[..., 11], labels_musical[..., 11], score_mask)
+        ),
     }
 
 
@@ -1784,7 +2100,21 @@ def _compute_integrated_loss(config, continuous_pred, labels_continuous, attenti
     )
     if getattr(config, "task_type", "epr") == "csr":
         weights = config.csr_loss_weights
-        return sum(weights.get(name, 1.0) * value for name, value in components.items())
+        alias = {
+            "hand": ("hand", "staff"),
+            "stacc": ("stacc", "staccato"),
+            "stem": ("stem",),
+        }
+        total = 0.0
+        for name, value in components.items():
+            candidates = alias.get(name, (name,))
+            weight = None
+            for key in candidates:
+                if key in weights:
+                    weight = weights[key]
+                    break
+            total = total + (1.0 if weight is None else weight) * value
+        return total
 
     weights = config.loss_weights
     return (
@@ -1926,15 +2256,6 @@ class IntegratedPianoTransformer(nn.Module):
         super().__init__()
         self.config = config
         self.note_encoder = IntegratedNoteEncoder(config, role="score")
-        embedding_mode = getattr(config, "note_embedding_mode", "fine").lower()
-        if embedding_mode in {"legacy", "score_perf", "score_perf_split"}:
-            self._decoder_note_encoder = IntegratedNoteEncoder(
-                config,
-                continuous_dim=config.output_continuous_dim + 2,
-                role="perf",
-            )
-        else:
-            self._decoder_note_encoder = None
         self.continuous_decoder = IntegratedContinuousDecoder(config)
         backbone_type = config.backbone_type.lower()
         self.backbone_type = backbone_type
@@ -1947,15 +2268,17 @@ class IntegratedPianoTransformer(nn.Module):
 
     @property
     def decoder_note_encoder(self):
-        return self._decoder_note_encoder if self._decoder_note_encoder is not None else self.note_encoder
+        return self.note_encoder
 
     def forward(
         self,
         pitch_ids: Optional[torch.LongTensor] = None,
         continuous: Optional[torch.FloatTensor] = None,
+        score_shared_raw: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         labels_continuous: Optional[torch.FloatTensor] = None,
         labels_epr_bins: Optional[torch.LongTensor] = None,
+        label_mask: Optional[torch.LongTensor] = None,
         interpolated: Optional[torch.BoolTensor] = None,
         continuous_sampling_strategy: str = "mean",
         **kwargs,
@@ -1963,6 +2286,8 @@ class IntegratedPianoTransformer(nn.Module):
         del interpolated, kwargs
         if pitch_ids is None or continuous is None:
             raise ValueError("pitch_ids and continuous are required")
+        if _uses_deviation_ratio_targets(self.config) and score_shared_raw is None:
+            raise ValueError("score_shared_raw is required for deviation_ratio EPR")
         if attention_mask is None:
             attention_mask = (pitch_ids != self.config.pitch_pad_id).long()
 
@@ -1976,9 +2301,10 @@ class IntegratedPianoTransformer(nn.Module):
                 raise ValueError("decoder_input_mode='ar' is supported for gpt in IntegratedPianoTransformer")
             if labels_continuous is not None:
                 decoder_target_continuous = _build_ar_note_continuous(
+                    self.config,
                     labels_continuous,
-                    self.config.task_type,
-                    getattr(self.config, "input_feature_mode", "integrated"),
+                    score_shared_raw=score_shared_raw,
+                    task_type=self.config.task_type,
                 )
                 decoder_input_continuous = _shift_continuous_right(decoder_target_continuous, attention_mask)
                 special_note_ids = _build_ar_special_note_ids(self.config, attention_mask)
@@ -2012,22 +2338,29 @@ class IntegratedPianoTransformer(nn.Module):
         else:
             raise ValueError(f"Unsupported decoder_input_mode: {self.config.decoder_input_mode}")
 
-        if labels_continuous is None and self.config.task_type == "epr":
-            continuous_pred = _materialize_epr_prediction(
-                self.config,
-                continuous_pred,
-                sampling_strategy=continuous_sampling_strategy,
-            )
-            if str(getattr(self.config, "pedal_representation", "continuous_4")).lower() == "start_ctrl":
-                continuous_pred = materialize_start_ctrl_sequence(continuous_pred, attention_mask)
+        if labels_continuous is None:
+            if self.config.task_type == "epr":
+                continuous_pred = _materialize_epr_prediction(
+                    self.config,
+                    continuous_pred,
+                    sampling_strategy=continuous_sampling_strategy,
+                )
+                if (
+                    not _uses_deviation_ratio_targets(self.config)
+                    and str(getattr(self.config, "pedal_representation", "continuous_4")).lower() == "start_ctrl"
+                ):
+                    continuous_pred = materialize_start_ctrl_sequence(continuous_pred, attention_mask)
+            elif self.config.task_type == "csr":
+                continuous_pred = _materialize_csr_prediction(continuous_pred)
 
         loss = None
         if labels_continuous is not None:
+            loss_mask = label_mask if (self.config.task_type == "csr" and label_mask is not None) else attention_mask
             loss = _compute_integrated_loss(
                 self.config,
                 continuous_pred,
                 labels_continuous,
-                attention_mask,
+                loss_mask,
                 labels_epr_bins=labels_epr_bins,
             )
 
@@ -2037,6 +2370,7 @@ class IntegratedPianoTransformer(nn.Module):
         self,
         pitch_ids,
         continuous,
+        score_shared_raw=None,
         attention_mask=None,
         prefix_predictions=None,
         sampling_strategy="mean",
@@ -2048,6 +2382,7 @@ class IntegratedPianoTransformer(nn.Module):
             outputs = self(
                 pitch_ids=pitch_ids,
                 continuous=continuous,
+                score_shared_raw=score_shared_raw,
                 attention_mask=attention_mask,
                 continuous_sampling_strategy=sampling_strategy,
             )
@@ -2057,12 +2392,13 @@ class IntegratedPianoTransformer(nn.Module):
         return self._autoregressive_rollout_gpt(
             pitch_ids=pitch_ids,
             continuous=continuous,
+            score_shared_raw=score_shared_raw,
             attention_mask=attention_mask,
             sampling_strategy=sampling_strategy,
             prefix_predictions=prefix_predictions,
         )
 
-    def _autoregressive_rollout_gpt(self, pitch_ids, continuous, attention_mask, sampling_strategy="mean", prefix_predictions=None):
+    def _autoregressive_rollout_gpt(self, pitch_ids, continuous, score_shared_raw, attention_mask, sampling_strategy="mean", prefix_predictions=None):
         batch_size, seq_len = pitch_ids.shape
         score_note_embeds = self.note_encoder(pitch_ids, continuous)
         decoder_input_continuous, special_note_ids, prefix_len = _build_prefilled_ar_note_inputs(
@@ -2073,9 +2409,11 @@ class IntegratedPianoTransformer(nn.Module):
             if (
                 prefix_predictions is not None
                 and self.config.task_type == "epr"
+                and not _uses_deviation_ratio_targets(self.config)
                 and str(getattr(self.config, "pedal_representation", "continuous_4")).lower() == "start_ctrl"
             )
             else prefix_predictions,
+            score_shared_raw=score_shared_raw,
         )
         decoder_pitch_ids = _shift_pitch_right(self.config, pitch_ids, attention_mask)
         predictions = []
@@ -2096,17 +2434,34 @@ class IntegratedPianoTransformer(nn.Module):
                 performance_attention_mask=perf_prefix_mask,
             )
             step_raw = self.continuous_decoder(hidden_states[:, -1:, :])
-            step_pred = _materialize_epr_prediction(self.config, step_raw, sampling_strategy=sampling_strategy)
+            if self.config.task_type == "csr":
+                step_pred = _materialize_csr_prediction(step_raw)
+            else:
+                step_pred = _materialize_epr_prediction(self.config, step_raw, sampling_strategy=sampling_strategy)
             predictions.append(step_pred)
             if step + 1 < seq_len:
-                if self.config.task_type == "epr":
+                if _uses_deviation_ratio_targets(self.config):
+                    decoder_input_continuous[:, step + 1] = _build_epr_decoder_rows(
+                        self.config,
+                        score_shared_raw[:, step : step + 1],
+                        step_pred,
+                    )[:, 0]
+                elif self.config.task_type == "epr":
                     decoder_input_continuous[:, step + 1, 1] = 1.0
                 elif self.config.task_type == "csr":
-                    decoder_input_continuous[:, step + 1, 0] = 1.0
-                decoder_input_continuous[:, step + 1, 2:] = step_pred[:, 0, :]
+                    decoder_input_continuous[:, step + 1] = _build_csr_decoder_rows(
+                        self.config,
+                        step_pred,
+                    )[:, 0]
+                if not _uses_deviation_ratio_targets(self.config) and self.config.task_type != "csr":
+                    decoder_input_continuous[:, step + 1, 2:] = step_pred[:, 0, :]
 
-        output = torch.cat(predictions, dim=1) if predictions else torch.zeros_like(continuous)
-        if str(getattr(self.config, "pedal_representation", "continuous_4")).lower() == "start_ctrl":
+        output = torch.cat(predictions, dim=1) if predictions else continuous.new_zeros((batch_size, 0, self.config.output_continuous_dim))
+        if (
+            self.config.task_type == "epr"
+            and not _uses_deviation_ratio_targets(self.config)
+            and str(getattr(self.config, "pedal_representation", "continuous_4")).lower() == "start_ctrl"
+        ):
             output = materialize_start_ctrl_sequence(output, attention_mask)
         return output
 
@@ -2123,22 +2478,13 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
         config.is_encoder_decoder = True
         super().__init__(config)
         self.note_encoder = IntegratedNoteEncoder(config, role="score")
-        embedding_mode = getattr(config, "note_embedding_mode", "fine").lower()
-        if embedding_mode in {"legacy", "score_perf", "score_perf_split"}:
-            self._decoder_note_encoder = IntegratedNoteEncoder(
-                config,
-                continuous_dim=config.output_continuous_dim + 2,
-                role="perf",
-            )
-        else:
-            self._decoder_note_encoder = None
         self.model = IntegratedPianoT5GemmaModel(config)
         self.continuous_decoder = IntegratedContinuousDecoder(config)
         self.post_init()
 
     @property
     def decoder_note_encoder(self):
-        return self._decoder_note_encoder if self._decoder_note_encoder is not None else self.note_encoder
+        return self.note_encoder
 
     def get_encoder(self):
         return self.model.encoder
@@ -2154,6 +2500,8 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
     def _build_decoder_inputs(
         self,
         pitch_ids,
+        continuous,
+        score_shared_raw,
         score_note_embeds,
         attention_mask,
         labels_continuous=None,
@@ -2165,9 +2513,10 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
             if labels_continuous is None:
                 return None, None
             decoder_target_continuous = _build_ar_note_continuous(
+                self.config,
                 labels_continuous,
-                self.config.task_type,
-                getattr(self.config, "input_feature_mode", "integrated"),
+                score_shared_raw=score_shared_raw,
+                task_type=self.config.task_type,
             )
             decoder_input_continuous = _shift_continuous_right(decoder_target_continuous, attention_mask)
             special_note_ids = _build_ar_special_note_ids(self.config, attention_mask)
@@ -2191,9 +2540,11 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
         self,
         pitch_ids: Optional[torch.LongTensor] = None,
         continuous: Optional[torch.FloatTensor] = None,
+        score_shared_raw: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         labels_continuous: Optional[torch.FloatTensor] = None,
         labels_epr_bins: Optional[torch.LongTensor] = None,
+        label_mask: Optional[torch.LongTensor] = None,
         interpolated: Optional[torch.BoolTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         decoder_attention_mask: Optional[torch.BoolTensor] = None,
@@ -2218,6 +2569,8 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
 
         if pitch_ids is None or continuous is None:
             raise ValueError("pitch_ids and continuous are required")
+        if _uses_deviation_ratio_targets(self.config) and score_shared_raw is None:
+            raise ValueError("score_shared_raw is required for deviation_ratio EPR")
 
         if attention_mask is None:
             attention_mask = (pitch_ids != self.config.pitch_pad_id).long()
@@ -2225,6 +2578,8 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
         score_note_embeds = self.note_encoder(pitch_ids, continuous)
         decoder_inputs_embeds, decoder_input_mask = self._build_decoder_inputs(
             pitch_ids,
+            continuous,
+            score_shared_raw,
             score_note_embeds,
             attention_mask,
             labels_continuous=labels_continuous,
@@ -2233,6 +2588,7 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
             continuous_pred = self._autoregressive_rollout(
                 pitch_ids=pitch_ids,
                 continuous=continuous,
+                score_shared_raw=score_shared_raw,
                 attention_mask=attention_mask,
                 sampling_strategy=continuous_sampling_strategy,
                 position_ids=position_ids,
@@ -2244,11 +2600,12 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
             )
             loss = None
             if labels_continuous is not None:
+                loss_mask = label_mask if (self.config.task_type == "csr" and label_mask is not None) else attention_mask
                 loss = _compute_integrated_loss(
                     self.config,
                     continuous_pred,
                     labels_continuous,
-                    attention_mask,
+                    loss_mask,
                     labels_epr_bins=labels_epr_bins,
                 )
             return Seq2SeqLMOutput(loss=loss, logits=continuous_pred)
@@ -2270,22 +2627,29 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
         )
 
         continuous_pred = self.continuous_decoder(decoder_outputs.last_hidden_state)
-        if labels_continuous is None and self.config.task_type == "epr":
-            continuous_pred = _materialize_epr_prediction(
-                self.config,
-                continuous_pred,
-                sampling_strategy=continuous_sampling_strategy,
-            )
-            if str(getattr(self.config, "pedal_representation", "continuous_4")).lower() == "start_ctrl":
-                continuous_pred = materialize_start_ctrl_sequence(continuous_pred, attention_mask)
+        if labels_continuous is None:
+            if self.config.task_type == "epr":
+                continuous_pred = _materialize_epr_prediction(
+                    self.config,
+                    continuous_pred,
+                    sampling_strategy=continuous_sampling_strategy,
+                )
+                if (
+                    not _uses_deviation_ratio_targets(self.config)
+                    and str(getattr(self.config, "pedal_representation", "continuous_4")).lower() == "start_ctrl"
+                ):
+                    continuous_pred = materialize_start_ctrl_sequence(continuous_pred, attention_mask)
+            elif self.config.task_type == "csr":
+                continuous_pred = _materialize_csr_prediction(continuous_pred)
 
         loss = None
         if labels_continuous is not None:
+            loss_mask = label_mask if (self.config.task_type == "csr" and label_mask is not None) else attention_mask
             loss = _compute_integrated_loss(
                 self.config,
                 continuous_pred,
                 labels_continuous,
-                attention_mask,
+                loss_mask,
                 labels_epr_bins=labels_epr_bins,
             )
 
@@ -2305,6 +2669,7 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
         self,
         pitch_ids,
         continuous,
+        score_shared_raw=None,
         attention_mask=None,
         prefix_predictions=None,
         sampling_strategy="mean",
@@ -2316,6 +2681,7 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
             return self._autoregressive_rollout(
                 pitch_ids=pitch_ids,
                 continuous=continuous,
+                score_shared_raw=score_shared_raw,
                 attention_mask=attention_mask,
                 sampling_strategy=sampling_strategy,
                 prefix_predictions=prefix_predictions,
@@ -2323,6 +2689,7 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
         outputs = self(
             pitch_ids=pitch_ids,
             continuous=continuous,
+            score_shared_raw=score_shared_raw,
             attention_mask=attention_mask,
             continuous_sampling_strategy=sampling_strategy,
         )
@@ -2332,6 +2699,7 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
         self,
         pitch_ids,
         continuous,
+        score_shared_raw,
         attention_mask,
         sampling_strategy="mean",
         prefix_predictions=None,
@@ -2360,9 +2728,11 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
             if (
                 prefix_predictions is not None
                 and self.config.task_type == "epr"
+                and not _uses_deviation_ratio_targets(self.config)
                 and str(getattr(self.config, "pedal_representation", "continuous_4")).lower() == "start_ctrl"
             )
             else prefix_predictions,
+            score_shared_raw=score_shared_raw,
         )
         decoder_pitch_ids = _shift_pitch_right(self.config, pitch_ids, attention_mask)
         if prefix_len >= seq_len:
@@ -2446,17 +2816,34 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
                 cached_past_key_values = decoder_outputs.past_key_values
 
             step_raw = self.continuous_decoder(decoder_outputs.last_hidden_state[:, -1:, :])
-            step_pred = _materialize_epr_prediction(self.config, step_raw, sampling_strategy=sampling_strategy)
+            if self.config.task_type == "csr":
+                step_pred = _materialize_csr_prediction(step_raw)
+            else:
+                step_pred = _materialize_epr_prediction(self.config, step_raw, sampling_strategy=sampling_strategy)
             predictions.append(step_pred)
 
             if step + 1 < seq_len:
-                if self.config.task_type == "epr":
+                if _uses_deviation_ratio_targets(self.config):
+                    decoder_input_continuous[:, step + 1] = _build_epr_decoder_rows(
+                        self.config,
+                        score_shared_raw[:, step : step + 1],
+                        step_pred,
+                    )[:, 0]
+                elif self.config.task_type == "epr":
                     decoder_input_continuous[:, step + 1, 1] = 1.0
                 elif self.config.task_type == "csr":
-                    decoder_input_continuous[:, step + 1, 0] = 1.0
-                decoder_input_continuous[:, step + 1, 2:] = step_pred[:, 0, :]
+                    decoder_input_continuous[:, step + 1] = _build_csr_decoder_rows(
+                        self.config,
+                        step_pred,
+                    )[:, 0]
+                if not _uses_deviation_ratio_targets(self.config) and self.config.task_type != "csr":
+                    decoder_input_continuous[:, step + 1, 2:] = step_pred[:, 0, :]
 
-        output = torch.cat(predictions, dim=1) if predictions else torch.zeros_like(continuous)
-        if str(getattr(self.config, "pedal_representation", "continuous_4")).lower() == "start_ctrl":
+        output = torch.cat(predictions, dim=1) if predictions else continuous.new_zeros((batch_size, 0, self.config.output_continuous_dim))
+        if (
+            self.config.task_type == "epr"
+            and not _uses_deviation_ratio_targets(self.config)
+            and str(getattr(self.config, "pedal_representation", "continuous_4")).lower() == "start_ctrl"
+        ):
             output = materialize_start_ctrl_sequence(output, attention_mask)
         return output
