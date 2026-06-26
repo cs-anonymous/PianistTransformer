@@ -211,7 +211,9 @@ def continuation_window_predictions(
             overlap_len = max(0, last_end - start)
             keep_prefix_len = max(0, overlap_len - int(overlap_len * drop_ratio))
             if keep_prefix_len > 0:
-                prefix_predictions = window_predictions[-1][:, overlap_len - keep_prefix_len : overlap_len].to(device)
+                prefix_start = max(0, start - last_start)
+                prefix_end = prefix_start + keep_prefix_len
+                prefix_predictions = window_predictions[-1][:, prefix_start:prefix_end].to(device)
 
         with torch.no_grad():
             pred = model.predict_performance_continuous(
@@ -230,7 +232,7 @@ def continuation_window_predictions(
             last_start, last_end = windows[window_idx - 1]
             overlap_len = max(0, last_end - start)
             keep_prefix_len = max(0, overlap_len - int(overlap_len * drop_ratio))
-            append_from = keep_prefix_len
+            append_from = overlap_len
             merged = torch.cat([merged, pred[:, append_from:]], dim=1)
 
     return merged.squeeze(0)

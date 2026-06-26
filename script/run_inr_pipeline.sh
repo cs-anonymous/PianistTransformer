@@ -167,7 +167,7 @@ if [[ "${PIPELINE_STAGE_START}" == "train" ]]; then
     echo "TRAIN_OUTPUT_DIR ${TRAIN_OUTPUT_DIR}"
     echo "CHECKPOINT ${CHECKPOINT}"
   } | tee -a "${EVALUATE_LOG}"
-elif [[ "${PIPELINE_STAGE_START}" == "adapt" ]]; then
+elif [[ "${PIPELINE_STAGE_START}" == "adapt" || "${PIPELINE_STAGE_START}" == "infer" ]]; then
   [[ -n "${TRAIN_OUTPUT_DIR}" ]] || TRAIN_OUTPUT_DIR="$(
     find "${TRAIN_ROOT}" -maxdepth 1 -mindepth 1 -type d -name 'inr_*' \
       -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-
@@ -184,12 +184,30 @@ elif [[ "${PIPELINE_STAGE_START}" == "adapt" ]]; then
     echo "CHECKPOINT ${CHECKPOINT}"
   } | tee -a "${EVALUATE_LOG}"
 else
-  echo "Unsupported PIPELINE_STAGE_START=${PIPELINE_STAGE_START}; expected train or adapt" >&2
+  echo "Unsupported PIPELINE_STAGE_START=${PIPELINE_STAGE_START}; expected train, adapt, or infer" >&2
   exit 1
 fi
 
 ACTIVE_CONFIG="${RUN_CONFIG}"
-if [[ "${ADAPT_ON_ASAP}" == "1" ]]; then
+if [[ "${PIPELINE_STAGE_START}" == "infer" && "${ADAPT_ON_ASAP}" == "1" ]]; then
+  [[ -f "${ADAPT_CONFIG}" ]] \
+    || { echo "Missing adapted config for infer stage: ${ADAPT_CONFIG}" >&2; exit 1; }
+  ADAPT_OUTPUT_DIR="${ADAPT_OUTPUT_DIR_OVERRIDE:-}"
+  [[ -n "${ADAPT_OUTPUT_DIR}" ]] || ADAPT_OUTPUT_DIR="$(
+    find "${ADAPT_TRAIN_ROOT}" -maxdepth 1 -mindepth 1 -type d -name 'inr_*' \
+      -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-
+  )"
+  [[ -n "${ADAPT_OUTPUT_DIR}" ]] \
+    || { echo "Could not locate existing adapted output under ${ADAPT_TRAIN_ROOT}" >&2; exit 1; }
+  CHECKPOINT="${ADAPT_OUTPUT_DIR}"
+  [[ -d "${ADAPT_OUTPUT_DIR}/checkpoint-best" ]] && CHECKPOINT="${ADAPT_OUTPUT_DIR}/checkpoint-best"
+  ACTIVE_CONFIG="${ADAPT_CONFIG}"
+  {
+    echo "SKIP_ADAPT 1"
+    echo "ADAPT_OUTPUT_DIR ${ADAPT_OUTPUT_DIR}"
+    echo "ADAPTED_CHECKPOINT ${CHECKPOINT}"
+  } | tee -a "${EVALUATE_LOG}"
+elif [[ "${ADAPT_ON_ASAP}" == "1" ]]; then
   python - "${RUN_CONFIG}" "${ADAPT_CONFIG}" "${ADAPT_TRAIN_ROOT}" "${ADAPT_TF_LOG_ROOT}" "${CHECKPOINT}" "${ADAPT_LR}" "${ADAPT_EPOCHS}" <<'PY'
 import json, sys
 src, dst, train_root, tf_log_root, checkpoint, lr, epochs = sys.argv[1:8]
