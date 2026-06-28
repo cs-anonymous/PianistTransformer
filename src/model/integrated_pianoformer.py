@@ -29,6 +29,29 @@ from src.model.pianoformer import PianoT5Gemma, PianoT5GemmaConfig
 logger = logging.get_logger(__name__)
 
 
+def resolve_timing_control_mode(timing_control_mode=None, use_timing_scale_bit=True):
+    if timing_control_mode is None:
+        return "piecewise_scale_bit" if bool(use_timing_scale_bit) else "piecewise_single"
+    mode = str(timing_control_mode).lower()
+    valid_modes = {
+        "piecewise_scale_bit",
+        "piecewise_single",
+        "dual_log_linear",
+        "dual_clip_linear",
+    }
+    if mode not in valid_modes:
+        raise ValueError(f"Unsupported timing_control_mode={timing_control_mode}")
+    return mode
+
+
+def timing_control_feature_dim(timing_control_mode=None, use_timing_scale_bit=True):
+    mode = resolve_timing_control_mode(
+        timing_control_mode=timing_control_mode,
+        use_timing_scale_bit=use_timing_scale_bit,
+    )
+    return 3 if mode == "piecewise_single" else 5
+
+
 class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
     def __init__(
         self,
@@ -46,6 +69,12 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         time_loss_type="huber",
         value_loss_type="mse",
         csr_grid_loss_type="huber",
+        csr_grid_step=1.0 / 24.0,
+        csr_grid_soft_ce_tau=1.5,
+        csr_mo_max=6.0,
+        csr_mioi_max=6.0,
+        csr_md_max=6.0,
+        csr_ml_max=6.0,
         huber_delta=0.05,
         loss_weights=None,
         csr_loss_weights=None,
@@ -75,6 +104,7 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         epr_timing_bins=5000,
         epr_value_bins=128,
         epr_timing_target="absolute",
+        timing_control_mode=None,
         use_timing_scale_bit=True,
         soft_ce_tau=None,
         timing_input_normalization="scaled_log_5000_s10",
@@ -105,6 +135,12 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.time_loss_type = time_loss_type
         self.value_loss_type = value_loss_type
         self.csr_grid_loss_type = csr_grid_loss_type
+        self.csr_grid_step = float(csr_grid_step)
+        self.csr_grid_soft_ce_tau = float(csr_grid_soft_ce_tau)
+        self.csr_mo_max = float(csr_mo_max)
+        self.csr_mioi_max = float(csr_mioi_max)
+        self.csr_md_max = float(csr_md_max)
+        self.csr_ml_max = float(csr_ml_max)
         self.huber_delta = huber_delta
         self.loss_weights = loss_weights or {
             "ioi": 1.0,
@@ -160,8 +196,15 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.epr_timing_bins = int(epr_timing_bins)
         self.epr_value_bins = int(epr_value_bins)
         self.epr_timing_target = str(epr_timing_target).lower()
-        self.use_timing_scale_bit = bool(use_timing_scale_bit)
-        self.control_feature_dim = 5 if self.use_timing_scale_bit else 3
+        self.timing_control_mode = resolve_timing_control_mode(
+            timing_control_mode=timing_control_mode,
+            use_timing_scale_bit=use_timing_scale_bit,
+        )
+        self.use_timing_scale_bit = self.timing_control_mode == "piecewise_scale_bit"
+        self.control_feature_dim = timing_control_feature_dim(
+            timing_control_mode=self.timing_control_mode,
+            use_timing_scale_bit=self.use_timing_scale_bit,
+        )
         self.dev_feature_dim = 2
         self.pedal_feature_dim = 2
         self.musical_feature_dim = 12
@@ -417,9 +460,13 @@ class IntegratedContinuousDecoder(nn.Module):
             else:
                 pedal_output_dim = 2
 
+        generic_output_dim = self.output_dim
+        if getattr(config, "task_type", "epr") == "csr" and _csr_uses_grid_head(config):
+            generic_output_dim = _csr_grid_raw_output_dim(config)
+
         self.shared_head = _make_mlp(shared_dim, shared_output_dim, shared_dim, head_depth, activation)
         self.pedal_head = _make_mlp(perf_dim, pedal_output_dim, perf_dim, head_depth, activation)
-        self.generic_head = _make_mlp(score_dim, self.output_dim, score_dim, head_depth, activation)
+        self.generic_head = _make_mlp(score_dim, generic_output_dim, score_dim, head_depth, activation)
 
     def forward(self, hidden_states):
         if _uses_deviation_ratio_targets(self.config):
@@ -654,29 +701,51 @@ def _pack_start_ctrl_prediction(shared, start, ctrl):
 def _uses_deviation_ratio_targets(config):
     return (
         getattr(config, "task_type", "epr") == "epr"
-        and str(getattr(config, "epr_timing_target", "absolute")).lower() in {"deviation_ratio", "dev_ratio"}
+        and str(getattr(config, "epr_timing_target", "absolute")).lower() in {"deviation", "dev", "deviation_ratio", "dev_ratio"}
     )
 
 
-def _torch_piecewise_time_code(time_ms, use_scale_bit=True):
+def _torch_timing_control_code(time_ms, timing_control_mode=None, use_scale_bit=True):
     value = time_ms.float().clamp(0.0, 5000.0)
-    if bool(use_scale_bit):
+    mode = resolve_timing_control_mode(
+        timing_control_mode=timing_control_mode,
+        use_timing_scale_bit=use_scale_bit,
+    )
+    if mode == "piecewise_scale_bit":
         scale_bit = (value > 500.0).to(dtype=value.dtype)
         cont = torch.where(value > 500.0, value / 5000.0, value / 500.0)
         return torch.stack([scale_bit, cont], dim=-1)
-    return torch.stack(
-        [
-            torch.where(value > 500.0, value / 5000.0, value / 500.0),
-        ],
-        dim=-1,
-    )
+    if mode == "piecewise_single":
+        return torch.stack(
+            [
+                torch.where(value > 500.0, value / 5000.0, value / 500.0),
+            ],
+            dim=-1,
+        )
+    if mode == "dual_log_linear":
+        return torch.stack(
+            [
+                torch.log1p(value) / torch.log1p(value.new_tensor(5000.0)),
+                value / 5000.0,
+            ],
+            dim=-1,
+        )
+    if mode == "dual_clip_linear":
+        return torch.stack(
+            [
+                torch.clamp(value / 500.0, max=1.0),
+                value / 5000.0,
+            ],
+            dim=-1,
+        )
+    raise ValueError(f"Unsupported timing_control_mode={mode}")
 
 
 def _target5_to_raw7(score_shared_raw, target_predictions):
     score_shared_raw = score_shared_raw.float()
     target_predictions = target_predictions.float().clamp(0.0, 1.0)
     perf_ioi_ms = (score_shared_raw[..., 0] + (target_predictions[..., 0] * 1000.0 - 500.0)).clamp_min(0.0)
-    perf_duration_ms = (score_shared_raw[..., 1] * (target_predictions[..., 1] * 5.0)).clamp_min(0.0)
+    perf_duration_ms = (score_shared_raw[..., 1] + (target_predictions[..., 1] * 1000.0 - 500.0)).clamp_min(0.0)
     velocity = target_predictions[..., 2] * 127.0
     pedal_start = target_predictions[..., 3] * 127.0
     pedal_ctrl = target_predictions[..., 4] * 127.0
@@ -697,8 +766,18 @@ def _target5_to_raw7(score_shared_raw, target_predictions):
 
 def _build_epr_decoder_rows(config, score_shared_raw, target_predictions):
     raw_perf = _target5_to_raw7(score_shared_raw, target_predictions)
-    shared = _torch_piecewise_time_code(raw_perf[..., 0], getattr(config, "use_timing_scale_bit", True))
-    duration = _torch_piecewise_time_code(raw_perf[..., 1], getattr(config, "use_timing_scale_bit", True))
+    timing_control_mode = getattr(config, "timing_control_mode", None)
+    use_timing_scale_bit = getattr(config, "use_timing_scale_bit", True)
+    shared = _torch_timing_control_code(
+        raw_perf[..., 0],
+        timing_control_mode=timing_control_mode,
+        use_scale_bit=use_timing_scale_bit,
+    )
+    duration = _torch_timing_control_code(
+        raw_perf[..., 1],
+        timing_control_mode=timing_control_mode,
+        use_scale_bit=use_timing_scale_bit,
+    )
     velocity = (raw_perf[..., 2] / 127.0).unsqueeze(-1)
     control = torch.cat([shared, duration, velocity], dim=-1)
     dev = target_predictions[..., 0:2].float().clamp(0.0, 1.0)
@@ -710,16 +789,77 @@ def _build_epr_decoder_rows(config, score_shared_raw, target_predictions):
 
 
 def _build_csr_decoder_rows(config, musical_predictions):
-    del config
     musical = musical_predictions.float().clamp(0.0, 1.0)
-    zeros = musical.new_zeros(*musical.shape[:-1], 5 + 2 + 2)
+    control_dim = int(getattr(config, "control_feature_dim", 5))
+    zeros = musical.new_zeros(*musical.shape[:-1], control_dim + 2 + 2)
     control_is_perf = 0.0
     masks = musical.new_tensor([0.0, 0.0, 0.0, 1.0, control_is_perf]).expand(*musical.shape[:-1], 5)
     return torch.cat([zeros, musical, masks], dim=-1)
 
 
-def _materialize_csr_prediction(raw_outputs):
-    return torch.sigmoid(raw_outputs)
+def _csr_uses_grid_head(config):
+    return str(getattr(config, "csr_grid_loss_type", "huber")).lower() in {
+        "soft_ce",
+        "soft_ce_huber",
+        "ce",
+        "hard_ce",
+        "ordinal",
+        "grid",
+    }
+
+
+def _csr_grid_bins(config, name):
+    step = max(float(getattr(config, "csr_grid_step", 1.0 / 24.0)), 1e-12)
+    max_value = float(getattr(config, f"csr_{name}_max"))
+    return int(round(max_value / step)) + 1
+
+
+def _csr_grid_raw_output_dim(config):
+    return (
+        _csr_grid_bins(config, "mo")
+        + _csr_grid_bins(config, "mioi")
+        + _csr_grid_bins(config, "md")
+        + _csr_grid_bins(config, "ml")
+        + 1
+        + 7
+    )
+
+
+def _split_csr_grid_outputs(config, raw_outputs):
+    start = 0
+    outputs = {}
+    for name in ("mo", "mioi", "md", "ml"):
+        bins = _csr_grid_bins(config, name)
+        outputs[name] = raw_outputs[..., start : start + bins]
+        start += bins
+    outputs["tempo"] = raw_outputs[..., start]
+    start += 1
+    outputs["binary"] = raw_outputs[..., start : start + 7]
+    return outputs
+
+
+def _csr_grid_to_normalized(config, name, logits):
+    bins = logits.shape[-1]
+    values = torch.arange(bins, device=logits.device, dtype=torch.float32)
+    step = float(getattr(config, "csr_grid_step", 1.0 / 24.0))
+    max_value = max(float(getattr(config, f"csr_{name}_max")), step)
+    indices = logits.float().argmax(dim=-1).to(dtype=torch.float32)
+    return (indices * step / max_value).clamp(0.0, 1.0)
+
+
+def _materialize_csr_prediction(config, raw_outputs):
+    if not _csr_uses_grid_head(config):
+        return torch.sigmoid(raw_outputs)
+    parts = _split_csr_grid_outputs(config, raw_outputs)
+    continuous = [
+        _csr_grid_to_normalized(config, "mo", parts["mo"]),
+        _csr_grid_to_normalized(config, "mioi", parts["mioi"]),
+        _csr_grid_to_normalized(config, "md", parts["md"]),
+        _csr_grid_to_normalized(config, "ml", parts["ml"]),
+        torch.sigmoid(parts["tempo"]),
+    ]
+    binary = (torch.sigmoid(parts["binary"]) >= 0.5).to(dtype=raw_outputs.dtype)
+    return torch.cat([torch.stack(continuous, dim=-1), binary], dim=-1)
 
 
 def _logistic_normal_params(raw_mu, raw_log_sigma, sigma_min=1e-3, sigma_max=10.0):
@@ -2036,11 +2176,59 @@ def _bce_loss(logits, target, mask):
     return _masked_mean(values, mask)
 
 
+def _normalized_to_csr_grid_target(config, name, target):
+    step = max(float(getattr(config, "csr_grid_step", 1.0 / 24.0)), 1e-12)
+    max_value = float(getattr(config, f"csr_{name}_max"))
+    bins = _csr_grid_bins(config, name)
+    return torch.round(target.float().clamp(0.0, 1.0) * max_value / step).long().clamp(0, bins - 1)
+
+
+def _csr_grid_loss(config, name, logits, target, mask):
+    target_bin = _normalized_to_csr_grid_target(config, name, target)
+    grid_loss_type = str(getattr(config, "csr_grid_loss_type", "huber")).lower()
+    if grid_loss_type in {"ce", "hard_ce", "ordinal", "grid"}:
+        return _hard_categorical_loss(logits, target_bin, mask)
+    if grid_loss_type in {"soft_ce", "soft_ce_huber"}:
+        return _soft_categorical_loss(
+            logits,
+            target_bin,
+            mask,
+            tau=float(getattr(config, "csr_grid_soft_ce_tau", 1.5)),
+        )
+    raise ValueError(f"Unsupported CSR grid loss type: {grid_loss_type}")
+
+
 def _compute_csr_loss_components(config, musical_logits, labels_musical, musical_mask):
     score_mask = musical_mask.bool()
     first_target = labels_musical[..., 5].float()
     ml_mask = score_mask & (first_target >= 0.5)
     grid_loss_type = getattr(config, "csr_grid_loss_type", "huber")
+
+    if _csr_uses_grid_head(config):
+        parts = _split_csr_grid_outputs(config, musical_logits)
+        binary = parts["binary"]
+        return {
+            "mo": _csr_grid_loss(config, "mo", parts["mo"], labels_musical[..., 0], score_mask),
+            "mioi": _csr_grid_loss(config, "mioi", parts["mioi"], labels_musical[..., 1], score_mask),
+            "md": _csr_grid_loss(config, "md", parts["md"], labels_musical[..., 2], score_mask),
+            "ml": _csr_grid_loss(config, "ml", parts["ml"], labels_musical[..., 3], ml_mask),
+            "tempo": _regression_loss(
+                torch.sigmoid(parts["tempo"]),
+                labels_musical[..., 4],
+                score_mask,
+                "huber",
+                config.huber_delta,
+            ),
+            "first": _bce_loss(binary[..., 0], labels_musical[..., 5], score_mask),
+            "grace": _bce_loss(binary[..., 1], labels_musical[..., 6], score_mask),
+            "hand": _bce_loss(binary[..., 2], labels_musical[..., 7], score_mask),
+            "trill": _bce_loss(binary[..., 3], labels_musical[..., 8], score_mask),
+            "stacc": _bce_loss(binary[..., 4], labels_musical[..., 9], score_mask),
+            "stem": 0.5 * (
+                _bce_loss(binary[..., 5], labels_musical[..., 10], score_mask)
+                + _bce_loss(binary[..., 6], labels_musical[..., 11], score_mask)
+            ),
+        }
 
     return {
         "mo": _regression_loss(
@@ -2287,7 +2475,7 @@ class IntegratedPianoTransformer(nn.Module):
         if pitch_ids is None or continuous is None:
             raise ValueError("pitch_ids and continuous are required")
         if _uses_deviation_ratio_targets(self.config) and score_shared_raw is None:
-            raise ValueError("score_shared_raw is required for deviation_ratio EPR")
+            raise ValueError("score_shared_raw is required for deviation EPR")
         if attention_mask is None:
             attention_mask = (pitch_ids != self.config.pitch_pad_id).long()
 
@@ -2351,7 +2539,7 @@ class IntegratedPianoTransformer(nn.Module):
                 ):
                     continuous_pred = materialize_start_ctrl_sequence(continuous_pred, attention_mask)
             elif self.config.task_type == "csr":
-                continuous_pred = _materialize_csr_prediction(continuous_pred)
+                continuous_pred = _materialize_csr_prediction(self.config, continuous_pred)
 
         loss = None
         if labels_continuous is not None:
@@ -2435,7 +2623,7 @@ class IntegratedPianoTransformer(nn.Module):
             )
             step_raw = self.continuous_decoder(hidden_states[:, -1:, :])
             if self.config.task_type == "csr":
-                step_pred = _materialize_csr_prediction(step_raw)
+                step_pred = _materialize_csr_prediction(self.config, step_raw)
             else:
                 step_pred = _materialize_epr_prediction(self.config, step_raw, sampling_strategy=sampling_strategy)
             predictions.append(step_pred)
@@ -2459,9 +2647,9 @@ class IntegratedPianoTransformer(nn.Module):
         output = torch.cat(predictions, dim=1) if predictions else continuous.new_zeros((batch_size, 0, self.config.output_continuous_dim))
         if (
             self.config.task_type == "epr"
-            and not _uses_deviation_ratio_targets(self.config)
-            and str(getattr(self.config, "pedal_representation", "continuous_4")).lower() == "start_ctrl"
-        ):
+                and not _uses_deviation_ratio_targets(self.config)
+                and str(getattr(self.config, "pedal_representation", "continuous_4")).lower() == "start_ctrl"
+            ):
             output = materialize_start_ctrl_sequence(output, attention_mask)
         return output
 
@@ -2640,7 +2828,7 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
                 ):
                     continuous_pred = materialize_start_ctrl_sequence(continuous_pred, attention_mask)
             elif self.config.task_type == "csr":
-                continuous_pred = _materialize_csr_prediction(continuous_pred)
+                continuous_pred = _materialize_csr_prediction(self.config, continuous_pred)
 
         loss = None
         if labels_continuous is not None:
@@ -2817,7 +3005,7 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
 
             step_raw = self.continuous_decoder(decoder_outputs.last_hidden_state[:, -1:, :])
             if self.config.task_type == "csr":
-                step_pred = _materialize_csr_prediction(step_raw)
+                step_pred = _materialize_csr_prediction(self.config, step_raw)
             else:
                 step_pred = _materialize_epr_prediction(self.config, step_raw, sampling_strategy=sampling_strategy)
             predictions.append(step_pred)

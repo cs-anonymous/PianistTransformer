@@ -2,6 +2,7 @@ import argparse
 import bisect
 import datetime
 import json
+import math
 import os
 import random
 import shutil
@@ -116,8 +117,34 @@ def infer_input_feature_mode(config):
     return "integrated"
 
 
-def integrated_epr_input_dim(use_timing_scale_bit=True):
-    control_dim = 5 if bool(use_timing_scale_bit) else 3
+def resolve_timing_control_mode(timing_control_mode=None, use_timing_scale_bit=True):
+    if timing_control_mode is None:
+        return "piecewise_scale_bit" if bool(use_timing_scale_bit) else "piecewise_single"
+    mode = str(timing_control_mode).lower()
+    valid_modes = {
+        "piecewise_scale_bit",
+        "piecewise_single",
+        "dual_log_linear",
+        "dual_clip_linear",
+    }
+    if mode not in valid_modes:
+        raise ValueError(f"Unsupported timing_control_mode={timing_control_mode}")
+    return mode
+
+
+def timing_control_feature_dim(timing_control_mode=None, use_timing_scale_bit=True):
+    mode = resolve_timing_control_mode(
+        timing_control_mode=timing_control_mode,
+        use_timing_scale_bit=use_timing_scale_bit,
+    )
+    return 3 if mode == "piecewise_single" else 5
+
+
+def integrated_epr_input_dim(timing_control_mode=None, use_timing_scale_bit=True):
+    control_dim = timing_control_feature_dim(
+        timing_control_mode=timing_control_mode,
+        use_timing_scale_bit=use_timing_scale_bit,
+    )
     musical_dim = 12
     dev_dim = 2
     pedal_dim = 2
@@ -247,9 +274,9 @@ def normalize_ioi_dev(score_ioi_ms, perf_ioi_ms):
     return min(max((dev_ms + 500.0) / 1000.0, 0.0), 1.0)
 
 
-def normalize_duration_ratio(score_duration_ms, perf_duration_ms, eps=1e-6):
-    ratio = float(perf_duration_ms) / max(float(score_duration_ms), float(eps))
-    return min(max(ratio / 5.0, 0.0), 1.0)
+def normalize_duration_dev(score_duration_ms, perf_duration_ms):
+    dev_ms = float(perf_duration_ms) - float(score_duration_ms)
+    return min(max((dev_ms + 500.0) / 1000.0, 0.0), 1.0)
 
 
 def performance_dev_velocity_pedal2_rows(perf, score_shared_raw):
@@ -275,7 +302,7 @@ def performance_dev_velocity_pedal2_rows(perf, score_shared_raw):
         rows.append(
             [
                 normalize_ioi_dev(score_row[0], perf_row[0]),
-                normalize_duration_ratio(score_row[1], perf_row[1]),
+                normalize_duration_dev(score_row[1], perf_row[1]),
                 min(max(float(perf_row[2]), 0.0), 127.0) / 127.0,
                 min(max(float(pedal_row[0]), 0.0), 127.0) / 127.0,
                 min(max(float(pedal_row[1]), 0.0), 127.0) / 127.0,
@@ -291,21 +318,52 @@ def normalize_piecewise_time_value(time_ms):
     return value / 5000.0
 
 
-def encode_shared_control_row(raw_shared_row, use_timing_scale_bit=True):
+def normalize_log_timing_value(time_ms, max_time_ms=5000.0):
+    value = min(max(float(time_ms), 0.0), float(max_time_ms))
+    return math.log1p(value) / math.log1p(float(max_time_ms))
+
+
+def encode_timing_control_features(time_ms, timing_control_mode=None, use_timing_scale_bit=True):
+    mode = resolve_timing_control_mode(
+        timing_control_mode=timing_control_mode,
+        use_timing_scale_bit=use_timing_scale_bit,
+    )
+    value = min(max(float(time_ms), 0.0), 5000.0)
+    if mode == "piecewise_scale_bit":
+        return [
+            1.0 if value > 500.0 else 0.0,
+            normalize_piecewise_time_value(value),
+        ]
+    if mode == "piecewise_single":
+        return [normalize_piecewise_time_value(value)]
+    if mode == "dual_log_linear":
+        return [
+            normalize_log_timing_value(value, max_time_ms=5000.0),
+            value / 5000.0,
+        ]
+    if mode == "dual_clip_linear":
+        return [
+            min(value / 500.0, 1.0),
+            value / 5000.0,
+        ]
+    raise ValueError(f"Unsupported timing_control_mode={mode}")
+
+
+def encode_shared_control_row(raw_shared_row, use_timing_scale_bit=True, timing_control_mode=None):
     ioi_ms = float(raw_shared_row[0])
     duration_ms = float(raw_shared_row[1])
     velocity = min(max(float(raw_shared_row[2]), 0.0), 127.0) / 127.0
-    if bool(use_timing_scale_bit):
-        return [
-            1.0 if ioi_ms > 500.0 else 0.0,
-            normalize_piecewise_time_value(ioi_ms),
-            1.0 if duration_ms > 500.0 else 0.0,
-            normalize_piecewise_time_value(duration_ms),
-            velocity,
-        ]
     return [
-        normalize_piecewise_time_value(ioi_ms),
-        normalize_piecewise_time_value(duration_ms),
+        *encode_timing_control_features(
+            ioi_ms,
+            timing_control_mode=timing_control_mode,
+            use_timing_scale_bit=use_timing_scale_bit,
+        ),
+        *encode_timing_control_features(
+            duration_ms,
+            timing_control_mode=timing_control_mode,
+            use_timing_scale_bit=use_timing_scale_bit,
+        ),
         velocity,
     ]
 
@@ -382,7 +440,7 @@ def build_score_musical_rows(score):
     return rows
 
 
-def build_epr_score_input_rows(score, use_timing_scale_bit=True):
+def build_epr_score_input_rows(score, use_timing_scale_bit=True, timing_control_mode=None):
     score_raw = score["score_raw"]
     has_score_feature = score.get("has_score_feature", [0] * len(score["pitch"]))
     musical_rows = build_score_musical_rows(score)
@@ -391,7 +449,11 @@ def build_epr_score_input_rows(score, use_timing_scale_bit=True):
         control_is_perf = 0.0
         masks = [1.0, 0.0, 0.0, 1.0 if bool(has_feature) else 0.0, control_is_perf]
         rows.append(
-            encode_shared_control_row(raw_shared[:3], use_timing_scale_bit=use_timing_scale_bit)
+            encode_shared_control_row(
+                raw_shared[:3],
+                use_timing_scale_bit=use_timing_scale_bit,
+                timing_control_mode=timing_control_mode,
+            )
             + [0.0, 0.0]
             + [0.0, 0.0]
             + [value * masks[3] for value in musical]
@@ -400,7 +462,7 @@ def build_epr_score_input_rows(score, use_timing_scale_bit=True):
     return rows
 
 
-def build_csr_performance_input_rows(perf, use_timing_scale_bit=True):
+def build_csr_performance_input_rows(perf, use_timing_scale_bit=True, timing_control_mode=None):
     shared_rows = perf.get("label_shared_raw")
     pedal_rows = _raw_value_rows(perf, "label_pedal2_raw", "pedal2_raw")
     if shared_rows is None or pedal_rows is None:
@@ -418,7 +480,11 @@ def build_csr_performance_input_rows(perf, use_timing_scale_bit=True):
         control_is_perf = 1.0
         masks = [1.0, 0.0, 1.0, 0.0, control_is_perf]
         rows.append(
-            encode_shared_control_row(raw_shared[:3], use_timing_scale_bit=use_timing_scale_bit)
+            encode_shared_control_row(
+                raw_shared[:3],
+                use_timing_scale_bit=use_timing_scale_bit,
+                timing_control_mode=timing_control_mode,
+            )
             + [0.0, 0.0]
             + [
                 min(max(float(pedal[0]), 0.0), 127.0) / 127.0,
@@ -543,6 +609,7 @@ class PianoCoReNodeSFTDataset(Dataset):
         pedal_representation="continuous_4",
         epr_timing_target="absolute",
         use_timing_scale_bit=True,
+        timing_control_mode=None,
     ):
         super().__init__()
         self.split = split
@@ -555,6 +622,10 @@ class PianoCoReNodeSFTDataset(Dataset):
         self.pedal_representation = pedal_representation
         self.epr_timing_target = str(epr_timing_target or "absolute").lower()
         self.use_timing_scale_bit = bool(use_timing_scale_bit)
+        self.timing_control_mode = resolve_timing_control_mode(
+            timing_control_mode=timing_control_mode,
+            use_timing_scale_bit=use_timing_scale_bit,
+        )
         items = list(manifest)
         if shuffle:
             random.Random(seed).shuffle(items)
@@ -634,6 +705,7 @@ class PianoCoReNodeSFTDataset(Dataset):
             prepared["score_input"] = build_epr_score_input_rows(
                 score,
                 use_timing_scale_bit=self.use_timing_scale_bit,
+                timing_control_mode=self.timing_control_mode,
             )
         elif task_type == "csr":
             prepared["score_musical"] = build_score_musical_rows(score)
@@ -666,16 +738,23 @@ class PianoCoReNodeSFTDataset(Dataset):
         if cache_key in label_cache:
             return label_cache[cache_key]
 
+        if self.task_type.lower() == "epr" and self.epr_timing_target in {"deviation", "dev"}:
+            labels = performance_dev_velocity_pedal2_rows(perf, prepared["score"]["score_raw"])
+            if labels is None:
+                raise KeyError("Missing score_raw/label_shared_raw/label_pedal2_raw for deviation EPR targets")
+            label_cache[cache_key] = (labels, None)
+            return labels, None
         if self.task_type.lower() == "epr" and self.epr_timing_target in {"deviation_ratio", "dev_ratio"}:
             labels = performance_dev_velocity_pedal2_rows(perf, prepared["score"]["score_raw"])
             if labels is None:
-                raise KeyError("Missing score_raw/label_shared_raw/label_pedal2_raw for deviation_ratio EPR targets")
+                raise KeyError("Missing score_raw/label_shared_raw/label_pedal2_raw for deviation EPR targets")
             label_cache[cache_key] = (labels, None)
             return labels, None
         if self.task_type.lower() == "csr":
             labels = build_csr_performance_input_rows(
                 perf,
                 use_timing_scale_bit=self.use_timing_scale_bit,
+                timing_control_mode=self.timing_control_mode,
             )
             if labels is None:
                 raise KeyError("Missing label_shared_raw/label_pedal2_raw for CSR inputs")
@@ -809,6 +888,48 @@ class NodeSFTTrainer(Trainer):
         # epoch length.
         return SequentialSampler(train_dataset)
 
+    def _clear_eval_dataloader_cache(self):
+        if hasattr(self, "_eval_dataloaders"):
+            delattr(self, "_eval_dataloaders")
+
+    def _eval_loader_settings(self):
+        num_workers = int(getattr(self, "eval_dataloader_num_workers", 0) or 0)
+        persistent_workers = bool(getattr(self, "eval_dataloader_persistent_workers", False)) and num_workers > 0
+        prefetch_factor = getattr(self, "eval_dataloader_prefetch_factor", None)
+        if num_workers <= 0:
+            prefetch_factor = None
+        pin_memory = bool(
+            getattr(
+                self,
+                "eval_dataloader_pin_memory",
+                getattr(self.args, "dataloader_pin_memory", False),
+            )
+        )
+        return {
+            "num_workers": num_workers,
+            "persistent_workers": persistent_workers,
+            "prefetch_factor": prefetch_factor,
+            "pin_memory": pin_memory,
+        }
+
+    def get_eval_dataloader(self, eval_dataset=None):
+        settings = self._eval_loader_settings()
+        original_num_workers = self.args.dataloader_num_workers
+        original_persistent_workers = self.args.dataloader_persistent_workers
+        original_prefetch_factor = self.args.dataloader_prefetch_factor
+        original_pin_memory = self.args.dataloader_pin_memory
+        self.args.dataloader_num_workers = settings["num_workers"]
+        self.args.dataloader_persistent_workers = settings["persistent_workers"]
+        self.args.dataloader_prefetch_factor = settings["prefetch_factor"]
+        self.args.dataloader_pin_memory = settings["pin_memory"]
+        try:
+            return super().get_eval_dataloader(eval_dataset=eval_dataset)
+        finally:
+            self.args.dataloader_num_workers = original_num_workers
+            self.args.dataloader_persistent_workers = original_persistent_workers
+            self.args.dataloader_prefetch_factor = original_prefetch_factor
+            self.args.dataloader_pin_memory = original_pin_memory
+
     def _list_checkpoint_dirs(self):
         out = Path(self.args.output_dir)
         if not out.exists():
@@ -842,8 +963,47 @@ class NodeSFTTrainer(Trainer):
                 shutil.rmtree(p)
 
     def evaluate(self, *args, **kwargs):
-        # call base evaluate to get metrics
-        metrics = super().evaluate(*args, **kwargs)
+        try:
+            metrics = super().evaluate(*args, **kwargs)
+        except RuntimeError as exc:
+            message = str(exc)
+            can_retry = (
+                getattr(self, "eval_dataloader_num_workers", 0) not in (None, 0)
+                and "DataLoader worker" in message
+                and "exited unexpectedly" in message
+            )
+            if not can_retry:
+                raise
+
+            original_num_workers = self.eval_dataloader_num_workers
+            original_persistent_workers = getattr(self, "eval_dataloader_persistent_workers", False)
+            original_prefetch_factor = getattr(self, "eval_dataloader_prefetch_factor", None)
+            if self.is_world_process_zero():
+                print(
+                    json.dumps(
+                        {
+                            "step": self.state.global_step,
+                            "event": "eval_dataloader_retry",
+                            "reason": message,
+                            "retry_num_workers": 0,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            self.eval_dataloader_num_workers = 0
+            self.eval_dataloader_persistent_workers = False
+            self.eval_dataloader_prefetch_factor = None
+            self._clear_eval_dataloader_cache()
+            try:
+                metrics = super().evaluate(*args, **kwargs)
+            finally:
+                self.eval_dataloader_num_workers = original_num_workers
+                self.eval_dataloader_persistent_workers = original_persistent_workers
+                self.eval_dataloader_prefetch_factor = original_prefetch_factor
+                self._clear_eval_dataloader_cache()
+
         if not self.is_world_process_zero():
             return metrics
 
@@ -978,7 +1138,11 @@ def create_model(train_config):
     task_type = train_config.get("task_type", "epr").lower()
     input_feature_mode = infer_input_feature_mode(train_config)
     epr_timing_target = str(train_config.get("epr_timing_target", "absolute")).lower()
-    use_timing_scale_bit = bool(train_config.get("use_timing_scale_bit", True))
+    timing_control_mode = resolve_timing_control_mode(
+        timing_control_mode=train_config.get("timing_control_mode"),
+        use_timing_scale_bit=train_config.get("use_timing_scale_bit", True),
+    )
+    use_timing_scale_bit = timing_control_mode == "piecewise_scale_bit"
     note_embedding_mode = str(train_config.get("note_embedding_mode", "sine")).lower()
     if input_feature_mode != "integrated":
         raise ValueError(f"INR0624 only supports input_feature_mode=integrated, got {input_feature_mode}")
@@ -1047,11 +1211,11 @@ def create_model(train_config):
             ]
             if missing_beta_keys:
                 raise ValueError(f"EPR beta_mu_kappa config is missing required keys: {missing_beta_keys}")
-        if epr_timing_target in {"deviation_ratio", "dev_ratio"}:
+        if epr_timing_target in {"deviation", "dev", "deviation_ratio", "dev_ratio"}:
             if int(train_config.get("output_continuous_dim", train_config["continuous_dim"])) != 5:
-                raise ValueError("deviation_ratio EPR requires output_continuous_dim=5")
+                raise ValueError("deviation EPR requires output_continuous_dim=5")
             if str(train_config.get("pedal_representation", "continuous_4")).lower() != "start_ctrl":
-                raise ValueError("deviation_ratio EPR currently requires pedal_representation=start_ctrl")
+                raise ValueError("deviation EPR currently requires pedal_representation=start_ctrl")
             if distribution not in {
                 "point",
                 "huber",
@@ -1062,7 +1226,7 @@ def create_model(train_config):
                 "mixture_beta",
             }:
                 raise ValueError(
-                    "deviation_ratio EPR currently supports point/huber, mln, mln3, beta, and mixture_beta, "
+                    "deviation EPR currently supports point/huber, mln, mln3, beta, and mixture_beta, "
                     f"got epr_distribution={distribution}"
                 )
     elif task_type == "csr":
@@ -1075,7 +1239,10 @@ def create_model(train_config):
     score_feature_dim = train_config.get("score_feature_dim", 8)
     input_continuous_dim = train_config.get(
         "input_continuous_dim",
-        integrated_epr_input_dim(use_timing_scale_bit=use_timing_scale_bit)
+        integrated_epr_input_dim(
+            timing_control_mode=timing_control_mode,
+            use_timing_scale_bit=use_timing_scale_bit,
+        )
         if task_type == "epr" and input_feature_mode == "integrated"
         else default_input_continuous_dim(
             task_type,
@@ -1085,11 +1252,14 @@ def create_model(train_config):
         ),
     )
     if task_type in {"epr", "csr"} and input_feature_mode == "integrated":
-        expected_input_dim = integrated_epr_input_dim(use_timing_scale_bit=use_timing_scale_bit)
+        expected_input_dim = integrated_epr_input_dim(
+            timing_control_mode=timing_control_mode,
+            use_timing_scale_bit=use_timing_scale_bit,
+        )
         if int(input_continuous_dim) != expected_input_dim:
             raise ValueError(
                 f"Integrated INR0624 {task_type.upper()} expects input_continuous_dim={expected_input_dim} "
-                f"for use_timing_scale_bit={use_timing_scale_bit}, got {input_continuous_dim}"
+                f"for timing_control_mode={timing_control_mode}, got {input_continuous_dim}"
             )
     model_config = IntegratedPianoT5GemmaConfig(
         backbone_type=backbone_type,
@@ -1114,6 +1284,12 @@ def create_model(train_config):
         time_loss_type=train_config["time_loss_type"],
         value_loss_type=train_config["value_loss_type"],
         csr_grid_loss_type=train_config.get("csr_grid_loss_type", "huber"),
+        csr_grid_step=train_config.get("csr_grid_step", 1.0 / 24.0),
+        csr_grid_soft_ce_tau=train_config.get("csr_grid_soft_ce_tau", 1.5),
+        csr_mo_max=train_config.get("csr_mo_max", 6.0),
+        csr_mioi_max=train_config.get("csr_mioi_max", 6.0),
+        csr_md_max=train_config.get("csr_md_max", 6.0),
+        csr_ml_max=train_config.get("csr_ml_max", 6.0),
         huber_delta=train_config["huber_delta"],
         loss_weights=train_config["loss_weights"],
         csr_loss_weights=train_config.get("csr_loss_weights"),
@@ -1140,6 +1316,7 @@ def create_model(train_config):
         epr_timing_bins=train_config.get("epr_timing_bins", 5000),
         epr_value_bins=train_config.get("epr_value_bins", 128),
         epr_timing_target=epr_timing_target,
+        timing_control_mode=timing_control_mode,
         use_timing_scale_bit=use_timing_scale_bit,
         soft_ce_tau=train_config.get("soft_ce_tau"),
         timing_input_normalization=train_config.get("timing_input_normalization", "scaled_log_5000_s10"),
@@ -1228,9 +1405,16 @@ def main():
     task_type = train_config.get("task_type", "epr").lower()
     input_feature_mode = infer_input_feature_mode(train_config)
     train_config["input_feature_mode"] = input_feature_mode
+    timing_control_mode = resolve_timing_control_mode(
+        timing_control_mode=train_config.get("timing_control_mode"),
+        use_timing_scale_bit=train_config.get("use_timing_scale_bit", True),
+    )
     train_config.setdefault(
         "input_continuous_dim",
-        integrated_epr_input_dim(use_timing_scale_bit=train_config.get("use_timing_scale_bit", True))
+        integrated_epr_input_dim(
+            timing_control_mode=timing_control_mode,
+            use_timing_scale_bit=train_config.get("use_timing_scale_bit", True),
+        )
         if task_type in {"epr", "csr"} and input_feature_mode == "integrated"
         else default_input_continuous_dim(
             task_type,
@@ -1312,6 +1496,7 @@ def main():
         pedal_representation=train_config.get("pedal_representation", "continuous_4"),
         epr_timing_target=train_config.get("epr_timing_target", "absolute"),
         use_timing_scale_bit=train_config.get("use_timing_scale_bit", True),
+        timing_control_mode=train_config.get("timing_control_mode"),
     )
     eval_dataset = PianoCoReNodeSFTDataset(
         eval_manifest,
@@ -1330,6 +1515,7 @@ def main():
         pedal_representation=train_config.get("pedal_representation", "continuous_4"),
         epr_timing_target=train_config.get("epr_timing_target", "absolute"),
         use_timing_scale_bit=train_config.get("use_timing_scale_bit", True),
+        timing_control_mode=train_config.get("timing_control_mode"),
     )
 
     model = create_model(train_config)
@@ -1363,6 +1549,20 @@ def main():
         ),
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
+    )
+    if "eval_dataloader_num_workers" not in train_config:
+        train_config["eval_dataloader_num_workers"] = 0
+    if "eval_dataloader_persistent_workers" not in train_config:
+        train_config["eval_dataloader_persistent_workers"] = False
+    if "eval_dataloader_prefetch_factor" not in train_config:
+        train_config["eval_dataloader_prefetch_factor"] = None
+    if "eval_dataloader_pin_memory" not in train_config:
+        train_config["eval_dataloader_pin_memory"] = training_args.dataloader_pin_memory
+    trainer.eval_dataloader_num_workers = int(train_config.get("eval_dataloader_num_workers", 0) or 0)
+    trainer.eval_dataloader_persistent_workers = bool(train_config.get("eval_dataloader_persistent_workers", False))
+    trainer.eval_dataloader_prefetch_factor = train_config.get("eval_dataloader_prefetch_factor")
+    trainer.eval_dataloader_pin_memory = bool(
+        train_config.get("eval_dataloader_pin_memory", training_args.dataloader_pin_memory)
     )
 
     resume_path = train_config.get("resume_path")

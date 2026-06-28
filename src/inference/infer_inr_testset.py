@@ -18,7 +18,9 @@ if str(ROOT_DIR) not in sys.path:
 
 from src.train.train_inr import (
     build_work_manifest,
+    build_csr_performance_input_rows,
     build_epr_score_input_rows,
+    build_score_musical_rows,
     create_model,
     infer_input_feature_mode,
 )
@@ -32,6 +34,12 @@ def parse_args():
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--split", type=str, default="test")
     parser.add_argument("--protocol", choices=["deterministic", "sampling"], default="deterministic")
+    parser.add_argument(
+        "--deterministic-strategy",
+        choices=["mean", "greedy"],
+        default="mean",
+        help="How deterministic inference materializes probabilistic outputs.",
+    )
     parser.add_argument("--num-samples", type=int, default=1)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--device", type=str, default=None)
@@ -47,6 +55,12 @@ def parse_args():
     parser.add_argument("--merge-mode", choices=["continuation", "average"], default="continuation")
     parser.add_argument("--continuation-drop-ratio", type=float, default=0.0)
     return parser.parse_args()
+
+
+def resolve_sampling_strategy(args):
+    if args.protocol == "sampling":
+        return "sample"
+    return str(args.deterministic_strategy).lower()
 
 
 def select_device(device_arg):
@@ -108,17 +122,39 @@ def list_gt_midis(
 def load_score_from_node(
     path: Path,
     use_timing_scale_bit=True,
+    timing_control_mode=None,
+    task_type="epr",
+    performance_source=None,
 ):
     with open(path, "r", encoding="utf-8") as file:
         work = json.load(file)
     score = work["score"]
     pitch = score["pitch"]
-    continuous = build_epr_score_input_rows(
-        score,
-        use_timing_scale_bit=use_timing_scale_bit,
-    )
+    if str(task_type).lower() == "csr":
+        performances = work.get("performances", [])
+        perf = None
+        if performance_source is not None:
+            for candidate in performances:
+                if candidate.get("performance_source") == performance_source:
+                    perf = candidate
+                    break
+        if perf is None:
+            perf = performances[0] if performances else None
+        if perf is None:
+            raise ValueError(f"No performance rows available for CSR inference in {path}")
+        continuous = build_csr_performance_input_rows(
+            perf,
+            use_timing_scale_bit=use_timing_scale_bit,
+            timing_control_mode=timing_control_mode,
+        )
+    else:
+        continuous = build_epr_score_input_rows(
+            score,
+            use_timing_scale_bit=use_timing_scale_bit,
+            timing_control_mode=timing_control_mode,
+        )
     score_shared_raw = [row[:3] for row in score["score_raw"]]
-    return pitch, continuous, score_shared_raw
+    return pitch, continuous, score_shared_raw, work
 
 
 def build_windows(total_notes: int, block_notes: int, overlap_ratio: float):
@@ -141,7 +177,17 @@ def build_windows(total_notes: int, block_notes: int, overlap_ratio: float):
     return deduped
 
 
-def batch_window_predictions(model, pitch, continuous, score_shared_raw, windows, pitch_pad_id, device, batch_size):
+def batch_window_predictions(
+    model,
+    pitch,
+    continuous,
+    score_shared_raw,
+    windows,
+    pitch_pad_id,
+    device,
+    batch_size,
+    sampling_strategy="mean",
+):
     total_notes = len(pitch)
     pred_sum = None
     pred_count = torch.zeros(total_notes, 1, dtype=torch.float32)
@@ -170,6 +216,7 @@ def batch_window_predictions(model, pitch, continuous, score_shared_raw, windows
                 continuous=continuous_tensor,
                 score_shared_raw=score_shared_raw_tensor,
                 attention_mask=attention_mask,
+                continuous_sampling_strategy=sampling_strategy,
             )
         logits = outputs.logits.detach().float().cpu()
         if pred_sum is None:
@@ -255,11 +302,140 @@ def load_model(config, device):
     return model
 
 
-def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir):
+def musical_rows_to_score_features(rows):
+    features = []
+    for row in rows:
+        mo = float(row[0]) * 6.0
+        md = float(row[2]) * 6.0
+        ml = float(row[3]) * 6.0
+        first = 1.0 if float(row[5]) >= 0.5 else 0.0
+        grace = 1.0 if float(row[6]) >= 0.5 else 0.0
+        hand = 1.0 if float(row[7]) >= 0.5 else 0.0
+        trill = 1.0 if float(row[8]) >= 0.5 else 0.0
+        stacc = 1.0 if float(row[9]) >= 0.5 else 0.0
+        stem_up = float(row[10]) >= 0.5
+        stem_down = float(row[11]) >= 0.5
+        if stem_up and not stem_down:
+            stem = 1.0
+        elif stem_down and not stem_up:
+            stem = 2.0
+        else:
+            stem = 0.0
+        features.append([mo, md, ml, first, hand, trill, grace, stacc, stem])
+    return features
+
+
+def csr_metric_summary(pred_rows, target_rows, mask):
+    valid = torch.tensor(mask, dtype=torch.bool)
+    if not valid.any():
+        return {"valid_notes": 0}
+    pred = torch.tensor(pred_rows, dtype=torch.float32)[valid]
+    target = torch.tensor(target_rows, dtype=torch.float32)[valid]
+
+    def mae(idx, scale=1.0):
+        return float((pred[:, idx] * scale - target[:, idx] * scale).abs().mean().item())
+
+    def acc(idx):
+        return float(((pred[:, idx] >= 0.5) == (target[:, idx] >= 0.5)).float().mean().item())
+
+    stem_pred = pred[:, 10:12].argmax(dim=-1)
+    stem_target = target[:, 10:12].argmax(dim=-1)
+    return {
+        "valid_notes": int(valid.sum().item()),
+        "mo_mae_quarter": mae(0, 6.0),
+        "mioi_mae_quarter": mae(1, 6.0),
+        "md_mae_quarter": mae(2, 6.0),
+        "ml_mae_quarter": mae(3, 6.0),
+        "tempo_mae_norm": mae(4, 1.0),
+        "first_acc": acc(5),
+        "grace_acc": acc(6),
+        "hand_acc": acc(7),
+        "trill_acc": acc(8),
+        "stacc_acc": acc(9),
+        "stem_acc": float((stem_pred == stem_target).float().mean().item()),
+    }
+
+
+def predict_one_csr_work(model, device, config, work, args):
     score_source = work["score_source"]
-    pitch, continuous, score_shared_raw = load_score_from_node(
+    selected_sources = work.get("selected_performance_sources") or [None]
+    performance_source = selected_sources[0]
+    pitch, continuous, score_shared_raw, loaded = load_score_from_node(
         Path(work["path"]),
         use_timing_scale_bit=config.get("use_timing_scale_bit", True),
+        timing_control_mode=config.get("timing_control_mode"),
+        task_type="csr",
+        performance_source=performance_source,
+    )
+    score = loaded["score"]
+    windows = build_windows(len(pitch), config["block_notes"], config["overlap_ratio"])
+
+    pred_continuous = batch_window_predictions(
+        model=model,
+        pitch=pitch,
+        continuous=continuous,
+        score_shared_raw=score_shared_raw,
+        windows=windows,
+        pitch_pad_id=config["pitch_pad_id"],
+        device=device,
+        batch_size=args.batch_size_windows,
+        sampling_strategy=resolve_sampling_strategy(args),
+    ) if args.merge_mode == "average" else continuation_window_predictions(
+        model=model,
+        pitch=pitch,
+        continuous=continuous,
+        score_shared_raw=score_shared_raw,
+        windows=windows,
+        pitch_pad_id=config["pitch_pad_id"],
+        device=device,
+        sampling_strategy=resolve_sampling_strategy(args),
+        drop_ratio=args.continuation_drop_ratio,
+    )
+
+    target_rows = build_score_musical_rows(score)
+    has_score_feature = score.get("has_score_feature", [0] * len(pitch))
+    pred_rows = pred_continuous.float().cpu().tolist()
+    score_features = musical_rows_to_score_features(pred_rows)
+
+    raw_dir = args.output_dir / "raw_outputs"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    score_stem = Path(score_source).with_suffix("").as_posix().replace("/", "__")
+    raw_path = raw_dir / f"{score_stem}__csr.json"
+    payload = {
+        "score_source": score_source,
+        "performance_source": performance_source,
+        "protocol": args.protocol,
+        "timing_representation": "inr0624_csr_musical12",
+        "pitch": [int(value) for value in pitch],
+        "predicted_musical": pred_rows,
+        "predicted_score_feature": score_features,
+        "target_musical": target_rows,
+        "has_score_feature": has_score_feature,
+        "metrics": csr_metric_summary(pred_rows, target_rows, has_score_feature),
+        "note_count": len(pitch),
+        "num_windows": len(windows),
+    }
+    raw_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return {
+        "score_source": score_source,
+        "performance_source": performance_source,
+        "raw_output_paths": [str(raw_path.resolve())],
+        "metrics": payload["metrics"],
+        "note_count": len(pitch),
+        "num_windows": len(windows),
+    }
+
+
+def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir):
+    if str(config.get("task_type", "epr")).lower() == "csr":
+        return predict_one_csr_work(model, device, config, work, args)
+
+    score_source = work["score_source"]
+    pitch, continuous, score_shared_raw, _ = load_score_from_node(
+        Path(work["path"]),
+        use_timing_scale_bit=config.get("use_timing_scale_bit", True),
+        timing_control_mode=config.get("timing_control_mode"),
+        task_type="epr",
     )
     windows = build_windows(len(pitch), config["block_notes"], config["overlap_ratio"])
     gt_rel_paths = list_gt_midis(
@@ -292,6 +468,7 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
             pitch_pad_id=config["pitch_pad_id"],
             device=device,
             batch_size=args.batch_size_windows,
+            sampling_strategy=resolve_sampling_strategy(args),
         ) if args.merge_mode == "average" else continuation_window_predictions(
             model=model,
             pitch=pitch,
@@ -300,7 +477,7 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
             windows=windows,
             pitch_pad_id=config["pitch_pad_id"],
             device=device,
-            sampling_strategy="sample" if args.protocol == "sampling" else "mean",
+            sampling_strategy=resolve_sampling_strategy(args),
             drop_ratio=args.continuation_drop_ratio,
         )
         pred_target = pred_continuous
@@ -320,6 +497,7 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
         raw_payload = {
             "score_source": score_source,
             "protocol": args.protocol,
+            "deterministic_strategy": args.deterministic_strategy if args.protocol == "deterministic" else None,
             "sample_idx": sample_idx,
             "seed": sample_seed,
             "timing_representation": "target5_dev_velocity_pedal2",
@@ -425,9 +603,25 @@ def build_pair_list(items):
     return [
         {"pred": pred_path, "gt": gt_path}
         for item in items
-        for pred_path in item["prediction_paths"]
-        for gt_path in item["ground_truth_paths"]
+        for pred_path in item.get("prediction_paths", [])
+        for gt_path in item.get("ground_truth_paths", [])
     ]
+
+
+def summarize_csr_items(items):
+    metric_sums = defaultdict(float)
+    metric_counts = defaultdict(int)
+    for item in items:
+        metrics = item.get("metrics") or {}
+        for key, value in metrics.items():
+            if key == "valid_notes":
+                continue
+            metric_sums[key] += float(value)
+            metric_counts[key] += 1
+    return {
+        key: metric_sums[key] / max(metric_counts[key], 1)
+        for key in sorted(metric_sums)
+    }
 
 
 def filter_manifest_by_performance_dataset(
@@ -524,6 +718,7 @@ def main():
     manifest_payload = {
         "config": str(args.config.resolve()),
         "checkpoint": args.checkpoint or config.get("resume_path"),
+        "task_type": config.get("task_type", "epr"),
         "protocol": args.protocol,
         "num_samples": args.num_samples,
         "num_workers": args.num_workers,
@@ -532,6 +727,8 @@ def main():
         "exclude_performance_dataset": args.exclude_performance_dataset,
         "items": items,
     }
+    if str(config.get("task_type", "epr")).lower() == "csr":
+        manifest_payload["csr_summary"] = summarize_csr_items(items)
     pair_list = build_pair_list(items)
     manifest_path.write_text(json.dumps(manifest_payload, indent=2, ensure_ascii=False))
     pair_list_path.write_text(json.dumps(pair_list, indent=2, ensure_ascii=False))

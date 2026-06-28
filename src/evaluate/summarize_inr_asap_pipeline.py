@@ -22,6 +22,7 @@ from src.evaluate.evaluate_inr_saved_midis import (
     score_level_metrics,
     score_level_metrics_worker,
 )
+from src.train.train_inr import build_work_manifest
 from src.utils.inr_midi import normalize_time_ms_for_inr_input
 
 
@@ -34,6 +35,11 @@ FEATURES = [
     ("pedal", "Pedal"),
 ]
 
+DEV_FEATURES = [
+    ("dev_ioi", "IOI Deviation"),
+    ("dev_duration", "Duration Ratio"),
+]
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -43,6 +49,7 @@ def parse_args():
     parser.add_argument("--sampling-manifest", type=Path, required=True)
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--output-plot", type=Path, required=True)
+    parser.add_argument("--output-dev-plot", type=Path, default=None)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--train-output-dir", type=Path, required=True)
@@ -270,6 +277,133 @@ def plot_distributions(
     }
 
 
+def normalize_ioi_dev(score_ioi_ms, perf_ioi_ms):
+    dev_ms = float(perf_ioi_ms) - float(score_ioi_ms)
+    return min(max((dev_ms + 500.0) / 1000.0, 0.0), 1.0)
+
+
+def normalize_duration_ratio(score_duration_ms, perf_duration_ms, eps=1e-6):
+    ratio = float(perf_duration_ms) / max(float(score_duration_ms), float(eps))
+    return min(max(ratio / 5.0, 0.0), 1.0)
+
+
+def load_score_source_to_work_path(config):
+    manifest = build_work_manifest(
+        metadata_path=config["metadata_path"],
+        refined_dir=config["refined_dir"],
+        split="test",
+        block_notes=config["block_notes"],
+        overlap_ratio=config["overlap_ratio"],
+        min_notes=config["min_notes"],
+        performance_dataset="ASAP",
+    )
+    return {
+        item["score_source"]: str((ROOT_DIR / item["path"]).resolve())
+        for item in manifest
+    }
+
+
+def extract_gt_dev_arrays(score_source_to_work_path):
+    dev_ioi = []
+    dev_duration = []
+    for work_path in score_source_to_work_path.values():
+        with open(work_path, "r", encoding="utf-8") as file:
+            work = json.load(file)
+        score_raw = work["score"]["score_raw"]
+        for perf in work.get("performances", []):
+            shared_rows = perf.get("label_shared_raw")
+            if shared_rows is None:
+                if "label_raw" not in perf:
+                    continue
+                shared_rows = [row[:3] for row in perf["label_raw"]]
+            if len(shared_rows) != len(score_raw):
+                continue
+            for score_row, perf_row in zip(score_raw, shared_rows):
+                dev_ioi.append(normalize_ioi_dev(score_row[0], perf_row[0]))
+                dev_duration.append(normalize_duration_ratio(score_row[1], perf_row[1]))
+    return {
+        "dev_ioi": np.asarray(dev_ioi, dtype=np.float64),
+        "dev_duration": np.asarray(dev_duration, dtype=np.float64),
+    }
+
+
+def extract_pred_dev_arrays(raw_output_paths):
+    dev_ioi = []
+    dev_duration = []
+    for path in raw_output_paths:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        target5 = payload.get("predicted_target5", [])
+        for row in target5:
+            dev_ioi.append(float(row[0]))
+            dev_duration.append(float(row[1]))
+    return {
+        "dev_ioi": np.asarray(dev_ioi, dtype=np.float64),
+        "dev_duration": np.asarray(dev_duration, dtype=np.float64),
+    }
+
+
+def analyze_dev_distribution(
+    det_manifest,
+    sampling_manifest,
+    config,
+    output_plot,
+):
+    return plot_dev_distributions(det_manifest, sampling_manifest, config, output_plot)
+
+
+def plot_dev_distributions(
+    det_manifest,
+    sampling_manifest,
+    config,
+    output_plot,
+):
+    score_source_to_work_path = load_score_source_to_work_path(config)
+    gt_arrays = extract_gt_dev_arrays(score_source_to_work_path)
+    det_arrays = extract_pred_dev_arrays(unique_paths(det_manifest, "raw_output_paths"))
+    sampling_arrays = extract_pred_dev_arrays(unique_paths(sampling_manifest, "raw_output_paths"))
+
+    output_plot.parent.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    colors = {
+        "gt": "#222222",
+        "det": "#2f6fed",
+        "sampling": "#d0522b",
+    }
+
+    for idx, (feature, title) in enumerate(DEV_FEATURES):
+        axis = axes[idx]
+        gt = finite_values(gt_arrays[feature])
+        det = finite_values(det_arrays[feature])
+        sampling = finite_values(sampling_arrays[feature])
+        bins = np.linspace(0.0, 1.0, 80)
+
+        for values, label, color, alpha in [
+            (gt, "ground truth", colors["gt"], 0.26),
+            (det, "deterministic", colors["det"], 0.32),
+            (sampling, "sampling", colors["sampling"], 0.32),
+        ]:
+            values = values[(values >= 0.0) & (values <= 1.0)]
+            if len(values):
+                axis.hist(values, bins=bins, density=True, alpha=alpha, label=label, color=color)
+        axis.set_title(title)
+        axis.set_xlim(0.0, 1.0)
+        axis.set_ylabel("density")
+        axis.grid(alpha=0.2)
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=3, frameon=False)
+    fig.suptitle("ASAP Test Dev Distribution: Ground Truth vs INR Predictions", y=0.98)
+    fig.tight_layout(rect=(0, 0.08, 1, 0.94))
+    fig.savefig(output_plot, dpi=180)
+    plt.close(fig)
+
+    return {
+        "ground_truth_dev_notes": int(len(gt_arrays["dev_ioi"])),
+        "deterministic_dev_notes": int(len(det_arrays["dev_ioi"])),
+        "sampling_dev_notes": int(len(sampling_arrays["dev_ioi"])),
+    }
+
+
 def main():
     args = parse_args()
     if args.num_workers < 1:
@@ -299,6 +433,13 @@ def main():
         timing_normalization=timing_normalization,
         max_time_ms=max_time_ms,
     )
+    output_dev_plot = args.output_dev_plot or args.output_plot.with_name("asap_dev_distribution.png")
+    dev_plot_summary = plot_dev_distributions(
+        det_manifest,
+        sampling_manifest,
+        config,
+        output_dev_plot,
+    )
 
     output = {
         "config": str(args.config.resolve()),
@@ -307,12 +448,14 @@ def main():
         "pipeline_log": str(args.pipeline_log.resolve()),
         "evaluate_log": str(args.evaluate_log.resolve()),
         "distribution_plot": str(args.output_plot.resolve()),
+        "dev_distribution_plot": str(output_dev_plot.resolve()),
         "dataset": {
             "split": det_manifest.get("split"),
             "performance_dataset": det_manifest.get("performance_dataset"),
             "exclude_performance_dataset": det_manifest.get("exclude_performance_dataset"),
             "timing_normalization": timing_normalization,
             **plot_summary,
+            **dev_plot_summary,
         },
         "metrics": {
             "deterministic": det_metrics,
@@ -329,6 +472,7 @@ def main():
     print(json.dumps(sanitize_for_json({
         "output_json": str(args.output_json),
         "distribution_plot": str(args.output_plot),
+        "dev_distribution_plot": str(output_dev_plot),
         "deterministic": det_metrics["aggregate"],
         "sampling": sampling_metrics["aggregate"],
     }), indent=2, ensure_ascii=False, allow_nan=False))

@@ -13,6 +13,7 @@ INFER_NUM_WORKERS=8
 METRIC_NUM_WORKERS=8
 DET_NUM_SAMPLES=1
 SAMPLING_NUM_SAMPLES=1
+DET_STRATEGY="${DET_STRATEGY:-mean}"
 INFER_BATCH_SIZE_WINDOWS=8
 MERGE_MODE="continuation"
 CONTINUATION_DROP_RATIO=0.0
@@ -127,6 +128,7 @@ PY
   echo "MASTER_PORT ${MASTER_PORT}"
   echo "RUN_DIR ${RUN_DIR}"
   echo "PIPELINE_STAGE_START ${PIPELINE_STAGE_START}"
+  echo "DET_STRATEGY ${DET_STRATEGY}"
   echo "RESUME_CHECKPOINT ${RESUME_CHECKPOINT:-NONE}"
   echo "ADAPT_ON_ASAP ${ADAPT_ON_ASAP}"
   echo "ADAPT_LR ${ADAPT_LR}"
@@ -286,17 +288,23 @@ run_infer() {
   CUDA_VISIBLE_DEVICES="${infer_gpu}" PYTHONUNBUFFERED=1 \
     python src/inference/infer_inr_testset.py "${COMMON_INFER_ARGS[@]}" \
       --protocol "${protocol}" --num-samples "${num_samples}" --output-dir "${out_dir}" \
+      --deterministic-strategy "${DET_STRATEGY}" \
     2>&1 | tee -a "${EVALUATE_LOG}"
   echo "[$(date '+%F %T')] infer ${protocol}: finished" | tee -a "${EVALUATE_LOG}"
 }
 
 mkdir -p "${DET_DIR}" "${SAMPLING_DIR}"
-run_infer deterministic "${DET_NUM_SAMPLES}" "${DET_DIR}" "${DET_GPU}" &
-DET_PID=$!
-run_infer sampling "${SAMPLING_NUM_SAMPLES}" "${SAMPLING_DIR}" "${SAMPLING_GPU}" &
-SAMPLING_PID=$!
-wait "${DET_PID}" || { echo "deterministic inference failed" >&2; exit 1; }
-wait "${SAMPLING_PID}" || { echo "sampling inference failed" >&2; exit 1; }
+if [[ "${TRAIN_GPU_COUNT}" -gt 1 ]]; then
+  run_infer deterministic "${DET_NUM_SAMPLES}" "${DET_DIR}" "${DET_GPU}" &
+  DET_PID=$!
+  run_infer sampling "${SAMPLING_NUM_SAMPLES}" "${SAMPLING_DIR}" "${SAMPLING_GPU}" &
+  SAMPLING_PID=$!
+  wait "${DET_PID}" || { echo "deterministic inference failed" >&2; exit 1; }
+  wait "${SAMPLING_PID}" || { echo "sampling inference failed" >&2; exit 1; }
+else
+  run_infer deterministic "${DET_NUM_SAMPLES}" "${DET_DIR}" "${DET_GPU}"
+  run_infer sampling "${SAMPLING_NUM_SAMPLES}" "${SAMPLING_DIR}" "${SAMPLING_GPU}"
+fi
 
 # --- Summarize -------------------------------------------------------------
 echo "[$(date '+%F %T')] summarize: ASAP metrics + plot, workers=${METRIC_NUM_WORKERS}" | tee -a "${EVALUATE_LOG}"
