@@ -126,6 +126,7 @@ def resolve_timing_control_mode(timing_control_mode=None, use_timing_scale_bit=T
         "piecewise_single",
         "dual_log_linear",
         "dual_clip_linear",
+        "log_scaled",
     }
     if mode not in valid_modes:
         raise ValueError(f"Unsupported timing_control_mode={timing_control_mode}")
@@ -137,7 +138,7 @@ def timing_control_feature_dim(timing_control_mode=None, use_timing_scale_bit=Tr
         timing_control_mode=timing_control_mode,
         use_timing_scale_bit=use_timing_scale_bit,
     )
-    return 3 if mode == "piecewise_single" else 5
+    return 3 if mode in {"piecewise_single", "log_scaled"} else 5
 
 
 def integrated_epr_input_dim(timing_control_mode=None, use_timing_scale_bit=True):
@@ -269,17 +270,51 @@ def performance_label_bins(perf, timing_bins=5000, value_bins=128):
     )
 
 
-def normalize_ioi_dev(score_ioi_ms, perf_ioi_ms):
+def timing_log_scale(config_or_scale=None):
+    if isinstance(config_or_scale, dict):
+        return float(config_or_scale.get("timing_log_scale", 50.0))
+    if config_or_scale is None:
+        return 50.0
+    return float(config_or_scale)
+
+
+def normalize_log_timing_value(time_ms, scale=1.0, max_time_ms=5000.0):
+    value = min(max(float(time_ms), 0.0), float(max_time_ms))
+    scale = max(float(scale), 1e-12)
+    return math.log1p(value / scale) / math.log1p(float(max_time_ms) / scale)
+
+
+def denormalize_log_timing_value(time_norm, scale=50.0, max_time_ms=5000.0):
+    clipped = min(max(float(time_norm), 0.0), 1.0)
+    scale = max(float(scale), 1e-12)
+    return scale * math.expm1(clipped * math.log1p(float(max_time_ms) / scale))
+
+
+def normalize_log_timing_dev(score_time_ms, perf_time_ms, scale=50.0, max_time_ms=5000.0):
+    score_norm = normalize_log_timing_value(score_time_ms, scale=scale, max_time_ms=max_time_ms)
+    perf_norm = normalize_log_timing_value(perf_time_ms, scale=scale, max_time_ms=max_time_ms)
+    return min(max(perf_norm - score_norm + 0.5, 0.0), 1.0)
+
+
+def _uses_log_deviation_target(epr_timing_target):
+    return str(epr_timing_target or "").lower() in {"log_deviation", "log_dev", "log_deviation_ratio", "log_dev_ratio"}
+
+
+def normalize_ioi_dev(score_ioi_ms, perf_ioi_ms, epr_timing_target="deviation", log_scale=50.0):
+    if _uses_log_deviation_target(epr_timing_target):
+        return normalize_log_timing_dev(score_ioi_ms, perf_ioi_ms, scale=log_scale, max_time_ms=5000.0)
     dev_ms = float(perf_ioi_ms) - float(score_ioi_ms)
     return min(max((dev_ms + 500.0) / 1000.0, 0.0), 1.0)
 
 
-def normalize_duration_dev(score_duration_ms, perf_duration_ms):
+def normalize_duration_dev(score_duration_ms, perf_duration_ms, epr_timing_target="deviation", log_scale=50.0):
+    if _uses_log_deviation_target(epr_timing_target):
+        return normalize_log_timing_dev(score_duration_ms, perf_duration_ms, scale=log_scale, max_time_ms=5000.0)
     dev_ms = float(perf_duration_ms) - float(score_duration_ms)
     return min(max((dev_ms + 500.0) / 1000.0, 0.0), 1.0)
 
 
-def performance_dev_velocity_pedal2_rows(perf, score_shared_raw):
+def performance_dev_velocity_pedal2_rows(perf, score_shared_raw, epr_timing_target="deviation", log_scale=50.0):
     shared_rows = perf.get("label_shared_raw")
     pedal_rows = _raw_value_rows(perf, "label_pedal2_raw", "pedal2_raw")
     if shared_rows is None or pedal_rows is None:
@@ -301,8 +336,18 @@ def performance_dev_velocity_pedal2_rows(perf, score_shared_raw):
     for score_row, perf_row, pedal_row in zip(score_shared_raw, shared_rows, pedal_rows):
         rows.append(
             [
-                normalize_ioi_dev(score_row[0], perf_row[0]),
-                normalize_duration_dev(score_row[1], perf_row[1]),
+                normalize_ioi_dev(
+                    score_row[0],
+                    perf_row[0],
+                    epr_timing_target=epr_timing_target,
+                    log_scale=log_scale,
+                ),
+                normalize_duration_dev(
+                    score_row[1],
+                    perf_row[1],
+                    epr_timing_target=epr_timing_target,
+                    log_scale=log_scale,
+                ),
                 min(max(float(perf_row[2]), 0.0), 127.0) / 127.0,
                 min(max(float(pedal_row[0]), 0.0), 127.0) / 127.0,
                 min(max(float(pedal_row[1]), 0.0), 127.0) / 127.0,
@@ -318,12 +363,7 @@ def normalize_piecewise_time_value(time_ms):
     return value / 5000.0
 
 
-def normalize_log_timing_value(time_ms, max_time_ms=5000.0):
-    value = min(max(float(time_ms), 0.0), float(max_time_ms))
-    return math.log1p(value) / math.log1p(float(max_time_ms))
-
-
-def encode_timing_control_features(time_ms, timing_control_mode=None, use_timing_scale_bit=True):
+def encode_timing_control_features(time_ms, timing_control_mode=None, use_timing_scale_bit=True, log_scale=50.0):
     mode = resolve_timing_control_mode(
         timing_control_mode=timing_control_mode,
         use_timing_scale_bit=use_timing_scale_bit,
@@ -338,9 +378,11 @@ def encode_timing_control_features(time_ms, timing_control_mode=None, use_timing
         return [normalize_piecewise_time_value(value)]
     if mode == "dual_log_linear":
         return [
-            normalize_log_timing_value(value, max_time_ms=5000.0),
+            normalize_log_timing_value(value, scale=1.0, max_time_ms=5000.0),
             value / 5000.0,
         ]
+    if mode == "log_scaled":
+        return [normalize_log_timing_value(value, scale=log_scale, max_time_ms=5000.0)]
     if mode == "dual_clip_linear":
         return [
             min(value / 500.0, 1.0),
@@ -349,7 +391,7 @@ def encode_timing_control_features(time_ms, timing_control_mode=None, use_timing
     raise ValueError(f"Unsupported timing_control_mode={mode}")
 
 
-def encode_shared_control_row(raw_shared_row, use_timing_scale_bit=True, timing_control_mode=None):
+def encode_shared_control_row(raw_shared_row, use_timing_scale_bit=True, timing_control_mode=None, log_scale=50.0):
     ioi_ms = float(raw_shared_row[0])
     duration_ms = float(raw_shared_row[1])
     velocity = min(max(float(raw_shared_row[2]), 0.0), 127.0) / 127.0
@@ -358,11 +400,13 @@ def encode_shared_control_row(raw_shared_row, use_timing_scale_bit=True, timing_
             ioi_ms,
             timing_control_mode=timing_control_mode,
             use_timing_scale_bit=use_timing_scale_bit,
+            log_scale=log_scale,
         ),
         *encode_timing_control_features(
             duration_ms,
             timing_control_mode=timing_control_mode,
             use_timing_scale_bit=use_timing_scale_bit,
+            log_scale=log_scale,
         ),
         velocity,
     ]
@@ -427,6 +471,7 @@ def build_score_musical_rows(score):
                 min(max(mioi / 6.0, 0.0), 1.0),
                 min(max(md / 6.0, 0.0), 1.0),
                 min(max(ml / 6.0, 0.0), 1.0),
+                # Raw local ms/quarter context; log timing is only used for timing controls/targets.
                 tempo / 2000.0,
                 first,
                 grace,
@@ -440,7 +485,7 @@ def build_score_musical_rows(score):
     return rows
 
 
-def build_epr_score_input_rows(score, use_timing_scale_bit=True, timing_control_mode=None):
+def build_epr_score_input_rows(score, use_timing_scale_bit=True, timing_control_mode=None, log_scale=50.0):
     score_raw = score["score_raw"]
     has_score_feature = score.get("has_score_feature", [0] * len(score["pitch"]))
     musical_rows = build_score_musical_rows(score)
@@ -453,6 +498,7 @@ def build_epr_score_input_rows(score, use_timing_scale_bit=True, timing_control_
                 raw_shared[:3],
                 use_timing_scale_bit=use_timing_scale_bit,
                 timing_control_mode=timing_control_mode,
+                log_scale=log_scale,
             )
             + [0.0, 0.0]
             + [0.0, 0.0]
@@ -462,7 +508,7 @@ def build_epr_score_input_rows(score, use_timing_scale_bit=True, timing_control_
     return rows
 
 
-def build_csr_performance_input_rows(perf, use_timing_scale_bit=True, timing_control_mode=None):
+def build_csr_performance_input_rows(perf, use_timing_scale_bit=True, timing_control_mode=None, log_scale=50.0):
     shared_rows = perf.get("label_shared_raw")
     pedal_rows = _raw_value_rows(perf, "label_pedal2_raw", "pedal2_raw")
     if shared_rows is None or pedal_rows is None:
@@ -484,6 +530,7 @@ def build_csr_performance_input_rows(perf, use_timing_scale_bit=True, timing_con
                 raw_shared[:3],
                 use_timing_scale_bit=use_timing_scale_bit,
                 timing_control_mode=timing_control_mode,
+                log_scale=log_scale,
             )
             + [0.0, 0.0]
             + [
@@ -610,6 +657,7 @@ class PianoCoReNodeSFTDataset(Dataset):
         epr_timing_target="absolute",
         use_timing_scale_bit=True,
         timing_control_mode=None,
+        timing_log_scale=50.0,
     ):
         super().__init__()
         self.split = split
@@ -626,6 +674,7 @@ class PianoCoReNodeSFTDataset(Dataset):
             timing_control_mode=timing_control_mode,
             use_timing_scale_bit=use_timing_scale_bit,
         )
+        self.timing_log_scale = float(timing_log_scale)
         items = list(manifest)
         if shuffle:
             random.Random(seed).shuffle(items)
@@ -706,6 +755,7 @@ class PianoCoReNodeSFTDataset(Dataset):
                 score,
                 use_timing_scale_bit=self.use_timing_scale_bit,
                 timing_control_mode=self.timing_control_mode,
+                log_scale=self.timing_log_scale,
             )
         elif task_type == "csr":
             prepared["score_musical"] = build_score_musical_rows(score)
@@ -738,14 +788,29 @@ class PianoCoReNodeSFTDataset(Dataset):
         if cache_key in label_cache:
             return label_cache[cache_key]
 
-        if self.task_type.lower() == "epr" and self.epr_timing_target in {"deviation", "dev"}:
-            labels = performance_dev_velocity_pedal2_rows(perf, prepared["score"]["score_raw"])
+        if self.task_type.lower() == "epr" and self.epr_timing_target in {
+            "deviation",
+            "dev",
+            "log_deviation",
+            "log_dev",
+        }:
+            labels = performance_dev_velocity_pedal2_rows(
+                perf,
+                prepared["score"]["score_raw"],
+                epr_timing_target=self.epr_timing_target,
+                log_scale=self.timing_log_scale,
+            )
             if labels is None:
                 raise KeyError("Missing score_raw/label_shared_raw/label_pedal2_raw for deviation EPR targets")
             label_cache[cache_key] = (labels, None)
             return labels, None
         if self.task_type.lower() == "epr" and self.epr_timing_target in {"deviation_ratio", "dev_ratio"}:
-            labels = performance_dev_velocity_pedal2_rows(perf, prepared["score"]["score_raw"])
+            labels = performance_dev_velocity_pedal2_rows(
+                perf,
+                prepared["score"]["score_raw"],
+                epr_timing_target=self.epr_timing_target,
+                log_scale=self.timing_log_scale,
+            )
             if labels is None:
                 raise KeyError("Missing score_raw/label_shared_raw/label_pedal2_raw for deviation EPR targets")
             label_cache[cache_key] = (labels, None)
@@ -755,6 +820,7 @@ class PianoCoReNodeSFTDataset(Dataset):
                 perf,
                 use_timing_scale_bit=self.use_timing_scale_bit,
                 timing_control_mode=self.timing_control_mode,
+                log_scale=self.timing_log_scale,
             )
             if labels is None:
                 raise KeyError("Missing label_shared_raw/label_pedal2_raw for CSR inputs")
@@ -1211,7 +1277,7 @@ def create_model(train_config):
             ]
             if missing_beta_keys:
                 raise ValueError(f"EPR beta_mu_kappa config is missing required keys: {missing_beta_keys}")
-        if epr_timing_target in {"deviation", "dev", "deviation_ratio", "dev_ratio"}:
+        if epr_timing_target in {"deviation", "dev", "deviation_ratio", "dev_ratio", "log_deviation", "log_dev"}:
             if int(train_config.get("output_continuous_dim", train_config["continuous_dim"])) != 5:
                 raise ValueError("deviation EPR requires output_continuous_dim=5")
             if str(train_config.get("pedal_representation", "continuous_4")).lower() != "start_ctrl":
@@ -1317,6 +1383,7 @@ def create_model(train_config):
         epr_value_bins=train_config.get("epr_value_bins", 128),
         epr_timing_target=epr_timing_target,
         timing_control_mode=timing_control_mode,
+        timing_log_scale=train_config.get("timing_log_scale", 50.0),
         use_timing_scale_bit=use_timing_scale_bit,
         soft_ce_tau=train_config.get("soft_ce_tau"),
         timing_input_normalization=train_config.get("timing_input_normalization", "scaled_log_5000_s10"),
@@ -1497,6 +1564,7 @@ def main():
         epr_timing_target=train_config.get("epr_timing_target", "absolute"),
         use_timing_scale_bit=train_config.get("use_timing_scale_bit", True),
         timing_control_mode=train_config.get("timing_control_mode"),
+        timing_log_scale=train_config.get("timing_log_scale", 50.0),
     )
     eval_dataset = PianoCoReNodeSFTDataset(
         eval_manifest,
@@ -1516,6 +1584,7 @@ def main():
         epr_timing_target=train_config.get("epr_timing_target", "absolute"),
         use_timing_scale_bit=train_config.get("use_timing_scale_bit", True),
         timing_control_mode=train_config.get("timing_control_mode"),
+        timing_log_scale=train_config.get("timing_log_scale", 50.0),
     )
 
     model = create_model(train_config)

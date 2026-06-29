@@ -123,6 +123,7 @@ def load_score_from_node(
     path: Path,
     use_timing_scale_bit=True,
     timing_control_mode=None,
+    timing_log_scale=50.0,
     task_type="epr",
     performance_source=None,
 ):
@@ -146,12 +147,14 @@ def load_score_from_node(
             perf,
             use_timing_scale_bit=use_timing_scale_bit,
             timing_control_mode=timing_control_mode,
+            log_scale=timing_log_scale,
         )
     else:
         continuous = build_epr_score_input_rows(
             score,
             use_timing_scale_bit=use_timing_scale_bit,
             timing_control_mode=timing_control_mode,
+            log_scale=timing_log_scale,
         )
     score_shared_raw = [row[:3] for row in score["score_raw"]]
     return pitch, continuous, score_shared_raw, work
@@ -364,6 +367,7 @@ def predict_one_csr_work(model, device, config, work, args):
         Path(work["path"]),
         use_timing_scale_bit=config.get("use_timing_scale_bit", True),
         timing_control_mode=config.get("timing_control_mode"),
+        timing_log_scale=config.get("timing_log_scale", 50.0),
         task_type="csr",
         performance_source=performance_source,
     )
@@ -435,6 +439,7 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
         Path(work["path"]),
         use_timing_scale_bit=config.get("use_timing_scale_bit", True),
         timing_control_mode=config.get("timing_control_mode"),
+        timing_log_scale=config.get("timing_log_scale", 50.0),
         task_type="epr",
     )
     windows = build_windows(len(pitch), config["block_notes"], config["overlap_ratio"])
@@ -484,6 +489,7 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
         raw_rows = _target5_to_raw7(
             torch.tensor(score_shared_raw, dtype=torch.float32),
             pred_target.float().cpu(),
+            config=config,
         )
         midi_obj = note_features_to_midi(
             pitch=pitch,

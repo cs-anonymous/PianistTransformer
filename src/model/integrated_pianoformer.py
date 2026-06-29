@@ -38,6 +38,7 @@ def resolve_timing_control_mode(timing_control_mode=None, use_timing_scale_bit=T
         "piecewise_single",
         "dual_log_linear",
         "dual_clip_linear",
+        "log_scaled",
     }
     if mode not in valid_modes:
         raise ValueError(f"Unsupported timing_control_mode={timing_control_mode}")
@@ -49,7 +50,7 @@ def timing_control_feature_dim(timing_control_mode=None, use_timing_scale_bit=Tr
         timing_control_mode=timing_control_mode,
         use_timing_scale_bit=use_timing_scale_bit,
     )
-    return 3 if mode == "piecewise_single" else 5
+    return 3 if mode in {"piecewise_single", "log_scaled"} else 5
 
 
 class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
@@ -105,6 +106,7 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         epr_value_bins=128,
         epr_timing_target="absolute",
         timing_control_mode=None,
+        timing_log_scale=50.0,
         use_timing_scale_bit=True,
         soft_ce_tau=None,
         timing_input_normalization="scaled_log_5000_s10",
@@ -196,6 +198,7 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.epr_timing_bins = int(epr_timing_bins)
         self.epr_value_bins = int(epr_value_bins)
         self.epr_timing_target = str(epr_timing_target).lower()
+        self.timing_log_scale = float(timing_log_scale)
         self.timing_control_mode = resolve_timing_control_mode(
             timing_control_mode=timing_control_mode,
             use_timing_scale_bit=use_timing_scale_bit,
@@ -413,14 +416,19 @@ class IntegratedContinuousDecoder(nn.Module):
         self.shared_slice = self.score_slice = self.perf_slice = slice(None)
         shared_dim = score_dim = perf_dim = full_dim
 
+        shared_extra_output_dim = 0
+        shared_pack_mode = "concat"
         if (
             getattr(config, "task_type", "epr") == "epr"
             and self.epr_distribution in {"categorical", "hard_categorical", "soft_categorical"}
         ):
-            shared_output_dim = int(config.epr_timing_bins) * 2 + int(config.epr_value_bins)
+            ioi_output_dim = int(config.epr_timing_bins)
+            duration_output_dim = int(config.epr_timing_bins)
+            velocity_output_dim = int(config.epr_value_bins)
             pedal_output_dim = int(config.epr_value_bins) * 4
         elif getattr(config, "task_type", "epr") == "epr" and self.epr_distribution == "beta_mu_kappa":
-            shared_output_dim = 6
+            ioi_output_dim = duration_output_dim = velocity_output_dim = 2
+            shared_pack_mode = "beta_mu_kappa"
             pedal_output_dim = 8
         elif (
             getattr(config, "task_type", "epr") == "epr"
@@ -435,13 +443,13 @@ class IntegratedContinuousDecoder(nn.Module):
             if components < 1:
                 raise ValueError(f"epr_mixture_components must be >= 1, got {components}")
             per_feature_dim = components * 3
-            shared_output_dim = per_feature_dim * 3
+            ioi_output_dim = duration_output_dim = velocity_output_dim = per_feature_dim
             pedal_output_dim = per_feature_dim * 4
             if self.epr_distribution == "inflated_mixture_logistic_normal":
-                shared_output_dim += 2
+                shared_extra_output_dim = 2
                 pedal_output_dim += 3 * 4
         else:
-            shared_output_dim = 3
+            ioi_output_dim = duration_output_dim = velocity_output_dim = 1
             pedal_output_dim = 4
 
         self.pedal_representation = str(getattr(config, "pedal_representation", "continuous_4")).lower()
@@ -464,13 +472,52 @@ class IntegratedContinuousDecoder(nn.Module):
         if getattr(config, "task_type", "epr") == "csr" and _csr_uses_grid_head(config):
             generic_output_dim = _csr_grid_raw_output_dim(config)
 
-        self.shared_head = _make_mlp(shared_dim, shared_output_dim, shared_dim, head_depth, activation)
+        self.split_shared_heads = getattr(config, "task_type", "epr") == "epr"
+        self.shared_pack_mode = shared_pack_mode
+        if self.split_shared_heads:
+            self.ioi_head = _make_mlp(shared_dim, ioi_output_dim, shared_dim, head_depth, activation)
+            self.duration_head = _make_mlp(shared_dim, duration_output_dim, shared_dim, head_depth, activation)
+            self.velocity_head = _make_mlp(shared_dim, velocity_output_dim, shared_dim, head_depth, activation)
+            self.shared_extra_head = (
+                _make_mlp(shared_dim, shared_extra_output_dim, shared_dim, head_depth, activation)
+                if shared_extra_output_dim
+                else None
+            )
+        else:
+            shared_output_dim = ioi_output_dim + duration_output_dim + velocity_output_dim + shared_extra_output_dim
+            self.shared_head = _make_mlp(shared_dim, shared_output_dim, shared_dim, head_depth, activation)
         self.pedal_head = _make_mlp(perf_dim, pedal_output_dim, perf_dim, head_depth, activation)
         self.generic_head = _make_mlp(score_dim, generic_output_dim, score_dim, head_depth, activation)
 
+    def _shared_outputs(self, hidden_states):
+        shared_hidden = hidden_states[..., self.shared_slice]
+        if not self.split_shared_heads:
+            return self.shared_head(shared_hidden)
+
+        ioi = self.ioi_head(shared_hidden)
+        duration = self.duration_head(shared_hidden)
+        velocity = self.velocity_head(shared_hidden)
+        if self.shared_pack_mode == "beta_mu_kappa":
+            return torch.cat(
+                [
+                    ioi[..., 0:1],
+                    duration[..., 0:1],
+                    velocity[..., 0:1],
+                    ioi[..., 1:2],
+                    duration[..., 1:2],
+                    velocity[..., 1:2],
+                ],
+                dim=-1,
+            )
+
+        parts = [ioi, duration, velocity]
+        if self.shared_extra_head is not None:
+            parts.append(self.shared_extra_head(shared_hidden))
+        return torch.cat(parts, dim=-1)
+
     def forward(self, hidden_states):
         if _uses_deviation_ratio_targets(self.config):
-            shared = self.shared_head(hidden_states[..., self.shared_slice])
+            shared = self._shared_outputs(hidden_states)
             pedal = self.pedal_head(hidden_states[..., self.perf_slice])
             if self.epr_distribution in {
                 "beta_mu_kappa",
@@ -490,7 +537,7 @@ class IntegratedContinuousDecoder(nn.Module):
         if self.output_dim != 7:
             return self.generic_head(hidden_states[..., self.score_slice])
 
-        shared = self.shared_head(hidden_states[..., self.shared_slice])
+        shared = self._shared_outputs(hidden_states)
         pedal = self.pedal_head(hidden_states[..., self.perf_slice])
         if self.pedal_representation == "start_ctrl":
             if self.epr_distribution in {
@@ -700,12 +747,37 @@ def _pack_start_ctrl_prediction(shared, start, ctrl):
 
 def _uses_deviation_ratio_targets(config):
     return (
-        getattr(config, "task_type", "epr") == "epr"
-        and str(getattr(config, "epr_timing_target", "absolute")).lower() in {"deviation", "dev", "deviation_ratio", "dev_ratio"}
+        _config_value(config, "task_type", "epr") == "epr"
+        and str(_config_value(config, "epr_timing_target", "absolute")).lower()
+        in {"deviation", "dev", "deviation_ratio", "dev_ratio", "log_deviation", "log_dev"}
     )
 
 
-def _torch_timing_control_code(time_ms, timing_control_mode=None, use_scale_bit=True):
+def _uses_log_deviation_targets(config):
+    return str(_config_value(config, "epr_timing_target", "absolute")).lower() in {"log_deviation", "log_dev"}
+
+
+def _config_value(config, name, default):
+    if isinstance(config, dict):
+        return config.get(name, default)
+    return getattr(config, name, default)
+
+
+def _torch_log_timing_code(time_ms, scale=50.0, max_time_ms=5000.0):
+    value = time_ms.float().clamp(0.0, float(max_time_ms))
+    scale_value = value.new_tensor(max(float(scale), 1e-12))
+    denom = torch.log1p(value.new_tensor(float(max_time_ms)) / scale_value)
+    return torch.log1p(value / scale_value) / denom
+
+
+def _torch_log_timing_decode(time_norm, scale=50.0, max_time_ms=5000.0):
+    clipped = time_norm.float().clamp(0.0, 1.0)
+    scale_value = clipped.new_tensor(max(float(scale), 1e-12))
+    denom = torch.log1p(clipped.new_tensor(float(max_time_ms)) / scale_value)
+    return scale_value * torch.expm1(clipped * denom)
+
+
+def _torch_timing_control_code(time_ms, timing_control_mode=None, use_scale_bit=True, log_scale=50.0):
     value = time_ms.float().clamp(0.0, 5000.0)
     mode = resolve_timing_control_mode(
         timing_control_mode=timing_control_mode,
@@ -730,6 +802,8 @@ def _torch_timing_control_code(time_ms, timing_control_mode=None, use_scale_bit=
             ],
             dim=-1,
         )
+    if mode == "log_scaled":
+        return _torch_log_timing_code(value, scale=log_scale, max_time_ms=5000.0).unsqueeze(-1)
     if mode == "dual_clip_linear":
         return torch.stack(
             [
@@ -741,11 +815,20 @@ def _torch_timing_control_code(time_ms, timing_control_mode=None, use_scale_bit=
     raise ValueError(f"Unsupported timing_control_mode={mode}")
 
 
-def _target5_to_raw7(score_shared_raw, target_predictions):
+def _target5_to_raw7(score_shared_raw, target_predictions, config=None):
     score_shared_raw = score_shared_raw.float()
     target_predictions = target_predictions.float().clamp(0.0, 1.0)
-    perf_ioi_ms = (score_shared_raw[..., 0] + (target_predictions[..., 0] * 1000.0 - 500.0)).clamp_min(0.0)
-    perf_duration_ms = (score_shared_raw[..., 1] + (target_predictions[..., 1] * 1000.0 - 500.0)).clamp_min(0.0)
+    if config is not None and _uses_log_deviation_targets(config):
+        log_scale = float(_config_value(config, "timing_log_scale", 50.0))
+        score_ioi_norm = _torch_log_timing_code(score_shared_raw[..., 0], scale=log_scale, max_time_ms=5000.0)
+        score_duration_norm = _torch_log_timing_code(score_shared_raw[..., 1], scale=log_scale, max_time_ms=5000.0)
+        perf_ioi_norm = score_ioi_norm + (target_predictions[..., 0] - 0.5)
+        perf_duration_norm = score_duration_norm + (target_predictions[..., 1] - 0.5)
+        perf_ioi_ms = _torch_log_timing_decode(perf_ioi_norm, scale=log_scale, max_time_ms=5000.0)
+        perf_duration_ms = _torch_log_timing_decode(perf_duration_norm, scale=log_scale, max_time_ms=5000.0)
+    else:
+        perf_ioi_ms = (score_shared_raw[..., 0] + (target_predictions[..., 0] * 1000.0 - 500.0)).clamp_min(0.0)
+        perf_duration_ms = (score_shared_raw[..., 1] + (target_predictions[..., 1] * 1000.0 - 500.0)).clamp_min(0.0)
     velocity = target_predictions[..., 2] * 127.0
     pedal_start = target_predictions[..., 3] * 127.0
     pedal_ctrl = target_predictions[..., 4] * 127.0
@@ -765,18 +848,21 @@ def _target5_to_raw7(score_shared_raw, target_predictions):
 
 
 def _build_epr_decoder_rows(config, score_shared_raw, target_predictions):
-    raw_perf = _target5_to_raw7(score_shared_raw, target_predictions)
+    raw_perf = _target5_to_raw7(score_shared_raw, target_predictions, config=config)
     timing_control_mode = getattr(config, "timing_control_mode", None)
     use_timing_scale_bit = getattr(config, "use_timing_scale_bit", True)
+    log_scale = getattr(config, "timing_log_scale", 50.0)
     shared = _torch_timing_control_code(
         raw_perf[..., 0],
         timing_control_mode=timing_control_mode,
         use_scale_bit=use_timing_scale_bit,
+        log_scale=log_scale,
     )
     duration = _torch_timing_control_code(
         raw_perf[..., 1],
         timing_control_mode=timing_control_mode,
         use_scale_bit=use_timing_scale_bit,
+        log_scale=log_scale,
     )
     velocity = (raw_perf[..., 2] / 127.0).unsqueeze(-1)
     control = torch.cat([shared, duration, velocity], dim=-1)
@@ -1013,10 +1099,18 @@ def _epr_bins_to_normalized(config, ioi_bins, duration_bins, velocity_bins, peda
     timing_norm = str(getattr(config, "timing_input_normalization", "scaled_log_5000_s10")).lower()
     ioi_ms = ioi_bins.to(dtype=torch.float32).clamp(0.0, float(timing_bins - 1))
     duration_ms = duration_bins.to(dtype=torch.float32).clamp(0.0, float(timing_bins - 1))
-    if timing_norm in {"scaled_log_5000_s10", "log1p_x_over_10_5000"}:
+    if timing_norm in {"scaled_log_5000_s10", "log1p_t_over_10_5000", "log1p_x_over_10_5000"}:
         denom = torch.log1p(ioi_ms.new_tensor(500.0))
         ioi_norm = torch.log1p(ioi_ms.clamp(max=5000.0) / 10.0) / denom
         duration_norm = torch.log1p(duration_ms.clamp(max=5000.0) / 10.0) / denom
+    elif timing_norm in {"log1p_t_over_50_5000", "log1p_x_over_50_5000"}:
+        denom = torch.log1p(ioi_ms.new_tensor(100.0))
+        ioi_norm = torch.log1p(ioi_ms.clamp(max=5000.0) / 50.0) / denom
+        duration_norm = torch.log1p(duration_ms.clamp(max=5000.0) / 50.0) / denom
+    elif timing_norm in {"log1p_t_over_100_5000", "log1p_x_over_100_5000"}:
+        denom = torch.log1p(ioi_ms.new_tensor(50.0))
+        ioi_norm = torch.log1p(ioi_ms.clamp(max=5000.0) / 100.0) / denom
+        duration_norm = torch.log1p(duration_ms.clamp(max=5000.0) / 100.0) / denom
     elif timing_norm in {"legacy_log1p", "log1p", "log1p_10000"}:
         max_time = float(getattr(config, "max_time_ms", 10000.0))
         denom = torch.log1p(ioi_ms.new_tensor(max_time))

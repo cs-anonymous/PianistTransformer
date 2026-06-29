@@ -29,7 +29,7 @@
   "epr_timing_target": "deviation_ratio",
   "adapt_on_asap_after_train": true,
   "adapt_learning_rate": 3e-05,
-  "adapt_num_train_epochs": 2,
+  "adapt_num_train_epochs": 4,
   "beta_eps": 1e-05,
   "beta_kappa_min": 0.001,
   "note_embedding_mode": "cine",

@@ -13,6 +13,9 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+LOG_WASS_SCALE = 50.0
+LOG_WASS_MAX_TIME_MS = 5000.0
+
 
 def sorted_piano_notes(midi_obj):
     notes = []
@@ -129,6 +132,12 @@ def mae(pred: np.ndarray, target: np.ndarray) -> float:
     return float(np.mean(np.abs(pred - target))) if len(pred) else float("nan")
 
 
+def log_time_values(values, scale=LOG_WASS_SCALE, max_time_ms=LOG_WASS_MAX_TIME_MS):
+    values = np.asarray(values, dtype=np.float64)
+    values = np.clip(values, 0.0, float(max_time_ms))
+    return np.log1p(values / float(scale))
+
+
 def compute_pair_metrics_from_arrays(pred, gt):
     pointwise = {}
     distro = {}
@@ -140,6 +149,13 @@ def compute_pair_metrics_from_arrays(pred, gt):
         gt_slice = gt[name][:usable]
         pointwise[name] = mae(pred_slice, gt_slice)
         distro[name] = float(wasserstein_distance(pred_slice, gt_slice))
+        if name in {"ioi", "duration"}:
+            distro[f"{name}_log50"] = float(
+                wasserstein_distance(
+                    log_time_values(pred_slice),
+                    log_time_values(gt_slice),
+                )
+            )
 
     pedal_mae = float(np.mean([pointwise[k] for k in feature_names[3:]]))
     pedal_wass = float(np.mean([distro[k] for k in feature_names[3:]]))
@@ -147,8 +163,10 @@ def compute_pair_metrics_from_arrays(pred, gt):
     return {
         "ioi_mae": pointwise["ioi"],
         "ioi_wass": distro["ioi"],
+        "ioi_log50_wass": distro["ioi_log50"],
         "duration_mae": pointwise["duration"],
         "duration_wass": distro["duration"],
+        "duration_log50_wass": distro["duration_log50"],
         "velocity_mae": pointwise["velocity"],
         "velocity_wass": distro["velocity"],
         "pedal_mae": pedal_mae,
@@ -169,8 +187,10 @@ def aggregate_metrics(rows):
     keys = [
         "ioi_mae",
         "ioi_wass",
+        "ioi_log50_wass",
         "duration_mae",
         "duration_wass",
+        "duration_log50_wass",
         "velocity_mae",
         "velocity_wass",
         "pedal_mae",

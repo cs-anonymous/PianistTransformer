@@ -26,6 +26,9 @@ FEATURE_KEYS = [
     ("pedal_75", "pedal_75"),
 ]
 
+LOG_WASS_SCALE = 50.0
+LOG_WASS_MAX_TIME_MS = 5000.0
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate deterministic or sampling INR predictions against multi-reference GT sets.")
@@ -57,6 +60,12 @@ def feature_wasserstein(pred_values, gt_values):
     return float(wasserstein_distance(pred_values, gt_values))
 
 
+def log_time_values(values, scale=LOG_WASS_SCALE, max_time_ms=LOG_WASS_MAX_TIME_MS):
+    values = np.asarray(values, dtype=np.float64)
+    values = np.clip(values, 0.0, float(max_time_ms))
+    return np.log1p(values / float(scale))
+
+
 def pp_wass_metrics(prediction_paths, gt_paths):
     pred_arrays = [cached_note_arrays(path) for path in prediction_paths]
     gt_arrays = [cached_note_arrays(path) for path in gt_paths]
@@ -66,6 +75,11 @@ def pp_wass_metrics(prediction_paths, gt_paths):
         pred_pool = np.concatenate([item[feature_name] for item in pred_arrays]) if pred_arrays else np.asarray([], dtype=np.float64)
         gt_pool = np.concatenate([item[feature_name] for item in gt_arrays]) if gt_arrays else np.asarray([], dtype=np.float64)
         output[f"{metric_name}_wass"] = feature_wasserstein(pred_pool, gt_pool)
+        if metric_name in {"ioi", "duration"}:
+            output[f"{metric_name}_log50_wass"] = feature_wasserstein(
+                log_time_values(pred_pool),
+                log_time_values(gt_pool),
+            )
 
     pedal_keys = [f"{name}_wass" for name in ("pedal_0", "pedal_25", "pedal_50", "pedal_75")]
     output["pedal_wass"] = finite_mean([output[key] for key in pedal_keys])
@@ -88,6 +102,15 @@ def pn_wass_metrics(prediction_paths, gt_paths):
             for note_idx in range(usable)
         ]
         output[f"{metric_name}_wass"] = finite_mean(note_wass)
+        if metric_name in {"ioi", "duration"}:
+            note_log_wass = [
+                feature_wasserstein(
+                    [log_time_values([item[feature_name][note_idx]])[0] for item in pred_arrays],
+                    [log_time_values([item[feature_name][note_idx]])[0] for item in gt_arrays],
+                )
+                for note_idx in range(usable)
+            ]
+            output[f"{metric_name}_log50_wass"] = finite_mean(note_log_wass)
 
     pedal_keys = [f"{name}_wass" for name in ("pedal_0", "pedal_25", "pedal_50", "pedal_75")]
     output["pedal_wass"] = finite_mean([output[key] for key in pedal_keys])
@@ -153,6 +176,11 @@ def main():
         "protocol": manifest["protocol"],
         "num_samples": manifest["num_samples"],
         "num_scores": len(score_rows),
+        "log_wass": {
+            "scale": LOG_WASS_SCALE,
+            "max_time_ms": LOG_WASS_MAX_TIME_MS,
+            "features": ["ioi", "duration"],
+        },
         "aggregate": {
             "pn_wass": aggregate_score_metrics(score_rows, "pn_wass"),
             "pp_wass": aggregate_score_metrics(score_rows, "pp_wass"),

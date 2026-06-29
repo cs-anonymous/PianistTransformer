@@ -37,7 +37,7 @@ FEATURES = [
 
 DEV_FEATURES = [
     ("dev_ioi", "IOI Deviation"),
-    ("dev_duration", "Duration Ratio"),
+    ("dev_duration", "Duration Deviation"),
 ]
 
 
@@ -282,9 +282,43 @@ def normalize_ioi_dev(score_ioi_ms, perf_ioi_ms):
     return min(max((dev_ms + 500.0) / 1000.0, 0.0), 1.0)
 
 
-def normalize_duration_ratio(score_duration_ms, perf_duration_ms, eps=1e-6):
-    ratio = float(perf_duration_ms) / max(float(score_duration_ms), float(eps))
-    return min(max(ratio / 5.0, 0.0), 1.0)
+def normalize_duration_dev(score_duration_ms, perf_duration_ms):
+    dev_ms = float(perf_duration_ms) - float(score_duration_ms)
+    return min(max((dev_ms + 500.0) / 1000.0, 0.0), 1.0)
+
+
+def normalize_log_timing_value(time_ms, scale=50.0, max_time_ms=5000.0):
+    clipped = min(max(float(time_ms), 0.0), float(max_time_ms))
+    scale = max(float(scale), 1e-12)
+    return math.log1p(clipped / scale) / math.log1p(float(max_time_ms) / scale)
+
+
+def normalize_log_dev(score_time_ms, perf_time_ms, scale=50.0):
+    score_norm = normalize_log_timing_value(score_time_ms, scale=scale)
+    perf_norm = normalize_log_timing_value(perf_time_ms, scale=scale)
+    return min(max(perf_norm - score_norm + 0.5, 0.0), 1.0)
+
+
+def normalize_target_dev(score_time_ms, perf_time_ms, config):
+    target = str(config.get("epr_timing_target", "deviation")).lower()
+    if target in {"log_deviation", "log_dev"}:
+        return normalize_log_dev(
+            score_time_ms,
+            perf_time_ms,
+            scale=float(config.get("timing_log_scale", 50.0)),
+        )
+    return normalize_ioi_dev(score_time_ms, perf_time_ms)
+
+
+def normalize_target_duration_dev(score_time_ms, perf_time_ms, config):
+    target = str(config.get("epr_timing_target", "deviation")).lower()
+    if target in {"log_deviation", "log_dev"}:
+        return normalize_log_dev(
+            score_time_ms,
+            perf_time_ms,
+            scale=float(config.get("timing_log_scale", 50.0)),
+        )
+    return normalize_duration_dev(score_time_ms, perf_time_ms)
 
 
 def load_score_source_to_work_path(config):
@@ -303,7 +337,7 @@ def load_score_source_to_work_path(config):
     }
 
 
-def extract_gt_dev_arrays(score_source_to_work_path):
+def extract_gt_dev_arrays(score_source_to_work_path, config):
     dev_ioi = []
     dev_duration = []
     for work_path in score_source_to_work_path.values():
@@ -319,8 +353,8 @@ def extract_gt_dev_arrays(score_source_to_work_path):
             if len(shared_rows) != len(score_raw):
                 continue
             for score_row, perf_row in zip(score_raw, shared_rows):
-                dev_ioi.append(normalize_ioi_dev(score_row[0], perf_row[0]))
-                dev_duration.append(normalize_duration_ratio(score_row[1], perf_row[1]))
+                dev_ioi.append(normalize_target_dev(score_row[0], perf_row[0], config))
+                dev_duration.append(normalize_target_duration_dev(score_row[1], perf_row[1], config))
     return {
         "dev_ioi": np.asarray(dev_ioi, dtype=np.float64),
         "dev_duration": np.asarray(dev_duration, dtype=np.float64),
@@ -358,7 +392,7 @@ def plot_dev_distributions(
     output_plot,
 ):
     score_source_to_work_path = load_score_source_to_work_path(config)
-    gt_arrays = extract_gt_dev_arrays(score_source_to_work_path)
+    gt_arrays = extract_gt_dev_arrays(score_source_to_work_path, config)
     det_arrays = extract_pred_dev_arrays(unique_paths(det_manifest, "raw_output_paths"))
     sampling_arrays = extract_pred_dev_arrays(unique_paths(sampling_manifest, "raw_output_paths"))
 
