@@ -104,9 +104,9 @@ def make_windows(total_notes, block_notes, overlap_ratio, min_notes):
 def default_input_continuous_dim(task_type, input_feature_mode, score_feature_dim=8, continuous_dim=7):
     if input_feature_mode == "integrated":
         if task_type == "epr":
-            return 26
+            return integrated_epr_input_dim()
         if task_type == "csr":
-            return 26
+            return integrated_epr_input_dim()
     return continuous_dim
 
 
@@ -146,11 +146,11 @@ def integrated_epr_input_dim(timing_control_mode=None, use_timing_scale_bit=True
         timing_control_mode=timing_control_mode,
         use_timing_scale_bit=use_timing_scale_bit,
     )
+    score_control_dim = control_dim
+    performance_control_dim = control_dim + 2
     musical_dim = 12
-    dev_dim = 2
-    pedal_dim = 2
-    mask_dim = 5
-    return control_dim + dev_dim + pedal_dim + musical_dim + mask_dim
+    mask_dim = 3
+    return score_control_dim + performance_control_dim + musical_dim + mask_dim
 
 
 def integrated_csr_output_dim():
@@ -421,7 +421,7 @@ def build_score_musical_rows(score):
     measure_start = 0.0
     current_measure_length = 4.0
     prev_q = None
-    prev_tempo = 500.0
+    prev_ms_per_quarter = 500.0
     seen_any_measure = False
 
     for idx, has_feature in enumerate(has_score_feature):
@@ -462,8 +462,9 @@ def build_score_musical_rows(score):
             if md > 1e-6:
                 candidates.append(score_duration_ms / md)
         if candidates:
-            prev_tempo = sum(candidates) / len(candidates)
-        tempo = min(max(prev_tempo, 0.0), 2000.0)
+            prev_ms_per_quarter = sum(candidates) / len(candidates)
+        tempo_bpm = 60000.0 / max(prev_ms_per_quarter, 1e-6)
+        tempo_norm = min(max(tempo_bpm, 0.0), 300.0) / 300.0
 
         rows.append(
             [
@@ -471,8 +472,8 @@ def build_score_musical_rows(score):
                 min(max(mioi / 6.0, 0.0), 1.0),
                 min(max(md / 6.0, 0.0), 1.0),
                 min(max(ml / 6.0, 0.0), 1.0),
-                # Raw local ms/quarter context; log timing is only used for timing controls/targets.
-                tempo / 2000.0,
+                # Local musical tempo in BPM; log timing is only used for timing controls/targets.
+                tempo_norm,
                 first,
                 grace,
                 hand,
@@ -489,20 +490,25 @@ def build_epr_score_input_rows(score, use_timing_scale_bit=True, timing_control_
     score_raw = score["score_raw"]
     has_score_feature = score.get("has_score_feature", [0] * len(score["pitch"]))
     musical_rows = build_score_musical_rows(score)
+    control_dim = timing_control_feature_dim(
+        timing_control_mode=timing_control_mode,
+        use_timing_scale_bit=use_timing_scale_bit,
+    )
     rows = []
     for raw_shared, musical, has_feature in zip(score_raw, musical_rows, has_score_feature):
-        control_is_perf = 0.0
-        masks = [1.0, 0.0, 0.0, 1.0 if bool(has_feature) else 0.0, control_is_perf]
+        score_control = encode_shared_control_row(
+            raw_shared[:3],
+            use_timing_scale_bit=use_timing_scale_bit,
+            timing_control_mode=timing_control_mode,
+            log_scale=log_scale,
+        )
+        perf_control = [0.0] * (control_dim + 2)
+        m_musical = 1.0 if bool(has_feature) else 0.0
+        masks = [1.0, 0.0, m_musical]
         rows.append(
-            encode_shared_control_row(
-                raw_shared[:3],
-                use_timing_scale_bit=use_timing_scale_bit,
-                timing_control_mode=timing_control_mode,
-                log_scale=log_scale,
-            )
-            + [0.0, 0.0]
-            + [0.0, 0.0]
-            + [value * masks[3] for value in musical]
+            score_control
+            + perf_control
+            + [value * m_musical for value in musical]
             + masks
         )
     return rows
@@ -523,20 +529,26 @@ def build_csr_performance_input_rows(perf, use_timing_scale_bit=True, timing_con
 
     rows = []
     for raw_shared, pedal in zip(shared_rows, pedal_rows):
-        control_is_perf = 1.0
-        masks = [1.0, 0.0, 1.0, 0.0, control_is_perf]
-        rows.append(
+        score_control = [0.0] * timing_control_feature_dim(
+            timing_control_mode=timing_control_mode,
+            use_timing_scale_bit=use_timing_scale_bit,
+        )
+        perf_control = (
             encode_shared_control_row(
                 raw_shared[:3],
                 use_timing_scale_bit=use_timing_scale_bit,
                 timing_control_mode=timing_control_mode,
                 log_scale=log_scale,
             )
-            + [0.0, 0.0]
             + [
                 min(max(float(pedal[0]), 0.0), 127.0) / 127.0,
                 min(max(float(pedal[1]), 0.0), 127.0) / 127.0,
             ]
+        )
+        masks = [0.0, 1.0, 0.0]
+        rows.append(
+            score_control
+            + perf_control
             + [0.0] * 12
             + masks
         )

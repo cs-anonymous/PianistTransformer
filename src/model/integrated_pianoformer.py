@@ -208,10 +208,10 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
             timing_control_mode=self.timing_control_mode,
             use_timing_scale_bit=self.use_timing_scale_bit,
         )
-        self.dev_feature_dim = 2
-        self.pedal_feature_dim = 2
+        self.score_control_feature_dim = self.control_feature_dim
+        self.performance_control_feature_dim = self.control_feature_dim + 2
         self.musical_feature_dim = 12
-        self.mask_feature_dim = 5
+        self.mask_feature_dim = 3
         self.soft_ce_tau = soft_ce_tau or {
             "ioi": 10.0,
             "duration": 30.0,
@@ -264,11 +264,14 @@ class IntegratedNoteEncoder(nn.Module):
         self.embedding_depth = getattr(config, "embedding_depth", 2)
         self.activation = getattr(config, "head_activation", "gelu")
         self.pitch_factor_dim = 20
-        self.control_dim = int(getattr(config, "control_feature_dim", 5))
-        self.dev_dim = int(getattr(config, "dev_feature_dim", 2))
-        self.pedal_dim = int(getattr(config, "pedal_feature_dim", 2))
+        self.score_control_dim = int(
+            getattr(config, "score_control_feature_dim", getattr(config, "control_feature_dim", 5))
+        )
+        self.performance_control_dim = int(
+            getattr(config, "performance_control_feature_dim", getattr(config, "control_feature_dim", 5) + 2)
+        )
         self.musical_dim = int(getattr(config, "musical_feature_dim", 12))
-        self.mask_dim = int(getattr(config, "mask_feature_dim", 5))
+        self.mask_dim = int(getattr(config, "mask_feature_dim", 3))
 
         if self.mode == "sine":
             self.pitch_projection = _make_mlp(
@@ -278,22 +281,15 @@ class IntegratedNoteEncoder(nn.Module):
                 self.embedding_depth,
                 self.activation,
             )
-            self.control_projection = _make_mlp(
-                self.control_dim + 1,
+            self.score_control_projection = _make_mlp(
+                self.score_control_dim,
                 config.hidden_size,
                 config.hidden_size,
                 self.embedding_depth,
                 self.activation,
             )
-            self.dev_projection = _make_mlp(
-                self.dev_dim,
-                config.hidden_size,
-                config.hidden_size,
-                self.embedding_depth,
-                self.activation,
-            )
-            self.pedal_projection = _make_mlp(
-                self.pedal_dim,
+            self.performance_control_projection = _make_mlp(
+                self.performance_control_dim,
                 config.hidden_size,
                 config.hidden_size,
                 self.embedding_depth,
@@ -314,7 +310,13 @@ class IntegratedNoteEncoder(nn.Module):
                 self.activation,
             )
         elif self.mode == "cine":
-            flat_dim = self.pitch_factor_dim + self.control_dim + self.dev_dim + self.pedal_dim + self.musical_dim + self.mask_dim
+            flat_dim = (
+                self.pitch_factor_dim
+                + self.score_control_dim
+                + self.performance_control_dim
+                + self.musical_dim
+                + self.mask_dim
+            )
             self.continuous_mlp = _make_mlp(
                 flat_dim,
                 config.hidden_size,
@@ -352,12 +354,10 @@ class IntegratedNoteEncoder(nn.Module):
 
     def _split_inr0624(self, continuous):
         start = 0
-        control = continuous[..., start : start + self.control_dim]
-        start += self.control_dim
-        dev = continuous[..., start : start + self.dev_dim]
-        start += self.dev_dim
-        pedal = continuous[..., start : start + self.pedal_dim]
-        start += self.pedal_dim
+        score_control = continuous[..., start : start + self.score_control_dim]
+        start += self.score_control_dim
+        performance_control = continuous[..., start : start + self.performance_control_dim]
+        start += self.performance_control_dim
         musical = continuous[..., start : start + self.musical_dim]
         start += self.musical_dim
         masks = continuous[..., start : start + self.mask_dim]
@@ -365,31 +365,34 @@ class IntegratedNoteEncoder(nn.Module):
             raise ValueError(
                 f"Unexpected INR0624 continuous dim {continuous.shape[-1]}, expected {start + self.mask_dim}"
             )
-        return control, dev, pedal, musical, masks
+        return score_control, performance_control, musical, masks
 
     def forward(self, pitch_ids, continuous, special_note_ids=None):
         projection_dtype = next(self.parameters()).dtype
         continuous = continuous.to(dtype=projection_dtype)
-        control, dev, pedal, musical, masks = self._split_inr0624(continuous)
+        score_control, performance_control, musical, masks = self._split_inr0624(continuous)
         pitch_factors = self._pitch_factors(pitch_ids).to(dtype=projection_dtype)
 
         if self.mode == "cine":
             embeddings = self.continuous_mlp(
-                torch.cat([pitch_factors, control, dev, pedal, musical, masks], dim=-1)
+                torch.cat([pitch_factors, score_control, performance_control, musical, masks], dim=-1)
             )
         else:
-            m_c = masks[..., 0:1]
-            m_dev = masks[..., 1:2]
-            m_pedal = masks[..., 2:3]
-            m_m = masks[..., 3:4]
-            control_is_perf = masks[..., 4:5]
+            m_score_control = masks[..., 0:1]
+            m_performance_control = masks[..., 1:2]
+            m_m = masks[..., 2:3]
             pitch_embeds = self.pitch_projection(pitch_factors)
-            control_embeds = self.control_projection(torch.cat([control, control_is_perf], dim=-1)) * m_c
-            dev_embeds = self.dev_projection(dev) * m_dev
-            pedal_embeds = self.pedal_projection(pedal) * m_pedal
+            score_control_embeds = self.score_control_projection(score_control) * m_score_control
+            performance_control_embeds = self.performance_control_projection(performance_control) * m_performance_control
             musical_embeds = self.musical_projection(musical) * m_m
             mask_embeds = self.mask_projection(masks)
-            embeddings = pitch_embeds + control_embeds + dev_embeds + pedal_embeds + musical_embeds + mask_embeds
+            embeddings = (
+                pitch_embeds
+                + score_control_embeds
+                + performance_control_embeds
+                + musical_embeds
+                + mask_embeds
+            )
         embeddings = self.norm(embeddings)
         return self._apply_special_embeddings(embeddings, special_note_ids)
 
@@ -852,7 +855,7 @@ def _build_epr_decoder_rows(config, score_shared_raw, target_predictions):
     timing_control_mode = getattr(config, "timing_control_mode", None)
     use_timing_scale_bit = getattr(config, "use_timing_scale_bit", True)
     log_scale = getattr(config, "timing_log_scale", 50.0)
-    shared = _torch_timing_control_code(
+    perf_ioi = _torch_timing_control_code(
         raw_perf[..., 0],
         timing_control_mode=timing_control_mode,
         use_scale_bit=use_timing_scale_bit,
@@ -864,22 +867,26 @@ def _build_epr_decoder_rows(config, score_shared_raw, target_predictions):
         use_scale_bit=use_timing_scale_bit,
         log_scale=log_scale,
     )
-    velocity = (raw_perf[..., 2] / 127.0).unsqueeze(-1)
-    control = torch.cat([shared, duration, velocity], dim=-1)
-    dev = target_predictions[..., 0:2].float().clamp(0.0, 1.0)
-    pedal = (raw_perf[..., 3:5] / 127.0).float().clamp(0.0, 1.0)
+    velocity = target_predictions[..., 2:3].float().clamp(0.0, 1.0)
+    pedal = target_predictions[..., 3:5].float().clamp(0.0, 1.0)
+    score_control = target_predictions.new_zeros(
+        *target_predictions.shape[:-1],
+        int(getattr(config, "score_control_feature_dim", getattr(config, "control_feature_dim", 5))),
+    )
+    performance_control = torch.cat([perf_ioi, duration, velocity, pedal], dim=-1)
     musical = target_predictions.new_zeros(*target_predictions.shape[:-1], getattr(config, "musical_feature_dim", 12))
-    control_is_perf = 1.0
-    masks = target_predictions.new_tensor([1.0, 1.0, 1.0, 0.0, control_is_perf]).expand(*target_predictions.shape[:-1], 5)
-    return torch.cat([control, dev, pedal, musical, masks], dim=-1)
+    masks = target_predictions.new_tensor([0.0, 1.0, 0.0]).expand(*target_predictions.shape[:-1], 3)
+    return torch.cat([score_control, performance_control, musical, masks], dim=-1)
 
 
 def _build_csr_decoder_rows(config, musical_predictions):
     musical = musical_predictions.float().clamp(0.0, 1.0)
-    control_dim = int(getattr(config, "control_feature_dim", 5))
-    zeros = musical.new_zeros(*musical.shape[:-1], control_dim + 2 + 2)
-    control_is_perf = 0.0
-    masks = musical.new_tensor([0.0, 0.0, 0.0, 1.0, control_is_perf]).expand(*musical.shape[:-1], 5)
+    score_control_dim = int(getattr(config, "score_control_feature_dim", getattr(config, "control_feature_dim", 5)))
+    performance_control_dim = int(
+        getattr(config, "performance_control_feature_dim", getattr(config, "control_feature_dim", 5) + 2)
+    )
+    zeros = musical.new_zeros(*musical.shape[:-1], score_control_dim + performance_control_dim)
+    masks = musical.new_tensor([0.0, 0.0, 1.0]).expand(*musical.shape[:-1], 3)
     return torch.cat([zeros, musical, masks], dim=-1)
 
 

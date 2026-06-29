@@ -54,6 +54,18 @@ def parse_args():
                         help="Optional performance_dataset exclusion, e.g. ASAP for non-ASAP evaluation.")
     parser.add_argument("--merge-mode", choices=["continuation", "average"], default="continuation")
     parser.add_argument("--continuation-drop-ratio", type=float, default=0.0)
+    parser.add_argument(
+        "--timing-sampling-method",
+        choices=["none", "bias_correction", "calibrated_residual"],
+        default="none",
+        help="Timing-only sampling postprocess. Velocity/pedal keep the original sampled values.",
+    )
+    parser.add_argument(
+        "--timing-calibrator",
+        type=Path,
+        default=None,
+        help="JSON calibrator fitted on ASAP train for timing sampling postprocess.",
+    )
     return parser.parse_args()
 
 
@@ -305,6 +317,61 @@ def load_model(config, device):
     return model
 
 
+def load_timing_calibrator(path: Path | None):
+    if path is None:
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _feature_calibrator(calibrator, feature):
+    if not calibrator:
+        return {"bias": 0.0, "alpha_pos": 1.0, "alpha_neg": 1.0}
+    features = calibrator.get("features") or {}
+    params = features.get(feature) or {}
+    return {
+        "bias": float(params.get("bias", 0.0)),
+        "alpha_pos": float(params.get("alpha_pos", 1.0)),
+        "alpha_neg": float(params.get("alpha_neg", 1.0)),
+    }
+
+
+def apply_timing_sampling_postprocess(sample_pred, mean_pred, calibrator, method):
+    method = str(method or "none").lower()
+    if method == "none":
+        return sample_pred
+    if mean_pred is None:
+        raise ValueError(f"mean_pred is required for timing_sampling_method={method}")
+
+    output = sample_pred.clone()
+    mean_delta = mean_pred[..., :2].float().clamp(0.0, 1.0) - 0.5
+    sample_delta = sample_pred[..., :2].float().clamp(0.0, 1.0) - 0.5
+    residual = sample_delta - mean_delta
+
+    calibrated = []
+    for idx, feature in enumerate(("ioi", "duration")):
+        params = _feature_calibrator(calibrator, feature)
+        if method == "bias_correction":
+            alpha_pos = 1.0
+            alpha_neg = 1.0
+        elif method == "calibrated_residual":
+            alpha_pos = params["alpha_pos"]
+            alpha_neg = params["alpha_neg"]
+        else:
+            raise ValueError(f"Unsupported timing_sampling_method={method}")
+        residual_i = residual[..., idx]
+        scaled_residual = torch.where(
+            residual_i >= 0.0,
+            residual_i * alpha_pos,
+            residual_i * alpha_neg,
+        )
+        delta = (mean_delta[..., idx] + params["bias"] + scaled_residual).clamp(-0.5, 0.5)
+        calibrated.append(delta + 0.5)
+
+    output[..., 0] = calibrated[0].to(dtype=output.dtype)
+    output[..., 1] = calibrated[1].to(dtype=output.dtype)
+    return output.clamp(0.0, 1.0)
+
+
 def musical_rows_to_score_features(rows):
     features = []
     for row in rows:
@@ -457,6 +524,7 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
     prediction_paths = []
     raw_output_paths = []
     score_stem = Path(score_source).with_suffix("").as_posix().replace("/", "__")
+    timing_calibrator = load_timing_calibrator(args.timing_calibrator)
     for sample_idx in range(args.num_samples):
         sample_seed = args.seed + sample_idx
         random.seed(sample_seed)
@@ -464,6 +532,7 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(sample_seed)
 
+        sampling_strategy = resolve_sampling_strategy(args)
         pred_continuous = batch_window_predictions(
             model=model,
             pitch=pitch,
@@ -473,7 +542,7 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
             pitch_pad_id=config["pitch_pad_id"],
             device=device,
             batch_size=args.batch_size_windows,
-            sampling_strategy=resolve_sampling_strategy(args),
+            sampling_strategy=sampling_strategy,
         ) if args.merge_mode == "average" else continuation_window_predictions(
             model=model,
             pitch=pitch,
@@ -482,10 +551,38 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
             windows=windows,
             pitch_pad_id=config["pitch_pad_id"],
             device=device,
-            sampling_strategy=resolve_sampling_strategy(args),
+            sampling_strategy=sampling_strategy,
             drop_ratio=args.continuation_drop_ratio,
         )
-        pred_target = pred_continuous
+        mean_continuous = None
+        if args.protocol == "sampling" and args.timing_sampling_method != "none":
+            mean_continuous = batch_window_predictions(
+                model=model,
+                pitch=pitch,
+                continuous=continuous,
+                score_shared_raw=score_shared_raw,
+                windows=windows,
+                pitch_pad_id=config["pitch_pad_id"],
+                device=device,
+                batch_size=args.batch_size_windows,
+                sampling_strategy="mean",
+            ) if args.merge_mode == "average" else continuation_window_predictions(
+                model=model,
+                pitch=pitch,
+                continuous=continuous,
+                score_shared_raw=score_shared_raw,
+                windows=windows,
+                pitch_pad_id=config["pitch_pad_id"],
+                device=device,
+                sampling_strategy="mean",
+                drop_ratio=args.continuation_drop_ratio,
+            )
+        pred_target = apply_timing_sampling_postprocess(
+            sample_pred=pred_continuous,
+            mean_pred=mean_continuous,
+            calibrator=timing_calibrator,
+            method=args.timing_sampling_method if args.protocol == "sampling" else "none",
+        )
         raw_rows = _target5_to_raw7(
             torch.tensor(score_shared_raw, dtype=torch.float32),
             pred_target.float().cpu(),
@@ -506,9 +603,13 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
             "deterministic_strategy": args.deterministic_strategy if args.protocol == "deterministic" else None,
             "sample_idx": sample_idx,
             "seed": sample_seed,
+            "timing_sampling_method": args.timing_sampling_method if args.protocol == "sampling" else "none",
+            "timing_calibrator": str(args.timing_calibrator.resolve()) if args.timing_calibrator else None,
             "timing_representation": "target5_dev_velocity_pedal2",
             "pitch": [int(value) for value in pitch],
             "predicted_target5": pred_target.tolist(),
+            "original_sampled_target5": pred_continuous.tolist() if args.protocol == "sampling" else None,
+            "mean_target5": mean_continuous.tolist() if mean_continuous is not None else None,
             "reconstructed_raw7": raw_rows.tolist(),
             "ground_truth_paths": gt_rel_paths,
         }

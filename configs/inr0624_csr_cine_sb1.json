@@ -18,7 +18,7 @@
   "eval_include_all_performance_dataset": "ASAP",
   "max_eval_non_asap_performances_per_work": 8,
   "continuous_dim": 7,
-  "input_continuous_dim": 26,
+  "input_continuous_dim": 27,
   "output_continuous_dim": 12,
   "score_feature_dim": 8,
   "pitch_pad_id": 128,
