@@ -1,3 +1,4 @@
+import math
 from typing import Optional, Union
 
 import torch
@@ -239,6 +240,8 @@ def _activation(name):
 
 
 def _make_mlp(input_dim, output_dim, hidden_dim, depth=2, activation="gelu"):
+    if int(output_dim) == 0:
+        return None
     depth = int(depth)
     if depth <= 1:
         return nn.Linear(input_dim, output_dim)
@@ -437,6 +440,7 @@ class IntegratedContinuousDecoder(nn.Module):
             getattr(config, "task_type", "epr") == "epr"
             and self.epr_distribution in {
                 "amln3",
+                "bln3",
                 "logistic_normal",
                 "mixture_logistic_normal",
                 "inflated_mixture_logistic_normal",
@@ -449,6 +453,11 @@ class IntegratedContinuousDecoder(nn.Module):
             per_component_dim = 4 if self.epr_distribution == "amln3" else 3
             per_feature_dim = components * per_component_dim
             ioi_output_dim = duration_output_dim = velocity_output_dim = per_feature_dim
+            if self.epr_distribution == "bln3":
+                # BLN3 models IOI/duration jointly as a 3-component bivariate
+                # logistic-normal: logits, two means, two log-scales, and rho.
+                ioi_output_dim = components * 6
+                duration_output_dim = 0
             pedal_output_dim = per_feature_dim * 4
             if self.epr_distribution == "inflated_mixture_logistic_normal":
                 shared_extra_output_dim = 2
@@ -465,6 +474,7 @@ class IntegratedContinuousDecoder(nn.Module):
                 pedal_output_dim = 4
             elif self.epr_distribution in {
                 "amln3",
+                "bln3",
                 "logistic_normal",
                 "mixture_logistic_normal",
                 "inflated_mixture_logistic_normal",
@@ -502,7 +512,11 @@ class IntegratedContinuousDecoder(nn.Module):
             return self.shared_head(shared_hidden)
 
         ioi = self.ioi_head(shared_hidden)
-        duration = self.duration_head(shared_hidden)
+        duration = (
+            self.duration_head(shared_hidden)
+            if self.duration_head is not None
+            else shared_hidden.new_empty(*shared_hidden.shape[:-1], 0)
+        )
         velocity = self.velocity_head(shared_hidden)
         if self.shared_pack_mode == "beta_mu_kappa":
             return torch.cat(
@@ -529,6 +543,7 @@ class IntegratedContinuousDecoder(nn.Module):
             if self.epr_distribution in {
                 "beta_mu_kappa",
                 "amln3",
+                "bln3",
                 "logistic_normal",
                 "mixture_logistic_normal",
                 "inflated_mixture_logistic_normal",
@@ -554,6 +569,7 @@ class IntegratedContinuousDecoder(nn.Module):
                 "hard_categorical",
                 "soft_categorical",
                 "amln3",
+                "bln3",
                 "logistic_normal",
                 "mixture_logistic_normal",
                 "inflated_mixture_logistic_normal",
@@ -567,6 +583,7 @@ class IntegratedContinuousDecoder(nn.Module):
             "hard_categorical",
             "soft_categorical",
             "amln3",
+            "bln3",
             "logistic_normal",
             "mixture_logistic_normal",
             "inflated_mixture_logistic_normal",
@@ -643,6 +660,11 @@ def _split_epr_mixture_params(config, raw_outputs):
     }
     if distribution == "amln3":
         params["shared_c"] = shared_base[..., 3, :]
+        # AMLN timing uses one shared mixture component for IOI and duration.
+        # We keep separate heads but tie the component responsibility by
+        # averaging their logits and using the result for both timing losses
+        # and joint timing sampling.
+        params["timing_logits"] = 0.5 * (shared_base[..., 0, 0, :] + shared_base[..., 1, 0, :])
     if pedal_representation == "start_ctrl":
         if distribution == "inflated_mixture_logistic_normal":
             params["ioi_mode_logits"] = raw_outputs[..., shared_base_dim : shared_base_dim + 2]
@@ -669,12 +691,57 @@ def _split_epr_mixture_params(config, raw_outputs):
     return params
 
 
+def _split_bln3_params(config, raw_outputs):
+    components = _epr_mixture_components(config)
+    timing_dim = components * 6
+    scalar_dim = components * 3
+    timing_base = raw_outputs[..., :timing_dim].reshape(
+        *raw_outputs.shape[:-1],
+        6,
+        components,
+    )
+    velocity_start = timing_dim
+    velocity_end = velocity_start + scalar_dim
+    velocity_base = raw_outputs[..., velocity_start:velocity_end].reshape(
+        *raw_outputs.shape[:-1],
+        3,
+        components,
+    )
+    params = {
+        "timing_logits": timing_base[..., 0, :],
+        "timing_mu": timing_base[..., 1:3, :],
+        "timing_log_sigma": timing_base[..., 3:5, :],
+        "timing_rho_raw": timing_base[..., 5, :],
+        "velocity_logits": velocity_base[..., 0, :],
+        "velocity_mu": velocity_base[..., 1, :],
+        "velocity_log_sigma": velocity_base[..., 2, :],
+    }
+    pedal_start = velocity_end
+    pedal_end = pedal_start + scalar_dim * 4
+    if raw_outputs.shape[-1] >= pedal_end:
+        pedal_base = raw_outputs[..., pedal_start:pedal_end].reshape(
+            *raw_outputs.shape[:-1],
+            4,
+            3,
+            components,
+        )
+        params.update(
+            {
+                "pedal_logits": pedal_base[..., 0, :],
+                "pedal_a": pedal_base[..., 1, :],
+                "pedal_b": pedal_base[..., 2, :],
+            }
+        )
+    return params
+
+
 def _pedal_start_ctrl_scalar_dim(config):
     distribution = getattr(config, "epr_distribution", "point").lower()
     if distribution == "beta_mu_kappa":
         return 2
     if distribution in {
         "amln3",
+        "bln3",
         "logistic_normal",
         "mixture_logistic_normal",
         "inflated_mixture_logistic_normal",
@@ -1022,6 +1089,56 @@ def _mixture_logistic_normal_nll(logits, raw_mu, raw_log_sigma, target, mask, ep
     return _masked_mean(values, mask)
 
 
+def _bivariate_logistic_normal_log_prob(params, target, eps, sigma_min, sigma_max):
+    target = target.float().clamp(float(eps), 1.0 - float(eps))
+    z = torch.logit(target, eps=float(eps))
+    z1 = z[..., 0].unsqueeze(-1)
+    z2 = z[..., 1].unsqueeze(-1)
+
+    mu = params["timing_mu"].float()
+    log_sigma = params["timing_log_sigma"]
+    _, sigma1 = _logistic_normal_params(
+        mu[..., 0, :],
+        log_sigma[..., 0, :],
+        sigma_min=sigma_min,
+        sigma_max=sigma_max,
+    )
+    _, sigma2 = _logistic_normal_params(
+        mu[..., 1, :],
+        log_sigma[..., 1, :],
+        sigma_min=sigma_min,
+        sigma_max=sigma_max,
+    )
+    mu1 = mu[..., 0, :]
+    mu2 = mu[..., 1, :]
+    rho = torch.tanh(params["timing_rho_raw"].float()).clamp(-0.999, 0.999)
+    one_minus_rho2 = (1.0 - rho.square()).clamp_min(1e-6)
+
+    n1 = (z1 - mu1) / sigma1
+    n2 = (z2 - mu2) / sigma2
+    quad = (n1.square() - 2.0 * rho * n1 * n2 + n2.square()) / one_minus_rho2
+    log_normal = (
+        -math.log(2.0 * math.pi)
+        - torch.log(sigma1)
+        - torch.log(sigma2)
+        - 0.5 * torch.log(one_minus_rho2)
+        - 0.5 * quad
+    )
+    log_pi = F.log_softmax(params["timing_logits"].float(), dim=-1)
+    log_jacobian = (
+        -torch.log(target[..., 0]).unsqueeze(-1)
+        -torch.log1p(-target[..., 0]).unsqueeze(-1)
+        -torch.log(target[..., 1]).unsqueeze(-1)
+        -torch.log1p(-target[..., 1]).unsqueeze(-1)
+    )
+    return torch.logsumexp(log_pi + log_normal + log_jacobian, dim=-1)
+
+
+def _bivariate_logistic_normal_nll(params, target, mask, eps, sigma_min, sigma_max):
+    values = -_bivariate_logistic_normal_log_prob(params, target, eps, sigma_min, sigma_max)
+    return _masked_mean(values, mask)
+
+
 def _asymmetric_logistic_normal_log_prob(
     logits,
     raw_mu,
@@ -1047,9 +1164,17 @@ def _asymmetric_logistic_normal_log_prob(
         sigma_min=sigma_min,
         sigma_max=sigma_max,
     )
-    sigma = torch.where(z < mu, sigma_left, sigma_right)
+    left_mask = z < mu
+    sigma = torch.where(left_mask, sigma_left, sigma_right)
     log_pi = F.log_softmax(logits.float(), dim=-1)
-    log_normal = torch.distributions.Normal(mu, sigma).log_prob(z)
+    # Canonical split-normal density: side mass is induced by scale,
+    # P(left)=sigma_left/(sigma_left+sigma_right), not by an extra parameter.
+    log_normal = (
+        torch.distributions.Normal(mu, sigma).log_prob(z)
+        + math.log(2.0)
+        + torch.log(sigma)
+        - torch.log((sigma_left + sigma_right).clamp_min(1e-12))
+    )
     log_jacobian = -torch.log(target).unsqueeze(-1) - torch.log1p(-target).unsqueeze(-1)
     return torch.logsumexp(log_pi + log_normal + log_jacobian, dim=-1)
 
@@ -1142,8 +1267,12 @@ def _asymmetric_logistic_normal_mean_or_sample(
         sigma_max=getattr(config, "logistic_normal_sigma_max", 10.0),
     )
     probs = torch.softmax(logits.float(), dim=-1)
+    denom = (sigma_left + sigma_right).clamp_min(1e-12)
+    p_left = sigma_left / denom
+    p_right = sigma_right / denom
     if mode in {"mean", "deterministic", "mu", "expected", "expectation"}:
-        return torch.sum(probs * torch.sigmoid(mu), dim=-1)
+        component_mean_z = mu + math.sqrt(2.0 / math.pi) * (p_right * sigma_right - p_left * sigma_left)
+        return torch.sum(probs * torch.sigmoid(component_mean_z), dim=-1)
     if mode in {"argmax", "greedy"}:
         index = probs.argmax(dim=-1, keepdim=True)
         return torch.sigmoid(mu.gather(dim=-1, index=index).squeeze(-1))
@@ -1152,7 +1281,8 @@ def _asymmetric_logistic_normal_mean_or_sample(
         sampled_mu = mu.gather(dim=-1, index=index).squeeze(-1)
         sampled_left = sigma_left.gather(dim=-1, index=index).squeeze(-1)
         sampled_right = sigma_right.gather(dim=-1, index=index).squeeze(-1)
-        side = torch.rand_like(sampled_mu) < 0.5
+        sampled_p_right = p_right.gather(dim=-1, index=index).squeeze(-1)
+        side = torch.rand_like(sampled_mu) >= sampled_p_right
         magnitude = torch.distributions.HalfNormal(torch.ones_like(sampled_mu)).sample()
         z = torch.where(
             side,
@@ -1200,6 +1330,112 @@ def _decode_mixture_value(config, logits, a, b, c=None, sampling_strategy="mean"
             sampling_strategy=sampling_strategy,
         )
     return _mixture_logistic_normal_mean_or_sample(config, logits, a, b, sampling_strategy=sampling_strategy)
+
+
+def _decode_amln3_shared_timing(config, params, sampling_strategy="mean"):
+    """Decode IOI/duration with a shared mixture component and split-normal AMLN."""
+    logits = params["timing_logits"]
+    ioi_mu = params["shared_a"][..., 0, :]
+    ioi_left = params["shared_b"][..., 0, :]
+    ioi_right = params["shared_c"][..., 0, :]
+    dur_mu = params["shared_a"][..., 1, :]
+    dur_left = params["shared_b"][..., 1, :]
+    dur_right = params["shared_c"][..., 1, :]
+
+    mode = str(sampling_strategy).lower()
+    if mode not in {"sample", "sampling", "stochastic"}:
+        ioi = _asymmetric_logistic_normal_mean_or_sample(
+            config,
+            logits,
+            ioi_mu,
+            ioi_left,
+            ioi_right,
+            sampling_strategy=sampling_strategy,
+        )
+        duration = _asymmetric_logistic_normal_mean_or_sample(
+            config,
+            logits,
+            dur_mu,
+            dur_left,
+            dur_right,
+            sampling_strategy=sampling_strategy,
+        )
+        return torch.stack([ioi, duration], dim=-1)
+
+    sigma_min = getattr(config, "logistic_normal_sigma_min", 1e-3)
+    sigma_max = getattr(config, "logistic_normal_sigma_max", 10.0)
+
+    def gather_component(raw_mu, raw_left, raw_right, index):
+        mu, sigma_left = _logistic_normal_params(raw_mu, raw_left, sigma_min=sigma_min, sigma_max=sigma_max)
+        _, sigma_right = _logistic_normal_params(raw_mu, raw_right, sigma_min=sigma_min, sigma_max=sigma_max)
+        p_right = sigma_right / (sigma_left + sigma_right).clamp_min(1e-12)
+        return (
+            mu.gather(dim=-1, index=index).squeeze(-1),
+            sigma_left.gather(dim=-1, index=index).squeeze(-1),
+            sigma_right.gather(dim=-1, index=index).squeeze(-1),
+            p_right.gather(dim=-1, index=index).squeeze(-1),
+        )
+
+    probs = torch.softmax(logits.float(), dim=-1)
+    index = torch.distributions.Categorical(probs=probs).sample().unsqueeze(-1)
+
+    def sample_feature(raw_mu, raw_left, raw_right):
+        mu, sigma_left, sigma_right, p_right = gather_component(raw_mu, raw_left, raw_right, index)
+        left_side = torch.rand_like(mu) >= p_right
+        magnitude = torch.distributions.HalfNormal(torch.ones_like(mu)).sample()
+        z = torch.where(left_side, mu - sigma_left * magnitude, mu + sigma_right * magnitude)
+        return torch.sigmoid(z)
+
+    return torch.stack(
+        [
+            sample_feature(ioi_mu, ioi_left, ioi_right),
+            sample_feature(dur_mu, dur_left, dur_right),
+        ],
+        dim=-1,
+    )
+
+
+def _decode_bln3_timing(config, params, sampling_strategy="mean"):
+    """Decode IOI/duration from a 3-component bivariate logistic-normal."""
+    mode = str(sampling_strategy).lower()
+    mu = params["timing_mu"].float()
+    log_sigma = params["timing_log_sigma"]
+    _, sigma1 = _logistic_normal_params(
+        mu[..., 0, :],
+        log_sigma[..., 0, :],
+        sigma_min=getattr(config, "logistic_normal_sigma_min", 1e-3),
+        sigma_max=getattr(config, "logistic_normal_sigma_max", 10.0),
+    )
+    _, sigma2 = _logistic_normal_params(
+        mu[..., 1, :],
+        log_sigma[..., 1, :],
+        sigma_min=getattr(config, "logistic_normal_sigma_min", 1e-3),
+        sigma_max=getattr(config, "logistic_normal_sigma_max", 10.0),
+    )
+    rho = torch.tanh(params["timing_rho_raw"].float()).clamp(-0.999, 0.999)
+    probs = torch.softmax(params["timing_logits"].float(), dim=-1)
+
+    if mode in {"mean", "deterministic", "mu", "expected", "expectation"}:
+        return torch.sum(probs.unsqueeze(-2) * torch.sigmoid(mu), dim=-1)
+    if mode in {"argmax", "greedy"}:
+        index = probs.argmax(dim=-1, keepdim=True)
+        gather_index = index.unsqueeze(-2).expand(*index.shape[:-1], 2, 1)
+        return torch.sigmoid(mu.gather(dim=-1, index=gather_index).squeeze(-1))
+    if mode in {"sample", "sampling", "stochastic"}:
+        index = torch.distributions.Categorical(probs=probs).sample().unsqueeze(-1)
+        gather_index = index.unsqueeze(-2)
+        sampled_mu = mu.gather(dim=-1, index=gather_index.expand(*index.shape[:-1], 2, 1)).squeeze(-1)
+        sampled_sigma1 = sigma1.gather(dim=-1, index=index).squeeze(-1)
+        sampled_sigma2 = sigma2.gather(dim=-1, index=index).squeeze(-1)
+        sampled_rho = rho.gather(dim=-1, index=index).squeeze(-1)
+        eps1 = torch.randn_like(sampled_sigma1)
+        eps2 = torch.randn_like(sampled_sigma2)
+        z1 = sampled_mu[..., 0] + sampled_sigma1 * eps1
+        z2 = sampled_mu[..., 1] + sampled_sigma2 * (
+            sampled_rho * eps1 + torch.sqrt((1.0 - sampled_rho.square()).clamp_min(1e-6)) * eps2
+        )
+        return torch.sigmoid(torch.stack([z1, z2], dim=-1))
+    raise ValueError(f"Unsupported sampling_strategy: {sampling_strategy}")
 
 
 def _mixture_loss_value(config, logits, a, b, target, mask, eps, sigma_min, sigma_max, alpha_min, c=None):
@@ -1341,21 +1577,44 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean"):
 
         if distribution in {
             "amln3",
+            "bln3",
             "logistic_normal",
             "mixture_logistic_normal",
             "inflated_mixture_logistic_normal",
             "mixture_beta",
         }:
-            params = _split_epr_mixture_params(config, raw_outputs)
+            params = _split_bln3_params(config, raw_outputs) if distribution == "bln3" else _split_epr_mixture_params(config, raw_outputs)
             pedal_params = _split_start_ctrl_from_outputs(config, raw_outputs)
-            shared = _decode_mixture_value(
-                config,
-                params["shared_logits"],
-                params["shared_a"],
-                params["shared_b"],
-                params.get("shared_c"),
-                sampling_strategy=sampling_strategy,
-            )
+            if distribution == "bln3":
+                timing = _decode_bln3_timing(config, params, sampling_strategy=sampling_strategy)
+                velocity = _decode_mixture_value(
+                    config,
+                    params["velocity_logits"],
+                    params["velocity_mu"],
+                    params["velocity_log_sigma"],
+                    sampling_strategy=sampling_strategy,
+                )
+                shared = torch.cat([timing, velocity.unsqueeze(-1)], dim=-1)
+            elif distribution == "amln3":
+                timing = _decode_amln3_shared_timing(config, params, sampling_strategy=sampling_strategy)
+                velocity = _decode_mixture_value(
+                    config,
+                    params["shared_logits"][..., 2, :],
+                    params["shared_a"][..., 2, :],
+                    params["shared_b"][..., 2, :],
+                    params["shared_c"][..., 2, :],
+                    sampling_strategy=sampling_strategy,
+                )
+                shared = torch.cat([timing, velocity.unsqueeze(-1)], dim=-1)
+            else:
+                shared = _decode_mixture_value(
+                    config,
+                    params["shared_logits"],
+                    params["shared_a"],
+                    params["shared_b"],
+                    params.get("shared_c"),
+                    sampling_strategy=sampling_strategy,
+                )
             components = int(getattr(config, "epr_mixture_components", 1))
             per_component_dim = 4 if distribution == "amln3" else 3
 
@@ -1410,6 +1669,7 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean"):
             ctrl = decode_beta(pedal_params["ctrl_raw"])
         elif distribution in {
             "amln3",
+            "bln3",
             "logistic_normal",
             "mixture_logistic_normal",
             "inflated_mixture_logistic_normal",
@@ -1438,6 +1698,7 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean"):
         if distribution not in {
             "logistic_normal",
             "amln3",
+            "bln3",
             "mixture_logistic_normal",
             "inflated_mixture_logistic_normal",
             "mixture_beta",
@@ -1459,7 +1720,73 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean"):
                 else shared_mu
             )
         else:
-            params = _split_epr_mixture_params(config, raw_outputs)
+            params = _split_bln3_params(config, raw_outputs) if distribution == "bln3" else _split_epr_mixture_params(config, raw_outputs)
+            if distribution == "bln3":
+                timing = _decode_bln3_timing(config, params, sampling_strategy=sampling_strategy)
+                velocity = _decode_mixture_value(
+                    config,
+                    params["velocity_logits"],
+                    params["velocity_mu"],
+                    params["velocity_log_sigma"],
+                    sampling_strategy=sampling_strategy,
+                )
+                shared = torch.cat([timing, velocity.unsqueeze(-1)], dim=-1)
+            elif distribution == "amln3":
+                timing = _decode_amln3_shared_timing(config, params, sampling_strategy=sampling_strategy)
+                velocity = _decode_mixture_value(
+                    config,
+                    params["shared_logits"][..., 2, :],
+                    params["shared_a"][..., 2, :],
+                    params["shared_b"][..., 2, :],
+                    params["shared_c"][..., 2, :],
+                    sampling_strategy=sampling_strategy,
+                )
+                shared = torch.cat([timing, velocity.unsqueeze(-1)], dim=-1)
+            else:
+                shared = _decode_mixture_value(
+                    config,
+                    params["shared_logits"],
+                    params["shared_a"],
+                    params["shared_b"],
+                    params.get("shared_c"),
+                    sampling_strategy=sampling_strategy,
+                )
+        return _pack_start_ctrl_prediction(shared, start, ctrl)
+
+    if distribution != "beta_mu_kappa":
+        if distribution not in {
+            "amln3",
+            "bln3",
+            "logistic_normal",
+            "mixture_logistic_normal",
+            "inflated_mixture_logistic_normal",
+            "mixture_beta",
+        }:
+            return raw_outputs
+
+        params = _split_bln3_params(config, raw_outputs) if distribution == "bln3" else _split_epr_mixture_params(config, raw_outputs)
+        if distribution == "bln3":
+            timing = _decode_bln3_timing(config, params, sampling_strategy=sampling_strategy)
+            velocity = _decode_mixture_value(
+                config,
+                params["velocity_logits"],
+                params["velocity_mu"],
+                params["velocity_log_sigma"],
+                sampling_strategy=sampling_strategy,
+            )
+            shared = torch.cat([timing, velocity.unsqueeze(-1)], dim=-1)
+        elif distribution == "amln3":
+            timing = _decode_amln3_shared_timing(config, params, sampling_strategy=sampling_strategy)
+            velocity = _decode_mixture_value(
+                config,
+                params["shared_logits"][..., 2, :],
+                params["shared_a"][..., 2, :],
+                params["shared_b"][..., 2, :],
+                params["shared_c"][..., 2, :],
+                sampling_strategy=sampling_strategy,
+            )
+            shared = torch.cat([timing, velocity.unsqueeze(-1)], dim=-1)
+        else:
             shared = _decode_mixture_value(
                 config,
                 params["shared_logits"],
@@ -1468,27 +1795,6 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean"):
                 params.get("shared_c"),
                 sampling_strategy=sampling_strategy,
             )
-        return _pack_start_ctrl_prediction(shared, start, ctrl)
-
-    if distribution != "beta_mu_kappa":
-        if distribution not in {
-            "amln3",
-            "logistic_normal",
-            "mixture_logistic_normal",
-            "inflated_mixture_logistic_normal",
-            "mixture_beta",
-        }:
-            return raw_outputs
-
-        params = _split_epr_mixture_params(config, raw_outputs)
-        shared = _decode_mixture_value(
-            config,
-            params["shared_logits"],
-            params["shared_a"],
-            params["shared_b"],
-            params.get("shared_c"),
-            sampling_strategy=sampling_strategy,
-        )
         pedal = _decode_mixture_value(
             config,
             params["pedal_logits"],
@@ -1942,12 +2248,13 @@ def _compute_integrated_loss_components(config, continuous_pred, labels_continuo
         distribution = getattr(config, "epr_distribution", "point").lower()
         if distribution in {
             "amln3",
+            "bln3",
             "logistic_normal",
             "mixture_logistic_normal",
             "inflated_mixture_logistic_normal",
             "mixture_beta",
         }:
-            params = _split_epr_mixture_params(config, continuous_pred)
+            params = _split_bln3_params(config, continuous_pred) if distribution == "bln3" else _split_epr_mixture_params(config, continuous_pred)
             pedal_params = _split_start_ctrl_from_outputs(config, continuous_pred)
             eps = getattr(config, "epr_distribution_eps", getattr(config, "beta_eps", 1e-5))
             sigma_min = getattr(config, "logistic_normal_sigma_min", 1e-3)
@@ -1969,27 +2276,45 @@ def _compute_integrated_loss_components(config, continuous_pred, labels_continuo
                     raw_c,
                 )
 
-            loss_ioi = loss_one(
-                params["shared_logits"][..., 0, :],
-                params["shared_a"][..., 0, :],
-                params["shared_b"][..., 0, :],
-                labels_continuous[..., 0],
-                params.get("shared_c", None)[..., 0, :] if "shared_c" in params else None,
-            )
-            loss_duration = loss_one(
-                params["shared_logits"][..., 1, :],
-                params["shared_a"][..., 1, :],
-                params["shared_b"][..., 1, :],
-                labels_continuous[..., 1],
-                params.get("shared_c", None)[..., 1, :] if "shared_c" in params else None,
-            )
-            loss_velocity = loss_one(
-                params["shared_logits"][..., 2, :],
-                params["shared_a"][..., 2, :],
-                params["shared_b"][..., 2, :],
-                labels_continuous[..., 2],
-                params.get("shared_c", None)[..., 2, :] if "shared_c" in params else None,
-            )
+            if distribution == "bln3":
+                joint_timing_loss = _bivariate_logistic_normal_nll(
+                    params,
+                    labels_continuous[..., 0:2],
+                    mask,
+                    eps,
+                    sigma_min,
+                    sigma_max,
+                )
+                loss_ioi = 0.5 * joint_timing_loss
+                loss_duration = 0.5 * joint_timing_loss
+                loss_velocity = loss_one(
+                    params["velocity_logits"],
+                    params["velocity_mu"],
+                    params["velocity_log_sigma"],
+                    labels_continuous[..., 2],
+                )
+            else:
+                loss_ioi = loss_one(
+                    params["timing_logits"] if distribution == "amln3" else params["shared_logits"][..., 0, :],
+                    params["shared_a"][..., 0, :],
+                    params["shared_b"][..., 0, :],
+                    labels_continuous[..., 0],
+                    params["shared_c"][..., 0, :] if distribution == "amln3" else None,
+                )
+                loss_duration = loss_one(
+                    params["timing_logits"] if distribution == "amln3" else params["shared_logits"][..., 1, :],
+                    params["shared_a"][..., 1, :],
+                    params["shared_b"][..., 1, :],
+                    labels_continuous[..., 1],
+                    params["shared_c"][..., 1, :] if distribution == "amln3" else None,
+                )
+                loss_velocity = loss_one(
+                    params["shared_logits"][..., 2, :],
+                    params["shared_a"][..., 2, :],
+                    params["shared_b"][..., 2, :],
+                    labels_continuous[..., 2],
+                    params["shared_c"][..., 2, :] if distribution == "amln3" else None,
+                )
             components = int(getattr(config, "epr_mixture_components", 1))
             per_component_dim = 4 if distribution == "amln3" else 3
             start_base = pedal_params["start_raw"].reshape(*pedal_params["start_raw"].shape[:-1], per_component_dim, components)
@@ -2110,12 +2435,13 @@ def _compute_integrated_loss_components(config, continuous_pred, labels_continuo
 
         if distribution in {
             "amln3",
+            "bln3",
             "logistic_normal",
             "mixture_logistic_normal",
             "inflated_mixture_logistic_normal",
             "mixture_beta",
         }:
-            params = _split_epr_mixture_params(config, continuous_pred)
+            params = _split_bln3_params(config, continuous_pred) if distribution == "bln3" else _split_epr_mixture_params(config, continuous_pred)
             eps = getattr(config, "epr_distribution_eps", getattr(config, "beta_eps", 1e-5))
             sigma_min = getattr(config, "logistic_normal_sigma_min", 1e-3)
             sigma_max = getattr(config, "logistic_normal_sigma_max", 10.0)
@@ -2136,27 +2462,45 @@ def _compute_integrated_loss_components(config, continuous_pred, labels_continuo
                     raw_c,
                 )
 
-            loss_ioi = loss_one(
-                params["shared_logits"][..., 0, :],
-                params["shared_a"][..., 0, :],
-                params["shared_b"][..., 0, :],
-                labels_continuous[..., 0],
-                params.get("shared_c", None)[..., 0, :] if "shared_c" in params else None,
-            )
-            loss_duration = loss_one(
-                params["shared_logits"][..., 1, :],
-                params["shared_a"][..., 1, :],
-                params["shared_b"][..., 1, :],
-                labels_continuous[..., 1],
-                params.get("shared_c", None)[..., 1, :] if "shared_c" in params else None,
-            )
-            loss_velocity = loss_one(
-                params["shared_logits"][..., 2, :],
-                params["shared_a"][..., 2, :],
-                params["shared_b"][..., 2, :],
-                labels_continuous[..., 2],
-                params.get("shared_c", None)[..., 2, :] if "shared_c" in params else None,
-            )
+            if distribution == "bln3":
+                joint_timing_loss = _bivariate_logistic_normal_nll(
+                    params,
+                    labels_continuous[..., 0:2],
+                    mask,
+                    eps,
+                    sigma_min,
+                    sigma_max,
+                )
+                loss_ioi = 0.5 * joint_timing_loss
+                loss_duration = 0.5 * joint_timing_loss
+                loss_velocity = loss_one(
+                    params["velocity_logits"],
+                    params["velocity_mu"],
+                    params["velocity_log_sigma"],
+                    labels_continuous[..., 2],
+                )
+            else:
+                loss_ioi = loss_one(
+                    params["timing_logits"] if distribution == "amln3" else params["shared_logits"][..., 0, :],
+                    params["shared_a"][..., 0, :],
+                    params["shared_b"][..., 0, :],
+                    labels_continuous[..., 0],
+                    params["shared_c"][..., 0, :] if distribution == "amln3" else None,
+                )
+                loss_duration = loss_one(
+                    params["timing_logits"] if distribution == "amln3" else params["shared_logits"][..., 1, :],
+                    params["shared_a"][..., 1, :],
+                    params["shared_b"][..., 1, :],
+                    labels_continuous[..., 1],
+                    params["shared_c"][..., 1, :] if distribution == "amln3" else None,
+                )
+                loss_velocity = loss_one(
+                    params["shared_logits"][..., 2, :],
+                    params["shared_a"][..., 2, :],
+                    params["shared_b"][..., 2, :],
+                    labels_continuous[..., 2],
+                    params["shared_c"][..., 2, :] if distribution == "amln3" else None,
+                )
             components = int(getattr(config, "epr_mixture_components", 1))
             per_component_dim = 4 if distribution == "amln3" else 3
             start_base = start_ctrl["start_raw"].reshape(*start_ctrl["start_raw"].shape[:-1], per_component_dim, components)
@@ -2270,12 +2614,13 @@ def _compute_integrated_loss_components(config, continuous_pred, labels_continuo
 
     if distribution in {
         "amln3",
+        "bln3",
         "logistic_normal",
         "mixture_logistic_normal",
         "inflated_mixture_logistic_normal",
         "mixture_beta",
     }:
-        params = _split_epr_mixture_params(config, continuous_pred)
+        params = _split_bln3_params(config, continuous_pred) if distribution == "bln3" else _split_epr_mixture_params(config, continuous_pred)
         eps = getattr(config, "epr_distribution_eps", getattr(config, "beta_eps", 1e-5))
         sigma_min = getattr(config, "logistic_normal_sigma_min", 1e-3)
         sigma_max = getattr(config, "logistic_normal_sigma_max", 10.0)
@@ -2296,7 +2641,17 @@ def _compute_integrated_loss_components(config, continuous_pred, labels_continuo
                 raw_c,
             )
 
-        if distribution == "inflated_mixture_logistic_normal":
+        if distribution == "bln3":
+            joint_timing_loss = _bivariate_logistic_normal_nll(
+                params,
+                labels_continuous[..., 0:2],
+                mask,
+                eps,
+                sigma_min,
+                sigma_max,
+            )
+            loss_ioi = 0.5 * joint_timing_loss
+        elif distribution == "inflated_mixture_logistic_normal":
             loss_ioi = _inflated_logistic_normal_nll(
                 config,
                 params["shared_logits"][..., 0, :],
@@ -2309,27 +2664,36 @@ def _compute_integrated_loss_components(config, continuous_pred, labels_continuo
             )
         else:
             loss_ioi = loss_one(
-                params["shared_logits"][..., 0, :],
+                params["timing_logits"] if distribution == "amln3" else params["shared_logits"][..., 0, :],
                 params["shared_a"][..., 0, :],
                 params["shared_b"][..., 0, :],
                 labels_continuous[..., 0],
-                params.get("shared_c", None)[..., 0, :] if "shared_c" in params else None,
+                params["shared_c"][..., 0, :] if distribution == "amln3" else None,
             )
 
-        loss_duration = loss_one(
-            params["shared_logits"][..., 1, :],
-            params["shared_a"][..., 1, :],
-            params["shared_b"][..., 1, :],
-            labels_continuous[..., 1],
-            params.get("shared_c", None)[..., 1, :] if "shared_c" in params else None,
-        )
-        loss_velocity = loss_one(
-            params["shared_logits"][..., 2, :],
-            params["shared_a"][..., 2, :],
-            params["shared_b"][..., 2, :],
-            labels_continuous[..., 2],
-            params.get("shared_c", None)[..., 2, :] if "shared_c" in params else None,
-        )
+        if distribution == "bln3":
+            loss_duration = loss_ioi
+            loss_velocity = loss_one(
+                params["velocity_logits"],
+                params["velocity_mu"],
+                params["velocity_log_sigma"],
+                labels_continuous[..., 2],
+            )
+        else:
+            loss_duration = loss_one(
+                params["timing_logits"] if distribution == "amln3" else params["shared_logits"][..., 1, :],
+                params["shared_a"][..., 1, :],
+                params["shared_b"][..., 1, :],
+                labels_continuous[..., 1],
+                params["shared_c"][..., 1, :] if distribution == "amln3" else None,
+            )
+            loss_velocity = loss_one(
+                params["shared_logits"][..., 2, :],
+                params["shared_a"][..., 2, :],
+                params["shared_b"][..., 2, :],
+                labels_continuous[..., 2],
+                params["shared_c"][..., 2, :] if distribution == "amln3" else None,
+            )
         pedal_losses = []
         for idx in range(4):
             if distribution == "inflated_mixture_logistic_normal":

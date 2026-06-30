@@ -235,6 +235,8 @@ cfg["eval_split"] = "train"
 cfg["eval_performance_dataset"] = "ASAP"
 cfg["eval_include_all_performance_dataset"] = None
 cfg["max_eval_non_asap_performances_per_work"] = None
+cfg.setdefault("precompute_dataset_items", True)
+cfg.setdefault("precompute_eval_dataset_items", True)
 cfg["save_steps"] = min(int(cfg.get("save_steps", 2000)), 500)
 cfg["eval_steps"] = min(int(cfg.get("eval_steps", 2000)), 500)
 cfg["logging_steps"] = int(cfg.get("logging_steps", 20))

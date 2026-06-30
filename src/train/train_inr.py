@@ -670,6 +670,7 @@ class PianoCoReNodeSFTDataset(Dataset):
         use_timing_scale_bit=True,
         timing_control_mode=None,
         timing_log_scale=50.0,
+        precompute_items=False,
     ):
         super().__init__()
         self.split = split
@@ -718,9 +719,12 @@ class PianoCoReNodeSFTDataset(Dataset):
             self.cumulative_sizes.append(total)
 
         self.total_examples = total
-        self.cache_size = cache_size
+        self.precompute_items = bool(precompute_items)
+        self.cache_size = max(int(cache_size), len(self.items)) if self.precompute_items else int(cache_size)
         self._cache = OrderedDict()
         self._prepared_cache = OrderedDict()
+        if self.precompute_items:
+            self._precompute_items()
 
     def __len__(self):
         return self.total_examples
@@ -853,6 +857,45 @@ class PianoCoReNodeSFTDataset(Dataset):
         )
         label_cache[cache_key] = (labels, label_bins)
         return labels, label_bins
+
+    def _precompute_items(self):
+        rank, _ = distributed_info()
+        if rank == 0:
+            print(
+                json.dumps(
+                    {
+                        "event": "dataset_precompute_start",
+                        "split": self.split,
+                        "works": len(self.items),
+                        "examples": self.total_examples,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        total_performances = 0
+        for item in self.items:
+            work = self._load_work(item["path"])
+            prepared = self._prepare_work(item["path"], work)
+            performances = self._selected_performances(prepared, item)
+            for perf in performances:
+                self._performance_labels(prepared, perf)
+                total_performances += 1
+        if rank == 0:
+            print(
+                json.dumps(
+                    {
+                        "event": "dataset_precompute_done",
+                        "split": self.split,
+                        "works": len(self._prepared_cache),
+                        "performances": total_performances,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
 
     def __getitem__(self, index):
         if index < 0:
@@ -1241,6 +1284,7 @@ def create_model(train_config):
             "hard_categorical",
             "soft_categorical",
             "amln3",
+            "bln3",
             "logistic_normal",
             "mixture_logistic_normal",
             "inflated_mixture_logistic_normal",
@@ -1250,6 +1294,7 @@ def create_model(train_config):
             raise ValueError(f"Unsupported epr_distribution={distribution}")
         mixture_distributions = {
             "amln3",
+            "bln3",
             "logistic_normal",
             "mixture_logistic_normal",
             "inflated_mixture_logistic_normal",
@@ -1277,7 +1322,7 @@ def create_model(train_config):
                 raise ValueError(f"epr_mixture_components must be >= 1, got {components}")
             if distribution == "logistic_normal" and components != 1:
                 raise ValueError("epr_distribution=logistic_normal requires epr_mixture_components=1")
-            if distribution in {"amln3", "mixture_logistic_normal", "inflated_mixture_logistic_normal", "mixture_beta"} and components < 2:
+            if distribution in {"amln3", "bln3", "mixture_logistic_normal", "inflated_mixture_logistic_normal", "mixture_beta"} and components < 2:
                 raise ValueError(f"epr_distribution={distribution} requires epr_mixture_components >= 2")
             if distribution == "inflated_mixture_logistic_normal":
                 expected = {"ioi": "zero", "pedal": "zero_one"}
@@ -1303,13 +1348,14 @@ def create_model(train_config):
                 "huber",
                 "deterministic_huber",
                 "amln3",
+                "bln3",
                 "logistic_normal",
                 "mixture_logistic_normal",
                 "beta_mu_kappa",
                 "mixture_beta",
             }:
                 raise ValueError(
-                    "deviation EPR currently supports point/huber, mln, mln3/amln3, beta, and mixture_beta, "
+                    "deviation EPR currently supports point/huber, mln, mln3/amln3/bln3, beta, and mixture_beta, "
                     f"got epr_distribution={distribution}"
                 )
     elif task_type == "csr":
@@ -1582,6 +1628,7 @@ def main():
         use_timing_scale_bit=train_config.get("use_timing_scale_bit", True),
         timing_control_mode=train_config.get("timing_control_mode"),
         timing_log_scale=train_config.get("timing_log_scale", 50.0),
+        precompute_items=train_config.get("precompute_dataset_items", False),
     )
     eval_dataset = PianoCoReNodeSFTDataset(
         eval_manifest,
@@ -1602,6 +1649,7 @@ def main():
         use_timing_scale_bit=train_config.get("use_timing_scale_bit", True),
         timing_control_mode=train_config.get("timing_control_mode"),
         timing_log_scale=train_config.get("timing_log_scale", 50.0),
+        precompute_items=train_config.get("precompute_eval_dataset_items", train_config.get("precompute_dataset_items", False)),
     )
 
     model = create_model(train_config)
