@@ -97,6 +97,10 @@ src, dst, train_root, tf_log_root, resume_checkpoint = sys.argv[1:6]
 cfg = json.loads(open(src).read())
 cfg["output_dir"] = train_root
 cfg["logging_dir"] = tf_log_root
+cfg.setdefault("eval_dataloader_num_workers", cfg.get("dataloader_num_workers", 0))
+cfg.setdefault("eval_dataloader_persistent_workers", bool(int(cfg.get("eval_dataloader_num_workers") or 0) > 0))
+cfg.setdefault("eval_dataloader_prefetch_factor", cfg.get("dataloader_prefetch_factor", 2))
+cfg.setdefault("loss_component_interval", cfg.get("logging_steps", 20))
 if resume_checkpoint:
     cfg["resume_path"] = resume_checkpoint
     cfg["resume_trainer_state"] = True
@@ -238,6 +242,10 @@ cfg["save_total_limit"] = 2
 cfg["load_best_model_at_end"] = True
 cfg["metric_for_best_model"] = "eval_loss"
 cfg["greater_is_better"] = False
+cfg.setdefault("eval_dataloader_num_workers", cfg.get("dataloader_num_workers", 0))
+cfg.setdefault("eval_dataloader_persistent_workers", bool(int(cfg.get("eval_dataloader_num_workers") or 0) > 0))
+cfg.setdefault("eval_dataloader_prefetch_factor", cfg.get("dataloader_prefetch_factor", 2))
+cfg.setdefault("loss_component_interval", cfg.get("logging_steps", 20))
 open(dst, "w", encoding="utf-8").write(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
 PY
 

@@ -941,7 +941,9 @@ class NodeSFTTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         outputs = model(**inputs)
         loss = outputs.loss
-        self._record_loss_components(model, outputs, inputs)
+        interval = int(getattr(self, "loss_component_interval", 1) or 0)
+        if interval > 0 and self.state.global_step % interval == 0:
+            self._record_loss_components(model, outputs, inputs)
         return (loss, outputs) if return_outputs else loss
 
     def log(self, logs, *args, **kwargs):
@@ -1238,6 +1240,7 @@ def create_model(train_config):
             "categorical",
             "hard_categorical",
             "soft_categorical",
+            "amln3",
             "logistic_normal",
             "mixture_logistic_normal",
             "inflated_mixture_logistic_normal",
@@ -1246,6 +1249,7 @@ def create_model(train_config):
         if distribution not in supported_distributions:
             raise ValueError(f"Unsupported epr_distribution={distribution}")
         mixture_distributions = {
+            "amln3",
             "logistic_normal",
             "mixture_logistic_normal",
             "inflated_mixture_logistic_normal",
@@ -1273,7 +1277,7 @@ def create_model(train_config):
                 raise ValueError(f"epr_mixture_components must be >= 1, got {components}")
             if distribution == "logistic_normal" and components != 1:
                 raise ValueError("epr_distribution=logistic_normal requires epr_mixture_components=1")
-            if distribution in {"mixture_logistic_normal", "inflated_mixture_logistic_normal", "mixture_beta"} and components < 2:
+            if distribution in {"amln3", "mixture_logistic_normal", "inflated_mixture_logistic_normal", "mixture_beta"} and components < 2:
                 raise ValueError(f"epr_distribution={distribution} requires epr_mixture_components >= 2")
             if distribution == "inflated_mixture_logistic_normal":
                 expected = {"ioi": "zero", "pedal": "zero_one"}
@@ -1298,13 +1302,14 @@ def create_model(train_config):
                 "point",
                 "huber",
                 "deterministic_huber",
+                "amln3",
                 "logistic_normal",
                 "mixture_logistic_normal",
                 "beta_mu_kappa",
                 "mixture_beta",
             }:
                 raise ValueError(
-                    "deviation EPR currently supports point/huber, mln, mln3, beta, and mixture_beta, "
+                    "deviation EPR currently supports point/huber, mln, mln3/amln3, beta, and mixture_beta, "
                     f"got epr_distribution={distribution}"
                 )
     elif task_type == "csr":
@@ -1617,7 +1622,7 @@ def main():
         training_args_dict.setdefault("dataloader_persistent_workers", True)
     training_args_dict.setdefault("dataloader_pin_memory", torch.cuda.is_available())
     if torch.cuda.device_count() > 1:
-        training_args_dict.setdefault("ddp_find_unused_parameters", True)
+        training_args_dict.setdefault("ddp_find_unused_parameters", False)
         training_args_dict.setdefault("ddp_broadcast_buffers", False)
     training_args = TrainingArguments(**training_args_dict)
 
@@ -1632,11 +1637,13 @@ def main():
         eval_dataset=eval_dataset,
     )
     if "eval_dataloader_num_workers" not in train_config:
-        train_config["eval_dataloader_num_workers"] = 0
+        train_config["eval_dataloader_num_workers"] = train_config.get("dataloader_num_workers", 0)
     if "eval_dataloader_persistent_workers" not in train_config:
-        train_config["eval_dataloader_persistent_workers"] = False
+        train_config["eval_dataloader_persistent_workers"] = bool(
+            int(train_config.get("eval_dataloader_num_workers", 0) or 0) > 0
+        )
     if "eval_dataloader_prefetch_factor" not in train_config:
-        train_config["eval_dataloader_prefetch_factor"] = None
+        train_config["eval_dataloader_prefetch_factor"] = train_config.get("dataloader_prefetch_factor", 2)
     if "eval_dataloader_pin_memory" not in train_config:
         train_config["eval_dataloader_pin_memory"] = training_args.dataloader_pin_memory
     trainer.eval_dataloader_num_workers = int(train_config.get("eval_dataloader_num_workers", 0) or 0)
@@ -1644,6 +1651,9 @@ def main():
     trainer.eval_dataloader_prefetch_factor = train_config.get("eval_dataloader_prefetch_factor")
     trainer.eval_dataloader_pin_memory = bool(
         train_config.get("eval_dataloader_pin_memory", training_args.dataloader_pin_memory)
+    )
+    trainer.loss_component_interval = int(
+        train_config.get("loss_component_interval", train_config.get("logging_steps", 20)) or 0
     )
 
     resume_path = train_config.get("resume_path")

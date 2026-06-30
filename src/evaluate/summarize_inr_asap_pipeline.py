@@ -321,30 +321,48 @@ def normalize_target_duration_dev(score_time_ms, perf_time_ms, config):
     return normalize_duration_dev(score_time_ms, perf_time_ms)
 
 
-def load_score_source_to_work_path(config):
-    manifest = build_work_manifest(
-        metadata_path=config["metadata_path"],
-        refined_dir=config["refined_dir"],
-        split="test",
-        block_notes=config["block_notes"],
-        overlap_ratio=config["overlap_ratio"],
-        min_notes=config["min_notes"],
-        performance_dataset="ASAP",
-    )
+def refined_root_from_config(config):
+    refined_dir = (ROOT_DIR / config["refined_dir"]).resolve()
+    return refined_dir.parent / "refined"
+
+
+def relative_refined_path(path, refined_root):
+    resolved = Path(path).resolve()
+    try:
+        return resolved.relative_to(refined_root).as_posix()
+    except ValueError:
+        return resolved.as_posix()
+
+
+def score_source_to_work_path_from_manifest(manifest, config):
     return {
-        item["score_source"]: str((ROOT_DIR / item["path"]).resolve())
-        for item in manifest
+        item["score_source"]: str((ROOT_DIR / config["refined_dir"] / Path(item["score_source"]).with_suffix(".json")).resolve())
+        for item in manifest["items"]
     }
 
 
-def extract_gt_dev_arrays(score_source_to_work_path, config):
+def selected_gt_sources_from_manifest(manifest, config):
+    refined_root = refined_root_from_config(config)
+    selected = {}
+    for item in manifest["items"]:
+        selected[item["score_source"]] = {
+            relative_refined_path(path, refined_root)
+            for path in item.get("ground_truth_paths", [])
+        }
+    return selected
+
+
+def extract_gt_dev_arrays(score_source_to_work_path, selected_gt_sources, config):
     dev_ioi = []
     dev_duration = []
-    for work_path in score_source_to_work_path.values():
+    for score_source, work_path in score_source_to_work_path.items():
+        selected_sources = selected_gt_sources.get(score_source)
         with open(work_path, "r", encoding="utf-8") as file:
             work = json.load(file)
         score_raw = work["score"]["score_raw"]
         for perf in work.get("performances", []):
+            if selected_sources is not None and perf.get("performance_source") not in selected_sources:
+                continue
             shared_rows = perf.get("label_shared_raw")
             if shared_rows is None:
                 if "label_raw" not in perf:
@@ -391,8 +409,9 @@ def plot_dev_distributions(
     config,
     output_plot,
 ):
-    score_source_to_work_path = load_score_source_to_work_path(config)
-    gt_arrays = extract_gt_dev_arrays(score_source_to_work_path, config)
+    score_source_to_work_path = score_source_to_work_path_from_manifest(det_manifest, config)
+    selected_gt_sources = selected_gt_sources_from_manifest(det_manifest, config)
+    gt_arrays = extract_gt_dev_arrays(score_source_to_work_path, selected_gt_sources, config)
     det_arrays = extract_pred_dev_arrays(unique_paths(det_manifest, "raw_output_paths"))
     sampling_arrays = extract_pred_dev_arrays(unique_paths(sampling_manifest, "raw_output_paths"))
 

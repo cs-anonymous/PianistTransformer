@@ -436,6 +436,7 @@ class IntegratedContinuousDecoder(nn.Module):
         elif (
             getattr(config, "task_type", "epr") == "epr"
             and self.epr_distribution in {
+                "amln3",
                 "logistic_normal",
                 "mixture_logistic_normal",
                 "inflated_mixture_logistic_normal",
@@ -445,7 +446,8 @@ class IntegratedContinuousDecoder(nn.Module):
             components = int(getattr(config, "epr_mixture_components", 1))
             if components < 1:
                 raise ValueError(f"epr_mixture_components must be >= 1, got {components}")
-            per_feature_dim = components * 3
+            per_component_dim = 4 if self.epr_distribution == "amln3" else 3
+            per_feature_dim = components * per_component_dim
             ioi_output_dim = duration_output_dim = velocity_output_dim = per_feature_dim
             pedal_output_dim = per_feature_dim * 4
             if self.epr_distribution == "inflated_mixture_logistic_normal":
@@ -462,12 +464,14 @@ class IntegratedContinuousDecoder(nn.Module):
             if self.epr_distribution == "beta_mu_kappa":
                 pedal_output_dim = 4
             elif self.epr_distribution in {
+                "amln3",
                 "logistic_normal",
                 "mixture_logistic_normal",
                 "inflated_mixture_logistic_normal",
                 "mixture_beta",
             }:
-                pedal_output_dim = int(getattr(config, "epr_mixture_components", 1)) * 3 * 2
+                per_component_dim = 4 if self.epr_distribution == "amln3" else 3
+                pedal_output_dim = int(getattr(config, "epr_mixture_components", 1)) * per_component_dim * 2
             else:
                 pedal_output_dim = 2
 
@@ -524,6 +528,7 @@ class IntegratedContinuousDecoder(nn.Module):
             pedal = self.pedal_head(hidden_states[..., self.perf_slice])
             if self.epr_distribution in {
                 "beta_mu_kappa",
+                "amln3",
                 "logistic_normal",
                 "mixture_logistic_normal",
                 "inflated_mixture_logistic_normal",
@@ -548,6 +553,7 @@ class IntegratedContinuousDecoder(nn.Module):
                 "categorical",
                 "hard_categorical",
                 "soft_categorical",
+                "amln3",
                 "logistic_normal",
                 "mixture_logistic_normal",
                 "inflated_mixture_logistic_normal",
@@ -560,6 +566,7 @@ class IntegratedContinuousDecoder(nn.Module):
             "categorical",
             "hard_categorical",
             "soft_categorical",
+            "amln3",
             "logistic_normal",
             "mixture_logistic_normal",
             "inflated_mixture_logistic_normal",
@@ -617,17 +624,25 @@ def _epr_mixture_components(config):
 
 def _split_epr_mixture_params(config, raw_outputs):
     components = _epr_mixture_components(config)
-    per_feature_dim = components * 3
+    distribution = getattr(config, "epr_distribution", "point").lower()
+    per_component_dim = 4 if distribution == "amln3" else 3
+    per_feature_dim = components * per_component_dim
     shared_base_dim = per_feature_dim * 3
     pedal_base_dim = per_feature_dim * 4
-    shared_base = raw_outputs[..., :shared_base_dim].reshape(*raw_outputs.shape[:-1], 3, 3, components)
-    distribution = getattr(config, "epr_distribution", "point").lower()
+    shared_base = raw_outputs[..., :shared_base_dim].reshape(
+        *raw_outputs.shape[:-1],
+        3,
+        per_component_dim,
+        components,
+    )
     pedal_representation = str(getattr(config, "pedal_representation", "continuous_4")).lower()
     params = {
         "shared_logits": shared_base[..., 0, :],
         "shared_a": shared_base[..., 1, :],
         "shared_b": shared_base[..., 2, :],
     }
+    if distribution == "amln3":
+        params["shared_c"] = shared_base[..., 3, :]
     if pedal_representation == "start_ctrl":
         if distribution == "inflated_mixture_logistic_normal":
             params["ioi_mode_logits"] = raw_outputs[..., shared_base_dim : shared_base_dim + 2]
@@ -637,10 +652,17 @@ def _split_epr_mixture_params(config, raw_outputs):
     if distribution == "inflated_mixture_logistic_normal":
         pedal_start += 2
     pedal_end = pedal_start + pedal_base_dim
-    pedal_base = raw_outputs[..., pedal_start:pedal_end].reshape(*raw_outputs.shape[:-1], 4, 3, components)
+    pedal_base = raw_outputs[..., pedal_start:pedal_end].reshape(
+        *raw_outputs.shape[:-1],
+        4,
+        per_component_dim,
+        components,
+    )
     params["pedal_logits"] = pedal_base[..., 0, :]
     params["pedal_a"] = pedal_base[..., 1, :]
     params["pedal_b"] = pedal_base[..., 2, :]
+    if distribution == "amln3":
+        params["pedal_c"] = pedal_base[..., 3, :]
     if distribution == "inflated_mixture_logistic_normal":
         params["ioi_mode_logits"] = raw_outputs[..., shared_base_dim : shared_base_dim + 2]
         params["pedal_mode_logits"] = raw_outputs[..., pedal_end : pedal_end + 12].reshape(*raw_outputs.shape[:-1], 4, 3)
@@ -652,12 +674,14 @@ def _pedal_start_ctrl_scalar_dim(config):
     if distribution == "beta_mu_kappa":
         return 2
     if distribution in {
+        "amln3",
         "logistic_normal",
         "mixture_logistic_normal",
         "inflated_mixture_logistic_normal",
         "mixture_beta",
     }:
-        return int(getattr(config, "epr_mixture_components", 1)) * 3
+        per_component_dim = 4 if distribution == "amln3" else 3
+        return int(getattr(config, "epr_mixture_components", 1)) * per_component_dim
     return 1
 
 
@@ -855,6 +879,19 @@ def _build_epr_decoder_rows(config, score_shared_raw, target_predictions):
     timing_control_mode = getattr(config, "timing_control_mode", None)
     use_timing_scale_bit = getattr(config, "use_timing_scale_bit", True)
     log_scale = getattr(config, "timing_log_scale", 50.0)
+    score_ioi = _torch_timing_control_code(
+        score_shared_raw[..., 0],
+        timing_control_mode=timing_control_mode,
+        use_scale_bit=use_timing_scale_bit,
+        log_scale=log_scale,
+    )
+    score_duration = _torch_timing_control_code(
+        score_shared_raw[..., 1],
+        timing_control_mode=timing_control_mode,
+        use_scale_bit=use_timing_scale_bit,
+        log_scale=log_scale,
+    )
+    score_velocity = (score_shared_raw[..., 2:3].float().clamp(0.0, 127.0) / 127.0)
     perf_ioi = _torch_timing_control_code(
         raw_perf[..., 0],
         timing_control_mode=timing_control_mode,
@@ -869,10 +906,10 @@ def _build_epr_decoder_rows(config, score_shared_raw, target_predictions):
     )
     velocity = target_predictions[..., 2:3].float().clamp(0.0, 1.0)
     pedal = target_predictions[..., 3:5].float().clamp(0.0, 1.0)
-    score_control = target_predictions.new_zeros(
-        *target_predictions.shape[:-1],
-        int(getattr(config, "score_control_feature_dim", getattr(config, "control_feature_dim", 5))),
-    )
+    score_control = torch.cat([score_ioi, score_duration, score_velocity], dim=-1)
+    expected_score_dim = int(getattr(config, "score_control_feature_dim", getattr(config, "control_feature_dim", 5)))
+    if score_control.shape[-1] != expected_score_dim:
+        raise ValueError(f"score control dim mismatch: got {score_control.shape[-1]}, expected {expected_score_dim}")
     performance_control = torch.cat([perf_ioi, duration, velocity, pedal], dim=-1)
     musical = target_predictions.new_zeros(*target_predictions.shape[:-1], getattr(config, "musical_feature_dim", 12))
     masks = target_predictions.new_tensor([0.0, 1.0, 0.0]).expand(*target_predictions.shape[:-1], 3)
@@ -985,6 +1022,62 @@ def _mixture_logistic_normal_nll(logits, raw_mu, raw_log_sigma, target, mask, ep
     return _masked_mean(values, mask)
 
 
+def _asymmetric_logistic_normal_log_prob(
+    logits,
+    raw_mu,
+    raw_log_sigma_left,
+    raw_log_sigma_right,
+    target,
+    eps,
+    sigma_min,
+    sigma_max,
+):
+    target = target.float().clamp(float(eps), 1.0 - float(eps))
+    z = torch.logit(target, eps=float(eps)).unsqueeze(-1)
+    mu = raw_mu.float()
+    _, sigma_left = _logistic_normal_params(
+        raw_mu,
+        raw_log_sigma_left,
+        sigma_min=sigma_min,
+        sigma_max=sigma_max,
+    )
+    _, sigma_right = _logistic_normal_params(
+        raw_mu,
+        raw_log_sigma_right,
+        sigma_min=sigma_min,
+        sigma_max=sigma_max,
+    )
+    sigma = torch.where(z < mu, sigma_left, sigma_right)
+    log_pi = F.log_softmax(logits.float(), dim=-1)
+    log_normal = torch.distributions.Normal(mu, sigma).log_prob(z)
+    log_jacobian = -torch.log(target).unsqueeze(-1) - torch.log1p(-target).unsqueeze(-1)
+    return torch.logsumexp(log_pi + log_normal + log_jacobian, dim=-1)
+
+
+def _asymmetric_logistic_normal_nll(
+    logits,
+    raw_mu,
+    raw_log_sigma_left,
+    raw_log_sigma_right,
+    target,
+    mask,
+    eps,
+    sigma_min,
+    sigma_max,
+):
+    values = -_asymmetric_logistic_normal_log_prob(
+        logits,
+        raw_mu,
+        raw_log_sigma_left,
+        raw_log_sigma_right,
+        target,
+        eps,
+        sigma_min,
+        sigma_max,
+    )
+    return _masked_mean(values, mask)
+
+
 def _mixture_beta_params(raw_alpha, raw_beta, alpha_min=1e-4):
     alpha = F.softplus(raw_alpha.float()) + float(alpha_min)
     beta = F.softplus(raw_beta.float()) + float(alpha_min)
@@ -1027,6 +1120,49 @@ def _mixture_logistic_normal_mean_or_sample(config, logits, raw_mu, raw_log_sigm
     raise ValueError(f"Unsupported sampling_strategy: {sampling_strategy}")
 
 
+def _asymmetric_logistic_normal_mean_or_sample(
+    config,
+    logits,
+    raw_mu,
+    raw_log_sigma_left,
+    raw_log_sigma_right,
+    sampling_strategy="mean",
+):
+    mode = str(sampling_strategy).lower()
+    mu, sigma_left = _logistic_normal_params(
+        raw_mu,
+        raw_log_sigma_left,
+        sigma_min=getattr(config, "logistic_normal_sigma_min", 1e-3),
+        sigma_max=getattr(config, "logistic_normal_sigma_max", 10.0),
+    )
+    _, sigma_right = _logistic_normal_params(
+        raw_mu,
+        raw_log_sigma_right,
+        sigma_min=getattr(config, "logistic_normal_sigma_min", 1e-3),
+        sigma_max=getattr(config, "logistic_normal_sigma_max", 10.0),
+    )
+    probs = torch.softmax(logits.float(), dim=-1)
+    if mode in {"mean", "deterministic", "mu", "expected", "expectation"}:
+        return torch.sum(probs * torch.sigmoid(mu), dim=-1)
+    if mode in {"argmax", "greedy"}:
+        index = probs.argmax(dim=-1, keepdim=True)
+        return torch.sigmoid(mu.gather(dim=-1, index=index).squeeze(-1))
+    if mode in {"sample", "sampling", "stochastic"}:
+        index = torch.distributions.Categorical(probs=probs).sample().unsqueeze(-1)
+        sampled_mu = mu.gather(dim=-1, index=index).squeeze(-1)
+        sampled_left = sigma_left.gather(dim=-1, index=index).squeeze(-1)
+        sampled_right = sigma_right.gather(dim=-1, index=index).squeeze(-1)
+        side = torch.rand_like(sampled_mu) < 0.5
+        magnitude = torch.distributions.HalfNormal(torch.ones_like(sampled_mu)).sample()
+        z = torch.where(
+            side,
+            sampled_mu - sampled_left * magnitude,
+            sampled_mu + sampled_right * magnitude,
+        )
+        return torch.sigmoid(z)
+    raise ValueError(f"Unsupported sampling_strategy: {sampling_strategy}")
+
+
 def _mixture_beta_mean_or_sample(config, logits, raw_alpha, raw_beta, sampling_strategy="mean"):
     mode = str(sampling_strategy).lower()
     alpha, beta, mean = _mixture_beta_params(
@@ -1046,6 +1182,35 @@ def _mixture_beta_mean_or_sample(config, logits, raw_alpha, raw_beta, sampling_s
         sampled_beta = beta.gather(dim=-1, index=index).squeeze(-1)
         return torch.distributions.Beta(sampled_alpha, sampled_beta).sample()
     raise ValueError(f"Unsupported sampling_strategy: {sampling_strategy}")
+
+
+def _decode_mixture_value(config, logits, a, b, c=None, sampling_strategy="mean"):
+    distribution = getattr(config, "epr_distribution", "point").lower()
+    if distribution == "mixture_beta":
+        return _mixture_beta_mean_or_sample(config, logits, a, b, sampling_strategy=sampling_strategy)
+    if distribution == "amln3":
+        if c is None:
+            raise ValueError("amln3 decoding requires right-scale parameters")
+        return _asymmetric_logistic_normal_mean_or_sample(
+            config,
+            logits,
+            a,
+            b,
+            c,
+            sampling_strategy=sampling_strategy,
+        )
+    return _mixture_logistic_normal_mean_or_sample(config, logits, a, b, sampling_strategy=sampling_strategy)
+
+
+def _mixture_loss_value(config, logits, a, b, target, mask, eps, sigma_min, sigma_max, alpha_min, c=None):
+    distribution = getattr(config, "epr_distribution", "point").lower()
+    if distribution == "mixture_beta":
+        return _mixture_beta_nll(logits, a, b, target, mask, eps, alpha_min)
+    if distribution == "amln3":
+        if c is None:
+            raise ValueError("amln3 NLL requires right-scale parameters")
+        return _asymmetric_logistic_normal_nll(logits, a, b, c, target, mask, eps, sigma_min, sigma_max)
+    return _mixture_logistic_normal_nll(logits, a, b, target, mask, eps, sigma_min, sigma_max)
 
 
 def _inflated_logistic_normal_nll(config, logits, raw_mu, raw_log_sigma, mode_logits, target, mask, inflation):
@@ -1175,6 +1340,7 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean"):
             return torch.cat([shared, start.unsqueeze(-1), ctrl.unsqueeze(-1)], dim=-1)
 
         if distribution in {
+            "amln3",
             "logistic_normal",
             "mixture_logistic_normal",
             "inflated_mixture_logistic_normal",
@@ -1182,27 +1348,25 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean"):
         }:
             params = _split_epr_mixture_params(config, raw_outputs)
             pedal_params = _split_start_ctrl_from_outputs(config, raw_outputs)
-            decode = (
-                _mixture_beta_mean_or_sample
-                if distribution == "mixture_beta"
-                else _mixture_logistic_normal_mean_or_sample
-            )
-            shared = decode(
+            shared = _decode_mixture_value(
                 config,
                 params["shared_logits"],
                 params["shared_a"],
                 params["shared_b"],
+                params.get("shared_c"),
                 sampling_strategy=sampling_strategy,
             )
             components = int(getattr(config, "epr_mixture_components", 1))
+            per_component_dim = 4 if distribution == "amln3" else 3
 
             def decode_scalar(raw):
-                base = raw.reshape(*raw.shape[:-1], 3, components)
-                return decode(
+                base = raw.reshape(*raw.shape[:-1], per_component_dim, components)
+                return _decode_mixture_value(
                     config,
                     base[..., 0, :],
                     base[..., 1, :],
                     base[..., 2, :],
+                    base[..., 3, :] if distribution == "amln3" else None,
                     sampling_strategy=sampling_strategy,
                 )
 
@@ -1245,28 +1409,23 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean"):
             start = decode_beta(pedal_params["start_raw"])
             ctrl = decode_beta(pedal_params["ctrl_raw"])
         elif distribution in {
+            "amln3",
             "logistic_normal",
             "mixture_logistic_normal",
             "inflated_mixture_logistic_normal",
             "mixture_beta",
         }:
             components = int(getattr(config, "epr_mixture_components", 1))
+            per_component_dim = 4 if distribution == "amln3" else 3
 
             def decode_mixture(raw):
-                base = raw.reshape(*raw.shape[:-1], 3, components)
-                if distribution == "mixture_beta":
-                    return _mixture_beta_mean_or_sample(
-                        config,
-                        base[..., 0, :],
-                        base[..., 1, :],
-                        base[..., 2, :],
-                        sampling_strategy=sampling_strategy,
-                    )
-                return _mixture_logistic_normal_mean_or_sample(
+                base = raw.reshape(*raw.shape[:-1], per_component_dim, components)
+                return _decode_mixture_value(
                     config,
                     base[..., 0, :],
                     base[..., 1, :],
                     base[..., 2, :],
+                    base[..., 3, :] if distribution == "amln3" else None,
                     sampling_strategy=sampling_strategy,
                 )
 
@@ -1278,6 +1437,7 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean"):
 
         if distribution not in {
             "logistic_normal",
+            "amln3",
             "mixture_logistic_normal",
             "inflated_mixture_logistic_normal",
             "mixture_beta",
@@ -1300,18 +1460,19 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean"):
             )
         else:
             params = _split_epr_mixture_params(config, raw_outputs)
-            decode = _mixture_beta_mean_or_sample if distribution == "mixture_beta" else _mixture_logistic_normal_mean_or_sample
-            shared = decode(
+            shared = _decode_mixture_value(
                 config,
                 params["shared_logits"],
                 params["shared_a"],
                 params["shared_b"],
+                params.get("shared_c"),
                 sampling_strategy=sampling_strategy,
             )
         return _pack_start_ctrl_prediction(shared, start, ctrl)
 
     if distribution != "beta_mu_kappa":
         if distribution not in {
+            "amln3",
             "logistic_normal",
             "mixture_logistic_normal",
             "inflated_mixture_logistic_normal",
@@ -1320,23 +1481,20 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean"):
             return raw_outputs
 
         params = _split_epr_mixture_params(config, raw_outputs)
-        if distribution in {"logistic_normal", "mixture_logistic_normal", "inflated_mixture_logistic_normal"}:
-            decode = _mixture_logistic_normal_mean_or_sample
-        else:
-            decode = _mixture_beta_mean_or_sample
-
-        shared = decode(
+        shared = _decode_mixture_value(
             config,
             params["shared_logits"],
             params["shared_a"],
             params["shared_b"],
+            params.get("shared_c"),
             sampling_strategy=sampling_strategy,
         )
-        pedal = decode(
+        pedal = _decode_mixture_value(
             config,
             params["pedal_logits"],
             params["pedal_a"],
             params["pedal_b"],
+            params.get("pedal_c"),
             sampling_strategy=sampling_strategy,
         )
 
@@ -1783,6 +1941,7 @@ def _compute_integrated_loss_components(config, continuous_pred, labels_continuo
     if _uses_deviation_ratio_targets(config):
         distribution = getattr(config, "epr_distribution", "point").lower()
         if distribution in {
+            "amln3",
             "logistic_normal",
             "mixture_logistic_normal",
             "inflated_mixture_logistic_normal",
@@ -1795,54 +1954,59 @@ def _compute_integrated_loss_components(config, continuous_pred, labels_continuo
             sigma_max = getattr(config, "logistic_normal_sigma_max", 10.0)
             alpha_min = getattr(config, "beta_alpha_min", 1e-4)
 
-            if distribution == "mixture_beta":
-                def loss_one(logits, raw_a, raw_b, target):
-                    return _mixture_beta_nll(logits, raw_a, raw_b, target, mask, eps, alpha_min)
-            else:
-                def loss_one(logits, raw_a, raw_b, target):
-                    return _mixture_logistic_normal_nll(
-                        logits,
-                        raw_a,
-                        raw_b,
-                        target,
-                        mask,
-                        eps,
-                        sigma_min,
-                        sigma_max,
-                    )
+            def loss_one(logits, raw_a, raw_b, target, raw_c=None):
+                return _mixture_loss_value(
+                    config,
+                    logits,
+                    raw_a,
+                    raw_b,
+                    target,
+                    mask,
+                    eps,
+                    sigma_min,
+                    sigma_max,
+                    alpha_min,
+                    raw_c,
+                )
 
             loss_ioi = loss_one(
                 params["shared_logits"][..., 0, :],
                 params["shared_a"][..., 0, :],
                 params["shared_b"][..., 0, :],
                 labels_continuous[..., 0],
+                params.get("shared_c", None)[..., 0, :] if "shared_c" in params else None,
             )
             loss_duration = loss_one(
                 params["shared_logits"][..., 1, :],
                 params["shared_a"][..., 1, :],
                 params["shared_b"][..., 1, :],
                 labels_continuous[..., 1],
+                params.get("shared_c", None)[..., 1, :] if "shared_c" in params else None,
             )
             loss_velocity = loss_one(
                 params["shared_logits"][..., 2, :],
                 params["shared_a"][..., 2, :],
                 params["shared_b"][..., 2, :],
                 labels_continuous[..., 2],
+                params.get("shared_c", None)[..., 2, :] if "shared_c" in params else None,
             )
             components = int(getattr(config, "epr_mixture_components", 1))
-            start_base = pedal_params["start_raw"].reshape(*pedal_params["start_raw"].shape[:-1], 3, components)
-            ctrl_base = pedal_params["ctrl_raw"].reshape(*pedal_params["ctrl_raw"].shape[:-1], 3, components)
+            per_component_dim = 4 if distribution == "amln3" else 3
+            start_base = pedal_params["start_raw"].reshape(*pedal_params["start_raw"].shape[:-1], per_component_dim, components)
+            ctrl_base = pedal_params["ctrl_raw"].reshape(*pedal_params["ctrl_raw"].shape[:-1], per_component_dim, components)
             pedal_start = loss_one(
                 start_base[..., 0, :],
                 start_base[..., 1, :],
                 start_base[..., 2, :],
                 labels_continuous[..., 3],
+                start_base[..., 3, :] if distribution == "amln3" else None,
             )
             pedal_ctrl = loss_one(
                 ctrl_base[..., 0, :],
                 ctrl_base[..., 1, :],
                 ctrl_base[..., 2, :],
                 labels_continuous[..., 4],
+                ctrl_base[..., 3, :] if distribution == "amln3" else None,
             )
         elif distribution == "beta_mu_kappa":
             params = _split_epr_distribution_params(continuous_pred)
@@ -1945,6 +2109,7 @@ def _compute_integrated_loss_components(config, continuous_pred, labels_continuo
         start_target, ctrl_target = _pedal_start_ctrl_targets(labels_continuous[..., 3:7], mask)
 
         if distribution in {
+            "amln3",
             "logistic_normal",
             "mixture_logistic_normal",
             "inflated_mixture_logistic_normal",
@@ -1956,54 +2121,59 @@ def _compute_integrated_loss_components(config, continuous_pred, labels_continuo
             sigma_max = getattr(config, "logistic_normal_sigma_max", 10.0)
             alpha_min = getattr(config, "beta_alpha_min", 1e-4)
 
-            if distribution == "mixture_beta":
-                def loss_one(logits, raw_a, raw_b, target):
-                    return _mixture_beta_nll(logits, raw_a, raw_b, target, mask, eps, alpha_min)
-            else:
-                def loss_one(logits, raw_a, raw_b, target):
-                    return _mixture_logistic_normal_nll(
-                        logits,
-                        raw_a,
-                        raw_b,
-                        target,
-                        mask,
-                        eps,
-                        sigma_min,
-                        sigma_max,
-                    )
+            def loss_one(logits, raw_a, raw_b, target, raw_c=None):
+                return _mixture_loss_value(
+                    config,
+                    logits,
+                    raw_a,
+                    raw_b,
+                    target,
+                    mask,
+                    eps,
+                    sigma_min,
+                    sigma_max,
+                    alpha_min,
+                    raw_c,
+                )
 
             loss_ioi = loss_one(
                 params["shared_logits"][..., 0, :],
                 params["shared_a"][..., 0, :],
                 params["shared_b"][..., 0, :],
                 labels_continuous[..., 0],
+                params.get("shared_c", None)[..., 0, :] if "shared_c" in params else None,
             )
             loss_duration = loss_one(
                 params["shared_logits"][..., 1, :],
                 params["shared_a"][..., 1, :],
                 params["shared_b"][..., 1, :],
                 labels_continuous[..., 1],
+                params.get("shared_c", None)[..., 1, :] if "shared_c" in params else None,
             )
             loss_velocity = loss_one(
                 params["shared_logits"][..., 2, :],
                 params["shared_a"][..., 2, :],
                 params["shared_b"][..., 2, :],
                 labels_continuous[..., 2],
+                params.get("shared_c", None)[..., 2, :] if "shared_c" in params else None,
             )
             components = int(getattr(config, "epr_mixture_components", 1))
-            start_base = start_ctrl["start_raw"].reshape(*start_ctrl["start_raw"].shape[:-1], 3, components)
-            ctrl_base = start_ctrl["ctrl_raw"].reshape(*start_ctrl["ctrl_raw"].shape[:-1], 3, components)
+            per_component_dim = 4 if distribution == "amln3" else 3
+            start_base = start_ctrl["start_raw"].reshape(*start_ctrl["start_raw"].shape[:-1], per_component_dim, components)
+            ctrl_base = start_ctrl["ctrl_raw"].reshape(*start_ctrl["ctrl_raw"].shape[:-1], per_component_dim, components)
             loss_pedal_start = loss_one(
                 start_base[..., 0, :],
                 start_base[..., 1, :],
                 start_base[..., 2, :],
                 start_target,
+                start_base[..., 3, :] if distribution == "amln3" else None,
             )
             loss_pedal_ctrl = loss_one(
                 ctrl_base[..., 0, :],
                 ctrl_base[..., 1, :],
                 ctrl_base[..., 2, :],
                 ctrl_target,
+                ctrl_base[..., 3, :] if distribution == "amln3" else None,
             )
         elif distribution == "beta_mu_kappa":
             params = _split_epr_distribution_params(continuous_pred)
@@ -2099,6 +2269,7 @@ def _compute_integrated_loss_components(config, continuous_pred, labels_continuo
         }
 
     if distribution in {
+        "amln3",
         "logistic_normal",
         "mixture_logistic_normal",
         "inflated_mixture_logistic_normal",
@@ -2110,21 +2281,20 @@ def _compute_integrated_loss_components(config, continuous_pred, labels_continuo
         sigma_max = getattr(config, "logistic_normal_sigma_max", 10.0)
         alpha_min = getattr(config, "beta_alpha_min", 1e-4)
 
-        if distribution == "mixture_beta":
-            def loss_one(logits, raw_a, raw_b, target):
-                return _mixture_beta_nll(logits, raw_a, raw_b, target, mask, eps, alpha_min)
-        else:
-            def loss_one(logits, raw_a, raw_b, target):
-                return _mixture_logistic_normal_nll(
-                    logits,
-                    raw_a,
-                    raw_b,
-                    target,
-                    mask,
-                    eps,
-                    sigma_min,
-                    sigma_max,
-                )
+        def loss_one(logits, raw_a, raw_b, target, raw_c=None):
+            return _mixture_loss_value(
+                config,
+                logits,
+                raw_a,
+                raw_b,
+                target,
+                mask,
+                eps,
+                sigma_min,
+                sigma_max,
+                alpha_min,
+                raw_c,
+            )
 
         if distribution == "inflated_mixture_logistic_normal":
             loss_ioi = _inflated_logistic_normal_nll(
@@ -2143,6 +2313,7 @@ def _compute_integrated_loss_components(config, continuous_pred, labels_continuo
                 params["shared_a"][..., 0, :],
                 params["shared_b"][..., 0, :],
                 labels_continuous[..., 0],
+                params.get("shared_c", None)[..., 0, :] if "shared_c" in params else None,
             )
 
         loss_duration = loss_one(
@@ -2150,12 +2321,14 @@ def _compute_integrated_loss_components(config, continuous_pred, labels_continuo
             params["shared_a"][..., 1, :],
             params["shared_b"][..., 1, :],
             labels_continuous[..., 1],
+            params.get("shared_c", None)[..., 1, :] if "shared_c" in params else None,
         )
         loss_velocity = loss_one(
             params["shared_logits"][..., 2, :],
             params["shared_a"][..., 2, :],
             params["shared_b"][..., 2, :],
             labels_continuous[..., 2],
+            params.get("shared_c", None)[..., 2, :] if "shared_c" in params else None,
         )
         pedal_losses = []
         for idx in range(4):
@@ -2179,6 +2352,7 @@ def _compute_integrated_loss_components(config, continuous_pred, labels_continuo
                         params["pedal_a"][..., idx, :],
                         params["pedal_b"][..., idx, :],
                         labels_continuous[..., 3 + idx],
+                        params.get("pedal_c", None)[..., idx, :] if "pedal_c" in params else None,
                     )
                 )
         return {
@@ -2621,6 +2795,7 @@ class IntegratedPianoTransformer(nn.Module):
                 continuous_pred = self._autoregressive_rollout_gpt(
                     pitch_ids=pitch_ids,
                     continuous=continuous,
+                    score_shared_raw=score_shared_raw,
                     attention_mask=attention_mask,
                     sampling_strategy=continuous_sampling_strategy,
                 )
