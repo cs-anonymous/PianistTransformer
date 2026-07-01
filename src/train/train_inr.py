@@ -1833,6 +1833,8 @@ def create_model(train_config):
                 "point",
                 "huber",
                 "deterministic_huber",
+                "aln",
+                "asymmetric_logistic_normal",
                 "amln3",
                 "logistic_normal",
                 "mixture_logistic_normal",
@@ -1851,6 +1853,8 @@ def create_model(train_config):
             "categorical",
             "hard_categorical",
             "soft_categorical",
+            "aln",
+            "asymmetric_logistic_normal",
             "amln3",
             "bln3",
             "logistic_normal",
@@ -1861,6 +1865,8 @@ def create_model(train_config):
         if distribution not in supported_distributions:
             raise ValueError(f"Unsupported epr_distribution={distribution}")
         mixture_distributions = {
+            "aln",
+            "asymmetric_logistic_normal",
             "amln3",
             "bln3",
             "logistic_normal",
@@ -1888,8 +1894,8 @@ def create_model(train_config):
             components = int(train_config["epr_mixture_components"])
             if components < 1:
                 raise ValueError(f"epr_mixture_components must be >= 1, got {components}")
-            if distribution == "logistic_normal" and components != 1:
-                raise ValueError("epr_distribution=logistic_normal requires epr_mixture_components=1")
+            if distribution in {"aln", "asymmetric_logistic_normal", "logistic_normal"} and components != 1:
+                raise ValueError(f"epr_distribution={distribution} requires epr_mixture_components=1")
             if distribution in {"amln3", "bln3", "mixture_logistic_normal", "inflated_mixture_logistic_normal", "mixture_beta"} and components < 2:
                 raise ValueError(f"epr_distribution={distribution} requires epr_mixture_components >= 2")
             if distribution == "inflated_mixture_logistic_normal":
@@ -1915,6 +1921,8 @@ def create_model(train_config):
                 "point",
                 "huber",
                 "deterministic_huber",
+                "aln",
+                "asymmetric_logistic_normal",
                 "amln3",
                 "bln3",
                 "logistic_normal",
