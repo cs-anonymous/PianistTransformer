@@ -101,6 +101,10 @@ cfg.setdefault("eval_dataloader_num_workers", cfg.get("dataloader_num_workers", 
 cfg.setdefault("eval_dataloader_persistent_workers", bool(int(cfg.get("eval_dataloader_num_workers") or 0) > 0))
 cfg.setdefault("eval_dataloader_prefetch_factor", cfg.get("dataloader_prefetch_factor", 2))
 cfg.setdefault("loss_component_interval", cfg.get("logging_steps", 20))
+cfg["use_prepared_sidecar"] = True
+cfg["use_prepared_cache"] = False
+cfg["precompute_dataset_items"] = False
+cfg["precompute_eval_dataset_items"] = False
 if resume_checkpoint:
     cfg["resume_path"] = resume_checkpoint
     cfg["resume_trainer_state"] = True
@@ -235,8 +239,11 @@ cfg["eval_split"] = "train"
 cfg["eval_performance_dataset"] = "ASAP"
 cfg["eval_include_all_performance_dataset"] = None
 cfg["max_eval_non_asap_performances_per_work"] = None
-cfg.setdefault("precompute_dataset_items", True)
-cfg.setdefault("precompute_eval_dataset_items", True)
+cfg["use_prepared_sidecar"] = True
+cfg["use_prepared_cache"] = False
+cfg["prepared_sidecar_tag"] = cfg.get("prepared_sidecar_tag") or "ASAP"
+cfg["precompute_dataset_items"] = False
+cfg["precompute_eval_dataset_items"] = False
 cfg["save_steps"] = min(int(cfg.get("save_steps", 2000)), 500)
 cfg["eval_steps"] = min(int(cfg.get("eval_steps", 2000)), 500)
 cfg["logging_steps"] = int(cfg.get("logging_steps", 20))
@@ -248,6 +255,10 @@ cfg.setdefault("eval_dataloader_num_workers", cfg.get("dataloader_num_workers", 
 cfg.setdefault("eval_dataloader_persistent_workers", bool(int(cfg.get("eval_dataloader_num_workers") or 0) > 0))
 cfg.setdefault("eval_dataloader_prefetch_factor", cfg.get("dataloader_prefetch_factor", 2))
 cfg.setdefault("loss_component_interval", cfg.get("logging_steps", 20))
+cfg["use_prepared_sidecar"] = True
+cfg["use_prepared_cache"] = False
+cfg["precompute_dataset_items"] = False
+cfg["precompute_eval_dataset_items"] = False
 open(dst, "w", encoding="utf-8").write(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
 PY
 

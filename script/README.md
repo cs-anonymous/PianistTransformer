@@ -68,7 +68,7 @@ tmux attach -t inr0624_sine_d4w1
 
 ## Python 工具的新位置
 
-- `src/train/prebuild_inr_work_pt.py`
+- `src/data_process/prebuild_inr_work_pt.py`
 - `src/evaluate/plot_target_distribution_diagnostic.py`
 - `src/evaluate/plot_zero_nz_ioi_dev_scales.py`
 - `src/evaluate/plot_duration_musical_diagnostics.py`

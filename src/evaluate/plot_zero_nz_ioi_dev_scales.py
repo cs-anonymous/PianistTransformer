@@ -16,7 +16,7 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src.train.prebuild_inr_work_pt import make_manifest, unique_work_paths
+from src.data_process.prebuild_inr_work_pt import make_manifest, unique_work_paths
 from src.train.train_inr import normalize_log_timing_dev
 
 

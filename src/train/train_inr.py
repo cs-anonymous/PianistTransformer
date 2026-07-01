@@ -929,7 +929,7 @@ class PianoCoReNodeSFTDataset(Dataset):
         precompute_items=False,
         use_prepared_cache=False,
         prepared_cache_dir=None,
-        use_prepared_sidecar=False,
+        use_prepared_sidecar=True,
         prepared_sidecar_tag=None,
     ):
         super().__init__()
@@ -1032,12 +1032,30 @@ class PianoCoReNodeSFTDataset(Dataset):
         except FileNotFoundError:
             return {"path": str(source)}
 
+    def _prepared_sidecar_paths(self, path):
+        source = Path(path)
+        tags = []
+        if self.prepared_sidecar_tag:
+            tags.append(self.prepared_sidecar_tag)
+        elif "ASAP" in source.stem.upper():
+            tags.append("ASAP")
+        candidates = []
+        for tag in tags:
+            candidates.append(source.with_suffix(f".{tag}.pt"))
+        candidates.append(source.with_suffix(".pt"))
+        deduped = []
+        seen = set()
+        for candidate in candidates:
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(candidate)
+        return deduped
+
     def _prepared_disk_cache_path(self, path):
         if self.use_prepared_sidecar:
-            source = Path(path)
-            if self.prepared_sidecar_tag:
-                return source.with_suffix(f".{self.prepared_sidecar_tag}.pt")
-            return source.with_suffix(".pt")
+            return self._prepared_sidecar_paths(path)[0]
         if self.prepared_cache_dir is None:
             return None
         source = Path(path)
@@ -1056,6 +1074,17 @@ class PianoCoReNodeSFTDataset(Dataset):
             return torch.load(cache_path, map_location="cpu")
 
     def _load_prepared_from_disk(self, path):
+        if self.use_prepared_sidecar:
+            for cache_path in self._prepared_sidecar_paths(path):
+                if not cache_path.exists():
+                    continue
+                prepared = self._torch_load_prepared(cache_path)
+                if prepared.get("_cache_signature") != self._prepared_cache_signature:
+                    continue
+                if prepared.get("_source_identity") != self._source_identity(path):
+                    continue
+                return prepared
+            return None
         cache_path = self._prepared_disk_cache_path(path)
         if cache_path is None or not cache_path.exists():
             return None
@@ -1101,7 +1130,7 @@ class PianoCoReNodeSFTDataset(Dataset):
             if self.use_prepared_sidecar and prepared is None:
                 raise FileNotFoundError(
                     f"Missing or stale INR prepared sidecar: {cache_path}. "
-                    "Run src/train/prebuild_inr_work_pt.py for the current config."
+                    "Run src/data_process/prebuild_inr_work_pt.py for the current config."
                 )
             if prepared is None:
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2235,7 +2264,7 @@ def main():
         precompute_items=train_config.get("precompute_dataset_items", False),
         use_prepared_cache=train_config.get("use_prepared_cache", False),
         prepared_cache_dir=train_config.get("prepared_cache_dir"),
-        use_prepared_sidecar=train_config.get("use_prepared_sidecar", False),
+        use_prepared_sidecar=train_config.get("use_prepared_sidecar", True),
         prepared_sidecar_tag=train_config.get("prepared_sidecar_tag"),
     )
     eval_dataset = PianoCoReNodeSFTDataset(
@@ -2264,7 +2293,7 @@ def main():
         precompute_items=train_config.get("precompute_eval_dataset_items", train_config.get("precompute_dataset_items", False)),
         use_prepared_cache=train_config.get("use_prepared_cache", False),
         prepared_cache_dir=train_config.get("prepared_cache_dir"),
-        use_prepared_sidecar=train_config.get("use_prepared_sidecar", False),
+        use_prepared_sidecar=train_config.get("use_prepared_sidecar", True),
         prepared_sidecar_tag=train_config.get("prepared_sidecar_tag"),
     )
 
