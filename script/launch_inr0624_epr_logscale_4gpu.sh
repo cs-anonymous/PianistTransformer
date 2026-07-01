@@ -23,6 +23,7 @@ make_config() {
 import json
 import sys
 from pathlib import Path
+from src.train.train_inr import integrated_epr_input_dim
 
 src, dst, mode, scale, seed, timing_sampling, run_root = sys.argv[1:8]
 scale_value = float(scale)
@@ -33,13 +34,22 @@ with open(src, encoding="utf-8") as file:
     cfg = json.load(file)
 
 cfg["note_embedding_mode"] = mode
-cfg["input_continuous_dim"] = 23
 cfg["output_continuous_dim"] = 5
+cfg["musical_feature_mode"] = "musical51"
 cfg["epr_timing_target"] = "log_deviation"
 cfg["timing_control_mode"] = "log_scaled"
 cfg["timing_log_scale"] = scale_value
+cfg["split_zero_ioi_head"] = True
+cfg["ioi_nonzero_dev_scale"] = 2.0
+cfg["ioi_zero_dev_scale"] = 4.0
 cfg["use_timing_scale_bit"] = False
+cfg["input_continuous_dim"] = integrated_epr_input_dim(
+    timing_control_mode=cfg["timing_control_mode"],
+    use_timing_scale_bit=cfg["use_timing_scale_bit"],
+    musical_feature_mode=cfg["musical_feature_mode"],
+)
 cfg["timing_input_normalization"] = f"log1p_t_over_{int(scale_value)}_5000"
+cfg["prepared_sidecar_tag"] = f"ASAP_s{int(scale_value)}_splitzeroioi_musical51"
 cfg["adapt_num_train_epochs"] = 4
 cfg["per_device_train_batch_size"] = 16
 cfg["per_device_eval_batch_size"] = 16

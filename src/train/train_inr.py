@@ -1,12 +1,14 @@
 import argparse
 import bisect
 import datetime
+import hashlib
 import json
 import math
 import os
 import random
 import shutil
 import re
+import time
 from collections import OrderedDict
 from pathlib import Path
 
@@ -64,6 +66,103 @@ def load_torch_state_dict(checkpoint_path):
     return checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
 
 
+OUTPUT_HEAD_PREFIXES = (
+    "continuous_decoder.ioi_head",
+    "continuous_decoder.ioi_zero_head",
+    "continuous_decoder.duration_head",
+    "continuous_decoder.velocity_head",
+    "continuous_decoder.shared_head",
+    "continuous_decoder.shared_extra_head",
+    "continuous_decoder.pedal_head",
+    "continuous_decoder.generic_head",
+)
+
+
+INPUT_EMBEDDING_PREFIXES = (
+    "encoder_note_encoder",
+    "decoder_note_encoder",
+    "note_encoder",
+)
+
+
+def is_output_head_parameter(name):
+    normalized = name.removeprefix("module.")
+    return normalized.startswith(OUTPUT_HEAD_PREFIXES)
+
+
+def is_input_embedding_parameter(name):
+    normalized = name.removeprefix("module.")
+    if not normalized.startswith(INPUT_EMBEDDING_PREFIXES):
+        return False
+    return any(
+        token in normalized
+        for token in (
+            "score_control_projection",
+            "performance_control_projection",
+            "musical_projection",
+            "mask_projection",
+            "continuous_mlp",
+        )
+    )
+
+
+def filter_resume_state_dict(model, state_dict, train_config):
+    model_state = model.state_dict()
+    filtered = OrderedDict()
+    reset_heads = bool(train_config.get("reset_output_heads_on_resume", False))
+    ignore_mismatched = bool(train_config.get("ignore_mismatched_resume_shapes", True))
+    skipped_heads = []
+    skipped_mismatched = []
+
+    for key, value in state_dict.items():
+        normalized_key = key.removeprefix("module.")
+        if reset_heads and is_output_head_parameter(normalized_key):
+            skipped_heads.append(key)
+            continue
+        target = model_state.get(normalized_key)
+        if target is not None and tuple(target.shape) != tuple(value.shape):
+            if ignore_mismatched:
+                skipped_mismatched.append((key, tuple(value.shape), tuple(target.shape)))
+                continue
+        filtered[normalized_key] = value
+
+    if skipped_heads:
+        print(f"Reset output heads on resume: skipped {len(skipped_heads)} head tensors")
+        print(f"  head examples: {skipped_heads[:8]}")
+    if skipped_mismatched:
+        print(f"Skipped mismatched resume tensors: {len(skipped_mismatched)}")
+        for key, src_shape, dst_shape in skipped_mismatched[:12]:
+            print(f"  {key}: checkpoint{src_shape} -> model{dst_shape}")
+    return filtered
+
+
+def apply_trainable_parameter_policy(model, train_config):
+    if train_config.get("freeze_non_output_heads", False):
+        trainable = []
+        train_input_embedding = bool(train_config.get("freeze_train_input_embedding", False))
+        for name, param in model.named_parameters():
+            param.requires_grad = is_output_head_parameter(name) or (
+                train_input_embedding and is_input_embedding_parameter(name)
+            )
+            if param.requires_grad:
+                trainable.append(name)
+        detail = "output heads + input embedding projections" if train_input_embedding else "output heads only"
+        print(f"Freeze policy: {detail} ({len(trainable)} tensors trainable)")
+        print(f"  trainable examples: {trainable[:12]}")
+        return
+
+    trainable_regex = train_config.get("trainable_parameter_regex")
+    if trainable_regex:
+        pattern = re.compile(trainable_regex)
+        trainable = []
+        for name, param in model.named_parameters():
+            param.requires_grad = bool(pattern.search(name))
+            if param.requires_grad:
+                trainable.append(name)
+        print(f"Freeze policy: regex={trainable_regex!r} ({len(trainable)} tensors trainable)")
+        print(f"  trainable examples: {trainable[:12]}")
+
+
 def score_json_path(refined_dir, score_rel_path):
     score_path = Path(refined_dir) / score_rel_path
     candidates = [
@@ -101,12 +200,18 @@ def make_windows(total_notes, block_notes, overlap_ratio, min_notes):
     return deduped
 
 
-def default_input_continuous_dim(task_type, input_feature_mode, score_feature_dim=8, continuous_dim=7):
+def default_input_continuous_dim(
+    task_type,
+    input_feature_mode,
+    score_feature_dim=8,
+    continuous_dim=7,
+    musical_feature_mode="categorical",
+):
     if input_feature_mode == "integrated":
         if task_type == "epr":
-            return integrated_epr_input_dim()
+            return integrated_epr_input_dim(musical_feature_mode=musical_feature_mode)
         if task_type == "csr":
-            return integrated_epr_input_dim()
+            return integrated_epr_input_dim(musical_feature_mode="continuous")
     return continuous_dim
 
 
@@ -141,14 +246,25 @@ def timing_control_feature_dim(timing_control_mode=None, use_timing_scale_bit=Tr
     return 3 if mode in {"piecewise_single", "log_scaled"} else 5
 
 
-def integrated_epr_input_dim(timing_control_mode=None, use_timing_scale_bit=True):
+def musical_feature_dim(musical_feature_mode="categorical"):
+    mode = str(musical_feature_mode).lower()
+    if mode == "continuous":
+        return 12
+    if mode in {"categorical", "categorical51", "musical51"}:
+        return 51
+    if mode in {"categorical62", "musical62"}:
+        return 62
+    raise ValueError(f"Unsupported musical_feature_mode={musical_feature_mode}")
+
+
+def integrated_epr_input_dim(timing_control_mode=None, use_timing_scale_bit=True, musical_feature_mode="categorical"):
     control_dim = timing_control_feature_dim(
         timing_control_mode=timing_control_mode,
         use_timing_scale_bit=use_timing_scale_bit,
     )
     score_control_dim = control_dim
     performance_control_dim = control_dim + 2
-    musical_dim = 12
+    musical_dim = musical_feature_dim(musical_feature_mode)
     mask_dim = 3
     return score_control_dim + performance_control_dim + musical_dim + mask_dim
 
@@ -300,9 +416,24 @@ def _uses_log_deviation_target(epr_timing_target):
     return str(epr_timing_target or "").lower() in {"log_deviation", "log_dev", "log_deviation_ratio", "log_dev_ratio"}
 
 
-def normalize_ioi_dev(score_ioi_ms, perf_ioi_ms, epr_timing_target="deviation", log_scale=50.0):
+def normalize_ioi_dev(
+    score_ioi_ms,
+    perf_ioi_ms,
+    epr_timing_target="deviation",
+    log_scale=50.0,
+    split_zero_ioi_head=False,
+    nonzero_scale=2.0,
+    zero_scale=4.0,
+):
     if _uses_log_deviation_target(epr_timing_target):
-        return normalize_log_timing_dev(score_ioi_ms, perf_ioi_ms, scale=log_scale, max_time_ms=5000.0)
+        score_norm = normalize_log_timing_value(score_ioi_ms, scale=log_scale, max_time_ms=5000.0)
+        perf_norm = normalize_log_timing_value(perf_ioi_ms, scale=log_scale, max_time_ms=5000.0)
+        delta = perf_norm - score_norm
+        if split_zero_ioi_head and float(score_ioi_ms) <= 0.0:
+            return min(max(float(zero_scale) * delta, 0.0), 1.0)
+        offset = 0.5 if split_zero_ioi_head else 0.5
+        scale = float(nonzero_scale) if split_zero_ioi_head else 1.0
+        return min(max(scale * delta + offset, 0.0), 1.0)
     dev_ms = float(perf_ioi_ms) - float(score_ioi_ms)
     return min(max((dev_ms + 500.0) / 1000.0, 0.0), 1.0)
 
@@ -314,7 +445,15 @@ def normalize_duration_dev(score_duration_ms, perf_duration_ms, epr_timing_targe
     return min(max((dev_ms + 500.0) / 1000.0, 0.0), 1.0)
 
 
-def performance_dev_velocity_pedal2_rows(perf, score_shared_raw, epr_timing_target="deviation", log_scale=50.0):
+def performance_dev_velocity_pedal2_rows(
+    perf,
+    score_shared_raw,
+    epr_timing_target="deviation",
+    log_scale=50.0,
+    split_zero_ioi_head=False,
+    ioi_nonzero_dev_scale=2.0,
+    ioi_zero_dev_scale=4.0,
+):
     shared_rows = perf.get("label_shared_raw")
     pedal_rows = _raw_value_rows(perf, "label_pedal2_raw", "pedal2_raw")
     if shared_rows is None or pedal_rows is None:
@@ -341,6 +480,9 @@ def performance_dev_velocity_pedal2_rows(perf, score_shared_raw, epr_timing_targ
                     perf_row[0],
                     epr_timing_target=epr_timing_target,
                     log_scale=log_scale,
+                    split_zero_ioi_head=split_zero_ioi_head,
+                    nonzero_scale=ioi_nonzero_dev_scale,
+                    zero_scale=ioi_zero_dev_scale,
                 ),
                 normalize_duration_dev(
                     score_row[1],
@@ -412,10 +554,65 @@ def encode_shared_control_row(raw_shared_row, use_timing_scale_bit=True, timing_
     ]
 
 
-def build_score_musical_rows(score):
+def _one_hot_bucket(value, edges):
+    bucket = 0
+    for edge in edges:
+        if value <= edge + 1e-12:
+            return bucket
+        bucket += 1
+    return bucket
+
+
+MUSICAL_MD_CATEGORIES = [
+    0.5,
+    0.25,
+    1.0,
+    1.0 / 3.0,
+    0.125,
+    1.0 / 6.0,
+    2.0,
+    1.5,
+    0.75,
+    3.0,
+    4.0,
+    0.0,
+    1.0 / 12.0,
+    0.375,
+    0.0625,
+    2.0 / 3.0,
+]
+
+MUSICAL_ML_CATEGORIES = [3.0, 4.0, 2.0, 1.5, 6.0, 1.0, 0.5, 0.25]
+
+MUSICAL_MO_PHASE_CATEGORIES = [
+    0.0,
+    0.5,
+    0.25,
+    2.0 / 3.0,
+    1.0 / 3.0,
+    0.75,
+    1.0 / 6.0,
+    0.125,
+    0.375,
+    0.2,
+    5.0 / 6.0,
+    0.875,
+    0.4,
+    1.0 / 7.0,
+    1.0 / 12.0,
+    0.625,
+]
+
+
+def _one_hot_exact(value, categories, tol=1e-4):
+    return [1.0 if abs(float(value) - float(category)) <= tol else 0.0 for category in categories]
+
+
+def build_score_musical_rows(score, musical_feature_mode="continuous"):
     score_feature = score.get("score_feature", [])
     has_score_feature = score.get("has_score_feature", [0] * len(score.get("pitch", [])))
     score_raw = score.get("score_raw", [])
+    mode = str(musical_feature_mode).lower()
 
     rows = []
     measure_start = 0.0
@@ -426,13 +623,13 @@ def build_score_musical_rows(score):
 
     for idx, has_feature in enumerate(has_score_feature):
         if not bool(has_feature):
-            rows.append([0.0] * 12)
+            rows.append([0.0] * musical_feature_dim(mode))
             continue
 
         feature = score_feature[idx]
         mo = float(feature[0]) if len(feature) > 0 else 0.0
         md = float(feature[1]) if len(feature) > 1 else 0.0
-        ml = float(feature[2]) if len(feature) > 2 else current_measure_length
+        raw_ml = float(feature[2]) if len(feature) > 2 else 0.0
         first = 1.0 if len(feature) > 3 and float(feature[3]) >= 0.5 else 0.0
         hand = 1.0 if len(feature) > 4 and float(feature[4]) >= 0.5 else 0.0
         trill = 1.0 if len(feature) > 5 and float(feature[5]) >= 0.5 else 0.0
@@ -442,12 +639,14 @@ def build_score_musical_rows(score):
 
         if not seen_any_measure:
             seen_any_measure = True
-            if ml > 0.0:
-                current_measure_length = ml
+            if raw_ml > 0.0:
+                current_measure_length = raw_ml
         elif first >= 0.5:
             measure_start += max(current_measure_length, 0.0)
-            if ml > 0.0:
-                current_measure_length = ml
+            if raw_ml > 0.0:
+                current_measure_length = raw_ml
+        ml_eff = current_measure_length
+        ml_present = 1.0 if raw_ml > 0.0 else 0.0
 
         q = measure_start + mo
         mioi = 0.0 if prev_q is None else max(q - prev_q, 0.0)
@@ -466,18 +665,65 @@ def build_score_musical_rows(score):
         tempo_bpm = 60000.0 / max(prev_ms_per_quarter, 1e-6)
         tempo_norm = min(max(tempo_bpm, 0.0), 300.0) / 300.0
 
+        if mode == "continuous":
+            rows.append(
+                [
+                    min(max(mo / 6.0, 0.0), 1.0),
+                    min(max(mioi / 6.0, 0.0), 1.0),
+                    min(max(md / 6.0, 0.0), 1.0),
+                    min(max(raw_ml / 6.0, 0.0), 1.0),
+                    tempo_norm,
+                    first,
+                    grace,
+                    hand,
+                    trill,
+                    stacc,
+                    1.0 if stem_code == 1 else 0.0,
+                    1.0 if stem_code == 2 else 0.0,
+                ]
+            )
+            continue
+
+        if mode in {"categorical62", "musical62"}:
+            d_bins = _one_hot_bucket(md, [0.0, 1 / 16, 1 / 12, 1 / 8, 1 / 6, 1 / 4, 1 / 3, 3 / 8, 1 / 2, 2 / 3, 3 / 4, 1.0, 1.5, 2.0, 3.0])
+            i_bins = _one_hot_bucket(mioi, [0.0, 1 / 16, 1 / 12, 1 / 8, 1 / 6, 1 / 4, 1 / 3, 3 / 8, 1 / 2, 2 / 3, 3 / 4, 1.0, 1.5, 2.0, 3.0])
+            l_bins = _one_hot_bucket(raw_ml, [0.0, 1.0, 1.5, 2.0, 4.0])
+            phase = (mo / max(raw_ml, 1e-6)) % 1.0 if raw_ml > 0 else (mo / 4.0) % 1.0
+            o_phase = min(15, int(math.floor(phase * 16.0)))
+            o_scalar = min(max(mo / 6.0, 0.0), 1.0)
+
+            rows.append(
+                [
+                    *([1.0 if d_bins == k else 0.0 for k in range(16)]),
+                    *([1.0 if i_bins == k else 0.0 for k in range(16)]),
+                    *([1.0 if l_bins == k else 0.0 for k in range(6)]),
+                    *([1.0 if o_phase == k else 0.0 for k in range(16)]),
+                    o_scalar,
+                    first,
+                    grace,
+                    hand,
+                    trill,
+                    stacc,
+                    1.0 if stem_code == 1 else 0.0,
+                    1.0 if stem_code == 2 else 0.0,
+                ]
+            )
+            continue
+
+        mo_phase = (mo / max(ml_eff, 1e-6)) % 1.0 if ml_eff > 0 else 0.0
         rows.append(
             [
-                min(max(mo / 6.0, 0.0), 1.0),
-                min(max(mioi / 6.0, 0.0), 1.0),
+                *_one_hot_exact(md, MUSICAL_MD_CATEGORIES),
                 min(max(md / 6.0, 0.0), 1.0),
-                min(max(ml / 6.0, 0.0), 1.0),
-                # Local musical tempo in BPM; log timing is only used for timing controls/targets.
+                *_one_hot_exact(ml_eff, MUSICAL_ML_CATEGORIES),
+                min(max(ml_eff / 6.0, 0.0), 1.0),
+                ml_present,
+                *_one_hot_exact(mo_phase, MUSICAL_MO_PHASE_CATEGORIES),
+                min(max(mo_phase, 0.0), 1.0),
                 tempo_norm,
-                first,
-                grace,
                 hand,
                 trill,
+                grace,
                 stacc,
                 1.0 if stem_code == 1 else 0.0,
                 1.0 if stem_code == 2 else 0.0,
@@ -486,10 +732,16 @@ def build_score_musical_rows(score):
     return rows
 
 
-def build_epr_score_input_rows(score, use_timing_scale_bit=True, timing_control_mode=None, log_scale=50.0):
+def build_epr_score_input_rows(
+    score,
+    use_timing_scale_bit=True,
+    timing_control_mode=None,
+    log_scale=50.0,
+    musical_feature_mode="categorical",
+):
     score_raw = score["score_raw"]
     has_score_feature = score.get("has_score_feature", [0] * len(score["pitch"]))
-    musical_rows = build_score_musical_rows(score)
+    musical_rows = build_score_musical_rows(score, musical_feature_mode=musical_feature_mode)
     control_dim = timing_control_feature_dim(
         timing_control_mode=timing_control_mode,
         use_timing_scale_bit=use_timing_scale_bit,
@@ -666,11 +918,19 @@ class PianoCoReNodeSFTDataset(Dataset):
         epr_timing_bins=5000,
         epr_value_bins=128,
         pedal_representation="continuous_4",
+        musical_feature_mode="categorical",
         epr_timing_target="absolute",
         use_timing_scale_bit=True,
         timing_control_mode=None,
         timing_log_scale=50.0,
+        split_zero_ioi_head=False,
+        ioi_nonzero_dev_scale=2.0,
+        ioi_zero_dev_scale=4.0,
         precompute_items=False,
+        use_prepared_cache=False,
+        prepared_cache_dir=None,
+        use_prepared_sidecar=False,
+        prepared_sidecar_tag=None,
     ):
         super().__init__()
         self.split = split
@@ -681,6 +941,7 @@ class PianoCoReNodeSFTDataset(Dataset):
         self.epr_timing_bins = epr_timing_bins
         self.epr_value_bins = epr_value_bins
         self.pedal_representation = pedal_representation
+        self.musical_feature_mode = str(musical_feature_mode).lower()
         self.epr_timing_target = str(epr_timing_target or "absolute").lower()
         self.use_timing_scale_bit = bool(use_timing_scale_bit)
         self.timing_control_mode = resolve_timing_control_mode(
@@ -688,6 +949,9 @@ class PianoCoReNodeSFTDataset(Dataset):
             use_timing_scale_bit=use_timing_scale_bit,
         )
         self.timing_log_scale = float(timing_log_scale)
+        self.split_zero_ioi_head = bool(split_zero_ioi_head)
+        self.ioi_nonzero_dev_scale = float(ioi_nonzero_dev_scale)
+        self.ioi_zero_dev_scale = float(ioi_zero_dev_scale)
         items = list(manifest)
         if shuffle:
             random.Random(seed).shuffle(items)
@@ -721,10 +985,167 @@ class PianoCoReNodeSFTDataset(Dataset):
         self.total_examples = total
         self.precompute_items = bool(precompute_items)
         self.cache_size = max(int(cache_size), len(self.items)) if self.precompute_items else int(cache_size)
+        self.use_prepared_cache = bool(use_prepared_cache)
+        self.use_prepared_sidecar = bool(use_prepared_sidecar)
+        self.prepared_sidecar_tag = str(prepared_sidecar_tag) if prepared_sidecar_tag else None
+        self.prepared_cache_dir = Path(prepared_cache_dir) if prepared_cache_dir else None
+        if self.use_prepared_cache and self.prepared_cache_dir is None:
+            raise ValueError("use_prepared_cache=true requires prepared_cache_dir")
+        if self.prepared_cache_dir is not None:
+            self.prepared_cache_dir.mkdir(parents=True, exist_ok=True)
+        self._prepared_cache_signature = self._build_prepared_cache_signature()
         self._cache = OrderedDict()
         self._prepared_cache = OrderedDict()
         if self.precompute_items:
             self._precompute_items()
+
+    def _build_prepared_cache_signature(self):
+        signature = {
+            "schema": 4,
+            "task_type": self.task_type,
+            "input_feature_mode": self.input_feature_mode,
+            "timing_normalization": self.timing_normalization,
+            "max_time_ms": self.max_time_ms,
+            "epr_timing_bins": self.epr_timing_bins,
+            "epr_value_bins": self.epr_value_bins,
+            "pedal_representation": self.pedal_representation,
+            "musical_feature_mode": self.musical_feature_mode,
+            "epr_timing_target": self.epr_timing_target,
+            "use_timing_scale_bit": self.use_timing_scale_bit,
+            "timing_control_mode": self.timing_control_mode,
+            "timing_log_scale": self.timing_log_scale,
+            "split_zero_ioi_head": self.split_zero_ioi_head,
+            "ioi_nonzero_dev_scale": self.ioi_nonzero_dev_scale,
+            "ioi_zero_dev_scale": self.ioi_zero_dev_scale,
+        }
+        return json.dumps(signature, sort_keys=True, separators=(",", ":"))
+
+    def _source_identity(self, path):
+        source = Path(path)
+        try:
+            stat = source.stat()
+            return {
+                "path": str(source.resolve()),
+                "mtime_ns": stat.st_mtime_ns,
+                "size": stat.st_size,
+            }
+        except FileNotFoundError:
+            return {"path": str(source)}
+
+    def _prepared_disk_cache_path(self, path):
+        if self.use_prepared_sidecar:
+            source = Path(path)
+            if self.prepared_sidecar_tag:
+                return source.with_suffix(f".{self.prepared_sidecar_tag}.pt")
+            return source.with_suffix(".pt")
+        if self.prepared_cache_dir is None:
+            return None
+        source = Path(path)
+        source_identity = dict(self._source_identity(path))
+        source_identity["signature"] = self._prepared_cache_signature
+        digest = hashlib.sha256(
+            json.dumps(source_identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", source.stem)[:80]
+        return self.prepared_cache_dir / self.split / f"{stem}.{digest}.pt"
+
+    def _torch_load_prepared(self, cache_path):
+        try:
+            return torch.load(cache_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            return torch.load(cache_path, map_location="cpu")
+
+    def _load_prepared_from_disk(self, path):
+        cache_path = self._prepared_disk_cache_path(path)
+        if cache_path is None or not cache_path.exists():
+            return None
+        prepared = self._torch_load_prepared(cache_path)
+        if prepared.get("_cache_signature") != self._prepared_cache_signature:
+            return None
+        if prepared.get("_source_identity") != self._source_identity(path):
+            return None
+        return prepared
+
+    def _save_prepared_to_disk(self, path, prepared):
+        cache_path = self._prepared_disk_cache_path(path)
+        if cache_path is None:
+            return
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.tmp")
+        payload = dict(prepared)
+        payload["_cache_signature"] = self._prepared_cache_signature
+        payload["_source_identity"] = self._source_identity(path)
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, cache_path)
+
+    def _wait_for_prepared_cache(self, path, lock_path, timeout=900.0):
+        start = time.time()
+        while time.time() - start < timeout:
+            prepared = self._load_prepared_from_disk(path)
+            if prepared is not None:
+                return prepared
+            if not lock_path.exists():
+                return None
+            time.sleep(0.25)
+        return None
+
+    def _load_or_prepare_work(self, path):
+        if path in self._prepared_cache:
+            self._prepared_cache.move_to_end(path)
+            return self._prepared_cache[path]
+
+        prepared = None
+        cache_path = self._prepared_disk_cache_path(path) if (self.use_prepared_cache or self.use_prepared_sidecar) else None
+        if cache_path is not None:
+            prepared = self._load_prepared_from_disk(path)
+            if self.use_prepared_sidecar and prepared is None:
+                raise FileNotFoundError(
+                    f"Missing or stale INR prepared sidecar: {cache_path}. "
+                    "Run script/prebuild_inr_work_pt.py for the current config."
+                )
+            if prepared is None:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                lock_path = cache_path.with_suffix(cache_path.suffix + ".lock")
+                try:
+                    lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                except FileExistsError:
+                    prepared = self._wait_for_prepared_cache(path, lock_path)
+                else:
+                    try:
+                        os.close(lock_fd)
+                        work = self._load_work(path)
+                        prepared = self._prepare_work(
+                            path,
+                            work,
+                            eager_labels=True,
+                            slim_performances=True,
+                            split_filter=True,
+                            force_rebuild=True,
+                        )
+                        self._save_prepared_to_disk(path, prepared)
+                    finally:
+                        try:
+                            lock_path.unlink()
+                        except FileNotFoundError:
+                            pass
+
+        if prepared is None:
+            work = self._load_work(path)
+            prepared = self._prepare_work(
+                path,
+                work,
+                eager_labels=self.use_prepared_cache,
+                slim_performances=self.use_prepared_cache,
+                split_filter=True,
+                force_rebuild=self.use_prepared_cache,
+            )
+
+        self._prepared_cache[path] = prepared
+        self._prepared_cache.move_to_end(path)
+        while len(self._prepared_cache) > self.cache_size:
+            evicted_path, _ = self._prepared_cache.popitem(last=False)
+            self._cache.pop(evicted_path, None)
+        return prepared
 
     def __len__(self):
         return self.total_examples
@@ -743,39 +1164,87 @@ class PianoCoReNodeSFTDataset(Dataset):
             self._prepared_cache.pop(evicted_path, None)
         return work
 
-    def _prepare_work(self, path, work):
-        if path in self._prepared_cache:
+    def _prepare_work(
+        self,
+        path,
+        work,
+        eager_labels=False,
+        slim_performances=False,
+        split_filter=True,
+        force_rebuild=False,
+    ):
+        if not force_rebuild and path in self._prepared_cache:
             self._prepared_cache.move_to_end(path)
             return self._prepared_cache[path]
 
         score = work["score"]
-        performances = [
-            perf for perf in work["performances"]
-            if perf.get("split", self.split) == self.split
-        ]
+        performances = list(work["performances"])
+        if split_filter:
+            performances = [
+                perf for perf in performances
+                if perf.get("split", self.split) == self.split
+            ]
         by_source = {perf.get("performance_source"): perf for perf in performances}
+
+        task_type = self.task_type.lower()
 
         # Cache score inputs and raw-label conversions per dataloader worker.
         # The new raw schema would otherwise rebuild the same score/performance
         # tensors for every overlapping window.
+        if slim_performances:
+            score_payload = {
+                "pitch": score["pitch"],
+                "score_raw": score["score_raw"],
+            }
+            if task_type == "csr":
+                score_payload["has_score_feature"] = score["has_score_feature"]
+        else:
+            score_payload = score
         prepared = {
-            "score": score,
+            "score": score_payload,
             "performances": performances,
             "performances_by_source": by_source,
             "label_cache": {},
         }
 
-        task_type = self.task_type.lower()
         if task_type == "epr":
             prepared["score_input"] = build_epr_score_input_rows(
                 score,
                 use_timing_scale_bit=self.use_timing_scale_bit,
                 timing_control_mode=self.timing_control_mode,
                 log_scale=self.timing_log_scale,
+                musical_feature_mode=self.musical_feature_mode,
             )
         elif task_type == "csr":
-            prepared["score_musical"] = build_score_musical_rows(score)
+            prepared["score_musical"] = build_score_musical_rows(score, musical_feature_mode="continuous")
             prepared["has_score_feature"] = score["has_score_feature"]
+
+        if eager_labels:
+            slimmed = []
+            label_prepared = dict(prepared)
+            label_prepared["score"] = score
+            for perf in performances:
+                labels, label_bins = self._compute_performance_labels(label_prepared, perf)
+                slim_perf = {
+                    "performance_source": perf.get("performance_source"),
+                    "performance_id": perf.get("performance_id", "unknown"),
+                    "performance_dataset": perf.get("performance_dataset", "unknown"),
+                    "split": perf.get("split", self.split),
+                    "interpolated": perf["interpolated"],
+                    "labels": labels,
+                    "label_bins": label_bins,
+                }
+                slimmed.append(slim_perf if slim_performances else perf)
+                if not slim_performances:
+                    prepared["label_cache"][self._performance_cache_key(slim_perf)] = (labels, label_bins)
+            if slim_performances:
+                prepared["performances"] = slimmed
+                prepared["performances_by_source"] = {
+                    perf.get("performance_source"): perf
+                    for perf in slimmed
+                    if perf.get("performance_source") is not None
+                }
+                prepared["label_cache"] = {}
 
         self._prepared_cache[path] = prepared
         self._prepared_cache.move_to_end(path)
@@ -787,9 +1256,34 @@ class PianoCoReNodeSFTDataset(Dataset):
     def _selected_performances(self, prepared, item):
         selected_sources = item.get("selected_performance_sources")
         if selected_sources is None:
-            return prepared["performances"]
-        by_source = prepared["performances_by_source"]
-        return [by_source[source] for source in selected_sources if source in by_source]
+            selected = prepared["performances"]
+        else:
+            by_source = prepared["performances_by_source"]
+            selected = [by_source[source] for source in selected_sources if source in by_source]
+        return [
+            perf for perf in selected
+            if perf.get("split", self.split) == self.split
+        ]
+
+    def write_prepared_sidecar(self, path, selected_sources=None):
+        work = self._load_work(path)
+        if selected_sources is not None:
+            selected_sources = set(selected_sources)
+            work = dict(work)
+            work["performances"] = [
+                perf for perf in work.get("performances", [])
+                if perf.get("performance_source") in selected_sources
+            ]
+        prepared = self._prepare_work(
+            path,
+            work,
+            eager_labels=True,
+            slim_performances=True,
+            split_filter=False,
+            force_rebuild=True,
+        )
+        self._save_prepared_to_disk(path, prepared)
+        return self._prepared_disk_cache_path(path)
 
     def _performance_cache_key(self, perf):
         return (
@@ -798,12 +1292,7 @@ class PianoCoReNodeSFTDataset(Dataset):
             or id(perf)
         )
 
-    def _performance_labels(self, prepared, perf):
-        label_cache = prepared["label_cache"]
-        cache_key = self._performance_cache_key(perf)
-        if cache_key in label_cache:
-            return label_cache[cache_key]
-
+    def _compute_performance_labels(self, prepared, perf):
         if self.task_type.lower() == "epr" and self.epr_timing_target in {
             "deviation",
             "dev",
@@ -815,10 +1304,12 @@ class PianoCoReNodeSFTDataset(Dataset):
                 prepared["score"]["score_raw"],
                 epr_timing_target=self.epr_timing_target,
                 log_scale=self.timing_log_scale,
+                split_zero_ioi_head=self.split_zero_ioi_head,
+                ioi_nonzero_dev_scale=self.ioi_nonzero_dev_scale,
+                ioi_zero_dev_scale=self.ioi_zero_dev_scale,
             )
             if labels is None:
                 raise KeyError("Missing score_raw/label_shared_raw/label_pedal2_raw for deviation EPR targets")
-            label_cache[cache_key] = (labels, None)
             return labels, None
         if self.task_type.lower() == "epr" and self.epr_timing_target in {"deviation_ratio", "dev_ratio"}:
             labels = performance_dev_velocity_pedal2_rows(
@@ -826,10 +1317,12 @@ class PianoCoReNodeSFTDataset(Dataset):
                 prepared["score"]["score_raw"],
                 epr_timing_target=self.epr_timing_target,
                 log_scale=self.timing_log_scale,
+                split_zero_ioi_head=self.split_zero_ioi_head,
+                ioi_nonzero_dev_scale=self.ioi_nonzero_dev_scale,
+                ioi_zero_dev_scale=self.ioi_zero_dev_scale,
             )
             if labels is None:
                 raise KeyError("Missing score_raw/label_shared_raw/label_pedal2_raw for deviation EPR targets")
-            label_cache[cache_key] = (labels, None)
             return labels, None
         if self.task_type.lower() == "csr":
             labels = build_csr_performance_input_rows(
@@ -840,7 +1333,6 @@ class PianoCoReNodeSFTDataset(Dataset):
             )
             if labels is None:
                 raise KeyError("Missing label_shared_raw/label_pedal2_raw for CSR inputs")
-            label_cache[cache_key] = (labels, None)
             return labels, None
 
         labels = performance_label_rows_for_representation(
@@ -855,6 +1347,16 @@ class PianoCoReNodeSFTDataset(Dataset):
             timing_bins=self.epr_timing_bins,
             value_bins=self.epr_value_bins,
         )
+        return labels, label_bins
+
+    def _performance_labels(self, prepared, perf):
+        if "labels" in perf:
+            return perf["labels"], perf.get("label_bins")
+        label_cache = prepared["label_cache"]
+        cache_key = self._performance_cache_key(perf)
+        if cache_key in label_cache:
+            return label_cache[cache_key]
+        labels, label_bins = self._compute_performance_labels(prepared, perf)
         label_cache[cache_key] = (labels, label_bins)
         return labels, label_bins
 
@@ -876,8 +1378,7 @@ class PianoCoReNodeSFTDataset(Dataset):
             )
         total_performances = 0
         for item in self.items:
-            work = self._load_work(item["path"])
-            prepared = self._prepare_work(item["path"], work)
+            prepared = self._load_or_prepare_work(item["path"])
             performances = self._selected_performances(prepared, item)
             for perf in performances:
                 self._performance_labels(prepared, perf)
@@ -890,6 +1391,56 @@ class PianoCoReNodeSFTDataset(Dataset):
                         "split": self.split,
                         "works": len(self._prepared_cache),
                         "performances": total_performances,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+
+    def prebuild_prepared_cache(self):
+        rank, _ = distributed_info()
+        if rank == 0:
+            print(
+                json.dumps(
+                    {
+                        "event": "prepared_cache_prebuild_start",
+                        "split": self.split,
+                        "works": len(self.items),
+                        "cache_dir": str(self.prepared_cache_dir) if self.prepared_cache_dir else None,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        total_performances = 0
+        for idx, item in enumerate(self.items, start=1):
+            prepared = self._load_or_prepare_work(item["path"])
+            total_performances += len(self._selected_performances(prepared, item))
+            if rank == 0 and (idx % 25 == 0 or idx == len(self.items)):
+                print(
+                    json.dumps(
+                        {
+                            "event": "prepared_cache_prebuild_progress",
+                            "split": self.split,
+                            "works_done": idx,
+                            "works": len(self.items),
+                            "performances_seen": total_performances,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+        if rank == 0:
+            print(
+                json.dumps(
+                    {
+                        "event": "prepared_cache_prebuild_done",
+                        "split": self.split,
+                        "works": len(self.items),
+                        "performances_seen": total_performances,
                     },
                     ensure_ascii=False,
                     sort_keys=True,
@@ -914,8 +1465,7 @@ class PianoCoReNodeSFTDataset(Dataset):
         window_slot = local_index % window_count
         start, end = windows[window_slot]
 
-        work = self._load_work(item["path"])
-        prepared = self._prepare_work(item["path"], work)
+        prepared = self._load_or_prepare_work(item["path"])
         score = prepared["score"]
         performances = self._selected_performances(prepared, item)
         if not performances:
@@ -973,6 +1523,7 @@ class NodeSFTTrainer(Trainer):
             inputs["labels_continuous"].detach(),
             loss_mask,
             labels_epr_bins=inputs.get("labels_epr_bins"),
+            score_shared_raw=inputs.get("score_shared_raw"),
         )
         if not getattr(self, "_loss_component_sums", None):
             self._loss_component_sums = {name: 0.0 for name in components}
@@ -1275,6 +1826,23 @@ def create_model(train_config):
         if "epr_distribution" not in train_config:
             raise ValueError("EPR config must set epr_distribution explicitly")
         distribution = str(train_config["epr_distribution"]).lower()
+        if train_config.get("split_zero_ioi_head", False):
+            if epr_timing_target not in {"log_deviation", "log_dev"}:
+                raise ValueError("split_zero_ioi_head requires epr_timing_target=log_deviation/log_dev")
+            supported_split_distributions = {
+                "point",
+                "huber",
+                "deterministic_huber",
+                "amln3",
+                "logistic_normal",
+                "mixture_logistic_normal",
+                "mixture_beta",
+            }
+            if distribution not in supported_split_distributions:
+                raise ValueError(
+                    "split_zero_ioi_head currently supports scalar point/MLN/AMLN/mixture_beta heads only; "
+                    f"got epr_distribution={distribution}"
+                )
         supported_distributions = {
             "point",
             "huber",
@@ -1366,11 +1934,18 @@ def create_model(train_config):
                 f"Integrated INR0624 CSR expects output_continuous_dim={expected_output_dim}, got {actual_output_dim}"
             )
     score_feature_dim = train_config.get("score_feature_dim", 8)
+    musical_feature_mode = str(
+        train_config.get(
+            "musical_feature_mode",
+            "continuous" if task_type == "csr" else "categorical",
+        )
+    ).lower()
     input_continuous_dim = train_config.get(
         "input_continuous_dim",
         integrated_epr_input_dim(
             timing_control_mode=timing_control_mode,
             use_timing_scale_bit=use_timing_scale_bit,
+            musical_feature_mode=musical_feature_mode,
         )
         if task_type == "epr" and input_feature_mode == "integrated"
         else default_input_continuous_dim(
@@ -1378,12 +1953,14 @@ def create_model(train_config):
             input_feature_mode,
             score_feature_dim=score_feature_dim,
             continuous_dim=train_config.get("continuous_dim", 7),
+            musical_feature_mode=musical_feature_mode,
         ),
     )
     if task_type in {"epr", "csr"} and input_feature_mode == "integrated":
         expected_input_dim = integrated_epr_input_dim(
             timing_control_mode=timing_control_mode,
             use_timing_scale_bit=use_timing_scale_bit,
+            musical_feature_mode=musical_feature_mode,
         )
         if int(input_continuous_dim) != expected_input_dim:
             raise ValueError(
@@ -1432,6 +2009,7 @@ def create_model(train_config):
         head_input_mode=train_config.get("head_input_mode", "full"),
         embedding_depth=train_config.get("embedding_depth", 2),
         head_depth=train_config.get("head_depth", 2),
+        head_width_multiplier=train_config.get("head_width_multiplier", 1.0),
         head_activation=train_config.get("head_activation", "gelu"),
         epr_distribution=train_config.get("epr_distribution", "point"),
         epr_mixture_components=train_config.get("epr_mixture_components", 1),
@@ -1447,9 +2025,13 @@ def create_model(train_config):
         epr_timing_target=epr_timing_target,
         timing_control_mode=timing_control_mode,
         timing_log_scale=train_config.get("timing_log_scale", 50.0),
+        split_zero_ioi_head=train_config.get("split_zero_ioi_head", False),
+        ioi_nonzero_dev_scale=train_config.get("ioi_nonzero_dev_scale", 2.0),
+        ioi_zero_dev_scale=train_config.get("ioi_zero_dev_scale", 4.0),
         use_timing_scale_bit=use_timing_scale_bit,
         soft_ce_tau=train_config.get("soft_ce_tau"),
         timing_input_normalization=train_config.get("timing_input_normalization", "scaled_log_5000_s10"),
+        musical_feature_mode=musical_feature_mode,
         prior_token_keep_prob=train_config.get("prior_token_keep_prob", 1.0),
         prior_token_dropout_mode=train_config.get("prior_token_dropout_mode", "mask"),
         piano_pitch_min=train_config.get("piano_pitch_min", 21),
@@ -1463,6 +2045,7 @@ def create_model(train_config):
     if resume_path:
         model = IntegratedPianoT5Gemma(model_config) if backbone_type in {"t5", "t5gemma"} else IntegratedPianoTransformer(model_config)
         state_dict = load_torch_state_dict(resume_path)
+        state_dict = filter_resume_state_dict(model, state_dict, train_config)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         print(f"Loaded Integrated {backbone_type} weights from {resume_path}")
         print(f"Missing keys: {len(missing)}")
@@ -1539,11 +2122,19 @@ def main():
         timing_control_mode=train_config.get("timing_control_mode"),
         use_timing_scale_bit=train_config.get("use_timing_scale_bit", True),
     )
+    musical_feature_mode = str(
+        train_config.get(
+            "musical_feature_mode",
+            "continuous" if task_type == "csr" else "categorical",
+        )
+    ).lower()
+    train_config["musical_feature_mode"] = musical_feature_mode
     train_config.setdefault(
         "input_continuous_dim",
         integrated_epr_input_dim(
             timing_control_mode=timing_control_mode,
             use_timing_scale_bit=train_config.get("use_timing_scale_bit", True),
+            musical_feature_mode=musical_feature_mode,
         )
         if task_type in {"epr", "csr"} and input_feature_mode == "integrated"
         else default_input_continuous_dim(
@@ -1551,6 +2142,7 @@ def main():
             input_feature_mode,
             score_feature_dim=train_config.get("score_feature_dim", 8),
             continuous_dim=train_config.get("continuous_dim", 7),
+            musical_feature_mode=musical_feature_mode,
         ),
     )
     if task_type == "csr":
@@ -1624,11 +2216,19 @@ def main():
         epr_timing_bins=train_config.get("epr_timing_bins", 5000),
         epr_value_bins=train_config.get("epr_value_bins", 128),
         pedal_representation=train_config.get("pedal_representation", "continuous_4"),
+        musical_feature_mode=musical_feature_mode,
         epr_timing_target=train_config.get("epr_timing_target", "absolute"),
         use_timing_scale_bit=train_config.get("use_timing_scale_bit", True),
         timing_control_mode=train_config.get("timing_control_mode"),
         timing_log_scale=train_config.get("timing_log_scale", 50.0),
+        split_zero_ioi_head=train_config.get("split_zero_ioi_head", False),
+        ioi_nonzero_dev_scale=train_config.get("ioi_nonzero_dev_scale", 2.0),
+        ioi_zero_dev_scale=train_config.get("ioi_zero_dev_scale", 4.0),
         precompute_items=train_config.get("precompute_dataset_items", False),
+        use_prepared_cache=train_config.get("use_prepared_cache", False),
+        prepared_cache_dir=train_config.get("prepared_cache_dir"),
+        use_prepared_sidecar=train_config.get("use_prepared_sidecar", False),
+        prepared_sidecar_tag=train_config.get("prepared_sidecar_tag"),
     )
     eval_dataset = PianoCoReNodeSFTDataset(
         eval_manifest,
@@ -1645,14 +2245,28 @@ def main():
         epr_timing_bins=train_config.get("epr_timing_bins", 5000),
         epr_value_bins=train_config.get("epr_value_bins", 128),
         pedal_representation=train_config.get("pedal_representation", "continuous_4"),
+        musical_feature_mode=musical_feature_mode,
         epr_timing_target=train_config.get("epr_timing_target", "absolute"),
         use_timing_scale_bit=train_config.get("use_timing_scale_bit", True),
         timing_control_mode=train_config.get("timing_control_mode"),
         timing_log_scale=train_config.get("timing_log_scale", 50.0),
+        split_zero_ioi_head=train_config.get("split_zero_ioi_head", False),
+        ioi_nonzero_dev_scale=train_config.get("ioi_nonzero_dev_scale", 2.0),
+        ioi_zero_dev_scale=train_config.get("ioi_zero_dev_scale", 4.0),
         precompute_items=train_config.get("precompute_eval_dataset_items", train_config.get("precompute_dataset_items", False)),
+        use_prepared_cache=train_config.get("use_prepared_cache", False),
+        prepared_cache_dir=train_config.get("prepared_cache_dir"),
+        use_prepared_sidecar=train_config.get("use_prepared_sidecar", False),
+        prepared_sidecar_tag=train_config.get("prepared_sidecar_tag"),
     )
 
+    if train_config.get("prebuild_prepared_cache", False):
+        train_dataset.prebuild_prepared_cache()
+        if train_config.get("prebuild_eval_prepared_cache", False):
+            eval_dataset.prebuild_prepared_cache()
+
     model = create_model(train_config)
+    apply_trainable_parameter_policy(model, train_config)
     model.to(device)
     print_model_parameters(model)
 

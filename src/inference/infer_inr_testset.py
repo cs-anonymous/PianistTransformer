@@ -136,6 +136,7 @@ def load_score_from_node(
     use_timing_scale_bit=True,
     timing_control_mode=None,
     timing_log_scale=50.0,
+    musical_feature_mode="categorical",
     task_type="epr",
     performance_source=None,
 ):
@@ -167,6 +168,7 @@ def load_score_from_node(
             use_timing_scale_bit=use_timing_scale_bit,
             timing_control_mode=timing_control_mode,
             log_scale=timing_log_scale,
+            musical_feature_mode=musical_feature_mode,
         )
     score_shared_raw = [row[:3] for row in score["score_raw"]]
     return pitch, continuous, score_shared_raw, work
@@ -435,6 +437,7 @@ def predict_one_csr_work(model, device, config, work, args):
         use_timing_scale_bit=config.get("use_timing_scale_bit", True),
         timing_control_mode=config.get("timing_control_mode"),
         timing_log_scale=config.get("timing_log_scale", 50.0),
+        musical_feature_mode="continuous",
         task_type="csr",
         performance_source=performance_source,
     )
@@ -463,7 +466,7 @@ def predict_one_csr_work(model, device, config, work, args):
         drop_ratio=args.continuation_drop_ratio,
     )
 
-    target_rows = build_score_musical_rows(score)
+    target_rows = build_score_musical_rows(score, musical_feature_mode="continuous")
     has_score_feature = score.get("has_score_feature", [0] * len(pitch))
     pred_rows = pred_continuous.float().cpu().tolist()
     score_features = musical_rows_to_score_features(pred_rows)
@@ -507,6 +510,7 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
         use_timing_scale_bit=config.get("use_timing_scale_bit", True),
         timing_control_mode=config.get("timing_control_mode"),
         timing_log_scale=config.get("timing_log_scale", 50.0),
+        musical_feature_mode=config.get("musical_feature_mode", "categorical"),
         task_type="epr",
     )
     windows = build_windows(len(pitch), config["block_notes"], config["overlap_ratio"])
