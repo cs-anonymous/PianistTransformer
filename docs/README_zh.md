@@ -99,7 +99,7 @@ python -m src.utils.download_model --source modelscope
 一切准备就绪！我们提供了一个便捷的推理脚本，它会自动处理示例乐谱。
 
 ```bash
-sh script/inference.sh
+python src/inference/inference.py
 ```
 
 渲染完成后，您可以在项目根目录下的 `data/midis/testset/inference` 目录中找到渲染的 MIDI 文件`0.mid`。您可以使用常用的DAW软件加载钢琴音源进行播放和编辑。
@@ -123,7 +123,7 @@ sh script/data_process.sh
 此阶段将在处理好的无标签数据上进行大规模预训练，让模型学习音乐的通用结构和知识。
 
 ```bash
-sh script/pretrain.sh
+python src/train/pretrain.py
 ```
 ⚠️ **注意**: 即使使用最小数据集，预训练也可能需要较长时间。训练日志和模型检查点将默认保存在 `models/pretrain/` 目录下。
 
@@ -132,7 +132,7 @@ sh script/pretrain.sh
 最后，我们使用预训练好的模型，在成对的（乐谱-演奏）数据上进行微调，教会模型如何生成富有表现力的演奏。
 
 ```bash
-sh script/sft.sh
+python src/train/sft.py --config configs/sft_config_pianocore.json
 ```
 微调完成后，最终可用于推理的模型将保存在 `models/sft/` 目录下。
 

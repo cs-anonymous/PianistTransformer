@@ -15,7 +15,7 @@
 - Integrated 模型：[src/model/integrated_pianoformer.py](/home/kaititech/EPR/PianistTransformer/src/model/integrated_pianoformer.py)
 - SFT 训练入口：[src/train/train_inr.py](/home/kaititech/EPR/PianistTransformer/src/train/train_inr.py)
 - 训练配置：[configs/inr_config_pianocore.json](/home/kaititech/EPR/PianistTransformer/configs/inr_config_pianocore.json)
-- 启动脚本：[script/train_inr.sh](/home/kaititech/EPR/PianistTransformer/script/train_inr.sh)
+- 启动命令：`python src/train/train_inr.py --config configs/inr_config_pianocore.json`
 
 数据格式已从原计划的 pair-level jsonl 改为 work-level INR JSON：每个作品一个 `*.json`，直接写在 refined score MIDI 旁边。第一步生成 paired MIDI JSON；第二步从 XML/MXL 投影 `score.score_feature` 与 `score.has_score_feature`，并在 `meta.xml_to_refined_score_alignment` 中记录 coverage。
 

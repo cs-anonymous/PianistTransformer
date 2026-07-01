@@ -101,7 +101,7 @@ python -m src.utils.download_model --source huggingface
 You're all set! We provide a convenient inference script that will automatically process an example score.
 
 ```bash
-sh script/inference.sh
+python src/inference/inference.py
 ```
 
 After the rendering is complete, you will find the generated MIDI file `0.mid` in the `data/midis/testset/inference` directory. You can load it into your favorite DAW with a piano plugin for playback and editing.
@@ -125,7 +125,7 @@ Once this process is complete, the processed data will be located in the `data/p
 In this stage, the model undergoes large-scale pre-training on the processed unlabeled data to learn general musical structures and knowledge.
 
 ```bash
-sh script/pretrain.sh
+python src/train/pretrain.py
 ```
 ⚠️ **Note**: Even with the minimal dataset, pre-training can be time-consuming. Training logs and model checkpoints will be saved to the `models/pretrain/` directory by default.
 
@@ -134,7 +134,7 @@ sh script/pretrain.sh
 Finally, we take the pre-trained model and fine-tune it on paired (score-performance) data to teach the model how to generate expressive performances.
 
 ```bash
-sh script/sft.sh
+python src/train/sft.py --config configs/sft_config_pianocore.json
 ```
 After fine-tuning is complete, the final model, ready for inference, will be saved in the `models/sft/` directory.
 

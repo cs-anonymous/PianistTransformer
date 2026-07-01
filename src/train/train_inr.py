@@ -1101,7 +1101,7 @@ class PianoCoReNodeSFTDataset(Dataset):
             if self.use_prepared_sidecar and prepared is None:
                 raise FileNotFoundError(
                     f"Missing or stale INR prepared sidecar: {cache_path}. "
-                    "Run script/prebuild_inr_work_pt.py for the current config."
+                    "Run src/train/prebuild_inr_work_pt.py for the current config."
                 )
             if prepared is None:
                 cache_path.parent.mkdir(parents=True, exist_ok=True)

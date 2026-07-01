@@ -200,7 +200,7 @@ PYTHONUNBUFFERED=1 python src/evaluate/summarize_inr_asap_pipeline.py \
   2>&1 | tee -a "${EVALUATE_LOG}"
 
 echo "[$(date '+%F %T')] target distribution diagnostic" | tee -a "${EVALUATE_LOG}"
-PYTHONUNBUFFERED=1 python script/plot_target_distribution_diagnostic.py \
+PYTHONUNBUFFERED=1 python src/evaluate/plot_target_distribution_diagnostic.py \
   --config "${FULL_CONFIG}" \
   --det-manifest "${DET_DIR}/prediction_manifest.json" \
   --sampling-manifest "${SAMPLING_DIR}/prediction_manifest.json" \
