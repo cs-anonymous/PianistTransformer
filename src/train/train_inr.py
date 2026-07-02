@@ -250,6 +250,8 @@ def musical_feature_dim(musical_feature_mode="categorical"):
     mode = str(musical_feature_mode).lower()
     if mode == "continuous":
         return 12
+    if mode in {"continuous_iszero", "legacy_iszero", "continuous_zeroioi"}:
+        return 13
     if mode in {"categorical", "categorical51", "musical51"}:
         return 51
     if mode in {"categorical62", "musical62"}:
@@ -665,23 +667,25 @@ def build_score_musical_rows(score, musical_feature_mode="continuous"):
         tempo_bpm = 60000.0 / max(prev_ms_per_quarter, 1e-6)
         tempo_norm = min(max(tempo_bpm, 0.0), 300.0) / 300.0
 
-        if mode == "continuous":
-            rows.append(
-                [
-                    min(max(mo / 6.0, 0.0), 1.0),
-                    min(max(mioi / 6.0, 0.0), 1.0),
-                    min(max(md / 6.0, 0.0), 1.0),
-                    min(max(raw_ml / 6.0, 0.0), 1.0),
-                    tempo_norm,
-                    first,
-                    grace,
-                    hand,
-                    trill,
-                    stacc,
-                    1.0 if stem_code == 1 else 0.0,
-                    1.0 if stem_code == 2 else 0.0,
-                ]
-            )
+        if mode in {"continuous", "continuous_iszero", "legacy_iszero", "continuous_zeroioi"}:
+            continuous = [
+                min(max(mo / 6.0, 0.0), 1.0),
+                min(max(mioi / 6.0, 0.0), 1.0),
+                min(max(md / 6.0, 0.0), 1.0),
+                min(max(raw_ml / 6.0, 0.0), 1.0),
+                tempo_norm,
+                first,
+                grace,
+                hand,
+                trill,
+                stacc,
+                1.0 if stem_code == 1 else 0.0,
+                1.0 if stem_code == 2 else 0.0,
+            ]
+            if mode in {"continuous_iszero", "legacy_iszero", "continuous_zeroioi"}:
+                score_ioi_ms = float(score_raw[idx][0]) if idx < len(score_raw) else 0.0
+                continuous.append(1.0 if score_ioi_ms <= 0.0 else 0.0)
+            rows.append(continuous)
             continue
 
         if mode in {"categorical62", "musical62"}:
@@ -994,6 +998,7 @@ class PianoCoReNodeSFTDataset(Dataset):
         if self.prepared_cache_dir is not None:
             self.prepared_cache_dir.mkdir(parents=True, exist_ok=True)
         self._prepared_cache_signature = self._build_prepared_cache_signature()
+        self._prepared_sidecar_signature = self._build_prepared_sidecar_signature()
         self._cache = OrderedDict()
         self._prepared_cache = OrderedDict()
         if self.precompute_items:
@@ -1019,6 +1024,68 @@ class PianoCoReNodeSFTDataset(Dataset):
             "ioi_zero_dev_scale": self.ioi_zero_dev_scale,
         }
         return json.dumps(signature, sort_keys=True, separators=(",", ":"))
+
+    def _build_prepared_sidecar_signature(self):
+        signature = {
+            "schema": 5,
+            "kind": "inr_raw_sidecar",
+        }
+        return json.dumps(signature, sort_keys=True, separators=(",", ":"))
+
+    def _is_raw_sidecar_signature(self, signature):
+        if signature == self._prepared_sidecar_signature:
+            return True
+        try:
+            payload = json.loads(signature)
+        except (TypeError, json.JSONDecodeError):
+            return False
+        return payload.get("schema") == 5 and payload.get("kind") == "inr_raw_sidecar"
+
+    def _has_raw_sidecar_payload(self, prepared):
+        score = prepared.get("score")
+        if not isinstance(score, dict):
+            return False
+        if "pitch" not in score or "score_raw" not in score:
+            return False
+        if self.task_type.lower() in {"epr", "csr"}:
+            if "score_feature" not in score or "has_score_feature" not in score:
+                return False
+
+        performances = prepared.get("performances")
+        if not isinstance(performances, list):
+            return False
+        for perf in performances:
+            if not isinstance(perf, dict) or "interpolated" not in perf:
+                return False
+            if self.task_type.lower() == "epr" and self.epr_timing_target in {
+                "deviation",
+                "dev",
+                "log_deviation",
+                "log_dev",
+                "deviation_ratio",
+                "dev_ratio",
+            }:
+                has_shared = "label_shared_raw" in perf or "label_raw" in perf
+                has_pedal = "label_pedal2_raw" in perf or "pedal2_raw" in perf or "label_raw" in perf
+                if not (has_shared and has_pedal):
+                    return False
+        return True
+
+    def _normalize_loaded_raw_sidecar(self, prepared):
+        normalized = dict(prepared)
+        normalized.pop("score_input", None)
+        normalized.pop("score_musical", None)
+        normalized.pop("has_score_feature", None)
+        normalized.pop("_derived_score_input_cache", None)
+        normalized.pop("_derived_score_musical", None)
+        normalized["label_cache"] = {}
+        if "performances_by_source" not in normalized:
+            normalized["performances_by_source"] = {
+                perf.get("performance_source"): perf
+                for perf in normalized.get("performances", [])
+                if perf.get("performance_source") is not None
+            }
+        return normalized
 
     def _source_identity(self, path):
         source = Path(path)
@@ -1079,9 +1146,14 @@ class PianoCoReNodeSFTDataset(Dataset):
                 if not cache_path.exists():
                     continue
                 prepared = self._torch_load_prepared(cache_path)
-                if prepared.get("_cache_signature") != self._prepared_cache_signature:
-                    continue
+                signature = prepared.get("_cache_signature")
                 if prepared.get("_source_identity") != self._source_identity(path):
+                    continue
+                if self._is_raw_sidecar_signature(signature):
+                    if self._has_raw_sidecar_payload(prepared):
+                        return self._normalize_loaded_raw_sidecar(prepared)
+                    continue
+                if signature != self._prepared_cache_signature:
                     continue
                 return prepared
             return None
@@ -1102,7 +1174,13 @@ class PianoCoReNodeSFTDataset(Dataset):
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.tmp")
         payload = dict(prepared)
-        payload["_cache_signature"] = self._prepared_cache_signature
+        payload.pop("_derived_score_input_cache", None)
+        payload.pop("_derived_score_musical", None)
+        payload["_cache_signature"] = (
+            self._prepared_sidecar_signature
+            if self.use_prepared_sidecar
+            else self._prepared_cache_signature
+        )
         payload["_source_identity"] = self._source_identity(path)
         torch.save(payload, tmp_path)
         os.replace(tmp_path, cache_path)
@@ -1130,7 +1208,7 @@ class PianoCoReNodeSFTDataset(Dataset):
             if self.use_prepared_sidecar and prepared is None:
                 raise FileNotFoundError(
                     f"Missing or stale INR prepared sidecar: {cache_path}. "
-                    "Run src/data_process/prebuild_inr_work_pt.py for the current config."
+                    "Run src/data_process/prebuild_inr_work_pt.py to build the shared raw sidecar."
                 )
             if prepared is None:
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1201,6 +1279,7 @@ class PianoCoReNodeSFTDataset(Dataset):
         slim_performances=False,
         split_filter=True,
         force_rebuild=False,
+        derive_features=True,
     ):
         if not force_rebuild and path in self._prepared_cache:
             self._prepared_cache.move_to_end(path)
@@ -1225,8 +1304,9 @@ class PianoCoReNodeSFTDataset(Dataset):
                 "pitch": score["pitch"],
                 "score_raw": score["score_raw"],
             }
-            if task_type == "csr":
-                score_payload["has_score_feature"] = score["has_score_feature"]
+            for key in ("score_feature", "has_score_feature"):
+                if key in score:
+                    score_payload[key] = score[key]
         else:
             score_payload = score
         prepared = {
@@ -1236,7 +1316,7 @@ class PianoCoReNodeSFTDataset(Dataset):
             "label_cache": {},
         }
 
-        if task_type == "epr":
+        if derive_features and task_type == "epr":
             prepared["score_input"] = build_epr_score_input_rows(
                 score,
                 use_timing_scale_bit=self.use_timing_scale_bit,
@@ -1244,7 +1324,7 @@ class PianoCoReNodeSFTDataset(Dataset):
                 log_scale=self.timing_log_scale,
                 musical_feature_mode=self.musical_feature_mode,
             )
-        elif task_type == "csr":
+        elif derive_features and task_type == "csr":
             prepared["score_musical"] = build_score_musical_rows(score, musical_feature_mode="continuous")
             prepared["has_score_feature"] = score["has_score_feature"]
 
@@ -1306,11 +1386,16 @@ class PianoCoReNodeSFTDataset(Dataset):
         prepared = self._prepare_work(
             path,
             work,
-            eager_labels=True,
+            eager_labels=False,
             slim_performances=True,
             split_filter=False,
             force_rebuild=True,
+            derive_features=False,
         )
+        prepared.pop("score_input", None)
+        prepared.pop("score_musical", None)
+        prepared.pop("has_score_feature", None)
+        prepared["label_cache"] = {}
         self._save_prepared_to_disk(path, prepared)
         return self._prepared_disk_cache_path(path)
 
@@ -1388,6 +1473,32 @@ class PianoCoReNodeSFTDataset(Dataset):
         labels, label_bins = self._compute_performance_labels(prepared, perf)
         label_cache[cache_key] = (labels, label_bins)
         return labels, label_bins
+
+    def _score_input_rows(self, prepared):
+        cache = prepared.setdefault("_derived_score_input_cache", {})
+        cache_key = self._prepared_cache_signature
+        if cache_key not in cache:
+            cache[cache_key] = build_epr_score_input_rows(
+                prepared["score"],
+                use_timing_scale_bit=self.use_timing_scale_bit,
+                timing_control_mode=self.timing_control_mode,
+                log_scale=self.timing_log_scale,
+                musical_feature_mode=self.musical_feature_mode,
+            )
+        return cache[cache_key]
+
+    def _score_musical_rows(self, prepared):
+        if "_derived_score_musical" not in prepared:
+            prepared["_derived_score_musical"] = build_score_musical_rows(
+                prepared["score"],
+                musical_feature_mode="continuous",
+            )
+        return prepared["_derived_score_musical"]
+
+    def _score_feature_mask(self, prepared):
+        if "has_score_feature" in prepared:
+            return prepared["has_score_feature"]
+        return prepared["score"]["has_score_feature"]
 
     def _precompute_items(self):
         rank, _ = distributed_info()
@@ -1508,15 +1619,15 @@ class PianoCoReNodeSFTDataset(Dataset):
         interpolated = perf["interpolated"]
         task_type = self.task_type.lower()
         if task_type == "epr":
-            continuous = prepared["score_input"][start:end]
+            continuous = self._score_input_rows(prepared)[start:end]
             labels_continuous = labels[start:end]
             labels_epr_bins = label_bins[start:end] if label_bins is not None else None
             label_mask = None
         elif task_type == "csr":
             continuous = labels[start:end]
-            labels_continuous = prepared["score_musical"][start:end]
+            labels_continuous = self._score_musical_rows(prepared)[start:end]
             labels_epr_bins = None
-            label_mask = prepared["has_score_feature"][start:end]
+            label_mask = self._score_feature_mask(prepared)[start:end]
         else:
             raise ValueError(f"Unsupported task_type: {self.task_type}")
 
@@ -1862,16 +1973,17 @@ def create_model(train_config):
                 "point",
                 "huber",
                 "deterministic_huber",
-                "aln",
-                "asymmetric_logistic_normal",
-                "amln3",
+                "lan",
+                "can",
+                "ican",
+                "iln",
                 "logistic_normal",
                 "mixture_logistic_normal",
                 "mixture_beta",
             }
             if distribution not in supported_split_distributions:
                 raise ValueError(
-                    "split_zero_ioi_head currently supports scalar point/MLN/AMLN/mixture_beta heads only; "
+                    "split_zero_ioi_head currently supports scalar point/lan/can/ican/LN/MLN/mixture_beta heads only; "
                     f"got epr_distribution={distribution}"
                 )
         supported_distributions = {
@@ -1882,28 +1994,34 @@ def create_model(train_config):
             "categorical",
             "hard_categorical",
             "soft_categorical",
-            "aln",
-            "asymmetric_logistic_normal",
-            "amln3",
-            "bln3",
+            "lan",
+            "can",
+            "ican",
+            "iln",
             "logistic_normal",
             "mixture_logistic_normal",
-            "inflated_mixture_logistic_normal",
             "mixture_beta",
         }
         if distribution not in supported_distributions:
             raise ValueError(f"Unsupported epr_distribution={distribution}")
-        mixture_distributions = {
-            "aln",
-            "asymmetric_logistic_normal",
-            "amln3",
-            "bln3",
+        scalar_distributions = {
+            "lan",
+            "can",
+            "ican",
+            "iln",
             "logistic_normal",
             "mixture_logistic_normal",
-            "inflated_mixture_logistic_normal",
             "mixture_beta",
         }
-        if distribution in mixture_distributions:
+        pedal_distribution = str(train_config.get("pedal_distribution", distribution)).lower()
+        if pedal_distribution not in supported_distributions:
+            raise ValueError(f"Unsupported pedal_distribution={pedal_distribution}")
+        if pedal_distribution in scalar_distributions and distribution not in scalar_distributions:
+            raise ValueError(
+                "pedal_distribution can only override another scalar EPR distribution; "
+                f"got epr_distribution={distribution}, pedal_distribution={pedal_distribution}"
+            )
+        if distribution in scalar_distributions or pedal_distribution in scalar_distributions:
             missing_keys = [
                 key
                 for key in (
@@ -1914,26 +2032,19 @@ def create_model(train_config):
                 )
                 if key not in train_config
             ]
-            if distribution == "mixture_beta":
+            if distribution == "mixture_beta" or pedal_distribution == "mixture_beta":
                 missing_keys.append("beta_alpha_min") if "beta_alpha_min" not in train_config else None
-            if distribution == "inflated_mixture_logistic_normal" and "epr_inflated_features" not in train_config:
-                missing_keys.append("epr_inflated_features")
             if missing_keys:
                 raise ValueError(f"EPR {distribution} config is missing required keys: {missing_keys}")
             components = int(train_config["epr_mixture_components"])
             if components < 1:
                 raise ValueError(f"epr_mixture_components must be >= 1, got {components}")
-            if distribution in {"aln", "asymmetric_logistic_normal", "logistic_normal"} and components != 1:
+            if distribution in {"lan", "can", "ican", "iln", "logistic_normal"} and components != 1:
                 raise ValueError(f"epr_distribution={distribution} requires epr_mixture_components=1")
-            if distribution in {"amln3", "bln3", "mixture_logistic_normal", "inflated_mixture_logistic_normal", "mixture_beta"} and components < 2:
+            if distribution in {"mixture_logistic_normal", "mixture_beta"} and components < 2:
                 raise ValueError(f"epr_distribution={distribution} requires epr_mixture_components >= 2")
-            if distribution == "inflated_mixture_logistic_normal":
-                expected = {"ioi": "zero", "pedal": "zero_one"}
-                if train_config.get("epr_inflated_features") != expected:
-                    raise ValueError(
-                        "inflated_mixture_logistic_normal currently requires "
-                        f"epr_inflated_features={expected}"
-                    )
+            if pedal_distribution in {"mixture_logistic_normal", "mixture_beta"} and components < 2:
+                raise ValueError(f"pedal_distribution={pedal_distribution} requires epr_mixture_components >= 2")
         if distribution == "beta_mu_kappa":
             missing_beta_keys = [
                 key for key in ("beta_eps", "beta_kappa_min")
@@ -1950,17 +2061,17 @@ def create_model(train_config):
                 "point",
                 "huber",
                 "deterministic_huber",
-                "aln",
-                "asymmetric_logistic_normal",
-                "amln3",
-                "bln3",
+                "lan",
+                "can",
+                "ican",
+                "iln",
                 "logistic_normal",
                 "mixture_logistic_normal",
                 "beta_mu_kappa",
                 "mixture_beta",
             }:
                 raise ValueError(
-                    "deviation EPR currently supports point/huber, mln, mln3/amln3/bln3, beta, and mixture_beta, "
+                    "deviation EPR currently supports point/huber, lan/can/ican, LN/MLN, beta, and mixture_beta, "
                     f"got epr_distribution={distribution}"
                 )
     elif task_type == "csr":
@@ -2049,6 +2160,7 @@ def create_model(train_config):
         head_width_multiplier=train_config.get("head_width_multiplier", 1.0),
         head_activation=train_config.get("head_activation", "gelu"),
         epr_distribution=train_config.get("epr_distribution", "point"),
+        pedal_distribution=train_config.get("pedal_distribution"),
         epr_mixture_components=train_config.get("epr_mixture_components", 1),
         epr_distribution_eps=train_config.get("epr_distribution_eps"),
         logistic_normal_sigma_min=train_config.get("logistic_normal_sigma_min", 1e-3),

@@ -13,10 +13,7 @@ INFER_NUM_WORKERS=8
 METRIC_NUM_WORKERS=8
 DET_NUM_SAMPLES=1
 SAMPLING_NUM_SAMPLES=1
-DET_STRATEGY="${DET_STRATEGY:-mean}"
-TIMING_SAMPLING_METHOD="${TIMING_SAMPLING_METHOD:-none}"
-CALIBRATOR_MAX_WORKS="${CALIBRATOR_MAX_WORKS:-32}"
-CALIBRATOR_MAX_GT_PER_WORK="${CALIBRATOR_MAX_GT_PER_WORK:-4}"
+DET_STRATEGY="greedy"
 INFER_BATCH_SIZE_WINDOWS=8
 MERGE_MODE="continuation"
 CONTINUATION_DROP_RATIO=0.0
@@ -32,7 +29,6 @@ PLOT_PATH="${RUN_DIR}/asap_label_distribution.png"
 RUN_CONFIG="${RUN_DIR}/config.json"
 DET_DIR="${RUN_DIR}/deterministic"
 SAMPLING_DIR="${RUN_DIR}/sampling"
-TIMING_CALIBRATOR="${RUN_DIR}/timing_sampling_calibrator.json"
 TMP_DIR="${RUN_DIR}/_tmp"
 TRAIN_ROOT="${RUN_DIR}/training"
 TF_LOG_ROOT="${RUN_DIR}/tf-logs"
@@ -141,7 +137,6 @@ PY
   echo "RUN_DIR ${RUN_DIR}"
   echo "PIPELINE_STAGE_START ${PIPELINE_STAGE_START}"
   echo "DET_STRATEGY ${DET_STRATEGY}"
-  echo "TIMING_SAMPLING_METHOD ${TIMING_SAMPLING_METHOD}"
   echo "RESUME_CHECKPOINT ${RESUME_CHECKPOINT:-NONE}"
   echo "ADAPT_ON_ASAP ${ADAPT_ON_ASAP}"
   echo "ADAPT_LR ${ADAPT_LR}"
@@ -295,24 +290,6 @@ PY
   } | tee -a "${EVALUATE_LOG}"
 fi
 
-# --- Fit timing sampling calibrator on ASAP train --------------------------
-TIMING_CALIBRATOR_ARG=()
-if [[ "${TIMING_SAMPLING_METHOD}" != "none" ]]; then
-  echo "[$(date '+%F %T')] fit timing calibrator: method=${TIMING_SAMPLING_METHOD}, max_works=${CALIBRATOR_MAX_WORKS}" | tee -a "${EVALUATE_LOG}"
-  CUDA_VISIBLE_DEVICES="${SAMPLING_GPU}" PYTHONUNBUFFERED=1 \
-    python src/evaluate/fit_timing_sampling_calibrator.py \
-      --config "${ACTIVE_CONFIG}" \
-      --checkpoint "${CHECKPOINT}" \
-      --output-json "${TIMING_CALIBRATOR}" \
-      --method "${TIMING_SAMPLING_METHOD}" \
-      --device cuda \
-      --max-works "${CALIBRATOR_MAX_WORKS}" \
-      --max-gt-per-work "${CALIBRATOR_MAX_GT_PER_WORK}" \
-      --batch-size-windows "${INFER_BATCH_SIZE_WINDOWS}" \
-    2>&1 | tee -a "${EVALUATE_LOG}"
-  TIMING_CALIBRATOR_ARG=(--timing-sampling-method "${TIMING_SAMPLING_METHOD}" --timing-calibrator "${TIMING_CALIBRATOR}")
-fi
-
 # --- Inference: deterministic + sampling in parallel -----------------------
 COMMON_INFER_ARGS=(
   --config "${ACTIVE_CONFIG}"
@@ -333,7 +310,6 @@ run_infer() {
     python src/inference/infer_inr_testset.py "${COMMON_INFER_ARGS[@]}" \
       --protocol "${protocol}" --num-samples "${num_samples}" --output-dir "${out_dir}" \
       --deterministic-strategy "${DET_STRATEGY}" \
-      "${TIMING_CALIBRATOR_ARG[@]}" \
     2>&1 | tee -a "${EVALUATE_LOG}"
   echo "[$(date '+%F %T')] infer ${protocol}: finished" | tee -a "${EVALUATE_LOG}"
 }

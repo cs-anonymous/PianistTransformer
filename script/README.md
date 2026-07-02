@@ -20,7 +20,6 @@ bash script/run_inr_pipeline.sh
 
 - `RUN_DIR_OVERRIDE`: 指定结果目录
 - `PIPELINE_STAGE_START=train|adapt|infer`: 从某个阶段继续
-- `TIMING_SAMPLING_METHOD=none|bias_correction|calibrated_residual`
 - `RESUME_CHECKPOINT_OVERRIDE=/path/to/checkpoint-*`
 
 ### 2. 当前这次双双卡任务

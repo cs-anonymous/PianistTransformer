@@ -22,7 +22,10 @@ from src.evaluate.evaluate_inr_saved_midis import (
     score_level_metrics,
     score_level_metrics_worker,
 )
-from src.train.train_inr import build_work_manifest
+from src.train.train_inr import (
+    normalize_duration_dev as normalize_train_duration_dev,
+    normalize_ioi_dev as normalize_train_ioi_dev,
+)
 from src.utils.inr_midi import normalize_time_ms_for_inr_input
 
 
@@ -36,8 +39,13 @@ FEATURES = [
 ]
 
 DEV_FEATURES = [
-    ("dev_ioi", "IOI Deviation"),
-    ("dev_duration", "Duration Deviation"),
+    ("dev_ioi", "Normalized IOI Dev"),
+    ("dev_duration", "Normalized Duration Dev"),
+]
+
+DEV_GROUPS = [
+    ("zero_ioi", "Score IOI = 0"),
+    ("nonzero_ioi", "Score IOI > 0"),
 ]
 
 
@@ -277,48 +285,39 @@ def plot_distributions(
     }
 
 
-def normalize_ioi_dev(score_ioi_ms, perf_ioi_ms):
-    dev_ms = float(perf_ioi_ms) - float(score_ioi_ms)
-    return min(max((dev_ms + 500.0) / 1000.0, 0.0), 1.0)
+def empty_dev_groups():
+    return {
+        group: {
+            "dev_ioi": [],
+            "dev_duration": [],
+        }
+        for group, _ in DEV_GROUPS
+    }
 
 
-def normalize_duration_dev(score_duration_ms, perf_duration_ms):
-    dev_ms = float(perf_duration_ms) - float(score_duration_ms)
-    return min(max((dev_ms + 500.0) / 1000.0, 0.0), 1.0)
+def dev_group_name(score_ioi_ms):
+    return "zero_ioi" if float(score_ioi_ms) <= 0.0 else "nonzero_ioi"
 
 
-def normalize_log_timing_value(time_ms, scale=50.0, max_time_ms=5000.0):
-    clipped = min(max(float(time_ms), 0.0), float(max_time_ms))
-    scale = max(float(scale), 1e-12)
-    return math.log1p(clipped / scale) / math.log1p(float(max_time_ms) / scale)
+def normalize_target_ioi_dev(score_ioi_ms, perf_ioi_ms, config):
+    return normalize_train_ioi_dev(
+        score_ioi_ms,
+        perf_ioi_ms,
+        epr_timing_target=config.get("epr_timing_target", "deviation"),
+        log_scale=float(config.get("timing_log_scale", 50.0)),
+        split_zero_ioi_head=bool(config.get("split_zero_ioi_head", False)),
+        nonzero_scale=float(config.get("ioi_nonzero_dev_scale", 2.0)),
+        zero_scale=float(config.get("ioi_zero_dev_scale", 4.0)),
+    )
 
 
-def normalize_log_dev(score_time_ms, perf_time_ms, scale=50.0):
-    score_norm = normalize_log_timing_value(score_time_ms, scale=scale)
-    perf_norm = normalize_log_timing_value(perf_time_ms, scale=scale)
-    return min(max(perf_norm - score_norm + 0.5, 0.0), 1.0)
-
-
-def normalize_target_dev(score_time_ms, perf_time_ms, config):
-    target = str(config.get("epr_timing_target", "deviation")).lower()
-    if target in {"log_deviation", "log_dev"}:
-        return normalize_log_dev(
-            score_time_ms,
-            perf_time_ms,
-            scale=float(config.get("timing_log_scale", 50.0)),
-        )
-    return normalize_ioi_dev(score_time_ms, perf_time_ms)
-
-
-def normalize_target_duration_dev(score_time_ms, perf_time_ms, config):
-    target = str(config.get("epr_timing_target", "deviation")).lower()
-    if target in {"log_deviation", "log_dev"}:
-        return normalize_log_dev(
-            score_time_ms,
-            perf_time_ms,
-            scale=float(config.get("timing_log_scale", 50.0)),
-        )
-    return normalize_duration_dev(score_time_ms, perf_time_ms)
+def normalize_target_duration_dev(score_duration_ms, perf_duration_ms, config):
+    return normalize_train_duration_dev(
+        score_duration_ms,
+        perf_duration_ms,
+        epr_timing_target=config.get("epr_timing_target", "deviation"),
+        log_scale=float(config.get("timing_log_scale", 50.0)),
+    )
 
 
 def refined_root_from_config(config):
@@ -352,9 +351,18 @@ def selected_gt_sources_from_manifest(manifest, config):
     return selected
 
 
+def dev_groups_to_arrays(groups):
+    return {
+        group: {
+            feature: np.asarray(values, dtype=np.float64)
+            for feature, values in features.items()
+        }
+        for group, features in groups.items()
+    }
+
+
 def extract_gt_dev_arrays(score_source_to_work_path, selected_gt_sources, config):
-    dev_ioi = []
-    dev_duration = []
+    groups = empty_dev_groups()
     for score_source, work_path in score_source_to_work_path.items():
         selected_sources = selected_gt_sources.get(score_source)
         with open(work_path, "r", encoding="utf-8") as file:
@@ -371,27 +379,31 @@ def extract_gt_dev_arrays(score_source_to_work_path, selected_gt_sources, config
             if len(shared_rows) != len(score_raw):
                 continue
             for score_row, perf_row in zip(score_raw, shared_rows):
-                dev_ioi.append(normalize_target_dev(score_row[0], perf_row[0], config))
-                dev_duration.append(normalize_target_duration_dev(score_row[1], perf_row[1], config))
-    return {
-        "dev_ioi": np.asarray(dev_ioi, dtype=np.float64),
-        "dev_duration": np.asarray(dev_duration, dtype=np.float64),
-    }
+                group = dev_group_name(score_row[0])
+                groups[group]["dev_ioi"].append(normalize_target_ioi_dev(score_row[0], perf_row[0], config))
+                groups[group]["dev_duration"].append(normalize_target_duration_dev(score_row[1], perf_row[1], config))
+    return dev_groups_to_arrays(groups)
 
 
-def extract_pred_dev_arrays(raw_output_paths):
-    dev_ioi = []
-    dev_duration = []
+def extract_pred_dev_arrays(raw_output_paths, score_source_to_work_path):
+    score_raw_cache = {}
+    groups = empty_dev_groups()
     for path in raw_output_paths:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        score_source = payload["score_source"]
+        if score_source not in score_raw_cache:
+            with open(score_source_to_work_path[score_source], "r", encoding="utf-8") as file:
+                work = json.load(file)
+            score_raw_cache[score_source] = work["score"]["score_raw"]
+        score_raw = score_raw_cache[score_source]
         target5 = payload.get("predicted_target5", [])
-        for row in target5:
-            dev_ioi.append(float(row[0]))
-            dev_duration.append(float(row[1]))
-    return {
-        "dev_ioi": np.asarray(dev_ioi, dtype=np.float64),
-        "dev_duration": np.asarray(dev_duration, dtype=np.float64),
-    }
+        if len(target5) != len(score_raw):
+            continue
+        for score_row, row in zip(score_raw, target5):
+            group = dev_group_name(score_row[0])
+            groups[group]["dev_ioi"].append(float(row[0]))
+            groups[group]["dev_duration"].append(float(row[1]))
+    return dev_groups_to_arrays(groups)
 
 
 def analyze_dev_distribution(
@@ -412,48 +424,60 @@ def plot_dev_distributions(
     score_source_to_work_path = score_source_to_work_path_from_manifest(det_manifest, config)
     selected_gt_sources = selected_gt_sources_from_manifest(det_manifest, config)
     gt_arrays = extract_gt_dev_arrays(score_source_to_work_path, selected_gt_sources, config)
-    det_arrays = extract_pred_dev_arrays(unique_paths(det_manifest, "raw_output_paths"))
-    sampling_arrays = extract_pred_dev_arrays(unique_paths(sampling_manifest, "raw_output_paths"))
+    det_arrays = extract_pred_dev_arrays(unique_paths(det_manifest, "raw_output_paths"), score_source_to_work_path)
+    sampling_arrays = extract_pred_dev_arrays(unique_paths(sampling_manifest, "raw_output_paths"), score_source_to_work_path)
 
     output_plot.parent.mkdir(parents=True, exist_ok=True)
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    fig, axes = plt.subplots(2, 2, figsize=(11, 7), sharex=True)
     colors = {
         "gt": "#222222",
         "det": "#2f6fed",
         "sampling": "#d0522b",
     }
 
-    for idx, (feature, title) in enumerate(DEV_FEATURES):
-        axis = axes[idx]
-        gt = finite_values(gt_arrays[feature])
-        det = finite_values(det_arrays[feature])
-        sampling = finite_values(sampling_arrays[feature])
-        bins = np.linspace(0.0, 1.0, 80)
+    bins = np.linspace(0.0, 1.0, 80)
+    for row_idx, (group, group_title) in enumerate(DEV_GROUPS):
+        for col_idx, (feature, title) in enumerate(DEV_FEATURES):
+            axis = axes[row_idx, col_idx]
+            gt = finite_values(gt_arrays[group][feature])
+            det = finite_values(det_arrays[group][feature])
+            sampling = finite_values(sampling_arrays[group][feature])
 
-        for values, label, color, alpha in [
-            (gt, "ground truth", colors["gt"], 0.26),
-            (det, "deterministic", colors["det"], 0.32),
-            (sampling, "sampling", colors["sampling"], 0.32),
-        ]:
-            values = values[(values >= 0.0) & (values <= 1.0)]
-            if len(values):
-                axis.hist(values, bins=bins, density=True, alpha=alpha, label=label, color=color)
-        axis.set_title(title)
-        axis.set_xlim(0.0, 1.0)
-        axis.set_ylabel("density")
-        axis.grid(alpha=0.2)
+            for values, label, color, alpha in [
+                (gt, "ground truth", colors["gt"], 0.26),
+                (det, "deterministic", colors["det"], 0.32),
+                (sampling, "sampling", colors["sampling"], 0.32),
+            ]:
+                values = values[(values >= 0.0) & (values <= 1.0)]
+                if len(values):
+                    axis.hist(values, bins=bins, density=True, alpha=alpha, label=label, color=color)
+            axis.set_title(f"{group_title}: {title}")
+            axis.set_xlim(0.0, 1.0)
+            axis.set_ylabel("density")
+            axis.grid(alpha=0.2)
 
-    handles, labels = axes[0].get_legend_handles_labels()
+    handles, labels = axes[0, 0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="lower center", ncol=3, frameon=False)
-    fig.suptitle("ASAP Test Dev Distribution: Ground Truth vs INR Predictions", y=0.98)
-    fig.tight_layout(rect=(0, 0.08, 1, 0.94))
+    fig.suptitle("ASAP Test Normalized Dev Distribution by Score IOI", y=0.98)
+    fig.tight_layout(rect=(0, 0.07, 1, 0.94))
     fig.savefig(output_plot, dpi=180)
     plt.close(fig)
 
+    def total_notes(arrays):
+        return int(sum(len(arrays[group]["dev_ioi"]) for group, _ in DEV_GROUPS))
+
     return {
-        "ground_truth_dev_notes": int(len(gt_arrays["dev_ioi"])),
-        "deterministic_dev_notes": int(len(det_arrays["dev_ioi"])),
-        "sampling_dev_notes": int(len(sampling_arrays["dev_ioi"])),
+        "ground_truth_dev_notes": total_notes(gt_arrays),
+        "deterministic_dev_notes": total_notes(det_arrays),
+        "sampling_dev_notes": total_notes(sampling_arrays),
+        "dev_distribution_groups": {
+            group: {
+                "ground_truth_notes": int(len(gt_arrays[group]["dev_ioi"])),
+                "deterministic_notes": int(len(det_arrays[group]["dev_ioi"])),
+                "sampling_notes": int(len(sampling_arrays[group]["dev_ioi"])),
+            }
+            for group, _ in DEV_GROUPS
+        },
     }
 
 
