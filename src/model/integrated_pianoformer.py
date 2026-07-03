@@ -140,6 +140,9 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         head_depth=2,
         head_width_multiplier=1.0,
         head_activation="gelu",
+        decoder_head_layout="pyramid4",
+        decoder_head_expand_ratio=2.0,
+        decoder_head_shrink_ratio=0.5,
         gpt_layers_num=None,
         bert_layers_num=None,
         max_position_embeddings=4096,
@@ -236,6 +239,9 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.head_depth = head_depth
         self.head_width_multiplier = float(head_width_multiplier)
         self.head_activation = head_activation
+        self.decoder_head_layout = str(decoder_head_layout).lower()
+        self.decoder_head_expand_ratio = float(decoder_head_expand_ratio)
+        self.decoder_head_shrink_ratio = float(decoder_head_shrink_ratio)
         self.gpt_layers_num = gpt_layers_num
         self.bert_layers_num = bert_layers_num
         self.max_position_embeddings = max_position_embeddings
@@ -321,6 +327,38 @@ def _make_mlp(input_dim, output_dim, hidden_dim, depth=2, activation="gelu"):
         layers.extend([nn.Linear(hidden_dim, hidden_dim), _activation(activation)])
     layers.append(nn.Linear(hidden_dim, output_dim))
     return nn.Sequential(*layers)
+
+
+def _make_decoder_head(
+    input_dim,
+    output_dim,
+    hidden_dim,
+    depth=2,
+    activation="gelu",
+    layout="pyramid4",
+    expand_ratio=2.0,
+    shrink_ratio=0.5,
+):
+    if int(output_dim) == 0:
+        return None
+
+    layout = str(layout).lower()
+    if layout in {"mlp", "default"}:
+        return _make_mlp(input_dim, output_dim, hidden_dim, depth=depth, activation=activation)
+    if layout != "pyramid4":
+        raise ValueError(f"Unsupported decoder_head_layout: {layout}")
+
+    expand_dim = max(1, int(round(float(input_dim) * float(expand_ratio))))
+    shrink_dim = max(1, int(round(float(input_dim) * float(shrink_ratio))))
+    return nn.Sequential(
+        nn.Linear(input_dim, expand_dim),
+        _activation(activation),
+        nn.Linear(expand_dim, input_dim),
+        _activation(activation),
+        nn.Linear(input_dim, shrink_dim),
+        _activation(activation),
+        nn.Linear(shrink_dim, output_dim),
+    )
 
 
 class IntegratedNoteEncoder(nn.Module):
@@ -488,9 +526,13 @@ class IntegratedContinuousDecoder(nn.Module):
         self.output_dim = config.output_continuous_dim
         self.epr_distribution = getattr(config, "epr_distribution", "point").lower()
         self.pedal_distribution = getattr(config, "pedal_distribution", self.epr_distribution).lower()
+        self.pedal_representation = str(getattr(config, "pedal_representation", "continuous_4")).lower()
         head_depth = getattr(config, "head_depth", 2)
         head_width_multiplier = float(getattr(config, "head_width_multiplier", 1.0))
         activation = getattr(config, "head_activation", "gelu")
+        decoder_head_layout = getattr(config, "decoder_head_layout", "pyramid4")
+        decoder_head_expand_ratio = float(getattr(config, "decoder_head_expand_ratio", 2.0))
+        decoder_head_shrink_ratio = float(getattr(config, "decoder_head_shrink_ratio", 0.5))
         full_dim = config.hidden_size
         head_hidden_dim = max(1, int(round(full_dim * head_width_multiplier)))
         self.shared_slice = self.score_slice = self.perf_slice = slice(None)
@@ -541,11 +583,12 @@ class IntegratedContinuousDecoder(nn.Module):
                 velocity_output_dim = components * 3
             pedal_components = _scalar_distribution_components(config, self.pedal_distribution)
             pedal_output_dim = pedal_components * _scalar_distribution_dim(self.pedal_distribution) * 4
+            if self.pedal_representation == "binary_4":
+                pedal_output_dim = 4
         else:
             ioi_output_dim = duration_output_dim = velocity_output_dim = 1
             pedal_output_dim = 4
 
-        self.pedal_representation = str(getattr(config, "pedal_representation", "continuous_4")).lower()
         if getattr(config, "task_type", "epr") == "epr" and self.pedal_representation == "start_ctrl":
             if self.epr_distribution in {"categorical", "hard_categorical", "soft_categorical"}:
                 raise ValueError("pedal_representation=start_ctrl is not implemented for categorical EPR heads")
@@ -573,22 +616,99 @@ class IntegratedContinuousDecoder(nn.Module):
         self.split_shared_heads = getattr(config, "task_type", "epr") == "epr"
         self.shared_pack_mode = shared_pack_mode
         if self.split_shared_heads:
-            self.ioi_head = _make_mlp(shared_dim, ioi_output_dim, head_hidden_dim, head_depth, activation)
+            self.ioi_head = _make_decoder_head(
+                shared_dim,
+                ioi_output_dim,
+                head_hidden_dim,
+                depth=head_depth,
+                activation=activation,
+                layout=decoder_head_layout,
+                expand_ratio=decoder_head_expand_ratio,
+                shrink_ratio=decoder_head_shrink_ratio,
+            )
             self.ioi_zero_head = (
-                _make_mlp(shared_dim, ioi_output_dim, head_hidden_dim, head_depth, activation)
+                _make_decoder_head(
+                    shared_dim,
+                    ioi_output_dim,
+                    head_hidden_dim,
+                    depth=head_depth,
+                    activation=activation,
+                    layout=decoder_head_layout,
+                    expand_ratio=decoder_head_expand_ratio,
+                    shrink_ratio=decoder_head_shrink_ratio,
+                )
                 if self.split_zero_ioi_head
                 else None
             )
-            self.duration_head = _make_mlp(shared_dim, duration_output_dim, head_hidden_dim, head_depth, activation)
-            self.velocity_head = _make_mlp(shared_dim, velocity_output_dim, head_hidden_dim, head_depth, activation)
+            self.duration_head = _make_decoder_head(
+                shared_dim,
+                duration_output_dim,
+                head_hidden_dim,
+                depth=head_depth,
+                activation=activation,
+                layout=decoder_head_layout,
+                expand_ratio=decoder_head_expand_ratio,
+                shrink_ratio=decoder_head_shrink_ratio,
+            )
+            self.duration_zero_head = (
+                _make_decoder_head(
+                    shared_dim,
+                    duration_output_dim,
+                    head_hidden_dim,
+                    depth=head_depth,
+                    activation=activation,
+                    layout=decoder_head_layout,
+                    expand_ratio=decoder_head_expand_ratio,
+                    shrink_ratio=decoder_head_shrink_ratio,
+                )
+                if self.split_zero_ioi_head
+                else None
+            )
+            self.velocity_head = _make_decoder_head(
+                shared_dim,
+                velocity_output_dim,
+                head_hidden_dim,
+                depth=head_depth,
+                activation=activation,
+                layout=decoder_head_layout,
+                expand_ratio=decoder_head_expand_ratio,
+                shrink_ratio=decoder_head_shrink_ratio,
+            )
             self.shared_extra_head = (
                 None
             )
         else:
             shared_output_dim = ioi_output_dim + duration_output_dim + velocity_output_dim
-            self.shared_head = _make_mlp(shared_dim, shared_output_dim, head_hidden_dim, head_depth, activation)
-        self.pedal_head = _make_mlp(perf_dim, pedal_output_dim, head_hidden_dim, head_depth, activation)
-        self.generic_head = _make_mlp(score_dim, generic_output_dim, head_hidden_dim, head_depth, activation)
+            self.shared_head = _make_decoder_head(
+                shared_dim,
+                shared_output_dim,
+                head_hidden_dim,
+                depth=head_depth,
+                activation=activation,
+                layout=decoder_head_layout,
+                expand_ratio=decoder_head_expand_ratio,
+                shrink_ratio=decoder_head_shrink_ratio,
+            )
+        self.pedal_head = _make_decoder_head(
+            perf_dim,
+            pedal_output_dim,
+            head_hidden_dim,
+            depth=head_depth,
+            activation=activation,
+            layout=decoder_head_layout,
+            expand_ratio=decoder_head_expand_ratio,
+            shrink_ratio=decoder_head_shrink_ratio,
+        )
+        self.generic_head = _make_decoder_head(
+            score_dim,
+            generic_output_dim,
+            head_hidden_dim,
+            depth=head_depth,
+            activation=activation,
+            layout=decoder_head_layout,
+            expand_ratio=decoder_head_expand_ratio,
+            shrink_ratio=decoder_head_shrink_ratio,
+        )
 
     def _shared_outputs(self, hidden_states):
         shared_hidden = hidden_states[..., self.shared_slice]
@@ -617,10 +737,14 @@ class IntegratedContinuousDecoder(nn.Module):
 
         parts = [ioi]
         if self.ioi_zero_head is not None:
-            # Packed as [nonzero-IOI, zero-IOI, duration, velocity, ...].
-            # The score-IOI mask selects the active branch in loss/materialization.
+            # Packed as [nonzero-IOI, zero-IOI, duration nonzero-IOI,
+            # duration zero-IOI, velocity, ...]. The score-IOI mask selects
+            # the active branch in loss/materialization.
             parts.append(self.ioi_zero_head(shared_hidden))
-        parts.extend([duration, velocity])
+        parts.append(duration)
+        if self.duration_zero_head is not None:
+            parts.append(self.duration_zero_head(shared_hidden))
+        parts.append(velocity)
         if self.shared_extra_head is not None:
             parts.append(self.shared_extra_head(shared_hidden))
         return torch.cat(parts, dim=-1)
@@ -641,6 +765,8 @@ class IntegratedContinuousDecoder(nn.Module):
             }:
                 return torch.cat([shared, pedal], dim=-1)
             shared = torch.sigmoid(shared)
+            if self.pedal_representation == "binary_4":
+                return torch.cat([shared, pedal], dim=-1)
             if self.config.pedal_output_activation == "sigmoid":
                 pedal = torch.sigmoid(pedal)
             elif self.config.pedal_output_activation != "linear":
@@ -734,6 +860,10 @@ def _split_zero_ioi_enabled(config):
     return bool(getattr(config, "split_zero_ioi_head", False))
 
 
+def _uses_binary4_pedal(config):
+    return str(getattr(config, "pedal_representation", "continuous_4")).lower() == "binary_4"
+
+
 def _score_zero_ioi_mask(score_shared_raw, attention_mask=None):
     if score_shared_raw is None:
         raise ValueError("score_shared_raw is required when split_zero_ioi_head=true")
@@ -743,13 +873,24 @@ def _score_zero_ioi_mask(score_shared_raw, attention_mask=None):
     return mask
 
 
+def _mask_count(mask):
+    return mask.to(dtype=torch.float32).sum().clamp_min(1.0)
+
+
+def _combine_split_losses(nonzero_loss, zero_loss, nonzero_mask, zero_mask):
+    nonzero_count = _mask_count(nonzero_mask).to(device=nonzero_loss.device, dtype=nonzero_loss.dtype)
+    zero_count = _mask_count(zero_mask).to(device=zero_loss.device, dtype=zero_loss.dtype)
+    total = (nonzero_count + zero_count).clamp_min(1.0)
+    return (nonzero_loss * nonzero_count + zero_loss * zero_count) / total
+
+
 def _split_epr_mixture_params(config, raw_outputs):
     components = _epr_mixture_components(config)
     distribution = getattr(config, "epr_distribution", "point").lower()
     split_zero_ioi = _split_zero_ioi_enabled(config)
     if distribution in {*ACN_DISTRIBUTIONS, *IACN_DISTRIBUTIONS}:
         per_feature_dim = _scalar_distribution_dim(distribution)
-        shared_feature_count = 4 if split_zero_ioi else 3
+        shared_feature_count = 5 if split_zero_ioi else 3
         shared_base_dim = per_feature_dim * shared_feature_count
         shared_base = raw_outputs[..., :shared_base_dim].reshape(
             *raw_outputs.shape[:-1],
@@ -757,7 +898,7 @@ def _split_epr_mixture_params(config, raw_outputs):
             per_feature_dim,
         )
         duration_idx = 2 if split_zero_ioi else 1
-        velocity_idx = 3 if split_zero_ioi else 2
+        velocity_idx = 4 if split_zero_ioi else 2
         params = {
             "shared_a": torch.stack(
                 [
@@ -797,9 +938,17 @@ def _split_epr_mixture_params(config, raw_outputs):
             params["ioi_zero_a"] = shared_base[..., 1, -3]
             params["ioi_zero_b"] = shared_base[..., 1, -2]
             params["ioi_zero_c"] = shared_base[..., 1, -1]
+            params["duration_zero_a"] = shared_base[..., 3, -3]
+            params["duration_zero_b"] = shared_base[..., 3, -2]
+            params["duration_zero_c"] = shared_base[..., 3, -1]
             if distribution in IACN_DISTRIBUTIONS:
                 params["ioi_zero_mode_logits"] = shared_base[..., 1, 0:2]
+                params["duration_zero_mode_logits"] = shared_base[..., 3, 0:2]
         pedal_representation = str(getattr(config, "pedal_representation", "continuous_4")).lower()
+        if pedal_representation == "binary_4":
+            pedal_start = shared_base_dim
+            params["pedal_binary_logits"] = raw_outputs[..., pedal_start : pedal_start + 4]
+            return params
         pedal_distribution = str(getattr(config, "pedal_distribution", distribution)).lower()
         pedal_feature_dim = _scalar_distribution_dim(pedal_distribution)
         pedal_base_dim = pedal_feature_dim * (2 if pedal_representation == "start_ctrl" else 4)
@@ -837,6 +986,15 @@ def _split_epr_mixture_params(config, raw_outputs):
             components,
         )
         cursor += timing_dim
+        if split_zero_ioi:
+            duration_zero_base = raw_outputs[..., cursor : cursor + timing_dim].reshape(
+                *raw_outputs.shape[:-1],
+                4,
+                components,
+            )
+            cursor += timing_dim
+        else:
+            duration_zero_base = None
         velocity_base = raw_outputs[..., cursor : cursor + scalar_dim].reshape(
             *raw_outputs.shape[:-1],
             3,
@@ -861,8 +1019,16 @@ def _split_epr_mixture_params(config, raw_outputs):
             params["ioi_zero_a"] = ioi_zero_base[..., 1, :]
             params["ioi_zero_b"] = ioi_zero_base[..., 2, :]
             params["ioi_zero_c"] = ioi_zero_base[..., 3, :]
+        if duration_zero_base is not None:
+            params["duration_zero_logits"] = duration_zero_base[..., 0, :]
+            params["duration_zero_a"] = duration_zero_base[..., 1, :]
+            params["duration_zero_b"] = duration_zero_base[..., 2, :]
+            params["duration_zero_c"] = duration_zero_base[..., 3, :]
         pedal_representation = str(getattr(config, "pedal_representation", "continuous_4")).lower()
         if pedal_representation == "start_ctrl":
+            return params
+        if pedal_representation == "binary_4":
+            params["pedal_binary_logits"] = raw_outputs[..., cursor : cursor + 4]
             return params
         pedal_base = raw_outputs[..., cursor : cursor + scalar_dim * 4].reshape(
             *raw_outputs.shape[:-1],
@@ -877,7 +1043,7 @@ def _split_epr_mixture_params(config, raw_outputs):
 
     per_component_dim = 3
     per_feature_dim = components * per_component_dim
-    shared_feature_count = 4 if split_zero_ioi else 3
+    shared_feature_count = 5 if split_zero_ioi else 3
     shared_base_dim = per_feature_dim * shared_feature_count
     pedal_base_dim = per_feature_dim * 4
     shared_base = raw_outputs[..., :shared_base_dim].reshape(
@@ -888,7 +1054,7 @@ def _split_epr_mixture_params(config, raw_outputs):
     )
     pedal_representation = str(getattr(config, "pedal_representation", "continuous_4")).lower()
     duration_idx = 2 if split_zero_ioi else 1
-    velocity_idx = 3 if split_zero_ioi else 2
+    velocity_idx = 4 if split_zero_ioi else 2
     params = {
         "shared_logits": torch.stack(
             [
@@ -919,7 +1085,14 @@ def _split_epr_mixture_params(config, raw_outputs):
         params["ioi_zero_logits"] = shared_base[..., 1, 0, :]
         params["ioi_zero_a"] = shared_base[..., 1, 1, :]
         params["ioi_zero_b"] = shared_base[..., 1, 2, :]
+        params["duration_zero_logits"] = shared_base[..., 3, 0, :]
+        params["duration_zero_a"] = shared_base[..., 3, 1, :]
+        params["duration_zero_b"] = shared_base[..., 3, 2, :]
     if pedal_representation == "start_ctrl":
+        return params
+    if pedal_representation == "binary_4":
+        pedal_start = shared_base_dim
+        params["pedal_binary_logits"] = raw_outputs[..., pedal_start : pedal_start + 4]
         return params
 
     pedal_start = shared_base_dim
@@ -1000,6 +1173,30 @@ def _ioi_zero_scalar_params(config, params):
         params["ioi_zero_a"],
         params["ioi_zero_b"],
         params.get("ioi_zero_c"),
+    )
+
+
+def _duration_zero_scalar_params(config, params):
+    distribution = getattr(config, "epr_distribution", "point").lower()
+    if distribution in IACN_DISTRIBUTIONS:
+        return (
+            params["duration_zero_mode_logits"],
+            params["duration_zero_a"],
+            params["duration_zero_b"],
+            params["duration_zero_c"],
+        )
+    if distribution in ACN_DISTRIBUTIONS:
+        return (
+            None,
+            params["duration_zero_a"],
+            params["duration_zero_b"],
+            params["duration_zero_c"],
+        )
+    return (
+        params["duration_zero_logits"],
+        params["duration_zero_a"],
+        params["duration_zero_b"],
+        params.get("duration_zero_c"),
     )
 
 
@@ -1205,15 +1402,7 @@ def _target5_to_raw7(score_shared_raw, target_predictions, config=None):
         log_scale = float(_config_value(config, "timing_log_scale", 50.0))
         score_ioi_norm = _torch_log_timing_code(score_shared_raw[..., 0], scale=log_scale, max_time_ms=5000.0)
         score_duration_norm = _torch_log_timing_code(score_shared_raw[..., 1], scale=log_scale, max_time_ms=5000.0)
-        if _split_zero_ioi_enabled(config):
-            nonzero_scale = float(_config_value(config, "ioi_nonzero_dev_scale", 2.0))
-            zero_scale = float(_config_value(config, "ioi_zero_dev_scale", 4.0))
-            nonzero_delta = (target_predictions[..., 0] - 0.5) / max(nonzero_scale, 1e-12)
-            zero_delta = target_predictions[..., 0] / max(zero_scale, 1e-12)
-            ioi_delta = torch.where(score_shared_raw[..., 0] <= 0.0, zero_delta, nonzero_delta)
-            perf_ioi_norm = score_ioi_norm + ioi_delta
-        else:
-            perf_ioi_norm = score_ioi_norm + (target_predictions[..., 0] - 0.5)
+        perf_ioi_norm = score_ioi_norm + (target_predictions[..., 0] - 0.5)
         perf_duration_norm = score_duration_norm + (target_predictions[..., 1] - 0.5)
         perf_ioi_ms = _torch_log_timing_decode(perf_ioi_norm, scale=log_scale, max_time_ms=5000.0)
         perf_duration_ms = _torch_log_timing_decode(perf_duration_norm, scale=log_scale, max_time_ms=5000.0)
@@ -1221,8 +1410,12 @@ def _target5_to_raw7(score_shared_raw, target_predictions, config=None):
         perf_ioi_ms = (score_shared_raw[..., 0] + (target_predictions[..., 0] * 1000.0 - 500.0)).clamp_min(0.0)
         perf_duration_ms = (score_shared_raw[..., 1] + (target_predictions[..., 1] * 1000.0 - 500.0)).clamp_min(0.0)
     velocity = target_predictions[..., 2] * 127.0
-    pedal_start = target_predictions[..., 3] * 127.0
-    pedal_ctrl = target_predictions[..., 4] * 127.0
+    if config is not None and _uses_binary4_pedal(config) and target_predictions.shape[-1] >= 7:
+        pedal_start = target_predictions[..., 3] * 127.0
+        pedal_ctrl = target_predictions[..., 5] * 127.0
+    else:
+        pedal_start = target_predictions[..., 3] * 127.0
+        pedal_ctrl = target_predictions[..., 4] * 127.0
     next_start = torch.cat([pedal_start[..., 1:], pedal_start[..., -1:]], dim=-1)
     return torch.stack(
         [
@@ -1269,7 +1462,10 @@ def _build_epr_decoder_rows(config, score_shared_raw, target_predictions):
         log_scale=log_scale,
     )
     velocity = target_predictions[..., 2:3].float().clamp(0.0, 1.0)
-    pedal = target_predictions[..., 3:5].float().clamp(0.0, 1.0)
+    if _uses_binary4_pedal(config) and target_predictions.shape[-1] >= 7:
+        pedal = target_predictions[..., [3, 5]].float().clamp(0.0, 1.0)
+    else:
+        pedal = target_predictions[..., 3:5].float().clamp(0.0, 1.0)
     score_control = torch.cat([score_ioi, score_duration, score_velocity], dim=-1)
     expected_score_dim = int(getattr(config, "score_control_feature_dim", getattr(config, "control_feature_dim", 5)))
     if score_control.shape[-1] != expected_score_dim:
@@ -1963,6 +2159,14 @@ def _select_split_zero_ioi(config, score_shared_raw, ioi_nonzero, ioi_zero):
     return torch.where(zero_mask.to(device=ioi_nonzero.device), ioi_zero, ioi_nonzero)
 
 
+def _materialize_binary4_logits(logits, sampling_strategy="mean"):
+    probs = torch.sigmoid(logits.float())
+    mode_name = str(sampling_strategy).lower()
+    if mode_name in {"sample", "sampling", "stochastic"}:
+        return torch.bernoulli(probs)
+    return (probs >= 0.5).to(dtype=probs.dtype)
+
+
 def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean", score_shared_raw=None):
     if _uses_deviation_ratio_targets(config):
         distribution = getattr(config, "epr_distribution", "point").lower()
@@ -2000,7 +2204,6 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean", s
 
         if _is_scalar_distribution(distribution):
             params = _split_epr_mixture_params(config, raw_outputs)
-            pedal_params = _split_start_ctrl_from_outputs(config, raw_outputs)
 
             def decode_shared(index):
                 logits, a, b, c = _shared_scalar_params(config, params, index)
@@ -2014,6 +2217,7 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean", s
                 )
 
             ioi = decode_shared(0)
+            duration = decode_shared(1)
             if _split_zero_ioi_enabled(config):
                 z_logits, z_a, z_b, z_c = _ioi_zero_scalar_params(config, params)
                 ioi_zero = _decode_mixture_value(
@@ -2025,8 +2229,26 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean", s
                     sampling_strategy=sampling_strategy,
                 )
                 ioi = _select_split_zero_ioi(config, score_shared_raw, ioi, ioi_zero)
-            shared = torch.stack([ioi, decode_shared(1), decode_shared(2)], dim=-1)
+                z_logits, z_a, z_b, z_c = _duration_zero_scalar_params(config, params)
+                duration_zero = _decode_mixture_value(
+                    config,
+                    z_logits,
+                    z_a,
+                    z_b,
+                    z_c,
+                    sampling_strategy=sampling_strategy,
+                )
+                duration = _select_split_zero_ioi(config, score_shared_raw, duration, duration_zero)
+            shared = torch.stack([ioi, duration, decode_shared(2)], dim=-1)
 
+            if _uses_binary4_pedal(config):
+                pedal = _materialize_binary4_logits(
+                    params["pedal_binary_logits"],
+                    sampling_strategy=sampling_strategy,
+                )
+                return torch.cat([shared, pedal], dim=-1)
+
+            pedal_params = _split_start_ctrl_from_outputs(config, raw_outputs)
             pedal_distribution = str(getattr(config, "pedal_distribution", distribution)).lower()
 
             def decode_start_ctrl(raw):
@@ -2052,10 +2274,22 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean", s
                 raw_outputs[..., 0].clamp(0.0, 1.0),
                 raw_outputs[..., 1].clamp(0.0, 1.0),
             )
-            duration = raw_outputs[..., 2].clamp(0.0, 1.0)
-            velocity = raw_outputs[..., 3].clamp(0.0, 1.0)
-            pedal = raw_outputs[..., -2:].clamp(0.0, 1.0)
+            duration = _select_split_zero_ioi(
+                config,
+                score_shared_raw,
+                raw_outputs[..., 2].clamp(0.0, 1.0),
+                raw_outputs[..., 3].clamp(0.0, 1.0),
+            )
+            velocity = raw_outputs[..., 4].clamp(0.0, 1.0)
+            if _uses_binary4_pedal(config):
+                pedal = _materialize_binary4_logits(raw_outputs[..., -4:], sampling_strategy=sampling_strategy)
+            else:
+                pedal = raw_outputs[..., -2:].clamp(0.0, 1.0)
             return torch.cat([ioi.unsqueeze(-1), duration.unsqueeze(-1), velocity.unsqueeze(-1), pedal], dim=-1)
+        if _uses_binary4_pedal(config):
+            shared = raw_outputs[..., :3].clamp(0.0, 1.0)
+            pedal = _materialize_binary4_logits(raw_outputs[..., -4:], sampling_strategy=sampling_strategy)
+            return torch.cat([shared, pedal], dim=-1)
         return raw_outputs[..., :5].clamp(0.0, 1.0)
 
     distribution = getattr(config, "epr_distribution", "point").lower()
@@ -2600,7 +2834,6 @@ def _compute_integrated_loss_components(
         extra_components = {}
         if _is_scalar_distribution(distribution):
             params = _split_epr_mixture_params(config, continuous_pred)
-            pedal_params = _split_start_ctrl_from_outputs(config, continuous_pred)
             eps = getattr(config, "epr_distribution_eps", getattr(config, "beta_eps", 1e-5))
             sigma_min = getattr(config, "logistic_normal_sigma_min", 1e-3)
             sigma_max = getattr(config, "logistic_normal_sigma_max", 10.0)
@@ -2629,7 +2862,7 @@ def _compute_integrated_loss_components(
                 loss_ioi_nz = loss_one(logits, a, b, labels_continuous[..., 0], c, loss_mask=nonzero_mask)
                 z_logits, z_a, z_b, z_c = _ioi_zero_scalar_params(config, params)
                 loss_ioi_zero = loss_one(z_logits, z_a, z_b, labels_continuous[..., 0], z_c, loss_mask=zero_mask)
-                loss_ioi = loss_ioi_nz + loss_ioi_zero
+                loss_ioi = _combine_split_losses(loss_ioi_nz, loss_ioi_zero, nonzero_mask, zero_mask)
                 extra_components["ioi_nz"] = loss_ioi_nz
                 extra_components["ioi_zero"] = loss_ioi_zero
             else:
@@ -2637,29 +2870,53 @@ def _compute_integrated_loss_components(
                 loss_ioi = loss_one(logits, a, b, labels_continuous[..., 0], c)
 
             logits, a, b, c = _shared_scalar_params(config, params, 1)
-            loss_duration = loss_one(logits, a, b, labels_continuous[..., 1], c)
+            if _split_zero_ioi_enabled(config):
+                loss_duration_nz = loss_one(logits, a, b, labels_continuous[..., 1], c, loss_mask=nonzero_mask)
+                z_logits, z_a, z_b, z_c = _duration_zero_scalar_params(config, params)
+                loss_duration_zero = loss_one(
+                    z_logits,
+                    z_a,
+                    z_b,
+                    labels_continuous[..., 1],
+                    z_c,
+                    loss_mask=zero_mask,
+                )
+                loss_duration = _combine_split_losses(loss_duration_nz, loss_duration_zero, nonzero_mask, zero_mask)
+                extra_components["duration_nz"] = loss_duration_nz
+                extra_components["duration_zero"] = loss_duration_zero
+            else:
+                loss_duration = loss_one(logits, a, b, labels_continuous[..., 1], c)
             logits, a, b, c = _shared_scalar_params(config, params, 2)
             loss_velocity = loss_one(logits, a, b, labels_continuous[..., 2], c)
 
-            pedal_distribution = str(getattr(config, "pedal_distribution", distribution)).lower()
-            logits, a, b, c = _start_ctrl_scalar_params(config, pedal_params["start_raw"])
-            pedal_start = loss_one(
-                logits,
-                a,
-                b,
-                labels_continuous[..., 3],
-                c,
-                scalar_distribution=pedal_distribution,
-            )
-            logits, a, b, c = _start_ctrl_scalar_params(config, pedal_params["ctrl_raw"])
-            pedal_ctrl = loss_one(
-                logits,
-                a,
-                b,
-                labels_continuous[..., 4],
-                c,
-                scalar_distribution=pedal_distribution,
-            )
+            if _uses_binary4_pedal(config):
+                loss_pedal = _bce_loss(
+                    params["pedal_binary_logits"],
+                    labels_continuous[..., 3:7],
+                    mask.unsqueeze(-1).expand_as(labels_continuous[..., 3:7]),
+                )
+            else:
+                pedal_params = _split_start_ctrl_from_outputs(config, continuous_pred)
+                pedal_distribution = str(getattr(config, "pedal_distribution", distribution)).lower()
+                logits, a, b, c = _start_ctrl_scalar_params(config, pedal_params["start_raw"])
+                pedal_start = loss_one(
+                    logits,
+                    a,
+                    b,
+                    labels_continuous[..., 3],
+                    c,
+                    scalar_distribution=pedal_distribution,
+                )
+                logits, a, b, c = _start_ctrl_scalar_params(config, pedal_params["ctrl_raw"])
+                pedal_ctrl = loss_one(
+                    logits,
+                    a,
+                    b,
+                    labels_continuous[..., 4],
+                    c,
+                    scalar_distribution=pedal_distribution,
+                )
+                loss_pedal = 0.5 * (pedal_start + pedal_ctrl)
         elif distribution == "beta_mu_kappa":
             params = _split_epr_distribution_params(continuous_pred)
             pedal_params = _split_start_ctrl_from_outputs(config, continuous_pred)
@@ -2724,11 +2981,32 @@ def _compute_integrated_loss_components(
                     config.time_loss_type,
                     config.huber_delta,
                 )
-                loss_ioi = loss_ioi_nz + loss_ioi_zero
-                duration_idx = 2
-                velocity_idx = 3
+                loss_ioi = _combine_split_losses(loss_ioi_nz, loss_ioi_zero, nonzero_mask, zero_mask)
+                loss_duration_nz = _regression_loss(
+                    pred[..., 2],
+                    labels_continuous[..., 1],
+                    nonzero_mask,
+                    config.time_loss_type,
+                    config.huber_delta,
+                )
+                loss_duration_zero = _regression_loss(
+                    pred[..., 3],
+                    labels_continuous[..., 1],
+                    zero_mask,
+                    config.time_loss_type,
+                    config.huber_delta,
+                )
+                loss_duration = _combine_split_losses(
+                    loss_duration_nz,
+                    loss_duration_zero,
+                    nonzero_mask,
+                    zero_mask,
+                )
+                velocity_idx = 4
                 extra_components["ioi_nz"] = loss_ioi_nz
                 extra_components["ioi_zero"] = loss_ioi_zero
+                extra_components["duration_nz"] = loss_duration_nz
+                extra_components["duration_zero"] = loss_duration_zero
             else:
                 loss_ioi = _regression_loss(
                     pred[..., 0],
@@ -2739,13 +3017,13 @@ def _compute_integrated_loss_components(
                 )
                 duration_idx = 1
                 velocity_idx = 2
-            loss_duration = _regression_loss(
-                pred[..., duration_idx],
-                labels_continuous[..., 1],
-                mask,
-                config.time_loss_type,
-                config.huber_delta,
-            )
+                loss_duration = _regression_loss(
+                    pred[..., duration_idx],
+                    labels_continuous[..., 1],
+                    mask,
+                    config.time_loss_type,
+                    config.huber_delta,
+                )
             loss_velocity = _regression_loss(
                 pred[..., velocity_idx],
                 labels_continuous[..., 2],
@@ -2753,25 +3031,33 @@ def _compute_integrated_loss_components(
                 config.value_loss_type,
                 config.huber_delta,
             )
-            pedal_start = _regression_loss(
-                pred[..., -2],
-                labels_continuous[..., 3],
-                mask,
-                config.value_loss_type,
-                config.huber_delta,
-            )
-            pedal_ctrl = _regression_loss(
-                pred[..., -1],
-                labels_continuous[..., 4],
-                mask,
-                config.value_loss_type,
-                config.huber_delta,
-            )
+            if _uses_binary4_pedal(config):
+                loss_pedal = _bce_loss(
+                    pred[..., -4:],
+                    labels_continuous[..., 3:7],
+                    mask.unsqueeze(-1).expand_as(labels_continuous[..., 3:7]),
+                )
+            else:
+                pedal_start = _regression_loss(
+                    pred[..., -2],
+                    labels_continuous[..., 3],
+                    mask,
+                    config.value_loss_type,
+                    config.huber_delta,
+                )
+                pedal_ctrl = _regression_loss(
+                    pred[..., -1],
+                    labels_continuous[..., 4],
+                    mask,
+                    config.value_loss_type,
+                    config.huber_delta,
+                )
+                loss_pedal = 0.5 * (pedal_start + pedal_ctrl)
         return {
             "ioi": loss_ioi,
             "duration": loss_duration,
             "velocity": loss_velocity,
-            "pedal": 0.5 * (pedal_start + pedal_ctrl),
+            "pedal": loss_pedal,
             **extra_components,
         }
 
@@ -2958,7 +3244,7 @@ def _compute_integrated_loss_components(
             loss_ioi_nz = loss_one(logits, a, b, labels_continuous[..., 0], c, loss_mask=nonzero_mask)
             z_logits, z_a, z_b, z_c = _ioi_zero_scalar_params(config, params)
             loss_ioi_zero = loss_one(z_logits, z_a, z_b, labels_continuous[..., 0], z_c, loss_mask=zero_mask)
-            loss_ioi = loss_ioi_nz + loss_ioi_zero
+            loss_ioi = _combine_split_losses(loss_ioi_nz, loss_ioi_zero, nonzero_mask, zero_mask)
             extra_components["ioi_nz"] = loss_ioi_nz
             extra_components["ioi_zero"] = loss_ioi_zero
         else:

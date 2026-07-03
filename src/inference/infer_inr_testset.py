@@ -15,8 +15,8 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from src.data_process.work_manifest import build_work_manifest
 from src.train.train_inr import (
-    build_work_manifest,
     build_csr_performance_input_rows,
     build_epr_score_input_rows,
     build_score_musical_rows,
@@ -509,7 +509,11 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
             "deterministic_strategy": args.deterministic_strategy if args.protocol == "deterministic" else None,
             "sample_idx": sample_idx,
             "seed": sample_seed,
-            "timing_representation": "target5_dev_velocity_pedal2",
+            "timing_representation": (
+                "target7_dev_velocity_binary4"
+                if str(config.get("pedal_representation", "")).lower() == "binary_4"
+                else "target5_dev_velocity_pedal2"
+            ),
             "pitch": [int(value) for value in pitch],
             "predicted_target5": pred_continuous.tolist(),
             "reconstructed_raw7": raw_rows.tolist(),

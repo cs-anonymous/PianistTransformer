@@ -9,9 +9,10 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from src.data_process.work_manifest import build_work_manifest
+from src.data_process.sidecar_builder import build_sidecar_for_work
 from src.train.train_inr import (
     PianoCoReNodeSFTDataset,
-    build_work_manifest,
     infer_input_feature_mode,
 )
 
@@ -108,7 +109,7 @@ def worker(args):
         }
     ]
     dataset = build_dataset(config, manifest, split)
-    sidecar = dataset.write_prepared_sidecar(work_path, selected_sources=selected_sources)
+    sidecar = build_sidecar_for_work(dataset, work_path, selected_sources=selected_sources)
     if sidecar is None or not Path(sidecar).exists():
         raise RuntimeError(f"Failed to write sidecar for {work_path}: {sidecar}")
     return str(work_path), str(sidecar)
@@ -117,7 +118,7 @@ def worker(args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
-    parser.add_argument("--split", default="train", choices=["train", "test"])
+    parser.add_argument("--split", default="train", choices=["train", "test", "valid"])
     parser.add_argument(
         "--performance-dataset",
         default=None,
@@ -132,7 +133,12 @@ def main():
         config = json.load(file)
     if args.sidecar_tag:
         config["prepared_sidecar_tag"] = args.sidecar_tag
-    manifest = make_manifest(config, args.split, performance_dataset_override=args.performance_dataset)
+    split = args.split
+    if split == "valid":
+        split = config.get("fixed_window_base_split", "train")
+        config["fixed_window_split_scheme"] = config.get("fixed_window_split_scheme") or "train_valid_asap3_nonasap1_v1"
+        config["fixed_window_eval_split_name"] = "valid"
+    manifest = make_manifest(config, split, performance_dataset_override=args.performance_dataset)
     paths = unique_work_paths(manifest)
     selected_by_path = work_selected_sources(manifest)
     if args.limit is not None:

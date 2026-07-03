@@ -82,6 +82,53 @@ not part of the main pipeline anymore.
 - `score_xml_alignment.py`: shared XML/MXL parsing and pitch-aware alignment
   helpers used by stage 2.
 
+## Fixed Train/Valid Window Split
+
+To create one shared, fixed `valid` split for all INR experiments, write a
+window-level split scheme back into each processed work JSON:
+
+```bash
+python src/data_process/create_fixed_window_valid_split.py \
+  --config <config.json> \
+  --scheme-name train_valid_asap3_nonasap1_v1
+```
+
+This annotates each processed work JSON under:
+
+- `meta.window_split_schemes[scheme_name]`
+
+The scheme stores:
+
+- `window_assignments`: every window labeled as `train` or `valid`
+- aggregate valid counts for `ASAP` and `non-ASAP`
+- the selection seed and target ratios used to build the split
+
+After updating JSONs, rebuild shared INR sidecars so they carry the same fixed
+metadata:
+
+```bash
+python src/data_process/prebuild_inr_work_pt.py \
+  --config <config.json> \
+  --split train
+```
+
+Training can then consume the fixed split by setting:
+
+```json
+{
+  "fixed_window_split_scheme": "train_valid_asap3_nonasap1_v1",
+  "fixed_window_base_split": "train",
+  "fixed_window_train_split_name": "train",
+  "fixed_window_eval_split_name": "valid"
+}
+```
+
+Recommended stage usage:
+
+- base `train`: use all performances with the fixed `valid` windows
+- `adapt`: keep `train_performance_dataset = "ASAP"` and `eval_performance_dataset = "ASAP"`
+  so the fixed `valid` windows are reused, but evaluation only keeps ASAP performances
+
 ## Legacy
 
 `legacy_pt_cpt/` contains old PT/CPT preprocessing scripts for pretrain, Arrow,

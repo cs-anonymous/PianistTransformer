@@ -98,7 +98,6 @@ cfg.setdefault("eval_dataloader_persistent_workers", bool(int(cfg.get("eval_data
 cfg.setdefault("eval_dataloader_prefetch_factor", cfg.get("dataloader_prefetch_factor", 2))
 cfg.setdefault("loss_component_interval", cfg.get("logging_steps", 20))
 cfg["use_prepared_sidecar"] = True
-cfg["use_prepared_cache"] = False
 cfg["precompute_dataset_items"] = False
 cfg["precompute_eval_dataset_items"] = False
 if resume_checkpoint:
@@ -230,12 +229,11 @@ cfg["learning_rate"] = float(lr)
 cfg["num_train_epochs"] = float(epochs)
 cfg["max_steps"] = -1
 cfg["train_performance_dataset"] = "ASAP"
-cfg["eval_split"] = "train"
+cfg["eval_split"] = "test"
 cfg["eval_performance_dataset"] = "ASAP"
 cfg["eval_include_all_performance_dataset"] = None
 cfg["max_eval_non_asap_performances_per_work"] = None
 cfg["use_prepared_sidecar"] = True
-cfg["use_prepared_cache"] = False
 cfg["prepared_sidecar_tag"] = cfg.get("prepared_sidecar_tag") or "ASAP"
 cfg["precompute_dataset_items"] = False
 cfg["precompute_eval_dataset_items"] = False
@@ -251,7 +249,6 @@ cfg.setdefault("eval_dataloader_persistent_workers", bool(int(cfg.get("eval_data
 cfg.setdefault("eval_dataloader_prefetch_factor", cfg.get("dataloader_prefetch_factor", 2))
 cfg.setdefault("loss_component_interval", cfg.get("logging_steps", 20))
 cfg["use_prepared_sidecar"] = True
-cfg["use_prepared_cache"] = False
 cfg["precompute_dataset_items"] = False
 cfg["precompute_eval_dataset_items"] = False
 open(dst, "w", encoding="utf-8").write(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")

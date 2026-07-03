@@ -12,12 +12,13 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 
-import pandas as pd
+import numpy as np
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 from torch.utils.data.sampler import SequentialSampler
-from transformers import Trainer, TrainingArguments
+from scipy.stats import wasserstein_distance
+from transformers import EarlyStoppingCallback, Trainer, TrainingArguments
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in os.sys.path:
@@ -28,7 +29,12 @@ from src.model.integrated_pianoformer import (
     IntegratedPianoT5GemmaConfig,
     IntegratedPianoTransformer,
     _compute_integrated_loss_components,
+    _materialize_csr_prediction,
+    _materialize_epr_prediction,
+    _target5_to_raw7,
+    _uses_deviation_ratio_targets,
 )
+from src.data_process.work_manifest import build_work_manifest
 from src.utils.func import filter_valid_args
 from src.utils.inr_midi import raw_rows_to_epr_bins, raw_rows_to_model_continuous
 
@@ -70,6 +76,7 @@ OUTPUT_HEAD_PREFIXES = (
     "continuous_decoder.ioi_head",
     "continuous_decoder.ioi_zero_head",
     "continuous_decoder.duration_head",
+    "continuous_decoder.duration_zero_head",
     "continuous_decoder.velocity_head",
     "continuous_decoder.shared_head",
     "continuous_decoder.shared_extra_head",
@@ -161,43 +168,6 @@ def apply_trainable_parameter_policy(model, train_config):
                 trainable.append(name)
         print(f"Freeze policy: regex={trainable_regex!r} ({len(trainable)} tensors trainable)")
         print(f"  trainable examples: {trainable[:12]}")
-
-
-def score_json_path(refined_dir, score_rel_path):
-    score_path = Path(refined_dir) / score_rel_path
-    candidates = [
-        score_path.with_suffix(".json"),
-        score_path.parent / f"{score_path.stem}.node_a.json",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return candidates[0]
-
-
-def make_windows(total_notes, block_notes, overlap_ratio, min_notes):
-    total_notes = int(total_notes)
-    if total_notes < min_notes:
-        return []
-    if total_notes <= block_notes:
-        return [(0, total_notes)]
-
-    stride = max(1, int(block_notes * (1.0 - overlap_ratio)))
-    windows = []
-    start = 0
-    while start + block_notes <= total_notes:
-        windows.append((start, start + block_notes))
-        start += stride
-    if windows[-1][1] != total_notes and total_notes - start >= min_notes:
-        windows.append((total_notes - block_notes, total_notes))
-
-    deduped = []
-    seen = set()
-    for window in windows:
-        if window not in seen:
-            deduped.append(window)
-            seen.add(window)
-    return deduped
 
 
 def default_input_continuous_dim(
@@ -431,11 +401,10 @@ def normalize_ioi_dev(
         score_norm = normalize_log_timing_value(score_ioi_ms, scale=log_scale, max_time_ms=5000.0)
         perf_norm = normalize_log_timing_value(perf_ioi_ms, scale=log_scale, max_time_ms=5000.0)
         delta = perf_norm - score_norm
-        if split_zero_ioi_head and float(score_ioi_ms) <= 0.0:
-            return min(max(float(zero_scale) * delta, 0.0), 1.0)
-        offset = 0.5 if split_zero_ioi_head else 0.5
-        scale = float(nonzero_scale) if split_zero_ioi_head else 1.0
-        return min(max(scale * delta + offset, 0.0), 1.0)
+        # Keep one target coordinate system for split and non-split heads.
+        # The score-IOI mask chooses a specialized head; it should not also
+        # change the meaning of the normalized target value.
+        return min(max(delta + 0.5, 0.0), 1.0)
     dev_ms = float(perf_ioi_ms) - float(score_ioi_ms)
     return min(max((dev_ms + 500.0) / 1000.0, 0.0), 1.0)
 
@@ -495,6 +464,60 @@ def performance_dev_velocity_pedal2_rows(
                 min(max(float(perf_row[2]), 0.0), 127.0) / 127.0,
                 min(max(float(pedal_row[0]), 0.0), 127.0) / 127.0,
                 min(max(float(pedal_row[1]), 0.0), 127.0) / 127.0,
+            ]
+        )
+    return rows
+
+
+def performance_dev_velocity_pedal4_binary_rows(
+    perf,
+    score_shared_raw,
+    epr_timing_target="deviation",
+    log_scale=50.0,
+    split_zero_ioi_head=False,
+    ioi_nonzero_dev_scale=2.0,
+    ioi_zero_dev_scale=4.0,
+    pedal_binary_threshold=64.0,
+):
+    shared_rows = perf.get("label_shared_raw")
+    pedal_rows = _raw_value_rows(perf, "label_pedal4_raw", "pedal4_raw")
+    if shared_rows is None or pedal_rows is None:
+        if "label_raw" not in perf:
+            return None
+        shared_rows = [row[:3] for row in perf["label_raw"]]
+        pedal_rows = [row[3:7] for row in perf["label_raw"]]
+
+    if len(score_shared_raw) != len(shared_rows):
+        raise ValueError(
+            f"score_raw/label_shared_raw length mismatch: {len(score_shared_raw)} vs {len(shared_rows)}"
+        )
+    if len(shared_rows) != len(pedal_rows):
+        raise ValueError(
+            f"label_shared_raw/label_pedal4_raw length mismatch: {len(shared_rows)} vs {len(pedal_rows)}"
+        )
+
+    threshold = float(pedal_binary_threshold)
+    rows = []
+    for score_row, perf_row, pedal_row in zip(score_shared_raw, shared_rows, pedal_rows):
+        rows.append(
+            [
+                normalize_ioi_dev(
+                    score_row[0],
+                    perf_row[0],
+                    epr_timing_target=epr_timing_target,
+                    log_scale=log_scale,
+                    split_zero_ioi_head=split_zero_ioi_head,
+                    nonzero_scale=ioi_nonzero_dev_scale,
+                    zero_scale=ioi_zero_dev_scale,
+                ),
+                normalize_duration_dev(
+                    score_row[1],
+                    perf_row[1],
+                    epr_timing_target=epr_timing_target,
+                    log_scale=log_scale,
+                ),
+                min(max(float(perf_row[2]), 0.0), 127.0) / 127.0,
+                *[1.0 if float(value) >= threshold else 0.0 for value in pedal_row[:4]],
             ]
         )
     return rows
@@ -819,90 +842,45 @@ def distributed_info():
     return 0, 1
 
 
-def build_work_manifest(
-    metadata_path,
-    refined_dir,
-    split,
-    block_notes,
-    overlap_ratio,
-    min_notes,
-    max_works=None,
-    include_all_performance_dataset=None,
-    max_non_asap_performances_per_work=None,
-    selection_seed=42,
-    skip_work_paths=None,
-    performance_dataset=None,
-    exclude_performance_dataset=None,
-):
-    columns = [
-        "tier_a",
-        "split",
-        "refined_score_midi_path",
-        "refined_performance_midi_path",
-        "refined_alignment_path",
-        "refined_score_note_count",
-        "performance_dataset",
-    ]
-    df = pd.read_csv(metadata_path, usecols=columns)
-    df = df[df["tier_a"].fillna(False).astype(bool)]
-    df = df[df["split"] == split]
-    df = df[df["refined_score_midi_path"].notna()]
-    df = df[df["refined_performance_midi_path"].notna()]
-    df = df[df["refined_alignment_path"].notna()]
-    dataset = df["performance_dataset"].fillna("").astype(str)
-    if performance_dataset is not None:
-        df = df[dataset == str(performance_dataset)]
-        dataset = df["performance_dataset"].fillna("").astype(str)
-    if exclude_performance_dataset is not None:
-        df = df[dataset != str(exclude_performance_dataset)]
-    df = df.sort_values(["refined_score_midi_path", "refined_performance_midi_path"], kind="stable")
+def finite_wasserstein_distance(pred_values, target_values):
+    pred = np.asarray(pred_values, dtype=np.float64)
+    target = np.asarray(target_values, dtype=np.float64)
+    pred = pred[np.isfinite(pred)]
+    target = target[np.isfinite(target)]
+    if len(pred) == 0 or len(target) == 0:
+        return float("nan")
+    return float(wasserstein_distance(pred, target))
 
-    manifest = []
-    skip_work_paths = set(skip_work_paths or [])
-    for score_rel_path, group in df.groupby("refined_score_midi_path", sort=True):
-        selected_group = group
-        if (
-            include_all_performance_dataset is not None
-            and max_non_asap_performances_per_work is not None
-        ):
-            dataset = group["performance_dataset"].fillna("").astype(str)
-            always_mask = dataset == str(include_all_performance_dataset)
-            always = group[always_mask]
-            other = group[~always_mask]
-            if len(other) > max_non_asap_performances_per_work:
-                rng = random.Random(f"{selection_seed}:{score_rel_path}")
-                sampled_indices = rng.sample(list(other.index), max_non_asap_performances_per_work)
-                other = other.loc[sampled_indices]
-            selected_group = pd.concat([always, other], axis=0).sort_values(
-                ["refined_performance_midi_path"],
-                kind="stable",
-            )
 
-        path = score_json_path(refined_dir, score_rel_path)
-        if not path.exists():
-            continue
-        if str(path) in skip_work_paths or score_rel_path in skip_work_paths:
-            print(f"Skipping configured work JSON: {path}", flush=True)
-            continue
-        note_count = int(group["refined_score_note_count"].iloc[0])
-        windows = make_windows(note_count, block_notes, overlap_ratio, min_notes)
-        if not windows:
-            continue
-        selected_sources = selected_group["refined_performance_midi_path"].tolist()
-        manifest.append(
-            {
-                "path": str(path),
-                "score_source": score_rel_path,
-                "note_count": note_count,
-                "windows": windows,
-                "selected_performance_sources": selected_sources,
-                "estimated_performances": int(len(selected_sources)),
-                "estimated_examples": int(len(windows) * len(selected_sources)),
-            }
+def configure_eval_schedule(train_config, train_examples):
+    eval_every_steps = train_config.get("eval_every_steps")
+    eval_every_epochs = train_config.get("eval_every_epochs")
+    save_every_steps = train_config.get("save_every_steps")
+
+    if eval_every_steps is not None:
+        eval_steps = max(1, int(eval_every_steps))
+    elif eval_every_epochs is not None:
+        world_size = int(os.environ.get("WORLD_SIZE", "1") or 1)
+        per_device = int(train_config.get("per_device_train_batch_size", 1) or 1)
+        grad_accum = int(train_config.get("gradient_accumulation_steps", 1) or 1)
+        global_batch_size = int(
+            train_config.get("global_batch_size") or (per_device * grad_accum * world_size)
         )
-    if max_works is not None:
-        manifest = manifest[:max_works]
-    return manifest
+        steps_per_epoch = max(1, math.ceil(int(train_examples) / max(global_batch_size, 1)))
+        eval_steps = max(1, int(round(float(eval_every_epochs) * steps_per_epoch)))
+    else:
+        eval_steps = train_config.get("eval_steps")
+
+    if eval_steps is not None:
+        eval_steps = max(1, int(eval_steps))
+        train_config["eval_strategy"] = "steps"
+        train_config["save_strategy"] = "steps"
+        train_config["eval_steps"] = eval_steps
+        train_config["save_steps"] = max(1, int(save_every_steps or eval_steps))
+
+    train_config.setdefault("load_best_model_at_end", True)
+    train_config.setdefault("metric_for_best_model", "eval_loss")
+    train_config.setdefault("greater_is_better", False)
 
 
 class PianoCoReNodeSFTDataset(Dataset):
@@ -931,8 +909,6 @@ class PianoCoReNodeSFTDataset(Dataset):
         ioi_nonzero_dev_scale=2.0,
         ioi_zero_dev_scale=4.0,
         precompute_items=False,
-        use_prepared_cache=False,
-        prepared_cache_dir=None,
         use_prepared_sidecar=True,
         prepared_sidecar_tag=None,
     ):
@@ -989,41 +965,25 @@ class PianoCoReNodeSFTDataset(Dataset):
         self.total_examples = total
         self.precompute_items = bool(precompute_items)
         self.cache_size = max(int(cache_size), len(self.items)) if self.precompute_items else int(cache_size)
-        self.use_prepared_cache = bool(use_prepared_cache)
         self.use_prepared_sidecar = bool(use_prepared_sidecar)
         self.prepared_sidecar_tag = str(prepared_sidecar_tag) if prepared_sidecar_tag else None
-        self.prepared_cache_dir = Path(prepared_cache_dir) if prepared_cache_dir else None
-        if self.use_prepared_cache and self.prepared_cache_dir is None:
-            raise ValueError("use_prepared_cache=true requires prepared_cache_dir")
-        if self.prepared_cache_dir is not None:
-            self.prepared_cache_dir.mkdir(parents=True, exist_ok=True)
-        self._prepared_cache_signature = self._build_prepared_cache_signature()
+        self._derived_feature_cache_signature = json.dumps(
+            {
+                "task_type": self.task_type,
+                "input_feature_mode": self.input_feature_mode,
+                "musical_feature_mode": self.musical_feature_mode,
+                "timing_control_mode": self.timing_control_mode,
+                "timing_log_scale": self.timing_log_scale,
+                "use_timing_scale_bit": self.use_timing_scale_bit,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         self._prepared_sidecar_signature = self._build_prepared_sidecar_signature()
         self._cache = OrderedDict()
         self._prepared_cache = OrderedDict()
         if self.precompute_items:
             self._precompute_items()
-
-    def _build_prepared_cache_signature(self):
-        signature = {
-            "schema": 4,
-            "task_type": self.task_type,
-            "input_feature_mode": self.input_feature_mode,
-            "timing_normalization": self.timing_normalization,
-            "max_time_ms": self.max_time_ms,
-            "epr_timing_bins": self.epr_timing_bins,
-            "epr_value_bins": self.epr_value_bins,
-            "pedal_representation": self.pedal_representation,
-            "musical_feature_mode": self.musical_feature_mode,
-            "epr_timing_target": self.epr_timing_target,
-            "use_timing_scale_bit": self.use_timing_scale_bit,
-            "timing_control_mode": self.timing_control_mode,
-            "timing_log_scale": self.timing_log_scale,
-            "split_zero_ioi_head": self.split_zero_ioi_head,
-            "ioi_nonzero_dev_scale": self.ioi_nonzero_dev_scale,
-            "ioi_zero_dev_scale": self.ioi_zero_dev_scale,
-        }
-        return json.dumps(signature, sort_keys=True, separators=(",", ":"))
 
     def _build_prepared_sidecar_signature(self):
         signature = {
@@ -1066,7 +1026,10 @@ class PianoCoReNodeSFTDataset(Dataset):
                 "dev_ratio",
             }:
                 has_shared = "label_shared_raw" in perf or "label_raw" in perf
-                has_pedal = "label_pedal2_raw" in perf or "pedal2_raw" in perf or "label_raw" in perf
+                if str(self.pedal_representation).lower() == "binary_4":
+                    has_pedal = "label_pedal4_raw" in perf or "pedal4_raw" in perf or "label_raw" in perf
+                else:
+                    has_pedal = "label_pedal2_raw" in perf or "pedal2_raw" in perf or "label_raw" in perf
                 if not (has_shared and has_pedal):
                     return False
         return True
@@ -1101,15 +1064,18 @@ class PianoCoReNodeSFTDataset(Dataset):
 
     def _prepared_sidecar_paths(self, path):
         source = Path(path)
-        tags = []
+        explicit_tags = []
+        inferred_tags = []
         if self.prepared_sidecar_tag:
-            tags.append(self.prepared_sidecar_tag)
+            explicit_tags.append(self.prepared_sidecar_tag)
         elif "ASAP" in source.stem.upper():
-            tags.append("ASAP")
+            inferred_tags.append("ASAP")
         candidates = []
-        for tag in tags:
+        for tag in explicit_tags:
             candidates.append(source.with_suffix(f".{tag}.pt"))
         candidates.append(source.with_suffix(".pt"))
+        for tag in inferred_tags:
+            candidates.append(source.with_suffix(f".{tag}.pt"))
         deduped = []
         seen = set()
         for candidate in candidates:
@@ -1121,18 +1087,9 @@ class PianoCoReNodeSFTDataset(Dataset):
         return deduped
 
     def _prepared_disk_cache_path(self, path):
-        if self.use_prepared_sidecar:
-            return self._prepared_sidecar_paths(path)[0]
-        if self.prepared_cache_dir is None:
+        if not self.use_prepared_sidecar:
             return None
-        source = Path(path)
-        source_identity = dict(self._source_identity(path))
-        source_identity["signature"] = self._prepared_cache_signature
-        digest = hashlib.sha256(
-            json.dumps(source_identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
-        stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", source.stem)[:80]
-        return self.prepared_cache_dir / self.split / f"{stem}.{digest}.pt"
+        return self._prepared_sidecar_paths(path)[0]
 
     def _torch_load_prepared(self, cache_path):
         try:
@@ -1141,31 +1098,18 @@ class PianoCoReNodeSFTDataset(Dataset):
             return torch.load(cache_path, map_location="cpu")
 
     def _load_prepared_from_disk(self, path):
-        if self.use_prepared_sidecar:
-            for cache_path in self._prepared_sidecar_paths(path):
-                if not cache_path.exists():
-                    continue
-                prepared = self._torch_load_prepared(cache_path)
-                signature = prepared.get("_cache_signature")
-                if prepared.get("_source_identity") != self._source_identity(path):
-                    continue
-                if self._is_raw_sidecar_signature(signature):
-                    if self._has_raw_sidecar_payload(prepared):
-                        return self._normalize_loaded_raw_sidecar(prepared)
-                    continue
-                if signature != self._prepared_cache_signature:
-                    continue
-                return prepared
-            return None
-        cache_path = self._prepared_disk_cache_path(path)
-        if cache_path is None or not cache_path.exists():
-            return None
-        prepared = self._torch_load_prepared(cache_path)
-        if prepared.get("_cache_signature") != self._prepared_cache_signature:
-            return None
-        if prepared.get("_source_identity") != self._source_identity(path):
-            return None
-        return prepared
+        for cache_path in self._prepared_sidecar_paths(path):
+            if not cache_path.exists():
+                continue
+            prepared = self._torch_load_prepared(cache_path)
+            signature = prepared.get("_cache_signature")
+            if prepared.get("_source_identity") != self._source_identity(path):
+                continue
+            if self._is_raw_sidecar_signature(signature):
+                if self._has_raw_sidecar_payload(prepared):
+                    return self._normalize_loaded_raw_sidecar(prepared)
+                continue
+        return None
 
     def _save_prepared_to_disk(self, path, prepared):
         cache_path = self._prepared_disk_cache_path(path)
@@ -1176,25 +1120,10 @@ class PianoCoReNodeSFTDataset(Dataset):
         payload = dict(prepared)
         payload.pop("_derived_score_input_cache", None)
         payload.pop("_derived_score_musical", None)
-        payload["_cache_signature"] = (
-            self._prepared_sidecar_signature
-            if self.use_prepared_sidecar
-            else self._prepared_cache_signature
-        )
+        payload["_cache_signature"] = self._prepared_sidecar_signature
         payload["_source_identity"] = self._source_identity(path)
         torch.save(payload, tmp_path)
         os.replace(tmp_path, cache_path)
-
-    def _wait_for_prepared_cache(self, path, lock_path, timeout=900.0):
-        start = time.time()
-        while time.time() - start < timeout:
-            prepared = self._load_prepared_from_disk(path)
-            if prepared is not None:
-                return prepared
-            if not lock_path.exists():
-                return None
-            time.sleep(0.25)
-        return None
 
     def _load_or_prepare_work(self, path):
         if path in self._prepared_cache:
@@ -1202,49 +1131,26 @@ class PianoCoReNodeSFTDataset(Dataset):
             return self._prepared_cache[path]
 
         prepared = None
-        cache_path = self._prepared_disk_cache_path(path) if (self.use_prepared_cache or self.use_prepared_sidecar) else None
+        cache_path = self._prepared_disk_cache_path(path) if self.use_prepared_sidecar else None
         if cache_path is not None:
             prepared = self._load_prepared_from_disk(path)
-            if self.use_prepared_sidecar and prepared is None:
-                raise FileNotFoundError(
-                    f"Missing or stale INR prepared sidecar: {cache_path}. "
-                    "Run src/data_process/prebuild_inr_work_pt.py to build the shared raw sidecar."
-                )
             if prepared is None:
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                lock_path = cache_path.with_suffix(cache_path.suffix + ".lock")
-                try:
-                    lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                except FileExistsError:
-                    prepared = self._wait_for_prepared_cache(path, lock_path)
-                else:
-                    try:
-                        os.close(lock_fd)
-                        work = self._load_work(path)
-                        prepared = self._prepare_work(
-                            path,
-                            work,
-                            eager_labels=True,
-                            slim_performances=True,
-                            split_filter=True,
-                            force_rebuild=True,
-                        )
-                        self._save_prepared_to_disk(path, prepared)
-                    finally:
-                        try:
-                            lock_path.unlink()
-                        except FileNotFoundError:
-                            pass
+                sidecar_candidates = ", ".join(str(p) for p in self._prepared_sidecar_paths(path))
+                raise FileNotFoundError(
+                    "Prepared sidecar missing or invalid during training. "
+                    "Sidecars must be prebuilt in data_process before training and are treated as read-only at runtime. "
+                    f"Source: {path}. Candidates: {sidecar_candidates}"
+                )
 
         if prepared is None:
             work = self._load_work(path)
             prepared = self._prepare_work(
                 path,
                 work,
-                eager_labels=self.use_prepared_cache,
-                slim_performances=self.use_prepared_cache,
+                eager_labels=False,
+                slim_performances=False,
                 split_filter=True,
-                force_rebuild=self.use_prepared_cache,
+                force_rebuild=False,
             )
 
         self._prepared_cache[path] = prepared
@@ -1374,31 +1280,6 @@ class PianoCoReNodeSFTDataset(Dataset):
             if perf.get("split", self.split) == self.split
         ]
 
-    def write_prepared_sidecar(self, path, selected_sources=None):
-        work = self._load_work(path)
-        if selected_sources is not None:
-            selected_sources = set(selected_sources)
-            work = dict(work)
-            work["performances"] = [
-                perf for perf in work.get("performances", [])
-                if perf.get("performance_source") in selected_sources
-            ]
-        prepared = self._prepare_work(
-            path,
-            work,
-            eager_labels=False,
-            slim_performances=True,
-            split_filter=False,
-            force_rebuild=True,
-            derive_features=False,
-        )
-        prepared.pop("score_input", None)
-        prepared.pop("score_musical", None)
-        prepared.pop("has_score_feature", None)
-        prepared["label_cache"] = {}
-        self._save_prepared_to_disk(path, prepared)
-        return self._prepared_disk_cache_path(path)
-
     def _performance_cache_key(self, perf):
         return (
             perf.get("performance_source")
@@ -1413,30 +1294,56 @@ class PianoCoReNodeSFTDataset(Dataset):
             "log_deviation",
             "log_dev",
         }:
-            labels = performance_dev_velocity_pedal2_rows(
-                perf,
-                prepared["score"]["score_raw"],
-                epr_timing_target=self.epr_timing_target,
-                log_scale=self.timing_log_scale,
-                split_zero_ioi_head=self.split_zero_ioi_head,
-                ioi_nonzero_dev_scale=self.ioi_nonzero_dev_scale,
-                ioi_zero_dev_scale=self.ioi_zero_dev_scale,
-            )
+            if str(self.pedal_representation).lower() == "binary_4":
+                labels = performance_dev_velocity_pedal4_binary_rows(
+                    perf,
+                    prepared["score"]["score_raw"],
+                    epr_timing_target=self.epr_timing_target,
+                    log_scale=self.timing_log_scale,
+                    split_zero_ioi_head=self.split_zero_ioi_head,
+                    ioi_nonzero_dev_scale=self.ioi_nonzero_dev_scale,
+                    ioi_zero_dev_scale=self.ioi_zero_dev_scale,
+                )
+                missing = "Missing score_raw/label_shared_raw/label_pedal4_raw for binary_4 deviation EPR targets"
+            else:
+                labels = performance_dev_velocity_pedal2_rows(
+                    perf,
+                    prepared["score"]["score_raw"],
+                    epr_timing_target=self.epr_timing_target,
+                    log_scale=self.timing_log_scale,
+                    split_zero_ioi_head=self.split_zero_ioi_head,
+                    ioi_nonzero_dev_scale=self.ioi_nonzero_dev_scale,
+                    ioi_zero_dev_scale=self.ioi_zero_dev_scale,
+                )
+                missing = "Missing score_raw/label_shared_raw/label_pedal2_raw for deviation EPR targets"
             if labels is None:
-                raise KeyError("Missing score_raw/label_shared_raw/label_pedal2_raw for deviation EPR targets")
+                raise KeyError(missing)
             return labels, None
         if self.task_type.lower() == "epr" and self.epr_timing_target in {"deviation_ratio", "dev_ratio"}:
-            labels = performance_dev_velocity_pedal2_rows(
-                perf,
-                prepared["score"]["score_raw"],
-                epr_timing_target=self.epr_timing_target,
-                log_scale=self.timing_log_scale,
-                split_zero_ioi_head=self.split_zero_ioi_head,
-                ioi_nonzero_dev_scale=self.ioi_nonzero_dev_scale,
-                ioi_zero_dev_scale=self.ioi_zero_dev_scale,
-            )
+            if str(self.pedal_representation).lower() == "binary_4":
+                labels = performance_dev_velocity_pedal4_binary_rows(
+                    perf,
+                    prepared["score"]["score_raw"],
+                    epr_timing_target=self.epr_timing_target,
+                    log_scale=self.timing_log_scale,
+                    split_zero_ioi_head=self.split_zero_ioi_head,
+                    ioi_nonzero_dev_scale=self.ioi_nonzero_dev_scale,
+                    ioi_zero_dev_scale=self.ioi_zero_dev_scale,
+                )
+                missing = "Missing score_raw/label_shared_raw/label_pedal4_raw for binary_4 deviation EPR targets"
+            else:
+                labels = performance_dev_velocity_pedal2_rows(
+                    perf,
+                    prepared["score"]["score_raw"],
+                    epr_timing_target=self.epr_timing_target,
+                    log_scale=self.timing_log_scale,
+                    split_zero_ioi_head=self.split_zero_ioi_head,
+                    ioi_nonzero_dev_scale=self.ioi_nonzero_dev_scale,
+                    ioi_zero_dev_scale=self.ioi_zero_dev_scale,
+                )
+                missing = "Missing score_raw/label_shared_raw/label_pedal2_raw for deviation EPR targets"
             if labels is None:
-                raise KeyError("Missing score_raw/label_shared_raw/label_pedal2_raw for deviation EPR targets")
+                raise KeyError(missing)
             return labels, None
         if self.task_type.lower() == "csr":
             labels = build_csr_performance_input_rows(
@@ -1476,7 +1383,7 @@ class PianoCoReNodeSFTDataset(Dataset):
 
     def _score_input_rows(self, prepared):
         cache = prepared.setdefault("_derived_score_input_cache", {})
-        cache_key = self._prepared_cache_signature
+        cache_key = self._derived_feature_cache_signature
         if cache_key not in cache:
             cache[cache_key] = build_epr_score_input_rows(
                 prepared["score"],
@@ -1531,56 +1438,6 @@ class PianoCoReNodeSFTDataset(Dataset):
                         "split": self.split,
                         "works": len(self._prepared_cache),
                         "performances": total_performances,
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ),
-                flush=True,
-            )
-
-    def prebuild_prepared_cache(self):
-        rank, _ = distributed_info()
-        if rank == 0:
-            print(
-                json.dumps(
-                    {
-                        "event": "prepared_cache_prebuild_start",
-                        "split": self.split,
-                        "works": len(self.items),
-                        "cache_dir": str(self.prepared_cache_dir) if self.prepared_cache_dir else None,
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ),
-                flush=True,
-            )
-        total_performances = 0
-        for idx, item in enumerate(self.items, start=1):
-            prepared = self._load_or_prepare_work(item["path"])
-            total_performances += len(self._selected_performances(prepared, item))
-            if rank == 0 and (idx % 25 == 0 or idx == len(self.items)):
-                print(
-                    json.dumps(
-                        {
-                            "event": "prepared_cache_prebuild_progress",
-                            "split": self.split,
-                            "works_done": idx,
-                            "works": len(self.items),
-                            "performances_seen": total_performances,
-                        },
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    ),
-                    flush=True,
-                )
-        if rank == 0:
-            print(
-                json.dumps(
-                    {
-                        "event": "prepared_cache_prebuild_done",
-                        "split": self.split,
-                        "works": len(self.items),
-                        "performances_seen": total_performances,
                     },
                     ensure_ascii=False,
                     sort_keys=True,
@@ -1651,6 +1508,109 @@ class NodeSFTTrainer(Trainer):
     def _model_config(self, model):
         return model.module.config if hasattr(model, "module") else model.config
 
+    def _init_eval_component_state(self):
+        self._eval_component_sums = {
+            "loss_ioi": 0.0,
+            "loss_duration": 0.0,
+            "loss_velocity": 0.0,
+            "loss_pedal": 0.0,
+        }
+        self._eval_component_weight = 0.0
+        self._eval_wass_sums = {
+            "eval_wass_ioi": 0.0,
+            "eval_wass_duration": 0.0,
+            "eval_wass_velocity": 0.0,
+            "eval_wass_pedal": 0.0,
+        }
+        self._eval_wass_count = 0.0
+
+    def _materialize_eval_predictions(self, config, outputs, inputs):
+        logits = outputs.logits.detach()
+        attention_mask = inputs["attention_mask"].detach()
+        if config.task_type == "csr":
+            return _materialize_csr_prediction(config, logits)
+        return _materialize_epr_prediction(
+            config,
+            logits,
+            sampling_strategy="mean",
+            score_shared_raw=inputs.get("score_shared_raw"),
+        )
+
+    def _record_eval_metrics(self, model, outputs, inputs):
+        if not hasattr(outputs, "logits"):
+            return
+        if "labels_continuous" not in inputs or "attention_mask" not in inputs:
+            return
+        if not hasattr(self, "_eval_component_sums"):
+            self._init_eval_component_state()
+
+        config = self._model_config(model)
+        loss_mask = inputs.get("label_mask", inputs["attention_mask"]).detach()
+        components = _compute_integrated_loss_components(
+            config,
+            outputs.logits.detach(),
+            inputs["labels_continuous"].detach(),
+            loss_mask,
+            labels_epr_bins=inputs.get("labels_epr_bins"),
+            score_shared_raw=inputs.get("score_shared_raw"),
+        )
+        batch_weight = float(inputs["attention_mask"].shape[0])
+        self._eval_component_weight += batch_weight
+        for key in ("ioi", "duration", "velocity", "pedal"):
+            self._eval_component_sums[f"loss_{key}"] += float(components[key].detach().float().cpu()) * batch_weight
+
+        if not bool(getattr(self, "eval_compute_wass", False)):
+            return
+
+        pred = self._materialize_eval_predictions(config, outputs, inputs)
+        labels = inputs["labels_continuous"].detach()
+        mask = loss_mask.detach().bool()
+        if config.task_type == "epr" and _uses_deviation_ratio_targets(config):
+            pred_raw = _target5_to_raw7(inputs["score_shared_raw"].detach(), pred, config=config)
+            target_raw = labels
+            if labels.shape[-1] == 5:
+                target_raw = _target5_to_raw7(inputs["score_shared_raw"].detach(), labels, config=config)
+            elif labels.shape[-1] == 7:
+                target_raw = labels.float()
+            else:
+                return
+
+            pred_cpu = pred_raw.float().cpu().numpy()
+            target_cpu = target_raw.float().cpu().numpy()
+            mask_cpu = mask.cpu().numpy().astype(bool)
+            feature_pairs = {
+                "eval_wass_ioi": (pred_cpu[..., 0], target_cpu[..., 0]),
+                "eval_wass_duration": (pred_cpu[..., 1], target_cpu[..., 1]),
+                "eval_wass_velocity": (pred_cpu[..., 2], target_cpu[..., 2]),
+                "eval_wass_pedal": (pred_cpu[..., 3:7].reshape(-1), target_cpu[..., 3:7].reshape(-1)),
+            }
+        else:
+            pred_cpu = pred.float().cpu().numpy()
+            target_cpu = labels.float().cpu().numpy()
+            mask_cpu = mask.cpu().numpy().astype(bool)
+            pedal_mask = np.repeat(mask_cpu[..., None], pred_cpu[..., 3:7].shape[-1], axis=-1).reshape(-1)
+            feature_pairs = {
+                "eval_wass_ioi": (pred_cpu[..., 0], target_cpu[..., 0]),
+                "eval_wass_duration": (pred_cpu[..., 1], target_cpu[..., 1]),
+                "eval_wass_velocity": (pred_cpu[..., 2], target_cpu[..., 2]),
+                "eval_wass_pedal": (pred_cpu[..., 3:7].reshape(-1), target_cpu[..., 3:7].reshape(-1), pedal_mask),
+            }
+
+        for metric_name, payload in feature_pairs.items():
+            if len(payload) == 2:
+                pred_values, target_values = payload
+                valid_mask = mask_cpu.reshape(-1)
+                pred_values = pred_values.reshape(-1)[valid_mask]
+                target_values = target_values.reshape(-1)[valid_mask]
+            else:
+                pred_values, target_values, valid_mask = payload
+                pred_values = pred_values[valid_mask]
+                target_values = target_values[valid_mask]
+            metric_value = finite_wasserstein_distance(pred_values, target_values)
+            if math.isfinite(metric_value):
+                self._eval_wass_sums[metric_name] += metric_value * batch_weight
+        self._eval_wass_count += batch_weight
+
     def _record_loss_components(self, model, outputs, inputs):
         if not hasattr(outputs, "logits"):
             return
@@ -1705,6 +1665,34 @@ class NodeSFTTrainer(Trainer):
     def _clear_eval_dataloader_cache(self):
         if hasattr(self, "_eval_dataloaders"):
             delattr(self, "_eval_dataloaders")
+
+    def evaluation_loop(self, *args, **kwargs):
+        self._init_eval_component_state()
+        return super().evaluation_loop(*args, **kwargs)
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        loss, logits, labels = super().prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+        if loss is not None and logits is not None and hasattr(model, "training") and not model.training:
+            try:
+                class _EvalOutputs:
+                    def __init__(self, logits):
+                        self.logits = logits
+                self._record_eval_metrics(model, _EvalOutputs(logits), inputs)
+            except Exception as exc:
+                if self.is_world_process_zero():
+                    print(
+                        json.dumps(
+                            {
+                                "step": self.state.global_step,
+                                "event": "eval_metric_record_failed",
+                                "reason": str(exc),
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+        return loss, logits, labels
 
     def _eval_loader_settings(self):
         num_workers = int(getattr(self, "eval_dataloader_num_workers", 0) or 0)
@@ -1821,6 +1809,13 @@ class NodeSFTTrainer(Trainer):
         if not self.is_world_process_zero():
             return metrics
 
+        if getattr(self, "_eval_component_weight", 0.0) > 0:
+            for key, total in self._eval_component_sums.items():
+                metrics[f"eval_{key}"] = total / self._eval_component_weight
+        if getattr(self, "_eval_wass_count", 0.0) > 0:
+            for key, total in self._eval_wass_sums.items():
+                metrics[key] = total / self._eval_wass_count
+
         # determine metric key
         metric_key = getattr(self.args, "metric_for_best_model", None)
         if metric_key is None:
@@ -1879,10 +1874,10 @@ class NodeSFTTrainer(Trainer):
 
         # determine keep paths: latest and best (if exist)
         keep = set()
-        if latest_ckpt:
-            keep.add(str(latest_ckpt))
         if self._best_ckpt:
             keep.add(str(self._best_ckpt))
+        elif latest_ckpt:
+            keep.add(str(latest_ckpt))
 
         # cleanup other checkpoints
         self._cleanup_checkpoints(keep_paths=keep)
@@ -2053,10 +2048,15 @@ def create_model(train_config):
             if missing_beta_keys:
                 raise ValueError(f"EPR beta_mu_kappa config is missing required keys: {missing_beta_keys}")
         if epr_timing_target in {"deviation", "dev", "deviation_ratio", "dev_ratio", "log_deviation", "log_dev"}:
-            if int(train_config.get("output_continuous_dim", train_config["continuous_dim"])) != 5:
-                raise ValueError("deviation EPR requires output_continuous_dim=5")
-            if str(train_config.get("pedal_representation", "continuous_4")).lower() != "start_ctrl":
-                raise ValueError("deviation EPR currently requires pedal_representation=start_ctrl")
+            pedal_representation = str(train_config.get("pedal_representation", "continuous_4")).lower()
+            expected_output_dim = 7 if pedal_representation == "binary_4" else 5
+            if int(train_config.get("output_continuous_dim", train_config["continuous_dim"])) != expected_output_dim:
+                raise ValueError(
+                    f"deviation EPR with pedal_representation={pedal_representation} "
+                    f"requires output_continuous_dim={expected_output_dim}"
+                )
+            if pedal_representation not in {"start_ctrl", "binary_4"}:
+                raise ValueError("deviation EPR currently requires pedal_representation=start_ctrl or binary_4")
             if distribution not in {
                 "point",
                 "huber",
@@ -2128,6 +2128,7 @@ def create_model(train_config):
         bert_layers_num=train_config.get("bert_layers_num"),
         max_position_embeddings=train_config.get("max_position_embeddings", 4096),
         attention_dropout=train_config.get("attention_dropout", 0.0),
+        attn_implementation=train_config.get("attn_implementation", "sdpa"),
         continuous_dim=train_config["continuous_dim"],
         input_continuous_dim=input_continuous_dim,
         output_continuous_dim=train_config.get("output_continuous_dim", train_config["continuous_dim"]),
@@ -2159,6 +2160,9 @@ def create_model(train_config):
         head_depth=train_config.get("head_depth", 2),
         head_width_multiplier=train_config.get("head_width_multiplier", 1.0),
         head_activation=train_config.get("head_activation", "gelu"),
+        decoder_head_layout=train_config.get("decoder_head_layout", "pyramid4"),
+        decoder_head_expand_ratio=train_config.get("decoder_head_expand_ratio", 2.0),
+        decoder_head_shrink_ratio=train_config.get("decoder_head_shrink_ratio", 0.5),
         epr_distribution=train_config.get("epr_distribution", "point"),
         pedal_distribution=train_config.get("pedal_distribution"),
         epr_mixture_components=train_config.get("epr_mixture_components", 1),
@@ -2318,41 +2322,95 @@ def main():
     with open(output_dir / "train_config.json", "w", encoding="utf-8") as file:
         json.dump(train_config, file, indent=2, ensure_ascii=False)
 
-    train_manifest = build_work_manifest(
-        metadata_path=train_config["metadata_path"],
-        refined_dir=train_config["refined_dir"],
-        split="train",
-        block_notes=train_config["block_notes"],
-        overlap_ratio=train_config["overlap_ratio"],
-        min_notes=train_config["min_notes"],
-        max_works=train_config.get("max_train_works"),
-        skip_work_paths=train_config.get("skip_work_paths"),
-        performance_dataset=train_config.get("train_performance_dataset"),
-        exclude_performance_dataset=train_config.get("train_exclude_performance_dataset"),
-    )
-    eval_manifest = build_work_manifest(
-        metadata_path=train_config["metadata_path"],
-        refined_dir=train_config["refined_dir"],
-        split=train_config.get("eval_split", "test"),
-        block_notes=train_config["block_notes"],
-        overlap_ratio=train_config["overlap_ratio"],
-        min_notes=train_config["min_notes"],
-        max_works=train_config.get("max_eval_works"),
-        include_all_performance_dataset=train_config.get("eval_include_all_performance_dataset"),
-        max_non_asap_performances_per_work=train_config.get("max_eval_non_asap_performances_per_work"),
-        selection_seed=train_config.get("seed", 42),
-        skip_work_paths=train_config.get("skip_work_paths"),
-        performance_dataset=train_config.get("eval_performance_dataset"),
-        exclude_performance_dataset=train_config.get("eval_exclude_performance_dataset"),
-    )
+    fixed_window_split_scheme = train_config.get("fixed_window_split_scheme")
+    fixed_window_split_summary_path = train_config.get("fixed_window_split_summary_path")
+    fixed_window_base_split = train_config.get("fixed_window_base_split", "train")
+    train_dataset_split = "train"
+    eval_dataset_split = train_config.get("eval_split", "test")
+
+    if fixed_window_split_scheme:
+        train_dataset_split = fixed_window_base_split
+        eval_dataset_split = fixed_window_base_split
+        train_manifest = build_work_manifest(
+            metadata_path=train_config["metadata_path"],
+            refined_dir=train_config["refined_dir"],
+            split=fixed_window_base_split,
+            block_notes=train_config["block_notes"],
+            overlap_ratio=train_config["overlap_ratio"],
+            min_notes=train_config["min_notes"],
+            max_works=train_config.get("max_train_works"),
+            skip_work_paths=train_config.get("skip_work_paths"),
+            performance_dataset=train_config.get("train_performance_dataset"),
+            exclude_performance_dataset=train_config.get("train_exclude_performance_dataset"),
+            window_split_scheme=fixed_window_split_scheme,
+            window_split_name=train_config.get("fixed_window_train_split_name", "train"),
+            window_split_summary_path=fixed_window_split_summary_path,
+        )
+    else:
+        train_manifest = build_work_manifest(
+            metadata_path=train_config["metadata_path"],
+            refined_dir=train_config["refined_dir"],
+            split="train",
+            block_notes=train_config["block_notes"],
+            overlap_ratio=train_config["overlap_ratio"],
+            min_notes=train_config["min_notes"],
+            max_works=train_config.get("max_train_works"),
+            skip_work_paths=train_config.get("skip_work_paths"),
+            performance_dataset=train_config.get("train_performance_dataset"),
+            exclude_performance_dataset=train_config.get("train_exclude_performance_dataset"),
+        )
+    if fixed_window_split_scheme:
+        eval_manifest = build_work_manifest(
+            metadata_path=train_config["metadata_path"],
+            refined_dir=train_config["refined_dir"],
+            split=fixed_window_base_split,
+            block_notes=train_config["block_notes"],
+            overlap_ratio=train_config["overlap_ratio"],
+            min_notes=train_config["min_notes"],
+            max_works=train_config.get("max_eval_works"),
+            include_all_performance_dataset=train_config.get("eval_include_all_performance_dataset"),
+            max_non_asap_performances_per_work=train_config.get("max_eval_non_asap_performances_per_work"),
+            selection_seed=train_config.get("seed", 42),
+            skip_work_paths=train_config.get("skip_work_paths"),
+            performance_dataset=train_config.get("eval_performance_dataset"),
+            exclude_performance_dataset=train_config.get("eval_exclude_performance_dataset"),
+            window_split_scheme=fixed_window_split_scheme,
+            window_split_name=train_config.get("fixed_window_eval_split_name", "valid"),
+            window_split_summary_path=fixed_window_split_summary_path,
+        )
+        train_config["eval_split"] = train_config.get("fixed_window_eval_split_name", "valid")
+    else:
+        eval_manifest = build_work_manifest(
+            metadata_path=train_config["metadata_path"],
+            refined_dir=train_config["refined_dir"],
+            split=train_config.get("eval_split", "test"),
+            block_notes=train_config["block_notes"],
+            overlap_ratio=train_config["overlap_ratio"],
+            min_notes=train_config["min_notes"],
+            max_works=train_config.get("max_eval_works"),
+            include_all_performance_dataset=train_config.get("eval_include_all_performance_dataset"),
+            max_non_asap_performances_per_work=train_config.get("max_eval_non_asap_performances_per_work"),
+            selection_seed=train_config.get("seed", 42),
+            skip_work_paths=train_config.get("skip_work_paths"),
+            performance_dataset=train_config.get("eval_performance_dataset"),
+            exclude_performance_dataset=train_config.get("eval_exclude_performance_dataset"),
+        )
+
+    max_train_epochs = float(train_config.get("max_train_epochs", 8.0))
+    train_config["num_train_epochs"] = min(float(train_config.get("num_train_epochs", 1.0)), max_train_epochs)
+    if "adapt_num_train_epochs" in train_config:
+        train_config["adapt_num_train_epochs"] = min(float(train_config["adapt_num_train_epochs"]), max_train_epochs)
+
+    estimated_train_examples = sum(item["estimated_examples"] for item in train_manifest)
+    configure_eval_schedule(train_config, estimated_train_examples)
     print(f"Train works: {len(train_manifest)}")
     print(f"Eval works: {len(eval_manifest)}")
-    print(f"Estimated train examples: {sum(item['estimated_examples'] for item in train_manifest):,}")
+    print(f"Estimated train examples: {estimated_train_examples:,}")
     print(f"Estimated eval examples: {sum(item['estimated_examples'] for item in eval_manifest):,}")
 
     train_dataset = PianoCoReNodeSFTDataset(
         train_manifest,
-        split="train",
+        split=train_dataset_split,
         task_type=task_type,
         input_feature_mode=input_feature_mode,
         shuffle=True,
@@ -2374,14 +2432,12 @@ def main():
         ioi_nonzero_dev_scale=train_config.get("ioi_nonzero_dev_scale", 2.0),
         ioi_zero_dev_scale=train_config.get("ioi_zero_dev_scale", 4.0),
         precompute_items=train_config.get("precompute_dataset_items", False),
-        use_prepared_cache=train_config.get("use_prepared_cache", False),
-        prepared_cache_dir=train_config.get("prepared_cache_dir"),
         use_prepared_sidecar=train_config.get("use_prepared_sidecar", True),
         prepared_sidecar_tag=train_config.get("prepared_sidecar_tag"),
     )
     eval_dataset = PianoCoReNodeSFTDataset(
         eval_manifest,
-        split=train_config.get("eval_split", "test"),
+        split=eval_dataset_split,
         task_type=task_type,
         input_feature_mode=input_feature_mode,
         shuffle=False,
@@ -2403,16 +2459,9 @@ def main():
         ioi_nonzero_dev_scale=train_config.get("ioi_nonzero_dev_scale", 2.0),
         ioi_zero_dev_scale=train_config.get("ioi_zero_dev_scale", 4.0),
         precompute_items=train_config.get("precompute_eval_dataset_items", train_config.get("precompute_dataset_items", False)),
-        use_prepared_cache=train_config.get("use_prepared_cache", False),
-        prepared_cache_dir=train_config.get("prepared_cache_dir"),
         use_prepared_sidecar=train_config.get("use_prepared_sidecar", True),
         prepared_sidecar_tag=train_config.get("prepared_sidecar_tag"),
     )
-
-    if train_config.get("prebuild_prepared_cache", False):
-        train_dataset.prebuild_prepared_cache()
-        if train_config.get("prebuild_eval_prepared_cache", False):
-            eval_dataset.prebuild_prepared_cache()
 
     model = create_model(train_config)
     apply_trainable_parameter_policy(model, train_config)
@@ -2432,6 +2481,8 @@ def main():
         # stalls for the bs32/acc1 DDP recipe used by the pedal2 experiments.
         training_args_dict.setdefault("dataloader_persistent_workers", True)
     training_args_dict.setdefault("dataloader_pin_memory", torch.cuda.is_available())
+    if bool(train_config.get("eval_compute_wass", False)):
+        training_args_dict["prediction_loss_only"] = False
     if torch.cuda.device_count() > 1:
         training_args_dict.setdefault("ddp_find_unused_parameters", False)
         training_args_dict.setdefault("ddp_broadcast_buffers", False)
@@ -2466,6 +2517,16 @@ def main():
     trainer.loss_component_interval = int(
         train_config.get("loss_component_interval", train_config.get("logging_steps", 20)) or 0
     )
+    trainer.eval_compute_wass = bool(train_config.get("eval_compute_wass", False))
+
+    early_stopping_patience = train_config.get("early_stopping_patience")
+    if early_stopping_patience is not None and int(early_stopping_patience) > 0:
+        trainer.add_callback(
+            EarlyStoppingCallback(
+                early_stopping_patience=int(early_stopping_patience),
+                early_stopping_threshold=float(train_config.get("early_stopping_threshold", 0.0)),
+            )
+        )
 
     resume_path = train_config.get("resume_path")
     resume_trainer_state = bool(train_config.get("resume_trainer_state", True))
