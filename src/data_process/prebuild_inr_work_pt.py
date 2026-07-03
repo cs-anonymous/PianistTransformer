@@ -117,8 +117,35 @@ def worker(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True)
+    parser.add_argument("--metadata-path", required=True)
+    parser.add_argument("--refined-dir", required=True)
     parser.add_argument("--split", default="train", choices=["train", "test", "valid"])
+    parser.add_argument("--block-notes", type=int, default=512)
+    parser.add_argument("--overlap-ratio", type=float, default=0.125)
+    parser.add_argument("--min-notes", type=int, default=64)
+    parser.add_argument("--task-type", default="epr")
+    parser.add_argument("--input-feature-mode", default="integrated")
+    parser.add_argument("--timing-input-normalization", default="log1p_t_over_50_5000")
+    parser.add_argument("--max-time-ms", type=float, default=10000.0)
+    parser.add_argument("--pedal-representation", default="start_ctrl")
+    parser.add_argument("--musical-feature-mode", default="musical51")
+    parser.add_argument("--epr-timing-target", default="absolute")
+    parser.add_argument("--use-timing-scale-bit", type=int, default=1)
+    parser.add_argument("--timing-control-mode", default=None)
+    parser.add_argument("--timing-log-scale", type=float, default=50.0)
+    parser.add_argument("--split-zero-ioi-head", type=int, default=0)
+    parser.add_argument("--ioi-nonzero-dev-scale", type=float, default=2.0)
+    parser.add_argument("--ioi-zero-dev-scale", type=float, default=4.0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--node-cache-size", type=int, default=8)
+    parser.add_argument("--fixed-window-split-scheme", default="train_valid_asap3_nonasap05_v1")
+    parser.add_argument("--fixed-window-base-split", default="train")
+    parser.add_argument("--fixed-window-eval-split-name", default="valid")
+    parser.add_argument("--fixed-window-train-split-name", default="train")
+    parser.add_argument(
+        "--fixed-window-split-summary-path",
+        default=str(ROOT_DIR / "data" / "train_valid_asap3_nonasap05_v1_summary.json"),
+    )
     parser.add_argument(
         "--performance-dataset",
         default=None,
@@ -129,14 +156,42 @@ def main():
     parser.add_argument("--sidecar-tag", default=None)
     args = parser.parse_args()
 
-    with open(args.config, "r", encoding="utf-8") as file:
-        config = json.load(file)
-    if args.sidecar_tag:
-        config["prepared_sidecar_tag"] = args.sidecar_tag
+    config = {
+        "metadata_path": args.metadata_path,
+        "refined_dir": args.refined_dir,
+        "block_notes": args.block_notes,
+        "overlap_ratio": args.overlap_ratio,
+        "min_notes": args.min_notes,
+        "task_type": args.task_type,
+        "input_feature_mode": args.input_feature_mode,
+        "timing_input_normalization": args.timing_input_normalization,
+        "max_time_ms": args.max_time_ms,
+        "pedal_representation": args.pedal_representation,
+        "musical_feature_mode": args.musical_feature_mode,
+        "epr_timing_target": args.epr_timing_target,
+        "use_timing_scale_bit": bool(args.use_timing_scale_bit),
+        "timing_control_mode": args.timing_control_mode,
+        "timing_log_scale": args.timing_log_scale,
+        "split_zero_ioi_head": bool(args.split_zero_ioi_head),
+        "ioi_nonzero_dev_scale": args.ioi_nonzero_dev_scale,
+        "ioi_zero_dev_scale": args.ioi_zero_dev_scale,
+        "seed": args.seed,
+        "node_cache_size": args.node_cache_size,
+        "fixed_window_split_scheme": args.fixed_window_split_scheme,
+        "fixed_window_base_split": args.fixed_window_base_split,
+        "fixed_window_eval_split_name": args.fixed_window_eval_split_name,
+        "fixed_window_train_split_name": args.fixed_window_train_split_name,
+        "fixed_window_split_summary_path": args.fixed_window_split_summary_path,
+    }
+    if args.sidecar_tag is not None:
+        if str(args.sidecar_tag).upper() in {"NONE", "NULL", "NO", "OFF"}:
+            config.pop("prepared_sidecar_tag", None)
+        else:
+            config["prepared_sidecar_tag"] = args.sidecar_tag
     split = args.split
     if split == "valid":
         split = config.get("fixed_window_base_split", "train")
-        config["fixed_window_split_scheme"] = config.get("fixed_window_split_scheme") or "train_valid_asap3_nonasap1_v1"
+        config["fixed_window_split_scheme"] = config.get("fixed_window_split_scheme") or "train_valid_asap3_nonasap05_v1"
         config["fixed_window_eval_split_name"] = "valid"
     manifest = make_manifest(config, split, performance_dataset_override=args.performance_dataset)
     paths = unique_work_paths(manifest)
@@ -148,7 +203,8 @@ def main():
         json.dumps(
             {
                 "event": "inr_sidecar_prebuild_start",
-                "config": args.config,
+                "metadata_path": args.metadata_path,
+                "refined_dir": args.refined_dir,
                 "split": args.split,
                 "performance_dataset": args.performance_dataset or config.get(
                     "train_performance_dataset" if args.split == "train" else "eval_performance_dataset"

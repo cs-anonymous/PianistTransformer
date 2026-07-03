@@ -1,22 +1,62 @@
 # Data Process Pipeline
 
-Integrated Note data processing is intentionally split into two stages.
+`src/data_process` now exposes one canonical INR preprocessing chain:
 
-## 1. Generate JSON With Paired MIDI
+`PianoCoRe metadata + refined MIDI + alignments -> paired work JSON -> XML score features -> fixed valid split -> prebuilt .pt/.ASAP.pt`
+
+The training side is expected to stay read-only. All split metadata and all
+prepared sidecars should be generated here before training starts.
+
+## One-Command Entry Point
+
+Use the shell pipeline below to build the current standard dataset:
 
 ```bash
-python src/data_process/generate_json_with_paired_midi.py --overwrite
+bash script/build_pianocore_inr_sidecars.sh
 ```
 
-This stage reads PianoCoRe-A metadata, refined score MIDI, refined performance
-MIDI, and PianoCoRe alignment files. It writes one work-level JSON beside each
-refined score MIDI, or mirrors the refined tree under `--output-dir`.
+By default it runs:
 
-```text
-data/pianocore/PianoCoRe/refined/**/*.json
+1. `generate_json_with_paired_midi.py`
+2. `update_json_score_feature_with_xml.py`
+3. `create_fixed_window_valid_split.py`
+4. `prebuild_inr_work_pt.py --sidecar-tag NONE`
+5. `prebuild_inr_work_pt.py --performance-dataset ASAP --sidecar-tag ASAP`
+
+Default fixed split scheme:
+
+- `train_valid_asap3_nonasap05_v1`
+- ASAP valid target: `3%`
+- non-ASAP valid target: `0.5%`
+
+Important environment variables accepted by the shell entrypoint:
+
+- `PIANOCORE_DIR`: source PianoCoRe directory, default `data/pianocore`
+- `PROCESSED_DIR`: output processed root, default `../PianoCoRe/processed`
+- `RAW_MIDI_ZIP`: raw PianoCoRe zip used for XML/MXL lookup
+- `WORKERS`: worker count shared by all stages, default `36`
+
+After this pipeline finishes, training can read:
+
+- base stage: `*.pt`
+- ASAP adapt stage: `*.ASAP.pt`
+
+No training-time sidecar writes should be necessary.
+
+## Stage Details
+
+### 1. Generate JSON With Paired MIDI
+
+```bash
+python src/data_process/generate_json_with_paired_midi.py \
+  --pianocore-dir data/pianocore \
+  --overwrite
 ```
 
-The raw v3 output contains:
+This stage writes one work-level JSON beside each refined score MIDI, or under
+`--output-dir` if a mirrored tree is requested.
+
+Latest required raw fields include:
 
 - `score.pitch`
 - `score.score_raw`
@@ -25,113 +65,94 @@ The raw v3 output contains:
 - `performances[].label_pedal2_raw`
 - `performances[].interpolated`
 
-`label_shared_raw` stores `ioi_ms`, `duration_ms`, and `velocity`.
-`label_pedal4_raw` stores the PT-style four sampled pedal values.
-`label_pedal2_raw` stores the native start/control pedal representation
-extracted directly from MIDI CC64 curves, not converted from `label_pedal4_raw`.
-
-## 2. Update JSON Score Feature With XML
+### 2. Update JSON Score Feature With XML
 
 ```bash
-python src/data_process/update_json_score_feature_with_xml.py
+python src/data_process/update_json_score_feature_with_xml.py \
+  --pianocore-dir data/pianocore
 ```
 
-This stage reads the existing `*.json` INR files and projects XML/MXL score
-features onto the refined score notes. It updates each JSON in place to schema
-`pianocore_integrated_node_work_v2`.
-
-The output adds:
+This stage projects XML/MXL score annotations onto refined score notes and
+updates each JSON in place. The output adds:
 
 - `score.score_feature`
 - `score.has_score_feature`
 - `meta.xml_to_refined_score_alignment`
 
-For the XML-derived score grid fields in `score.score_feature`:
-
-- `mo` comes from `MIDI2ScoreTransformer` `offset` with raw range `[0, 6]`
-- `md` comes from `MIDI2ScoreTransformer` `duration` with raw range `[0, 4]`
-- `ml` comes from the measure-length form of `downbeat`, using raw range `[0, 6]`
-- all three are quantized on a fixed `1/24` quarter-note grid before/after normalization
-
-The normalized mapping used by the current schema is:
-
-```python
-mo_norm = clamp(mo / 6.0, 0.0, 1.0)
-md_norm = clamp(md / 4.0, 0.0, 1.0)
-ml_norm = clamp(ml / 6.0, 0.0, 1.0)
-```
-
-The inverse mapping for decode is:
-
-```python
-SCORE_GRID = 1.0 / 24.0
-mo = round((mo_norm * 6.0) / SCORE_GRID) * SCORE_GRID
-md = round((md_norm * 4.0) / SCORE_GRID) * SCORE_GRID
-ml = round((ml_norm * 6.0) / SCORE_GRID) * SCORE_GRID
-```
-
-Storing normalized values in `[0, 1]` with 5 decimal places is sufficient for this
-grid, because the smallest normalized step is `1/144 ≈ 0.00694444`, which is much
-larger than `1e-5`.
-
-Coverage summaries are written by this stage, so a separate audit entrypoint is
-not part of the main pipeline anymore.
-
-## Helper Modules
-
-- `score_xml_alignment.py`: shared XML/MXL parsing and pitch-aware alignment
-  helpers used by stage 2.
-
-## Fixed Train/Valid Window Split
-
-To create one shared, fixed `valid` split for all INR experiments, write a
-window-level split scheme back into each processed work JSON:
+### 3. Create Shared Fixed Train/Valid Split
 
 ```bash
 python src/data_process/create_fixed_window_valid_split.py \
-  --config <config.json> \
-  --scheme-name train_valid_asap3_nonasap1_v1
+  --metadata-path <metadata.csv> \
+  --refined-dir <processed_dir> \
+  --scheme-name train_valid_asap3_nonasap05_v1 \
+  --asap-ratio 0.03 \
+  --non-asap-ratio 0.005 \
+  --skip-sidecars
 ```
 
-This annotates each processed work JSON under:
+This writes a fixed window-level split scheme into each processed work JSON:
 
 - `meta.window_split_schemes[scheme_name]`
 
-The scheme stores:
+The canonical flow runs this step before sidecar prebuild, so `--skip-sidecars`
+is intentional.
 
-- `window_assignments`: every window labeled as `train` or `valid`
-- aggregate valid counts for `ASAP` and `non-ASAP`
-- the selection seed and target ratios used to build the split
+### 4. Prebuild Training Sidecars
 
-After updating JSONs, rebuild shared INR sidecars so they carry the same fixed
-metadata:
+Build the base all-performance sidecars:
 
 ```bash
 python src/data_process/prebuild_inr_work_pt.py \
-  --config <config.json> \
-  --split train
+  --metadata-path <metadata.csv> \
+  --refined-dir <processed_dir> \
+  --split train \
+  --sidecar-tag NONE
 ```
 
-Training can then consume the fixed split by setting:
+Build the ASAP-only adapt sidecars:
+
+```bash
+python src/data_process/prebuild_inr_work_pt.py \
+  --metadata-path <metadata.csv> \
+  --refined-dir <processed_dir> \
+  --split train \
+  --performance-dataset ASAP \
+  --sidecar-tag ASAP
+```
+
+These sidecars contain the latest training-required payload, including:
+
+- raw score timing rows
+- score feature rows and masks
+- raw per-performance labels
+- fixed window split metadata copied from JSON
+
+## Training Config Expectations
+
+To consume the shared fixed valid set, configs should use:
 
 ```json
 {
-  "fixed_window_split_scheme": "train_valid_asap3_nonasap1_v1",
+  "fixed_window_split_scheme": "train_valid_asap3_nonasap05_v1",
   "fixed_window_base_split": "train",
   "fixed_window_train_split_name": "train",
   "fixed_window_eval_split_name": "valid"
 }
 ```
 
-Recommended stage usage:
+Recommended usage:
 
-- base `train`: use all performances with the fixed `valid` windows
-- `adapt`: keep `train_performance_dataset = "ASAP"` and `eval_performance_dataset = "ASAP"`
-  so the fixed `valid` windows are reused, but evaluation only keeps ASAP performances
+- base `train`: all performances, fixed `valid` windows
+- `adapt`: `train_performance_dataset = "ASAP"` and `eval_performance_dataset = "ASAP"`
+
+## Still Kept As Utilities
+
+- `rebuild_single_processed_work.py`: rebuild one work JSON if a single score needs repair
+- `score_xml_alignment.py`: shared XML/MXL alignment helpers
+- `fixed_window_split.py`: fixed split lookup helpers used by training and sidecar prebuild
 
 ## Legacy
 
-`legacy_pt_cpt/` contains old PT/CPT preprocessing scripts for pretrain, Arrow,
-and tokenizer-style SFT data. They are kept out of the active pipeline because
-the current Integrated Note experiments train directly on PianoCoRe-A paired data
-and do not use CPT data.
+`legacy_pt_cpt/` contains old PT/CPT preprocessing scripts and is not part of
+the active INR pipeline.

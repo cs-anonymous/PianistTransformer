@@ -58,7 +58,7 @@ tmux attach -t inr0624_sine_d4w1
 
 ### 3. 其他仍保留的 shell 脚本
 
-- `script/data_process.sh`: 原始数据处理链
+- `script/build_pianocore_inr_sidecars.sh`: 当前标准 INR 数据处理链
 - `script/run_inr_csr_pipeline.sh`: CSR 流水线
 - `script/run_head_capacity_pipeline.sh`: head capacity 对比实验
 - `script/run_pt_pipeline.sh`: Pianist Transformer 旧主线流水线
@@ -77,30 +77,26 @@ tmux attach -t inr0624_sine_d4w1
 - `src/evaluate/analyze_timing_delta_ratio.py`
 - `src/evaluate/report_inr0624_wass.py`
 
-## PT Pipeline 直跑命令
+## INR 数据预处理
 
-以下内容替代已删除的短壳包装器，直接按 Pianist Transformer 主流程执行。
+当前标准入口：
 
 ```bash
-# 进入仓库根目录，确保相对路径都成立
 cd /home/sy/EPR/PianistTransformer
 
-# 处理最小数据集，生成预训练和 SFT 所需的数据文件
-sh script/data_process.sh
-
-# 运行 PT 预训练
-python src/train/pretrain.py
-
-# 运行 PT 监督微调，使用当前默认 SFT 配置
-python src/train/sft.py --config configs/sft_config_pianocore.json
-
-# 对示例乐谱执行推理，生成演奏 MIDI
-python src/inference/inference.py
+bash script/build_pianocore_inr_sidecars.sh
 ```
 
-如果要直接启动 INR 训练，不再通过旧的 `script/train_inr.sh`，改用：
+该脚本会顺序完成：
+
+- 生成 paired INR JSON
+- 补 XML score feature
+- 写固定 `train_valid_asap3_nonasap05_v1` valid split
+- 预构建 base `.pt`
+- 预构建 ASAP `.ASAP.pt`
+
+如果要直接启动 INR 训练，不再通过旧短壳，改用：
 
 ```bash
-# 启动 INR 训练，配置文件按实验替换
 python src/train/train_inr.py --config <config.json>
 ```

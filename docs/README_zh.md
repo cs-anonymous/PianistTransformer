@@ -111,12 +111,20 @@ python src/inference/inference.py
 
 ### 1.数据预处理
 
-我们提供的脚本将自动处理仓库中自带的最小数据集，将其转换为模型训练所需的格式。处理SFT数据需要安装音符对齐工具，请将 [Symbolic Music Alignment Tool](https://midialignment.github.io/demo.html)，放置在`./tools`下，目录结构为`./tools/AlignmentTool/*`，然后运行其中的`compile.sh`编译安装。完成后，运行如下脚本: 
+对于当前在用的 INR 研究流程，请使用下面的标准入口，将
+PianoCoRe 处理成训练可直接读取的 JSON 与 sidecar：
 
 ```bash
-sh script/data_process.sh
+bash script/build_pianocore_inr_sidecars.sh
 ```
-此过程完成后，处理好的数据将位于 `data/processed` 目录下，为后续的训练步骤做好准备。
+
+该流程会依次完成：
+
+- 生成 paired work JSON
+- 补齐 XML score feature
+- 写入共享固定 valid 切分
+- 预构建 base `.pt`
+- 预构建 ASAP `.ASAP.pt`
 
 ### 2.自监督预训练
 
@@ -140,7 +148,9 @@ python src/train/sft.py --config configs/sft_config_pianocore.json
 
 如果您希望使用自己的数据集进行训练，请参考 `data/` 目录下的示例数据结构来组织您的文件。
 
-您需要相应地修改 `script/data_process.sh` 脚本，或参考其中的代码逻辑来编写您自己的数据处理流程，以确保您的数据能被正确地加载和处理。
+如果您希望适配自己的数据集，可以修改
+`script/build_pianocore_inr_sidecars.sh`，或直接参考 `src/data_process/`
+中的各阶段脚本来编排自己的 INR 数据处理流程。
 
 ## 使用图形用户界面（GUI）
 为了方便所有用户，尤其是那些不熟悉命令行的朋友，我们基于 PyQt 和 Pygame 开发了一个简单直观的图形用户界面 (GUI)。您无需编写任何代码，即可轻松使用 Pianist Transformer。
@@ -195,4 +205,3 @@ python -m src.gui.ui
       primaryClass={cs.SD}
 }
 ```
-

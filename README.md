@@ -113,12 +113,16 @@ To help you verify and understand the entire process, **we have included a minim
 
 ### 1. Data Preprocessing
 
-The provided script will automatically process the minimal dataset included in the repository, converting it into the format required for model training. To process the SFT data, you need to install the note-alignment tool. Please place the [Symbolic Music Alignment Tool](https://midialignment.github.io/demo.html)￼ under `./tools`, with the directory structure `./tools/AlignmentTool/*`, and then run the `compile.sh` script inside it to compile and install. After that, run the following script:
+For the active INR research pipeline, preprocess PianoCoRe into training-ready
+JSON and sidecars with:
 
 ```bash
-sh script/data_process.sh
+bash script/build_pianocore_inr_sidecars.sh
 ```
-Once this process is complete, the processed data will be located in the `data/processed` directory, ready for the subsequent training steps.
+
+This pipeline generates paired work JSON, projects XML score features, writes
+the shared fixed valid split, and prebuilds both base `.pt` and ASAP `.ASAP.pt`
+sidecars so training stays read-only.
 
 ### 2. Self-Supervised Pre-training
 
@@ -142,7 +146,8 @@ After fine-tuning is complete, the final model, ready for inference, will be sav
 
 If you wish to train the model on your own dataset, please organize your files according to the example data structure found in the `data/` directory.
 
-You will need to modify the `script/data_process.sh` script accordingly or write your own data processing workflow by referencing its logic to ensure your data is loaded and processed correctly.
+You can modify `script/build_pianocore_inr_sidecars.sh` or the Python stages in
+`src/data_process/` to adapt the INR pipeline to your own dataset layout.
 
 ## INSPIRE / INR Research Track
 

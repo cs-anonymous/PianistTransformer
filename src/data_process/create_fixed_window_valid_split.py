@@ -225,29 +225,30 @@ def worker(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True)
-    parser.add_argument("--scheme-name", default="train_valid_asap3_nonasap1_v1")
+    parser.add_argument("--metadata-path", required=True)
+    parser.add_argument("--refined-dir", required=True)
+    parser.add_argument("--scheme-name", default="train_valid_asap3_nonasap05_v1")
     parser.add_argument("--base-split", default="train")
+    parser.add_argument("--block-notes", type=int, default=512)
+    parser.add_argument("--overlap-ratio", type=float, default=0.125)
+    parser.add_argument("--min-notes", type=int, default=64)
     parser.add_argument("--asap-ratio", type=float, default=0.03)
-    parser.add_argument("--non-asap-ratio", type=float, default=0.01)
+    parser.add_argument("--non-asap-ratio", type=float, default=0.005)
     parser.add_argument("--selection-seed", type=int, default=42)
     parser.add_argument("--output-summary", default=None)
     parser.add_argument("--skip-sidecars", action="store_true")
     parser.add_argument("--workers", type=int, default=36)
     args = parser.parse_args()
 
-    with open(args.config, "r", encoding="utf-8") as file:
-        config = json.load(file)
-
     manifest = build_work_manifest(
-        metadata_path=config["metadata_path"],
-        refined_dir=config["refined_dir"],
+        metadata_path=args.metadata_path,
+        refined_dir=args.refined_dir,
         split=args.base_split,
-        block_notes=config["block_notes"],
-        overlap_ratio=config["overlap_ratio"],
-        min_notes=config["min_notes"],
+        block_notes=args.block_notes,
+        overlap_ratio=args.overlap_ratio,
+        min_notes=args.min_notes,
         max_works=None,
-        skip_work_paths=config.get("skip_work_paths"),
+        skip_work_paths=None,
         performance_dataset=None,
         exclude_performance_dataset=None,
     )
@@ -259,41 +260,23 @@ def main():
     )
     scheme_payload = dict(built["scheme"])
 
-    jobs = []
-    total_paths = len(built["assignments_by_path"])
-    for path, item in built["assignments_by_path"].items():
-        payload = dict(scheme_payload)
-        payload["window_assignments"] = item["window_assignments"]
-        payload["performance_dataset_counts"] = item["performance_dataset_counts"]
-        payload["estimated_performances"] = item["estimated_performances"]
-        payload["valid_examples"] = item["valid_examples"]
-        payload["valid_asap_examples"] = item["valid_asap_examples"]
-        payload["valid_non_asap_examples"] = item["valid_non_asap_examples"]
-        jobs.append((path, args.scheme_name, payload, bool(args.skip_sidecars)))
+    if not bool(args.skip_sidecars):
+        jobs = []
+        total_paths = len(built["assignments_by_path"])
+        for path, item in built["assignments_by_path"].items():
+            payload = dict(scheme_payload)
+            payload["window_assignments"] = item["window_assignments"]
+            payload["performance_dataset_counts"] = item["performance_dataset_counts"]
+            payload["estimated_performances"] = item["estimated_performances"]
+            payload["valid_examples"] = item["valid_examples"]
+            payload["valid_asap_examples"] = item["valid_asap_examples"]
+            payload["valid_non_asap_examples"] = item["valid_non_asap_examples"]
+            jobs.append((path, args.scheme_name, payload, bool(args.skip_sidecars)))
 
-    done = 0
-    if int(args.workers) <= 1:
-        for job in jobs:
-            worker(job)
-            done += 1
-            if done % 100 == 0 or done == total_paths:
-                print(
-                    json.dumps(
-                        {
-                            "event": "fixed_window_valid_split_progress",
-                            "done": done,
-                            "works": total_paths,
-                        },
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    ),
-                    flush=True,
-                )
-    else:
-        with ProcessPoolExecutor(max_workers=int(args.workers)) as pool:
-            futures = [pool.submit(worker, job) for job in jobs]
-            for future in as_completed(futures):
-                future.result()
+        done = 0
+        if int(args.workers) <= 1:
+            for job in jobs:
+                worker(job)
                 done += 1
                 if done % 100 == 0 or done == total_paths:
                     print(
@@ -308,6 +291,25 @@ def main():
                         ),
                         flush=True,
                     )
+        else:
+            with ProcessPoolExecutor(max_workers=int(args.workers)) as pool:
+                futures = [pool.submit(worker, job) for job in jobs]
+                for future in as_completed(futures):
+                    future.result()
+                    done += 1
+                    if done % 100 == 0 or done == total_paths:
+                        print(
+                            json.dumps(
+                                {
+                                    "event": "fixed_window_valid_split_progress",
+                                    "done": done,
+                                    "works": total_paths,
+                                },
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            ),
+                            flush=True,
+                        )
 
     summary_path = (
         Path(args.output_summary)

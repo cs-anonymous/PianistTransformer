@@ -99,20 +99,15 @@ PY
 } | tee -a "${EVALUATE_LOG}"
 
 if [[ ! -s "${DATA_FILE}" ]]; then
-  echo "[$(date '+%F %T')] data: generating PT SFT jsonl from processed_raw" | tee -a "${EVALUATE_LOG}"
-  GEN_ARGS=(
-    --processed-dir "${PROCESSED_RAW_DIR}" \
-    --output-file "${DATA_FILE}" \
-    --time-normalization raw \
-    --num-workers "${PT_DATA_NUM_WORKERS}"
-  )
-  [[ -n "${PT_DATA_PERFORMANCE_DATASET}" ]] && GEN_ARGS+=(--performance-dataset "${PT_DATA_PERFORMANCE_DATASET}")
-  [[ -n "${PT_DATA_SPLIT}" ]] && GEN_ARGS+=(--split "${PT_DATA_SPLIT}")
-  PYTHONPATH="${ROOT_DIR}" PYTHONUNBUFFERED=1 python src/data_process/generate_pt_sft_from_inr_json_multiprocess.py "${GEN_ARGS[@]}" \
-    2>&1 | tee -a "${EVALUATE_LOG}"
-else
-  echo "[$(date '+%F %T')] data: reuse existing ${DATA_FILE}" | tee -a "${EVALUATE_LOG}"
+  {
+    echo "[$(date '+%F %T')] data: missing PT jsonl ${DATA_FILE}"
+    echo "run_pt_pipeline.sh no longer auto-generates PT jsonl from INR JSON."
+    echo "Please prepare config.data_paths in advance, or use the legacy PT/CPT preprocessors under src/data_process/legacy_pt_cpt if you still need the tokenizer-style PT pipeline."
+  } | tee -a "${EVALUATE_LOG}"
+  exit 1
 fi
+
+echo "[$(date '+%F %T')] data: reuse existing ${DATA_FILE}" | tee -a "${EVALUATE_LOG}"
 
 echo "[$(date '+%F %T')] train: PT SFT start, GPUs=${CUDA_VISIBLE_DEVICES}, nproc=${TRAIN_GPU_COUNT}" | tee -a "${EVALUATE_LOG}"
 TRAIN_MARKER="${TMP_DIR}/train_start.marker"
