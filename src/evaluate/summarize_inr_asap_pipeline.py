@@ -82,7 +82,13 @@ def sanitize_for_json(value):
     return value
 
 
-def compute_manifest_metrics(manifest, max_gt_per_score=None, num_workers=1):
+def compute_manifest_metrics(
+    manifest,
+    max_gt_per_score=None,
+    num_workers=1,
+    pedal_binary_support=False,
+    pedal_binary_threshold=64.0,
+):
     items = manifest["items"]
     if num_workers and num_workers > 1:
         ctx = get_context("spawn")
@@ -91,7 +97,10 @@ def compute_manifest_metrics(manifest, max_gt_per_score=None, num_workers=1):
                 tqdm(
                     pool.imap(
                         score_level_metrics_worker,
-                        ((item, max_gt_per_score) for item in items),
+                        (
+                            (item, max_gt_per_score, pedal_binary_support, pedal_binary_threshold)
+                            for item in items
+                        ),
                         chunksize=1,
                     ),
                     total=len(items),
@@ -100,7 +109,12 @@ def compute_manifest_metrics(manifest, max_gt_per_score=None, num_workers=1):
             )
     else:
         score_rows = [
-            score_level_metrics(item, max_gt_per_score=max_gt_per_score)
+            score_level_metrics(
+                item,
+                max_gt_per_score=max_gt_per_score,
+                pedal_binary_support=pedal_binary_support,
+                pedal_binary_threshold=pedal_binary_threshold,
+            )
             for item in tqdm(items, total=len(items), desc=f"{manifest['protocol']} score metrics")
         ]
 
@@ -491,16 +505,22 @@ def main():
     config = load_manifest(args.config)
     timing_normalization = config.get("timing_input_normalization", "legacy_log1p")
     max_time_ms = float(config.get("max_time_ms", 10000.0))
+    pedal_binary_support = str(config.get("pedal_representation", "")).lower() == "binary_4"
+    pedal_binary_threshold = float(config.get("pedal_binary_threshold", 64.0))
 
     det_metrics = compute_manifest_metrics(
         det_manifest,
         max_gt_per_score=args.max_gt_per_score,
         num_workers=args.num_workers,
+        pedal_binary_support=pedal_binary_support,
+        pedal_binary_threshold=pedal_binary_threshold,
     )
     sampling_metrics = compute_manifest_metrics(
         sampling_manifest,
         max_gt_per_score=args.max_gt_per_score,
         num_workers=args.num_workers,
+        pedal_binary_support=pedal_binary_support,
+        pedal_binary_threshold=pedal_binary_threshold,
     )
     plot_summary = plot_distributions(
         det_manifest,

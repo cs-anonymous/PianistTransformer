@@ -103,12 +103,45 @@ def musical_feature_dim(musical_feature_mode="categorical"):
     raise ValueError(f"Unsupported musical_feature_mode={musical_feature_mode}")
 
 
+def score_note_input_schema(config_or_value=None):
+    if isinstance(config_or_value, dict):
+        return str(config_or_value.get("score_note_input_schema", "integrated")).lower()
+    if hasattr(config_or_value, "score_note_input_schema"):
+        return str(getattr(config_or_value, "score_note_input_schema", "integrated")).lower()
+    if config_or_value is None:
+        return "integrated"
+    return str(config_or_value).lower()
+
+
+def decoder_note_input_schema(config_or_value=None):
+    if isinstance(config_or_value, dict):
+        return str(config_or_value.get("decoder_note_input_schema", "integrated")).lower()
+    if hasattr(config_or_value, "decoder_note_input_schema"):
+        return str(getattr(config_or_value, "decoder_note_input_schema", "integrated")).lower()
+    if config_or_value is None:
+        return "integrated"
+    return str(config_or_value).lower()
+
+
+def score_musical_input_dim(timing_control_mode=None, use_timing_scale_bit=True, musical_feature_mode="categorical"):
+    return timing_control_feature_dim(
+        timing_control_mode=timing_control_mode,
+        use_timing_scale_bit=use_timing_scale_bit,
+    ) + musical_feature_dim(musical_feature_mode) + 1
+
+
+def decoder_perf_target_input_dim():
+    return 7 + 3
+
+
 class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
     def __init__(
         self,
         backbone_type="t5",
         continuous_dim=7,
         input_continuous_dim=None,
+        score_input_continuous_dim=None,
+        decoder_input_continuous_dim=None,
         output_continuous_dim=None,
         pitch_vocab_size=128,
         pitch_pad_id=128,
@@ -131,6 +164,8 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         csr_loss_weights=None,
         decoder_input_mode="score",
         note_embedding_mode="sine",
+        score_note_input_schema="integrated",
+        decoder_note_input_schema="integrated",
         special_note_vocab_size=5,
         special_note_ids=None,
         use_full_type_embedding=True,
@@ -171,16 +206,26 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         musical_feature_mode="categorical",
         prior_token_keep_prob=1.0,
         prior_token_dropout_mode="mask",
+        prior_attribute_keep_probs=None,
+        prior_attribute_noise_std=0.05,
         piano_pitch_min=21,
         pedal_representation="continuous_4",
         pedal_start_loss_weight=1.0,
         pedal_ctrl_loss_weight=1.0,
+        use_style_tokens=False,
+        style_creator_vocab_size=1,
+        style_source_vocab_size=1,
+        style_score_stat_dim=18,
+        style_perf_stat_dim=18,
+        style_integration_mode="prepend",
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.backbone_type = backbone_type
         self.continuous_dim = continuous_dim
         self.input_continuous_dim = input_continuous_dim or continuous_dim
+        self.score_input_continuous_dim = score_input_continuous_dim or self.input_continuous_dim
+        self.decoder_input_continuous_dim = decoder_input_continuous_dim or self.input_continuous_dim
         self.output_continuous_dim = output_continuous_dim or continuous_dim
         self.pitch_vocab_size = pitch_vocab_size
         self.pitch_pad_id = pitch_pad_id
@@ -224,6 +269,8 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         }
         self.decoder_input_mode = decoder_input_mode
         self.note_embedding_mode = note_embedding_mode
+        self.score_note_input_schema = score_note_input_schema
+        self.decoder_note_input_schema = decoder_note_input_schema
         self.special_note_vocab_size = special_note_vocab_size
         self.special_note_ids = special_note_ids or {
             "pad": 0,
@@ -289,10 +336,37 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.timing_input_normalization = timing_input_normalization
         self.prior_token_keep_prob = prior_token_keep_prob
         self.prior_token_dropout_mode = prior_token_dropout_mode
+        self.prior_attribute_keep_probs = prior_attribute_keep_probs
+        self.prior_attribute_noise_std = prior_attribute_noise_std
         self.piano_pitch_min = int(piano_pitch_min)
         self.pedal_representation = str(pedal_representation).lower()
         self.pedal_start_loss_weight = float(pedal_start_loss_weight)
         self.pedal_ctrl_loss_weight = float(pedal_ctrl_loss_weight)
+        self.use_style_tokens = bool(use_style_tokens)
+        self.style_creator_vocab_size = int(style_creator_vocab_size)
+        self.style_source_vocab_size = int(style_source_vocab_size)
+        self.style_score_stat_dim = int(style_score_stat_dim)
+        self.style_perf_stat_dim = int(style_perf_stat_dim)
+        self.style_integration_mode = str(style_integration_mode or "prepend").lower()
+        valid_style_modes = {
+            "prepend",
+            "add",
+            "film",
+            "add_film",
+            "prepend_add",
+            "prepend_film",
+            "dec_add",
+            "dec_film",
+            "dec_add_film",
+            "prepend_dec_add",
+            "prepend_dec_film",
+            "prepend_dec_add_film",
+        }
+        if self.style_integration_mode not in valid_style_modes:
+            raise ValueError(f"Unsupported style_integration_mode={style_integration_mode}")
+        self.style_token_count = (
+            4 if self.use_style_tokens and self.style_integration_mode.startswith("prepend") else 0
+        )
 
 
 def _activation(name):
@@ -365,10 +439,20 @@ class IntegratedNoteEncoder(nn.Module):
     def __init__(self, config, continuous_dim=None, role="score"):
         super().__init__()
         self.config = config
-        continuous_dim = continuous_dim or config.input_continuous_dim
+        role = str(role).lower()
+        if continuous_dim is None:
+            if role == "decoder":
+                continuous_dim = getattr(config, "decoder_input_continuous_dim", config.input_continuous_dim)
+            else:
+                continuous_dim = getattr(config, "score_input_continuous_dim", config.input_continuous_dim)
         self.continuous_dim = continuous_dim
-        self.role = str(role).lower()
+        self.role = role
         self.mode = getattr(config, "note_embedding_mode", "sine").lower()
+        self.schema = (
+            decoder_note_input_schema(config)
+            if self.role == "decoder"
+            else score_note_input_schema(config)
+        )
         self.special_note_embeddings = nn.Embedding(
             config.special_note_vocab_size,
             config.hidden_size,
@@ -384,60 +468,127 @@ class IntegratedNoteEncoder(nn.Module):
         )
         self.musical_dim = int(getattr(config, "musical_feature_dim", 12))
         self.mask_dim = int(getattr(config, "mask_feature_dim", 3))
+        self.decoder_target_dim = 7
+        self.decoder_target_mask_dim = 3
 
-        if self.mode == "sine":
-            self.pitch_projection = _make_mlp(
-                self.pitch_factor_dim,
-                config.hidden_size,
-                config.hidden_size,
-                self.embedding_depth,
-                self.activation,
-            )
-            self.score_control_projection = _make_mlp(
-                self.score_control_dim,
-                config.hidden_size,
-                config.hidden_size,
-                self.embedding_depth,
-                self.activation,
-            )
-            self.performance_control_projection = _make_mlp(
-                self.performance_control_dim,
-                config.hidden_size,
-                config.hidden_size,
-                self.embedding_depth,
-                self.activation,
-            )
-            self.musical_projection = _make_mlp(
-                self.musical_dim,
-                config.hidden_size,
-                config.hidden_size,
-                self.embedding_depth,
-                self.activation,
-            )
-            self.mask_projection = _make_mlp(
-                self.mask_dim,
-                config.hidden_size,
-                config.hidden_size,
-                self.embedding_depth,
-                self.activation,
-            )
-        elif self.mode == "cine":
-            flat_dim = (
-                self.pitch_factor_dim
-                + self.score_control_dim
-                + self.performance_control_dim
-                + self.musical_dim
-                + self.mask_dim
-            )
-            self.continuous_mlp = _make_mlp(
-                flat_dim,
-                config.hidden_size,
-                config.hidden_size,
-                self.embedding_depth,
-                self.activation,
-            )
-        else:
+        self.pitch_projection = _make_mlp(
+            self.pitch_factor_dim,
+            config.hidden_size,
+            config.hidden_size,
+            self.embedding_depth,
+            self.activation,
+        )
+        if self.mode not in {"sine", "cine"}:
             raise ValueError(f"Unsupported note_embedding_mode: {self.mode}. Expected one of: sine, cine")
+
+        if self.schema == "integrated":
+            if self.mode == "sine":
+                self.score_control_projection = _make_mlp(
+                    self.score_control_dim,
+                    config.hidden_size,
+                    config.hidden_size,
+                    self.embedding_depth,
+                    self.activation,
+                )
+                self.performance_control_projection = _make_mlp(
+                    self.performance_control_dim,
+                    config.hidden_size,
+                    config.hidden_size,
+                    self.embedding_depth,
+                    self.activation,
+                )
+                self.musical_projection = _make_mlp(
+                    self.musical_dim,
+                    config.hidden_size,
+                    config.hidden_size,
+                    self.embedding_depth,
+                    self.activation,
+                )
+                self.mask_projection = _make_mlp(
+                    self.mask_dim,
+                    config.hidden_size,
+                    config.hidden_size,
+                    self.embedding_depth,
+                    self.activation,
+                )
+            else:
+                flat_dim = (
+                    self.pitch_factor_dim
+                    + self.score_control_dim
+                    + self.performance_control_dim
+                    + self.musical_dim
+                    + self.mask_dim
+                )
+                self.continuous_mlp = _make_mlp(
+                    flat_dim,
+                    config.hidden_size,
+                    config.hidden_size,
+                    self.embedding_depth,
+                    self.activation,
+                )
+        elif self.schema == "score_musical":
+            if self.mode == "sine":
+                self.score_control_projection = _make_mlp(
+                    self.score_control_dim,
+                    config.hidden_size,
+                    config.hidden_size,
+                    self.embedding_depth,
+                    self.activation,
+                )
+                self.musical_projection = _make_mlp(
+                    self.musical_dim,
+                    config.hidden_size,
+                    config.hidden_size,
+                    self.embedding_depth,
+                    self.activation,
+                )
+                self.musical_mask_embedding = nn.Embedding(1, config.hidden_size)
+            else:
+                flat_dim = self.pitch_factor_dim + self.score_control_dim + self.musical_dim + 1
+                self.continuous_mlp = _make_mlp(
+                    flat_dim,
+                    config.hidden_size,
+                    config.hidden_size,
+                    self.embedding_depth,
+                    self.activation,
+                )
+        elif self.schema == "perf_target":
+            if self.mode == "sine":
+                self.timing_projection = _make_mlp(
+                    2,
+                    config.hidden_size,
+                    config.hidden_size,
+                    self.embedding_depth,
+                    self.activation,
+                )
+                self.velocity_projection = _make_mlp(
+                    1,
+                    config.hidden_size,
+                    config.hidden_size,
+                    self.embedding_depth,
+                    self.activation,
+                )
+                self.pedal_projection = _make_mlp(
+                    4,
+                    config.hidden_size,
+                    config.hidden_size,
+                    self.embedding_depth,
+                    self.activation,
+                )
+                self.timing_mask_embedding = nn.Embedding(1, config.hidden_size)
+                self.velocity_mask_embedding = nn.Embedding(1, config.hidden_size)
+                self.pedal_mask_embedding = nn.Embedding(1, config.hidden_size)
+            else:
+                flat_dim = self.pitch_factor_dim + self.decoder_target_dim + self.decoder_target_mask_dim
+                self.continuous_mlp = _make_mlp(
+                    flat_dim,
+                    config.hidden_size,
+                    config.hidden_size,
+                    self.embedding_depth,
+                    self.activation,
+                )
+        else:
+            raise ValueError(f"Unsupported note input schema: {self.schema}")
         self.norm = nn.LayerNorm(config.hidden_size)
 
     def _pitch_factors(self, pitch_ids):
@@ -479,32 +630,92 @@ class IntegratedNoteEncoder(nn.Module):
             )
         return score_control, performance_control, musical, masks
 
+    def _split_score_musical(self, continuous):
+        start = 0
+        score_control = continuous[..., start : start + self.score_control_dim]
+        start += self.score_control_dim
+        musical = continuous[..., start : start + self.musical_dim]
+        start += self.musical_dim
+        musical_mask = continuous[..., start : start + 1]
+        if continuous.shape[-1] != start + 1:
+            raise ValueError(
+                f"Unexpected score_musical continuous dim {continuous.shape[-1]}, expected {start + 1}"
+            )
+        return score_control, musical, musical_mask
+
+    def _split_perf_target(self, continuous):
+        start = 0
+        timing = continuous[..., start : start + 2]
+        start += 2
+        velocity = continuous[..., start : start + 1]
+        start += 1
+        pedal = continuous[..., start : start + 4]
+        start += 4
+        masks = continuous[..., start : start + self.decoder_target_mask_dim]
+        if continuous.shape[-1] != start + self.decoder_target_mask_dim:
+            raise ValueError(
+                f"Unexpected perf_target continuous dim {continuous.shape[-1]}, expected {start + self.decoder_target_mask_dim}"
+            )
+        return timing, velocity, pedal, masks
+
     def forward(self, pitch_ids, continuous, special_note_ids=None):
         projection_dtype = next(self.parameters()).dtype
         continuous = continuous.to(dtype=projection_dtype)
-        score_control, performance_control, musical, masks = self._split_inr0624(continuous)
         pitch_factors = self._pitch_factors(pitch_ids).to(dtype=projection_dtype)
+        pitch_embeds = self.pitch_projection(pitch_factors)
 
-        if self.mode == "cine":
-            embeddings = self.continuous_mlp(
-                torch.cat([pitch_factors, score_control, performance_control, musical, masks], dim=-1)
-            )
+        if self.schema == "integrated":
+            score_control, performance_control, musical, masks = self._split_inr0624(continuous)
+            if self.mode == "cine":
+                embeddings = self.continuous_mlp(
+                    torch.cat([pitch_factors, score_control, performance_control, musical, masks], dim=-1)
+                )
+            else:
+                m_score_control = masks[..., 0:1]
+                m_performance_control = masks[..., 1:2]
+                m_m = masks[..., 2:3]
+                score_control_embeds = self.score_control_projection(score_control) * m_score_control
+                performance_control_embeds = self.performance_control_projection(performance_control) * m_performance_control
+                musical_embeds = self.musical_projection(musical) * m_m
+                mask_embeds = self.mask_projection(masks)
+                embeddings = (
+                    pitch_embeds
+                    + score_control_embeds
+                    + performance_control_embeds
+                    + musical_embeds
+                    + mask_embeds
+                )
+        elif self.schema == "score_musical":
+            score_control, musical, musical_mask = self._split_score_musical(continuous)
+            if self.mode == "cine":
+                embeddings = self.continuous_mlp(
+                    torch.cat([pitch_factors, score_control, musical, musical_mask], dim=-1)
+                )
+            else:
+                musical_present = musical_mask >= 0.5
+                missing_musical = self.musical_mask_embedding.weight[0].view(1, 1, -1).to(dtype=projection_dtype)
+                musical_embeds = self.musical_projection(musical)
+                musical_embeds = torch.where(musical_present, musical_embeds, missing_musical)
+                embeddings = pitch_embeds + self.score_control_projection(score_control) + musical_embeds
+        elif self.schema == "perf_target":
+            timing, velocity, pedal, masks = self._split_perf_target(continuous)
+            if self.mode == "cine":
+                embeddings = self.continuous_mlp(
+                    torch.cat([pitch_factors, timing, velocity, pedal, masks], dim=-1)
+                )
+            else:
+                timing_present = masks[..., 0:1] >= 0.5
+                velocity_present = masks[..., 1:2] >= 0.5
+                pedal_present = masks[..., 2:3] >= 0.5
+                timing_missing = self.timing_mask_embedding.weight[0].view(1, 1, -1).to(dtype=projection_dtype)
+                velocity_missing = self.velocity_mask_embedding.weight[0].view(1, 1, -1).to(dtype=projection_dtype)
+                pedal_missing = self.pedal_mask_embedding.weight[0].view(1, 1, -1).to(dtype=projection_dtype)
+                timing_embeds = torch.where(timing_present, self.timing_projection(timing), timing_missing)
+                velocity_embeds = torch.where(velocity_present, self.velocity_projection(velocity), velocity_missing)
+                pedal_embeds = torch.where(pedal_present, self.pedal_projection(pedal), pedal_missing)
+                embeddings = pitch_embeds + timing_embeds + velocity_embeds + pedal_embeds
         else:
-            m_score_control = masks[..., 0:1]
-            m_performance_control = masks[..., 1:2]
-            m_m = masks[..., 2:3]
-            pitch_embeds = self.pitch_projection(pitch_factors)
-            score_control_embeds = self.score_control_projection(score_control) * m_score_control
-            performance_control_embeds = self.performance_control_projection(performance_control) * m_performance_control
-            musical_embeds = self.musical_projection(musical) * m_m
-            mask_embeds = self.mask_projection(masks)
-            embeddings = (
-                pitch_embeds
-                + score_control_embeds
-                + performance_control_embeds
-                + musical_embeds
-                + mask_embeds
-            )
+            raise ValueError(f"Unsupported note input schema: {self.schema}")
         embeddings = self.norm(embeddings)
         return self._apply_special_embeddings(embeddings, special_note_ids)
 
@@ -517,6 +728,222 @@ class IntegratedNoteEncoder(nn.Module):
         safe_ids = special_note_ids.clamp_min(0)
         special_embeds = self.special_note_embeddings(safe_ids).to(dtype=embeddings.dtype)
         return torch.where(special_mask.unsqueeze(-1), special_embeds, embeddings)
+
+
+class IntegratedStyleTokenEncoder(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        hidden_size = int(config.hidden_size)
+        activation = getattr(config, "head_activation", "gelu")
+        depth = getattr(config, "embedding_depth", 2)
+        self.creator_embedding = nn.Embedding(
+            max(1, int(getattr(config, "style_creator_vocab_size", 1))),
+            hidden_size,
+        )
+        self.source_embedding = nn.Embedding(
+            max(1, int(getattr(config, "style_source_vocab_size", 1))),
+            hidden_size,
+        )
+        self.score_projection = _make_mlp(
+            max(1, int(getattr(config, "style_score_stat_dim", 18))),
+            hidden_size,
+            hidden_size,
+            depth=depth,
+            activation=activation,
+        )
+        self.perf_projection = _make_mlp(
+            max(1, int(getattr(config, "style_perf_stat_dim", 18))),
+            hidden_size,
+            hidden_size,
+            depth=depth,
+            activation=activation,
+        )
+        self.perf_pad_embedding = nn.Embedding(1, hidden_size)
+        self.token_type_embedding = nn.Embedding(4, hidden_size)
+        self.norm = nn.LayerNorm(hidden_size)
+        self.fusion = nn.Sequential(
+            nn.Linear(hidden_size * 4, hidden_size),
+            _activation(activation),
+            nn.LayerNorm(hidden_size),
+        )
+        self.film = nn.Linear(hidden_size, hidden_size * 2)
+
+    def forward(
+        self,
+        creator_ids,
+        source_ids,
+        score_stats,
+        perf_stats,
+        perf_is_pad=None,
+    ):
+        projection_dtype = self.creator_embedding.weight.dtype
+        creator_ids = creator_ids.long().clamp(0, self.creator_embedding.num_embeddings - 1)
+        source_ids = source_ids.long().clamp(0, self.source_embedding.num_embeddings - 1)
+        score_stats = score_stats.to(dtype=projection_dtype)
+        perf_stats = perf_stats.to(dtype=projection_dtype)
+        creator = self.creator_embedding(creator_ids)
+        source = self.source_embedding(source_ids)
+        score = self.score_projection(score_stats)
+        perf = self.perf_projection(perf_stats)
+        if perf_is_pad is not None:
+            pad = self.perf_pad_embedding(
+                torch.zeros_like(creator_ids, dtype=torch.long, device=creator_ids.device)
+            ).to(dtype=projection_dtype)
+            perf = torch.where(perf_is_pad.bool().unsqueeze(-1), pad, perf)
+        style_tokens = torch.stack([creator, source, score, perf], dim=1)
+        token_types = torch.arange(4, device=style_tokens.device).unsqueeze(0)
+        style_tokens = style_tokens + self.token_type_embedding(token_types).to(dtype=style_tokens.dtype)
+        return self.norm(style_tokens)
+
+    def summary(
+        self,
+        creator_ids,
+        source_ids,
+        score_stats,
+        perf_stats,
+        perf_is_pad=None,
+    ):
+        style_tokens = self.forward(
+            creator_ids,
+            source_ids,
+            score_stats,
+            perf_stats,
+            perf_is_pad=perf_is_pad,
+        )
+        return self.fusion(style_tokens.reshape(style_tokens.shape[0], -1))
+
+    def apply_to_notes(self, note_embeds, style_vec, mode):
+        mode = str(mode).lower()
+        styled = note_embeds
+        if "add" in mode:
+            styled = styled + style_vec.unsqueeze(1).to(dtype=styled.dtype)
+        if "film" in mode:
+            gamma, beta = self.film(style_vec).chunk(2, dim=-1)
+            gamma = 0.1 * torch.tanh(gamma).unsqueeze(1).to(dtype=styled.dtype)
+            beta = beta.unsqueeze(1).to(dtype=styled.dtype)
+            styled = styled * (1.0 + gamma) + beta
+        return styled
+
+
+class IntegratedStyleTokenMixin:
+    def _style_tokens_enabled(self):
+        return bool(getattr(self.config, "use_style_tokens", False))
+
+    def _style_integration_mode(self):
+        return str(getattr(self.config, "style_integration_mode", "prepend") or "prepend").lower()
+
+    def _style_should_prepend(self):
+        return self._style_tokens_enabled() and self._style_integration_mode().startswith("prepend")
+
+    def _style_should_apply_to_notes(self):
+        mode = self._style_integration_mode()
+        note_modes = {"add", "film", "add_film", "prepend_add", "prepend_film"}
+        return self._style_tokens_enabled() and mode in note_modes
+
+    def _style_should_apply_to_decoder_inputs(self):
+        mode = self._style_integration_mode()
+        decoder_input_modes = {"dec_add", "dec_add_film", "prepend_dec_add", "prepend_dec_add_film"}
+        return self._style_tokens_enabled() and mode in decoder_input_modes
+
+    def _style_should_apply_to_decoder_hidden(self):
+        mode = self._style_integration_mode()
+        decoder_hidden_modes = {"dec_film", "dec_add_film", "prepend_dec_film", "prepend_dec_add_film"}
+        return self._style_tokens_enabled() and mode in decoder_hidden_modes
+
+    def _build_style_tokens(
+        self,
+        style_creator_ids=None,
+        style_source_ids=None,
+        style_score_stats=None,
+        style_perf_stats=None,
+        style_perf_is_pad=None,
+    ):
+        if not self._style_tokens_enabled():
+            return None
+        missing = [
+            name
+            for name, value in (
+                ("style_creator_ids", style_creator_ids),
+                ("style_source_ids", style_source_ids),
+                ("style_score_stats", style_score_stats),
+                ("style_perf_stats", style_perf_stats),
+            )
+            if value is None
+        ]
+        if missing:
+            raise ValueError(f"Style tokens are enabled but missing inputs: {missing}")
+        return self.style_token_encoder(
+            style_creator_ids,
+            style_source_ids,
+            style_score_stats,
+            style_perf_stats,
+            perf_is_pad=style_perf_is_pad,
+        )
+
+    def _prepend_style_tokens(self, note_embeds, attention_mask, **style_kwargs):
+        if not self._style_should_prepend():
+            return note_embeds, attention_mask, 0
+        style_tokens = self._build_style_tokens(**style_kwargs)
+        if style_tokens is None:
+            return note_embeds, attention_mask, 0
+        style_mask = attention_mask.new_ones((attention_mask.shape[0], style_tokens.shape[1]))
+        return (
+            torch.cat([style_tokens.to(dtype=note_embeds.dtype), note_embeds], dim=1),
+            torch.cat([style_mask, attention_mask], dim=1),
+            style_tokens.shape[1],
+        )
+
+    def _apply_style_to_note_embeds(self, note_embeds, **style_kwargs):
+        if not self._style_should_apply_to_notes():
+            return note_embeds
+        missing = [
+            name
+            for name, value in style_kwargs.items()
+            if name != "style_perf_is_pad" and value is None
+        ]
+        if missing:
+            raise ValueError(f"Style note conditioning is enabled but missing inputs: {missing}")
+        style_vec = self.style_token_encoder.summary(
+            style_kwargs["style_creator_ids"],
+            style_kwargs["style_source_ids"],
+            style_kwargs["style_score_stats"],
+            style_kwargs["style_perf_stats"],
+            perf_is_pad=style_kwargs.get("style_perf_is_pad"),
+        )
+        return self.style_token_encoder.apply_to_notes(
+            note_embeds,
+            style_vec,
+            self._style_integration_mode(),
+        )
+
+    def _style_summary_vector(self, **style_kwargs):
+        missing = [
+            name
+            for name, value in style_kwargs.items()
+            if name != "style_perf_is_pad" and value is None
+        ]
+        if missing:
+            raise ValueError(f"Style conditioning is enabled but missing inputs: {missing}")
+        return self.style_token_encoder.summary(
+            style_kwargs["style_creator_ids"],
+            style_kwargs["style_source_ids"],
+            style_kwargs["style_score_stats"],
+            style_kwargs["style_perf_stats"],
+            perf_is_pad=style_kwargs.get("style_perf_is_pad"),
+        )
+
+    def _apply_style_to_decoder_inputs(self, decoder_inputs_embeds, **style_kwargs):
+        if not self._style_should_apply_to_decoder_inputs():
+            return decoder_inputs_embeds
+        style_vec = self._style_summary_vector(**style_kwargs)
+        return self.style_token_encoder.apply_to_notes(decoder_inputs_embeds, style_vec, "add")
+
+    def _apply_style_to_decoder_hidden(self, decoder_hidden, **style_kwargs):
+        if not self._style_should_apply_to_decoder_hidden():
+            return decoder_hidden
+        style_vec = self._style_summary_vector(**style_kwargs)
+        return self.style_token_encoder.apply_to_notes(decoder_hidden, style_vec, "film")
 
 
 class IntegratedContinuousDecoder(nn.Module):
@@ -1431,7 +1858,19 @@ def _target5_to_raw7(score_shared_raw, target_predictions, config=None):
     )
 
 
+def _decoder_rows_require_score_shared_raw(config):
+    return decoder_note_input_schema(config) == "integrated"
+
+
+def _build_epr_decoder_perf_target_rows(config, target_predictions):
+    target_predictions = target_predictions.float().clamp(0.0, 1.0)
+    masks = target_predictions.new_ones(*target_predictions.shape[:-1], 3)
+    return torch.cat([target_predictions, masks], dim=-1)
+
+
 def _build_epr_decoder_rows(config, score_shared_raw, target_predictions):
+    if decoder_note_input_schema(config) == "perf_target":
+        return _build_epr_decoder_perf_target_rows(config, target_predictions)
     raw_perf = _target5_to_raw7(score_shared_raw, target_predictions, config=config)
     timing_control_mode = getattr(config, "timing_control_mode", None)
     use_timing_scale_bit = getattr(config, "use_timing_scale_bit", True)
@@ -2496,6 +2935,60 @@ def _apply_prior_note_dropout(config, decoder_input_continuous, special_note_ids
         else:
             dropped[:, 1:] = dropped[:, 1:] * keep_mask.unsqueeze(-1).to(dtype=dropped.dtype)
         return dropped, special_note_ids
+    if dropout_mode in {"attribute_zero", "attribute_noise", "attribute_uniform"}:
+        dropped = decoder_input_continuous.clone()
+        if _uses_deviation_ratio_targets(config):
+            attr_start = int(getattr(config, "score_control_feature_dim", getattr(config, "control_feature_dim", 3)))
+            attr_dim = int(getattr(config, "performance_control_feature_dim", getattr(config, "control_feature_dim", 3) + 2))
+        elif str(getattr(config, "task_type", "epr")).lower() == "epr":
+            attr_start = 2
+            attr_dim = int(getattr(config, "output_continuous_dim", getattr(config, "continuous_dim", 5)))
+        else:
+            attr_start = 0
+            attr_dim = min(
+                int(getattr(config, "output_continuous_dim", dropped.shape[-1])),
+                dropped.shape[-1],
+            )
+        attr_end = min(attr_start + attr_dim, dropped.shape[-1])
+        if attr_start >= attr_end:
+            return dropped, special_note_ids
+
+        attr_values = dropped[:, 1:, attr_start:attr_end]
+        attr_dim = attr_values.shape[-1]
+        raw_keep_probs = getattr(config, "prior_attribute_keep_probs", None)
+        if raw_keep_probs is None:
+            keep_probs = attr_values.new_full((attr_dim,), keep_prob)
+        else:
+            keep_probs = torch.as_tensor(raw_keep_probs, dtype=attr_values.dtype, device=attr_values.device).flatten()
+            if keep_probs.numel() == 0:
+                keep_probs = attr_values.new_full((attr_dim,), keep_prob)
+            elif keep_probs.numel() < attr_dim:
+                pad = keep_probs.new_full((attr_dim - keep_probs.numel(),), float(keep_probs[-1]))
+                keep_probs = torch.cat([keep_probs, pad], dim=0)
+            keep_probs = keep_probs[:attr_dim].clamp(0.0, 1.0)
+
+        attr_keep_mask = torch.rand(
+            *attr_values.shape,
+            device=attr_values.device,
+            dtype=attr_values.dtype,
+        ) < keep_probs.view(1, 1, -1)
+        attr_drop_mask = (~attr_keep_mask) & valid_mask.unsqueeze(-1)
+        if dropout_mode == "attribute_zero":
+            replacement = torch.zeros_like(attr_values)
+        elif dropout_mode == "attribute_uniform":
+            replacement = torch.rand_like(attr_values)
+        else:
+            raw_noise_std = getattr(config, "prior_attribute_noise_std", 0.05)
+            noise_std = torch.as_tensor(raw_noise_std, dtype=attr_values.dtype, device=attr_values.device).flatten()
+            if noise_std.numel() == 0:
+                noise_std = attr_values.new_full((attr_dim,), 0.05)
+            elif noise_std.numel() < attr_dim:
+                pad = noise_std.new_full((attr_dim - noise_std.numel(),), float(noise_std[-1]))
+                noise_std = torch.cat([noise_std, pad], dim=0)
+            noise_std = noise_std[:attr_dim].clamp_min(0.0)
+            replacement = (attr_values + torch.randn_like(attr_values) * noise_std.view(1, 1, -1)).clamp(0.0, 1.0)
+        dropped[:, 1:, attr_start:attr_end] = torch.where(attr_drop_mask, replacement, attr_values)
+        return dropped, special_note_ids
     if dropout_mode in {"none", "off"}:
         return decoder_input_continuous, special_note_ids
     else:
@@ -2519,7 +3012,7 @@ def _build_prefilled_ar_note_inputs(
 ):
     batch_size, seq_len = attention_mask.shape
     if _uses_deviation_ratio_targets(config) or getattr(config, "task_type", "epr") == "csr":
-        decoder_dim = int(getattr(config, "input_continuous_dim"))
+        decoder_dim = int(getattr(config, "decoder_input_continuous_dim", getattr(config, "input_continuous_dim")))
     else:
         decoder_dim = output_dim + 2
     decoder_input_continuous = attention_mask.new_zeros((batch_size, seq_len, decoder_dim), dtype=torch.float32)
@@ -2532,13 +3025,23 @@ def _build_prefilled_ar_note_inputs(
         prefix_len = int(prefix_predictions.shape[1])
         if prefix_len > 0:
             if _uses_deviation_ratio_targets(config):
-                if score_shared_raw is None:
+                if _decoder_rows_require_score_shared_raw(config) and score_shared_raw is None:
                     raise ValueError("score_shared_raw is required for deviation_ratio AR prefix inputs")
                 decoder_input_continuous[:, 1 : prefix_len + 1] = _build_epr_decoder_rows(
                     config,
-                    score_shared_raw[:, :prefix_len].to(
+                    (
+                        score_shared_raw[:, :prefix_len].to(
                         dtype=decoder_input_continuous.dtype,
                         device=decoder_input_continuous.device,
+                        )
+                        if score_shared_raw is not None
+                        else prefix_predictions.new_zeros(
+                            prefix_predictions.shape[0],
+                            prefix_len,
+                            3,
+                            dtype=decoder_input_continuous.dtype,
+                            device=decoder_input_continuous.device,
+                        )
                     ),
                     prefix_predictions[:, :prefix_len].to(
                         dtype=decoder_input_continuous.dtype,
@@ -2572,8 +3075,10 @@ def _build_ar_note_continuous(
     task_type="epr",
 ):
     if _uses_deviation_ratio_targets(config):
-        if score_shared_raw is None:
+        if _decoder_rows_require_score_shared_raw(config) and score_shared_raw is None:
             raise ValueError("score_shared_raw is required for deviation_ratio AR note construction")
+        if score_shared_raw is None:
+            score_shared_raw = labels_continuous.new_zeros(*labels_continuous.shape[:-1], 3)
         return _build_epr_decoder_rows(config, score_shared_raw, labels_continuous)
     if task_type == "csr":
         return _build_csr_decoder_rows(config, labels_continuous)
@@ -3638,11 +4143,21 @@ class IntegratedGptBackbone(nn.Module):
         return hidden_states[:, seq_len:, :]
 
 
-class IntegratedPianoTransformer(nn.Module):
+class IntegratedPianoTransformer(IntegratedStyleTokenMixin, nn.Module):
     def __init__(self, config: IntegratedPianoT5GemmaConfig):
         super().__init__()
         self.config = config
-        self.note_encoder = IntegratedNoteEncoder(config, role="score")
+        self.note_encoder = IntegratedNoteEncoder(
+            config,
+            continuous_dim=getattr(config, "score_input_continuous_dim", config.input_continuous_dim),
+            role="score",
+        )
+        self._decoder_note_encoder = IntegratedNoteEncoder(
+            config,
+            continuous_dim=getattr(config, "decoder_input_continuous_dim", config.input_continuous_dim),
+            role="decoder",
+        )
+        self.style_token_encoder = IntegratedStyleTokenEncoder(config) if config.use_style_tokens else None
         self.continuous_decoder = IntegratedContinuousDecoder(config)
         backbone_type = config.backbone_type.lower()
         self.backbone_type = backbone_type
@@ -3655,7 +4170,7 @@ class IntegratedPianoTransformer(nn.Module):
 
     @property
     def decoder_note_encoder(self):
-        return self.note_encoder
+        return self._decoder_note_encoder
 
     def forward(
         self,
@@ -3667,6 +4182,11 @@ class IntegratedPianoTransformer(nn.Module):
         labels_epr_bins: Optional[torch.LongTensor] = None,
         label_mask: Optional[torch.LongTensor] = None,
         interpolated: Optional[torch.BoolTensor] = None,
+        style_creator_ids: Optional[torch.LongTensor] = None,
+        style_source_ids: Optional[torch.LongTensor] = None,
+        style_score_stats: Optional[torch.FloatTensor] = None,
+        style_perf_stats: Optional[torch.FloatTensor] = None,
+        style_perf_is_pad: Optional[torch.BoolTensor] = None,
         continuous_sampling_strategy: str = "mean",
         **kwargs,
     ) -> Seq2SeqLMOutput:
@@ -3678,10 +4198,25 @@ class IntegratedPianoTransformer(nn.Module):
         if attention_mask is None:
             attention_mask = (pitch_ids != self.config.pitch_pad_id).long()
 
+        style_kwargs = {
+            "style_creator_ids": style_creator_ids,
+            "style_source_ids": style_source_ids,
+            "style_score_stats": style_score_stats,
+            "style_perf_stats": style_perf_stats,
+            "style_perf_is_pad": style_perf_is_pad,
+        }
         score_note_embeds = self.note_encoder(pitch_ids, continuous)
+        score_note_embeds = self._apply_style_to_note_embeds(score_note_embeds, **style_kwargs)
+        score_context_embeds, context_attention_mask, _ = self._prepend_style_tokens(
+            score_note_embeds,
+            attention_mask,
+            **style_kwargs,
+        )
         decoder_mode = self.config.decoder_input_mode.lower()
         if decoder_mode == "score":
-            hidden_states = self.backbone(score_note_embeds, attention_mask)
+            hidden_states = self.backbone(score_context_embeds, context_attention_mask)
+            if self._style_tokens_enabled():
+                hidden_states = hidden_states[:, -score_note_embeds.shape[1]:, :]
             continuous_pred = self.continuous_decoder(hidden_states)
         elif decoder_mode == "ar":
             if self.backbone_type != "gpt":
@@ -3708,12 +4243,17 @@ class IntegratedPianoTransformer(nn.Module):
                     decoder_input_continuous,
                     special_note_ids=special_note_ids,
                 )
+                performance_embeds = self._apply_style_to_decoder_inputs(
+                    performance_embeds,
+                    **style_kwargs,
+                )
                 hidden_states = self.backbone(
-                    score_note_embeds,
-                    attention_mask,
+                    score_context_embeds,
+                    context_attention_mask,
                     performance_embeds=performance_embeds,
                     performance_attention_mask=attention_mask,
                 )
+                hidden_states = self._apply_style_to_decoder_hidden(hidden_states, **style_kwargs)
                 continuous_pred = self.continuous_decoder(hidden_states)
             else:
                 continuous_pred = self._autoregressive_rollout_gpt(
@@ -3721,7 +4261,14 @@ class IntegratedPianoTransformer(nn.Module):
                     continuous=continuous,
                     score_shared_raw=score_shared_raw,
                     attention_mask=attention_mask,
+                    score_context_embeds=score_context_embeds,
+                    context_attention_mask=context_attention_mask,
                     sampling_strategy=continuous_sampling_strategy,
+                    style_creator_ids=style_creator_ids,
+                    style_source_ids=style_source_ids,
+                    style_score_stats=style_score_stats,
+                    style_perf_stats=style_perf_stats,
+                    style_perf_is_pad=style_perf_is_pad,
                 )
         else:
             raise ValueError(f"Unsupported decoder_input_mode: {self.config.decoder_input_mode}")
@@ -3764,6 +4311,11 @@ class IntegratedPianoTransformer(nn.Module):
         attention_mask=None,
         prefix_predictions=None,
         sampling_strategy="mean",
+        style_creator_ids=None,
+        style_source_ids=None,
+        style_score_stats=None,
+        style_perf_stats=None,
+        style_perf_is_pad=None,
     ):
         if attention_mask is None:
             attention_mask = (pitch_ids != self.config.pitch_pad_id).long()
@@ -3774,6 +4326,11 @@ class IntegratedPianoTransformer(nn.Module):
                 continuous=continuous,
                 score_shared_raw=score_shared_raw,
                 attention_mask=attention_mask,
+                style_creator_ids=style_creator_ids,
+                style_source_ids=style_source_ids,
+                style_score_stats=style_score_stats,
+                style_perf_stats=style_perf_stats,
+                style_perf_is_pad=style_perf_is_pad,
                 continuous_sampling_strategy=sampling_strategy,
             )
             return outputs.logits
@@ -3786,11 +4343,45 @@ class IntegratedPianoTransformer(nn.Module):
             attention_mask=attention_mask,
             sampling_strategy=sampling_strategy,
             prefix_predictions=prefix_predictions,
+            style_creator_ids=style_creator_ids,
+            style_source_ids=style_source_ids,
+            style_score_stats=style_score_stats,
+            style_perf_stats=style_perf_stats,
+            style_perf_is_pad=style_perf_is_pad,
         )
 
-    def _autoregressive_rollout_gpt(self, pitch_ids, continuous, score_shared_raw, attention_mask, sampling_strategy="mean", prefix_predictions=None):
+    def _autoregressive_rollout_gpt(
+        self,
+        pitch_ids,
+        continuous,
+        score_shared_raw,
+        attention_mask,
+        score_context_embeds=None,
+        context_attention_mask=None,
+        sampling_strategy="mean",
+        prefix_predictions=None,
+        style_creator_ids=None,
+        style_source_ids=None,
+        style_score_stats=None,
+        style_perf_stats=None,
+        style_perf_is_pad=None,
+    ):
         batch_size, seq_len = pitch_ids.shape
+        style_kwargs = {
+            "style_creator_ids": style_creator_ids,
+            "style_source_ids": style_source_ids,
+            "style_score_stats": style_score_stats,
+            "style_perf_stats": style_perf_stats,
+            "style_perf_is_pad": style_perf_is_pad,
+        }
         score_note_embeds = self.note_encoder(pitch_ids, continuous)
+        score_note_embeds = self._apply_style_to_note_embeds(score_note_embeds, **style_kwargs)
+        if score_context_embeds is None or context_attention_mask is None:
+            score_context_embeds, context_attention_mask, _ = self._prepend_style_tokens(
+                score_note_embeds,
+                attention_mask,
+                **style_kwargs,
+            )
         decoder_input_continuous, special_note_ids, prefix_len = _build_prefilled_ar_note_inputs(
             self.config,
             attention_mask,
@@ -3816,13 +4407,18 @@ class IntegratedPianoTransformer(nn.Module):
                 decoder_input_continuous[:, : step + 1],
                 special_note_ids=special_note_ids[:, : step + 1],
             )
+            perf_prefix_embeds = self._apply_style_to_decoder_inputs(
+                perf_prefix_embeds,
+                **style_kwargs,
+            )
             perf_prefix_mask = attention_mask[:, : step + 1]
             hidden_states = self.backbone(
-                score_note_embeds,
-                attention_mask,
+                score_context_embeds,
+                context_attention_mask,
                 performance_embeds=perf_prefix_embeds,
                 performance_attention_mask=perf_prefix_mask,
             )
+            hidden_states = self._apply_style_to_decoder_hidden(hidden_states, **style_kwargs)
             step_raw = self.continuous_decoder(hidden_states[:, -1:, :])
             if self.config.task_type == "csr":
                 step_pred = _materialize_csr_prediction(self.config, step_raw)
@@ -3861,7 +4457,7 @@ class IntegratedPianoTransformer(nn.Module):
         return output
 
 
-class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
+class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, GenerationMixin):
     config_class = IntegratedPianoT5GemmaConfig
     _tp_plan = {
         "continuous_decoder.shared_head": "colwise_rep",
@@ -3872,14 +4468,24 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
     def __init__(self, config: IntegratedPianoT5GemmaConfig):
         config.is_encoder_decoder = True
         super().__init__(config)
-        self.note_encoder = IntegratedNoteEncoder(config, role="score")
+        self.note_encoder = IntegratedNoteEncoder(
+            config,
+            continuous_dim=getattr(config, "score_input_continuous_dim", config.input_continuous_dim),
+            role="score",
+        )
+        self._decoder_note_encoder = IntegratedNoteEncoder(
+            config,
+            continuous_dim=getattr(config, "decoder_input_continuous_dim", config.input_continuous_dim),
+            role="decoder",
+        )
+        self.style_token_encoder = IntegratedStyleTokenEncoder(config) if config.use_style_tokens else None
         self.model = IntegratedPianoT5GemmaModel(config)
         self.continuous_decoder = IntegratedContinuousDecoder(config)
         self.post_init()
 
     @property
     def decoder_note_encoder(self):
-        return self.note_encoder
+        return self._decoder_note_encoder
 
     def get_encoder(self):
         return self.model.encoder
@@ -3941,6 +4547,11 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
         labels_epr_bins: Optional[torch.LongTensor] = None,
         label_mask: Optional[torch.LongTensor] = None,
         interpolated: Optional[torch.BoolTensor] = None,
+        style_creator_ids: Optional[torch.LongTensor] = None,
+        style_source_ids: Optional[torch.LongTensor] = None,
+        style_score_stats: Optional[torch.FloatTensor] = None,
+        style_perf_stats: Optional[torch.FloatTensor] = None,
+        style_perf_is_pad: Optional[torch.BoolTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         decoder_attention_mask: Optional[torch.BoolTensor] = None,
         decoder_position_ids: Optional[torch.LongTensor] = None,
@@ -3970,7 +4581,20 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
         if attention_mask is None:
             attention_mask = (pitch_ids != self.config.pitch_pad_id).long()
 
+        style_kwargs = {
+            "style_creator_ids": style_creator_ids,
+            "style_source_ids": style_source_ids,
+            "style_score_stats": style_score_stats,
+            "style_perf_stats": style_perf_stats,
+            "style_perf_is_pad": style_perf_is_pad,
+        }
         score_note_embeds = self.note_encoder(pitch_ids, continuous)
+        score_note_embeds = self._apply_style_to_note_embeds(score_note_embeds, **style_kwargs)
+        score_context_embeds, context_attention_mask, _ = self._prepend_style_tokens(
+            score_note_embeds,
+            attention_mask,
+            **style_kwargs,
+        )
         decoder_inputs_embeds, decoder_input_mask = self._build_decoder_inputs(
             pitch_ids,
             continuous,
@@ -3979,12 +4603,19 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
             attention_mask,
             labels_continuous=labels_continuous,
         )
+        if decoder_inputs_embeds is not None:
+            decoder_inputs_embeds = self._apply_style_to_decoder_inputs(
+                decoder_inputs_embeds,
+                **style_kwargs,
+            )
         if decoder_inputs_embeds is None:
             continuous_pred = self._autoregressive_rollout(
                 pitch_ids=pitch_ids,
                 continuous=continuous,
                 score_shared_raw=score_shared_raw,
                 attention_mask=attention_mask,
+                score_context_embeds=score_context_embeds,
+                context_attention_mask=context_attention_mask,
                 sampling_strategy=continuous_sampling_strategy,
                 position_ids=position_ids,
                 encoder_outputs=encoder_outputs,
@@ -4009,20 +4640,24 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
             decoder_attention_mask = decoder_input_mask
 
         decoder_outputs = self.model(
-            attention_mask=attention_mask,
+            attention_mask=context_attention_mask,
             position_ids=position_ids,
             decoder_attention_mask=decoder_attention_mask,
             decoder_position_ids=decoder_position_ids,
             encoder_outputs=encoder_outputs,
             past_key_values=past_key_values,
-            inputs_embeds=score_note_embeds,
+            inputs_embeds=score_context_embeds,
             decoder_inputs_embeds=decoder_inputs_embeds,
             use_cache=use_cache,
             cache_position=cache_position,
             **kwargs,
         )
 
-        continuous_pred = self.continuous_decoder(decoder_outputs.last_hidden_state)
+        decoder_hidden = self._apply_style_to_decoder_hidden(
+            decoder_outputs.last_hidden_state,
+            **style_kwargs,
+        )
+        continuous_pred = self.continuous_decoder(decoder_hidden)
         if labels_continuous is None:
             if self.config.task_type == "epr":
                 continuous_pred = _materialize_epr_prediction(
@@ -4071,6 +4706,11 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
         attention_mask=None,
         prefix_predictions=None,
         sampling_strategy="mean",
+        style_creator_ids=None,
+        style_source_ids=None,
+        style_score_stats=None,
+        style_perf_stats=None,
+        style_perf_is_pad=None,
     ):
         if attention_mask is None:
             attention_mask = (pitch_ids != self.config.pitch_pad_id).long()
@@ -4083,12 +4723,22 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
                 attention_mask=attention_mask,
                 sampling_strategy=sampling_strategy,
                 prefix_predictions=prefix_predictions,
+                style_creator_ids=style_creator_ids,
+                style_source_ids=style_source_ids,
+                style_score_stats=style_score_stats,
+                style_perf_stats=style_perf_stats,
+                style_perf_is_pad=style_perf_is_pad,
             )
         outputs = self(
             pitch_ids=pitch_ids,
             continuous=continuous,
             score_shared_raw=score_shared_raw,
             attention_mask=attention_mask,
+            style_creator_ids=style_creator_ids,
+            style_source_ids=style_source_ids,
+            style_score_stats=style_score_stats,
+            style_perf_stats=style_perf_stats,
+            style_perf_is_pad=style_perf_is_pad,
             continuous_sampling_strategy=sampling_strategy,
         )
         return outputs.logits
@@ -4099,8 +4749,15 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
         continuous,
         score_shared_raw,
         attention_mask,
+        score_context_embeds=None,
+        context_attention_mask=None,
         sampling_strategy="mean",
         prefix_predictions=None,
+        style_creator_ids=None,
+        style_source_ids=None,
+        style_score_stats=None,
+        style_perf_stats=None,
+        style_perf_is_pad=None,
         position_ids=None,
         encoder_outputs=None,
         past_key_values=None,
@@ -4110,12 +4767,26 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
     ):
         del kwargs
         batch_size, seq_len = pitch_ids.shape
+        style_kwargs = {
+            "style_creator_ids": style_creator_ids,
+            "style_source_ids": style_source_ids,
+            "style_score_stats": style_score_stats,
+            "style_perf_stats": style_perf_stats,
+            "style_perf_is_pad": style_perf_is_pad,
+        }
         score_note_embeds = self.note_encoder(pitch_ids, continuous)
+        score_note_embeds = self._apply_style_to_note_embeds(score_note_embeds, **style_kwargs)
+        if score_context_embeds is None or context_attention_mask is None:
+            score_context_embeds, context_attention_mask, _ = self._prepend_style_tokens(
+                score_note_embeds,
+                attention_mask,
+                **style_kwargs,
+            )
         if encoder_outputs is None:
             encoder_outputs = self.model.encoder(
-                attention_mask=attention_mask,
+                attention_mask=context_attention_mask,
                 position_ids=position_ids,
-                inputs_embeds=score_note_embeds,
+                inputs_embeds=score_context_embeds,
             )
 
         decoder_input_continuous, special_note_ids, prefix_len = _build_prefilled_ar_note_inputs(
@@ -4153,9 +4824,13 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
                 decoder_input_continuous[:, :prime_len],
                 special_note_ids=special_note_ids[:, :prime_len],
             )
+            decoder_inputs_embeds = self._apply_style_to_decoder_inputs(
+                decoder_inputs_embeds,
+                **style_kwargs,
+            )
             decoder_attention_mask = attention_mask[:, :prime_len]
             current_decoder_outputs = self.model(
-                attention_mask=attention_mask,
+                attention_mask=context_attention_mask,
                 position_ids=position_ids,
                 decoder_attention_mask=decoder_attention_mask,
                 encoder_outputs=encoder_outputs,
@@ -4173,9 +4848,13 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
                     decoder_input_continuous[:, :1],
                     special_note_ids=special_note_ids[:, :1],
                 )
+                decoder_inputs_embeds = self._apply_style_to_decoder_inputs(
+                    decoder_inputs_embeds,
+                    **style_kwargs,
+                )
                 decoder_attention_mask = attention_mask[:, :1]
                 decoder_outputs = self.model(
-                    attention_mask=attention_mask,
+                    attention_mask=context_attention_mask,
                     position_ids=position_ids,
                     decoder_attention_mask=decoder_attention_mask,
                     encoder_outputs=encoder_outputs,
@@ -4195,6 +4874,10 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
                     decoder_input_continuous[:, step_idx:step_idx+1],
                     special_note_ids=special_note_ids[:, step_idx:step_idx+1],
                 )
+                decoder_inputs_embeds = self._apply_style_to_decoder_inputs(
+                    decoder_inputs_embeds,
+                    **style_kwargs,
+                )
                 # For incremental decoding, we need the full decoder attention mask
                 # but only the new token's embeddings
                 decoder_attention_mask = attention_mask[:, :step_idx+1]
@@ -4202,7 +4885,7 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
                     [step_idx], device=pitch_ids.device, dtype=torch.long
                 )
                 decoder_outputs = self.model(
-                    attention_mask=attention_mask,
+                    attention_mask=context_attention_mask,
                     position_ids=position_ids,
                     decoder_attention_mask=decoder_attention_mask,
                     encoder_outputs=encoder_outputs,
@@ -4213,7 +4896,11 @@ class IntegratedPianoT5Gemma(T5GemmaPreTrainedModel, GenerationMixin):
                 )
                 cached_past_key_values = decoder_outputs.past_key_values
 
-            step_raw = self.continuous_decoder(decoder_outputs.last_hidden_state[:, -1:, :])
+            decoder_hidden = self._apply_style_to_decoder_hidden(
+                decoder_outputs.last_hidden_state,
+                **style_kwargs,
+            )
+            step_raw = self.continuous_decoder(decoder_hidden[:, -1:, :])
             if self.config.task_type == "csr":
                 step_pred = _materialize_csr_prediction(self.config, step_raw)
             else:

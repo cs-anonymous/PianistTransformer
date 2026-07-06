@@ -16,6 +16,7 @@ mkdir -p "${LOG_DIR}"
 echo "Launching paired 2-GPU runs:"
 echo "  GPUs 0,1 -> ${CONFIG_NOSPLIT}"
 echo "  GPUs 2,3 -> ${CONFIG_SPLIT}"
+echo "  Set LAUNCH_SPLIT=1 to also launch the 2,3 job"
 
 tmux new-session -d -s inr0624_cine_kp05_nosplit \
   "cd '${ROOT_DIR}' && \
@@ -24,18 +25,24 @@ tmux new-session -d -s inr0624_cine_kp05_nosplit \
    RUN_DIR_OVERRIDE='${BASE_DIR}/cine_kp05_nosplit' \
    bash '${RUN_SCRIPT}' 2>&1 | tee '${LOG_DIR}/cine_kp05_nosplit.log'"
 
-tmux new-session -d -s inr0624_cine_kp05_split \
-  "cd '${ROOT_DIR}' && \
-   CUDA_VISIBLE_DEVICES='2,3' \
-   CONFIG='${CONFIG_SPLIT}' \
-   RUN_DIR_OVERRIDE='${BASE_DIR}/cine_kp05_split' \
-   bash '${RUN_SCRIPT}' 2>&1 | tee '${LOG_DIR}/cine_kp05_split.log'"
+if [[ "${LAUNCH_SPLIT:-0}" == "1" ]]; then
+  tmux new-session -d -s inr0624_cine_kp05_split \
+    "cd '${ROOT_DIR}' && \
+     CUDA_VISIBLE_DEVICES='2,3' \
+     CONFIG='${CONFIG_SPLIT}' \
+     RUN_DIR_OVERRIDE='${BASE_DIR}/cine_kp05_split' \
+     bash '${RUN_SCRIPT}' 2>&1 | tee '${LOG_DIR}/cine_kp05_split.log'"
+fi
 
 echo
 echo "tmux sessions:"
 echo "  inr0624_cine_kp05_nosplit"
-echo "  inr0624_cine_kp05_split"
+if [[ "${LAUNCH_SPLIT:-0}" == "1" ]]; then
+  echo "  inr0624_cine_kp05_split"
+fi
 echo
 echo "Attach with:"
 echo "  tmux attach -t inr0624_cine_kp05_nosplit"
-echo "  tmux attach -t inr0624_cine_kp05_split"
+if [[ "${LAUNCH_SPLIT:-0}" == "1" ]]; then
+  echo "  tmux attach -t inr0624_cine_kp05_split"
+fi

@@ -13,6 +13,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
@@ -229,6 +230,26 @@ def musical_feature_dim(musical_feature_mode="categorical"):
     raise ValueError(f"Unsupported musical_feature_mode={musical_feature_mode}")
 
 
+def score_note_input_schema(config_or_value=None):
+    if isinstance(config_or_value, dict):
+        return str(config_or_value.get("score_note_input_schema", "integrated")).lower()
+    if hasattr(config_or_value, "score_note_input_schema"):
+        return str(getattr(config_or_value, "score_note_input_schema", "integrated")).lower()
+    if config_or_value is None:
+        return "integrated"
+    return str(config_or_value).lower()
+
+
+def decoder_note_input_schema(config_or_value=None):
+    if isinstance(config_or_value, dict):
+        return str(config_or_value.get("decoder_note_input_schema", "integrated")).lower()
+    if hasattr(config_or_value, "decoder_note_input_schema"):
+        return str(getattr(config_or_value, "decoder_note_input_schema", "integrated")).lower()
+    if config_or_value is None:
+        return "integrated"
+    return str(config_or_value).lower()
+
+
 def integrated_epr_input_dim(timing_control_mode=None, use_timing_scale_bit=True, musical_feature_mode="categorical"):
     control_dim = timing_control_feature_dim(
         timing_control_mode=timing_control_mode,
@@ -239,6 +260,18 @@ def integrated_epr_input_dim(timing_control_mode=None, use_timing_scale_bit=True
     musical_dim = musical_feature_dim(musical_feature_mode)
     mask_dim = 3
     return score_control_dim + performance_control_dim + musical_dim + mask_dim
+
+
+def score_musical_input_dim(timing_control_mode=None, use_timing_scale_bit=True, musical_feature_mode="categorical"):
+    control_dim = timing_control_feature_dim(
+        timing_control_mode=timing_control_mode,
+        use_timing_scale_bit=use_timing_scale_bit,
+    )
+    return control_dim + musical_feature_dim(musical_feature_mode) + 1
+
+
+def decoder_perf_target_input_dim():
+    return 7 + 3
 
 
 def integrated_csr_output_dim():
@@ -765,6 +798,7 @@ def build_epr_score_input_rows(
     timing_control_mode=None,
     log_scale=50.0,
     musical_feature_mode="categorical",
+    score_note_schema="integrated",
 ):
     score_raw = score["score_raw"]
     has_score_feature = score.get("has_score_feature", [0] * len(score["pitch"]))
@@ -773,6 +807,7 @@ def build_epr_score_input_rows(
         timing_control_mode=timing_control_mode,
         use_timing_scale_bit=use_timing_scale_bit,
     )
+    schema = score_note_input_schema(score_note_schema)
     rows = []
     for raw_shared, musical, has_feature in zip(score_raw, musical_rows, has_score_feature):
         score_control = encode_shared_control_row(
@@ -781,16 +816,218 @@ def build_epr_score_input_rows(
             timing_control_mode=timing_control_mode,
             log_scale=log_scale,
         )
-        perf_control = [0.0] * (control_dim + 2)
         m_musical = 1.0 if bool(has_feature) else 0.0
+        masked_musical = [value * m_musical for value in musical]
+        if schema == "score_musical":
+            rows.append(score_control + masked_musical + [m_musical])
+            continue
+        if schema != "integrated":
+            raise ValueError(f"Unsupported score_note_schema={score_note_schema}")
+        perf_control = [0.0] * (control_dim + 2)
         masks = [1.0, 0.0, m_musical]
-        rows.append(
-            score_control
-            + perf_control
-            + [value * m_musical for value in musical]
-            + masks
-        )
+        rows.append(score_control + perf_control + masked_musical + masks)
     return rows
+
+
+STYLE_STAT_DIM = 18
+
+
+def _mean_std(values):
+    values = np.asarray(values, dtype=np.float64)
+    if values.size == 0:
+        return 0.0, 0.0
+    mean = float(values.mean())
+    std = float(values.std())
+    return mean, std
+
+
+def score_style_stats(score, start, end):
+    pitch = np.asarray(score.get("pitch", [])[start:end], dtype=np.float64)
+    raw = np.asarray(score.get("score_raw", [])[start:end], dtype=np.float64)
+    if raw.ndim != 2 or raw.shape[1] < 3:
+        raw = np.zeros((0, 3), dtype=np.float64)
+    valid_count = max(int(end) - int(start), 0)
+    total_count = max(len(score.get("pitch", [])), 1)
+    length_norm = min(valid_count / 512.0, 1.0)
+    pos_norm = min(max(float(start) / float(total_count), 0.0), 1.0)
+
+    if raw.shape[0] > 0:
+        ioi = np.clip(raw[:, 0], 0.0, 5000.0)
+        dur = np.clip(raw[:, 1], 0.0, 5000.0)
+        vel = np.clip(raw[:, 2], 0.0, 127.0)
+    else:
+        ioi = dur = vel = np.zeros((0,), dtype=np.float64)
+    pitch_valid = pitch[(pitch >= 0.0) & (pitch < 128.0)]
+
+    ioi_mean, ioi_std = _mean_std(ioi / 5000.0)
+    dur_mean, dur_std = _mean_std(dur / 5000.0)
+    vel_mean, vel_std = _mean_std(vel / 127.0)
+    pitch_mean, pitch_std = _mean_std(pitch_valid / 127.0)
+    zero_ioi_ratio = float((ioi <= 0.0).mean()) if ioi.size else 0.0
+    density = min(float((ioi > 0.0).sum()) / max(float(ioi.sum()) / 1000.0, 1e-6), 20.0) / 20.0 if ioi.size else 0.0
+
+    has_feature = score.get("has_score_feature", [])
+    score_feature = score.get("score_feature", [])
+    feature_rows = [
+        score_feature[idx]
+        for idx in range(int(start), min(int(end), len(score_feature), len(has_feature)))
+        if bool(has_feature[idx])
+    ]
+    feature_ratio = len(feature_rows) / max(valid_count, 1)
+    first_ratio = grace_ratio = hand_ratio = trill_ratio = stacc_ratio = 0.0
+    if feature_rows:
+        features = np.asarray(feature_rows, dtype=np.float64)
+        first_ratio = float((features[:, 3] >= 0.5).mean()) if features.shape[1] > 3 else 0.0
+        hand_ratio = float((features[:, 4] >= 0.5).mean()) if features.shape[1] > 4 else 0.0
+        trill_ratio = float((features[:, 5] >= 0.5).mean()) if features.shape[1] > 5 else 0.0
+        grace_ratio = float((features[:, 6] >= 0.5).mean()) if features.shape[1] > 6 else 0.0
+        stacc_ratio = float((features[:, 7] >= 0.5).mean()) if features.shape[1] > 7 else 0.0
+
+    return [
+        length_norm,
+        pos_norm,
+        ioi_mean,
+        ioi_std,
+        dur_mean,
+        dur_std,
+        vel_mean,
+        vel_std,
+        pitch_mean,
+        pitch_std,
+        zero_ioi_ratio,
+        density,
+        feature_ratio,
+        first_ratio,
+        grace_ratio,
+        hand_ratio,
+        trill_ratio,
+        stacc_ratio,
+    ]
+
+
+def _label_style_base_values(labels):
+    arr = np.asarray(labels, dtype=np.float64)
+    if arr.ndim != 2:
+        arr = np.zeros((0, 5), dtype=np.float64)
+    dim = arr.shape[1] if arr.size else 5
+    if dim < 5:
+        padded = np.zeros((arr.shape[0], 5), dtype=np.float64)
+        if arr.shape[0] > 0 and dim > 0:
+            padded[:, :dim] = arr[:, :dim]
+        arr = padded
+    return np.clip(arr[:, :5], 0.0, 1.0)
+
+
+def build_perf_style_prefix_cache(labels):
+    values = _label_style_base_values(labels)
+    n = values.shape[0]
+    sums = np.zeros((n + 1, 5), dtype=np.float64)
+    sums_sq = np.zeros((n + 1, 5), dtype=np.float64)
+    deltas = np.zeros((n, 1), dtype=np.float64)
+    if n > 1:
+        deltas[1:, 0] = np.abs(values[1:, 2] - values[:-1, 2])
+    pedal_changes = np.zeros((n, 1), dtype=np.float64)
+    if n > 1:
+        pedal_changes[1:, 0] = np.abs(values[1:, 3] - values[:-1, 3])
+    extra = np.concatenate([deltas, pedal_changes], axis=1) if n > 0 else np.zeros((0, 2), dtype=np.float64)
+    extra_sums = np.zeros((n + 1, 2), dtype=np.float64)
+    if n > 0:
+        sums[1:] = np.cumsum(values, axis=0)
+        sums_sq[1:] = np.cumsum(values * values, axis=0)
+        extra_sums[1:] = np.cumsum(extra, axis=0)
+    pedal_on = np.zeros((n + 1,), dtype=np.float64)
+    if n > 0:
+        pedal_on[1:] = np.cumsum((values[:, 3] >= 0.5).astype(np.float64))
+    return {
+        "count": n,
+        "sum": sums,
+        "sum_sq": sums_sq,
+        "extra_sum": extra_sums,
+        "pedal_on": pedal_on,
+        "start_cache": {},
+    }
+
+
+def perf_style_stats_from_cache(cache, start):
+    start = int(max(0, min(int(start), int(cache["count"]))))
+    if start in cache["start_cache"]:
+        return cache["start_cache"][start]
+    if start <= 0:
+        stats = [0.0] * STYLE_STAT_DIM
+        cache["start_cache"][start] = stats
+        return stats
+    count = float(start)
+    mean = cache["sum"][start] / count
+    var = np.maximum(cache["sum_sq"][start] / count - mean * mean, 0.0)
+    std = np.sqrt(var)
+    extra_mean = cache["extra_sum"][start] / count
+    pedal_on_ratio = float(cache["pedal_on"][start] / count)
+    stats = [
+        min(count / 2048.0, 1.0),
+        float(mean[0]),
+        float(std[0]),
+        float(mean[1]),
+        float(std[1]),
+        float(mean[2]),
+        float(std[2]),
+        float(mean[3]),
+        float(std[3]),
+        float(mean[4]),
+        float(std[4]),
+        float(extra_mean[0]),
+        float(extra_mean[1]),
+        pedal_on_ratio,
+        float(np.clip(mean[1] - mean[0], -1.0, 1.0) * 0.5 + 0.5),
+        float(np.clip(mean[2] - 0.5, -0.5, 0.5) + 0.5),
+        float(np.clip(std[0] + std[1], 0.0, 1.0)),
+        float(np.clip(std[2] + std[3], 0.0, 1.0)),
+    ]
+    cache["start_cache"][start] = stats
+    return stats
+
+
+def perf_style_stats_range_from_cache(cache, start, end):
+    start = int(max(0, min(int(start), int(cache["count"]))))
+    end = int(max(start, min(int(end), int(cache["count"]))))
+    range_cache = cache.setdefault("range_cache", {})
+    key = (start, end)
+    if key in range_cache:
+        return range_cache[key]
+    count_int = end - start
+    if count_int <= 0:
+        stats = [0.0] * STYLE_STAT_DIM
+        range_cache[key] = stats
+        return stats
+    count = float(count_int)
+    sum_values = cache["sum"][end] - cache["sum"][start]
+    sum_sq_values = cache["sum_sq"][end] - cache["sum_sq"][start]
+    mean = sum_values / count
+    var = np.maximum(sum_sq_values / count - mean * mean, 0.0)
+    std = np.sqrt(var)
+    extra_mean = (cache["extra_sum"][end] - cache["extra_sum"][start]) / count
+    pedal_on_ratio = float((cache["pedal_on"][end] - cache["pedal_on"][start]) / count)
+    stats = [
+        min(count / 512.0, 1.0),
+        float(mean[0]),
+        float(std[0]),
+        float(mean[1]),
+        float(std[1]),
+        float(mean[2]),
+        float(std[2]),
+        float(mean[3]),
+        float(std[3]),
+        float(mean[4]),
+        float(std[4]),
+        float(extra_mean[0]),
+        float(extra_mean[1]),
+        pedal_on_ratio,
+        float(np.clip(mean[1] - mean[0], -1.0, 1.0) * 0.5 + 0.5),
+        float(np.clip(mean[2] - 0.5, -0.5, 0.5) + 0.5),
+        float(np.clip(std[0] + std[1], 0.0, 1.0)),
+        float(np.clip(std[2] + std[3], 0.0, 1.0)),
+    ]
+    range_cache[key] = stats
+    return stats
 
 
 def build_csr_performance_input_rows(perf, use_timing_scale_bit=True, timing_control_mode=None, log_scale=50.0):
@@ -883,6 +1120,23 @@ def configure_eval_schedule(train_config, train_examples):
     train_config.setdefault("greater_is_better", False)
 
 
+def build_style_vocabs(metadata_path):
+    header = pd.read_csv(metadata_path, nrows=0).columns.tolist()
+    usecols = [col for col in ("composer", "performance_dataset") if col in header]
+    df = pd.read_csv(metadata_path, usecols=usecols) if usecols else pd.DataFrame()
+    composer_vocab = {"<unk>": 0}
+    source_vocab = {"<unk>": 0}
+    if "composer" in df:
+        for value in sorted(df["composer"].dropna().astype(str).unique()):
+            if value and value not in composer_vocab:
+                composer_vocab[value] = len(composer_vocab)
+    if "performance_dataset" in df:
+        for value in sorted(df["performance_dataset"].dropna().astype(str).unique()):
+            if value and value not in source_vocab:
+                source_vocab[value] = len(source_vocab)
+    return composer_vocab, source_vocab
+
+
 class PianoCoReNodeSFTDataset(Dataset):
     def __init__(
         self,
@@ -901,6 +1155,7 @@ class PianoCoReNodeSFTDataset(Dataset):
         epr_value_bins=128,
         pedal_representation="continuous_4",
         musical_feature_mode="categorical",
+        score_note_schema="integrated",
         epr_timing_target="absolute",
         use_timing_scale_bit=True,
         timing_control_mode=None,
@@ -911,6 +1166,10 @@ class PianoCoReNodeSFTDataset(Dataset):
         precompute_items=False,
         use_prepared_sidecar=True,
         prepared_sidecar_tag=None,
+        use_style_tokens=False,
+        composer_vocab=None,
+        source_vocab=None,
+        perf_style_stats_mode="prefix",
     ):
         super().__init__()
         self.split = split
@@ -922,6 +1181,7 @@ class PianoCoReNodeSFTDataset(Dataset):
         self.epr_value_bins = epr_value_bins
         self.pedal_representation = pedal_representation
         self.musical_feature_mode = str(musical_feature_mode).lower()
+        self.score_note_schema = score_note_input_schema(score_note_schema)
         self.epr_timing_target = str(epr_timing_target or "absolute").lower()
         self.use_timing_scale_bit = bool(use_timing_scale_bit)
         self.timing_control_mode = resolve_timing_control_mode(
@@ -932,6 +1192,14 @@ class PianoCoReNodeSFTDataset(Dataset):
         self.split_zero_ioi_head = bool(split_zero_ioi_head)
         self.ioi_nonzero_dev_scale = float(ioi_nonzero_dev_scale)
         self.ioi_zero_dev_scale = float(ioi_zero_dev_scale)
+        self.use_style_tokens = bool(use_style_tokens)
+        self.perf_style_stats_mode = str(perf_style_stats_mode or "prefix").lower()
+        if self.perf_style_stats_mode not in {"prefix", "window"}:
+            raise ValueError(f"Unsupported perf_style_stats_mode={perf_style_stats_mode}")
+        self.composer_vocab = dict(composer_vocab or {})
+        self.source_vocab = dict(source_vocab or {})
+        self.unknown_composer_id = int(self.composer_vocab.get("<unk>", 0))
+        self.unknown_source_id = int(self.source_vocab.get("<unk>", 0))
         items = list(manifest)
         if shuffle:
             random.Random(seed).shuffle(items)
@@ -972,6 +1240,7 @@ class PianoCoReNodeSFTDataset(Dataset):
                 "task_type": self.task_type,
                 "input_feature_mode": self.input_feature_mode,
                 "musical_feature_mode": self.musical_feature_mode,
+                "score_note_input_schema": self.score_note_schema,
                 "timing_control_mode": self.timing_control_mode,
                 "timing_log_scale": self.timing_log_scale,
                 "use_timing_scale_bit": self.use_timing_scale_bit,
@@ -1042,6 +1311,7 @@ class PianoCoReNodeSFTDataset(Dataset):
         normalized.pop("_derived_score_input_cache", None)
         normalized.pop("_derived_score_musical", None)
         normalized["label_cache"] = {}
+        normalized["perf_style_cache"] = {}
         if "performances_by_source" not in normalized:
             normalized["performances_by_source"] = {
                 perf.get("performance_source"): perf
@@ -1220,7 +1490,10 @@ class PianoCoReNodeSFTDataset(Dataset):
             "performances": performances,
             "performances_by_source": by_source,
             "label_cache": {},
+            "perf_style_cache": {},
         }
+        if isinstance(work.get("meta"), dict):
+            prepared["meta"] = dict(work["meta"])
 
         if derive_features and task_type == "epr":
             prepared["score_input"] = build_epr_score_input_rows(
@@ -1229,6 +1502,7 @@ class PianoCoReNodeSFTDataset(Dataset):
                 timing_control_mode=self.timing_control_mode,
                 log_scale=self.timing_log_scale,
                 musical_feature_mode=self.musical_feature_mode,
+                score_note_schema=self.score_note_schema,
             )
         elif derive_features and task_type == "csr":
             prepared["score_musical"] = build_score_musical_rows(score, musical_feature_mode="continuous")
@@ -1381,6 +1655,26 @@ class PianoCoReNodeSFTDataset(Dataset):
         label_cache[cache_key] = (labels, label_bins)
         return labels, label_bins
 
+    def _style_creator_id(self, prepared):
+        meta = prepared.get("meta")
+        composer = str(meta.get("composer") or "") if isinstance(meta, dict) else ""
+        return int(self.composer_vocab.get(composer, self.unknown_composer_id))
+
+    def _style_source_id(self, perf):
+        source = str(perf.get("performance_dataset") or "unknown")
+        return int(self.source_vocab.get(source, self.unknown_source_id))
+
+    def _perf_style_stats(self, prepared, perf, labels, start, end=None):
+        perf_cache = prepared.setdefault("perf_style_cache", {})
+        cache_key = self._performance_cache_key(perf)
+        if cache_key not in perf_cache:
+            perf_cache[cache_key] = build_perf_style_prefix_cache(labels)
+        if self.perf_style_stats_mode == "window":
+            if end is None:
+                raise ValueError("end is required for perf_style_stats_mode=window")
+            return perf_style_stats_range_from_cache(perf_cache[cache_key], start, end)
+        return perf_style_stats_from_cache(perf_cache[cache_key], start)
+
     def _score_input_rows(self, prepared):
         cache = prepared.setdefault("_derived_score_input_cache", {})
         cache_key = self._derived_feature_cache_signature
@@ -1391,6 +1685,7 @@ class PianoCoReNodeSFTDataset(Dataset):
                 timing_control_mode=self.timing_control_mode,
                 log_scale=self.timing_log_scale,
                 musical_feature_mode=self.musical_feature_mode,
+                score_note_schema=self.score_note_schema,
             )
         return cache[cache_key]
 
@@ -1497,6 +1792,16 @@ class PianoCoReNodeSFTDataset(Dataset):
             "performance_dataset": perf.get("performance_dataset", "unknown"),
             "performance_id": perf.get("performance_id", "unknown"),
         }
+        if self.use_style_tokens:
+            sample.update(
+                {
+                    "style_creator_id": self._style_creator_id(prepared),
+                    "style_source_id": self._style_source_id(perf),
+                    "style_score_stats": score_style_stats(score, start, end),
+                    "style_perf_stats": self._perf_style_stats(prepared, perf, labels, start, end),
+                    "style_perf_is_pad": bool(start <= 0 and self.perf_style_stats_mode == "prefix"),
+                }
+            )
         if labels_epr_bins is not None:
             sample["labels_epr_bins"] = labels_epr_bins
         if label_mask is not None:
@@ -1507,6 +1812,66 @@ class PianoCoReNodeSFTDataset(Dataset):
 class NodeSFTTrainer(Trainer):
     def _model_config(self, model):
         return model.module.config if hasattr(model, "module") else model.config
+
+    def _reduced_eval_totals(self):
+        component_keys = ("loss_ioi", "loss_duration", "loss_velocity", "loss_pedal")
+        wass_keys = ("eval_wass_ioi", "eval_wass_duration", "eval_wass_velocity", "eval_wass_pedal")
+        component_sums = {
+            key: float(getattr(self, "_eval_component_sums", {}).get(key, 0.0))
+            for key in component_keys
+        }
+        component_weight = float(getattr(self, "_eval_component_weight", 0.0))
+        wass_sums = {
+            key: float(getattr(self, "_eval_wass_sums", {}).get(key, 0.0))
+            for key in wass_keys
+        }
+        wass_count = float(getattr(self, "_eval_wass_count", 0.0))
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            values = [
+                component_sums["loss_ioi"],
+                component_sums["loss_duration"],
+                component_sums["loss_velocity"],
+                component_sums["loss_pedal"],
+                component_weight,
+                wass_sums["eval_wass_ioi"],
+                wass_sums["eval_wass_duration"],
+                wass_sums["eval_wass_velocity"],
+                wass_sums["eval_wass_pedal"],
+                wass_count,
+            ]
+            reduce_device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+            totals = torch.tensor(values, dtype=torch.float64, device=reduce_device)
+            torch.distributed.all_reduce(totals, op=torch.distributed.ReduceOp.SUM)
+            component_sums = {
+                "loss_ioi": float(totals[0].item()),
+                "loss_duration": float(totals[1].item()),
+                "loss_velocity": float(totals[2].item()),
+                "loss_pedal": float(totals[3].item()),
+            }
+            component_weight = float(totals[4].item())
+            wass_sums = {
+                "eval_wass_ioi": float(totals[5].item()),
+                "eval_wass_duration": float(totals[6].item()),
+                "eval_wass_velocity": float(totals[7].item()),
+                "eval_wass_pedal": float(totals[8].item()),
+            }
+            wass_count = float(totals[9].item())
+        return component_sums, component_weight, wass_sums, wass_count
+
+    def _inject_eval_metrics(self, metrics):
+        if metrics is None:
+            return metrics
+        if not bool(getattr(self, "eval_record_components", True)) and not bool(getattr(self, "eval_compute_wass", False)):
+            return metrics
+        component_sums, component_weight, wass_sums, wass_count = self._reduced_eval_totals()
+        if component_weight > 0.0:
+            for key, total in component_sums.items():
+                metrics[f"eval_{key}"] = total / component_weight
+        if wass_count > 0.0:
+            for key, total in wass_sums.items():
+                metrics[key] = total / wass_count
+        return metrics
 
     def _init_eval_component_state(self):
         self._eval_component_sums = {
@@ -1578,11 +1943,12 @@ class NodeSFTTrainer(Trainer):
             pred_cpu = pred_raw.float().cpu().numpy()
             target_cpu = target_raw.float().cpu().numpy()
             mask_cpu = mask.cpu().numpy().astype(bool)
+            pedal_mask = np.repeat(mask_cpu[..., None], pred_cpu[..., 3:7].shape[-1], axis=-1).reshape(-1)
             feature_pairs = {
                 "eval_wass_ioi": (pred_cpu[..., 0], target_cpu[..., 0]),
                 "eval_wass_duration": (pred_cpu[..., 1], target_cpu[..., 1]),
                 "eval_wass_velocity": (pred_cpu[..., 2], target_cpu[..., 2]),
-                "eval_wass_pedal": (pred_cpu[..., 3:7].reshape(-1), target_cpu[..., 3:7].reshape(-1)),
+                "eval_wass_pedal": (pred_cpu[..., 3:7].reshape(-1), target_cpu[..., 3:7].reshape(-1), pedal_mask),
             }
         else:
             pred_cpu = pred.float().cpu().numpy()
@@ -1647,6 +2013,8 @@ class NodeSFTTrainer(Trainer):
                 logs[f"loss_{name}"] = total / count
             self._loss_component_sums = {}
             self._loss_component_count = 0
+        if "eval_loss" in logs:
+            self._inject_eval_metrics(logs)
         if self.is_world_process_zero():
             printable_logs = {"step": self.state.global_step}
             printable_logs.update(logs)
@@ -1668,16 +2036,30 @@ class NodeSFTTrainer(Trainer):
 
     def evaluation_loop(self, *args, **kwargs):
         self._init_eval_component_state()
-        return super().evaluation_loop(*args, **kwargs)
+        output = super().evaluation_loop(*args, **kwargs)
+        if getattr(output, "metrics", None) is not None:
+            self._inject_eval_metrics(output.metrics)
+        return output
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         loss, logits, labels = super().prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
-        if loss is not None and logits is not None and hasattr(model, "training") and not model.training:
+        if not bool(getattr(self, "eval_record_components", True)) and not bool(getattr(self, "eval_compute_wass", False)):
+            return loss, logits, labels
+        if loss is not None and hasattr(model, "training") and not model.training:
             try:
+                metric_logits = logits
+                if metric_logits is None:
+                    with torch.no_grad():
+                        metric_outputs = model(**inputs)
+                    metric_logits = getattr(metric_outputs, "logits", None)
+                if metric_logits is None:
+                    return loss, logits, labels
+
                 class _EvalOutputs:
                     def __init__(self, logits):
                         self.logits = logits
-                self._record_eval_metrics(model, _EvalOutputs(logits), inputs)
+
+                self._record_eval_metrics(model, _EvalOutputs(metric_logits), inputs)
             except Exception as exc:
                 if self.is_world_process_zero():
                     print(
@@ -1764,9 +2146,74 @@ class NodeSFTTrainer(Trainer):
                     continue
                 shutil.rmtree(p)
 
-    def evaluate(self, *args, **kwargs):
+    def _sync_checkpoint_best_alias(self):
+        if not self.is_world_process_zero():
+            return
+        best_checkpoint = getattr(getattr(self, "state", None), "best_model_checkpoint", None)
+        if not best_checkpoint:
+            return
+
+        source = Path(best_checkpoint)
+        if not source.exists() or not source.is_dir():
+            return
+
+        output_dir = Path(self.args.output_dir)
+        best_dir = output_dir / "checkpoint-best"
         try:
-            metrics = super().evaluate(*args, **kwargs)
+            if source.resolve() == best_dir.resolve():
+                return
+        except FileNotFoundError:
+            pass
+
+        tmp_dir = output_dir / f".checkpoint-best.tmp-{os.getpid()}"
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        try:
+            shutil.copytree(source, tmp_dir)
+            if best_dir.exists():
+                shutil.rmtree(best_dir)
+            tmp_dir.rename(best_dir)
+            print(
+                json.dumps(
+                    {
+                        "step": self.state.global_step,
+                        "event": "checkpoint_best_synced",
+                        "source": str(source),
+                        "alias": str(best_dir),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        except Exception as exc:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            print(
+                json.dumps(
+                    {
+                        "step": self.state.global_step,
+                        "event": "checkpoint_best_sync_failed",
+                        "source": str(source),
+                        "alias": str(best_dir),
+                        "reason": str(exc),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+
+    def _save_checkpoint(self, model, trial):
+        super()._save_checkpoint(model, trial)
+        self._sync_checkpoint_best_alias()
+
+    def evaluate(self, *args, **kwargs):
+        self._clear_eval_dataloader_cache()
+        try:
+            try:
+                metrics = super().evaluate(*args, **kwargs)
+            finally:
+                self._clear_eval_dataloader_cache()
         except RuntimeError as exc:
             message = str(exc)
             can_retry = (
@@ -1808,86 +2255,17 @@ class NodeSFTTrainer(Trainer):
 
         if not self.is_world_process_zero():
             return metrics
-
-        if getattr(self, "_eval_component_weight", 0.0) > 0:
-            for key, total in self._eval_component_sums.items():
-                metrics[f"eval_{key}"] = total / self._eval_component_weight
-        if getattr(self, "_eval_wass_count", 0.0) > 0:
-            for key, total in self._eval_wass_sums.items():
-                metrics[key] = total / self._eval_wass_count
-
-        # determine metric key
-        metric_key = getattr(self.args, "metric_for_best_model", None)
-        if metric_key is None:
-            metric_key = "eval_loss"
-
-        # possible keys in returned metrics
-        candidate_keys = [metric_key, f"eval_{metric_key}", "loss", "eval_loss"]
-        metric_value = None
-        for k in candidate_keys:
-            if k in metrics:
-                metric_value = metrics[k]
-                break
-
-        # find latest checkpoint (highest step)
-        ckpts = self._list_checkpoint_dirs()
-        latest_ckpt = str(ckpts[-1]) if ckpts else None
-
-        # init best tracking
-        if not hasattr(self, "_best_metric"):
-            self._best_metric = None
-            self._best_ckpt = None
-
-        # compare metrics
-        is_better = False
-        if metric_value is not None:
-            greater_is_better = getattr(self.args, "greater_is_better", False)
-            if self._best_metric is None:
-                is_better = True
-            else:
-                if greater_is_better:
-                    is_better = metric_value > self._best_metric
-                else:
-                    is_better = metric_value < self._best_metric
-
-        # if we have a new best, copy latest checkpoint to checkpoint-best
-        out = Path(self.args.output_dir)
-        best_dir = out / "checkpoint-best"
-        if is_better and latest_ckpt is not None:
-            # remove previous best if exists and different
-            if self._best_ckpt and best_dir.exists():
-                try:
-                    shutil.rmtree(best_dir)
-                except Exception:
-                    pass
-            try:
-                # copy latest to checkpoint-best
-                if best_dir.exists():
-                    shutil.rmtree(best_dir)
-                shutil.copytree(latest_ckpt, best_dir)
-                self._best_metric = metric_value
-                self._best_ckpt = str(best_dir)
-            except Exception:
-                # fallback: just record path
-                self._best_metric = metric_value
-                self._best_ckpt = latest_ckpt
-
-        # determine keep paths: latest and best (if exist)
-        keep = set()
-        if self._best_ckpt:
-            keep.add(str(self._best_ckpt))
-        elif latest_ckpt:
-            keep.add(str(latest_ckpt))
-
-        # cleanup other checkpoints
-        self._cleanup_checkpoints(keep_paths=keep)
-
+        metrics = self._inject_eval_metrics(metrics)
+        printable_metrics = {"step": self.state.global_step}
+        printable_metrics.update(metrics)
+        print(json.dumps(printable_metrics, ensure_ascii=False, sort_keys=True), flush=True)
         return metrics
 
 class NodeSFTDataCollator:
-    def __init__(self, pitch_pad_id=128, task_type="epr"):
+    def __init__(self, pitch_pad_id=128, task_type="epr", use_style_tokens=False):
         self.pitch_pad_id = pitch_pad_id
         self.task_type = task_type
+        self.use_style_tokens = bool(use_style_tokens)
 
     def __call__(self, examples):
         pitch_tensors = [torch.tensor(example["pitch_ids"], dtype=torch.long) for example in examples]
@@ -1930,6 +2308,27 @@ class NodeSFTDataCollator:
             "attention_mask": attention_mask,
             "interpolated": interpolated,
         }
+        if self.use_style_tokens:
+            batch["style_creator_ids"] = torch.tensor(
+                [int(example["style_creator_id"]) for example in examples],
+                dtype=torch.long,
+            )
+            batch["style_source_ids"] = torch.tensor(
+                [int(example["style_source_id"]) for example in examples],
+                dtype=torch.long,
+            )
+            batch["style_score_stats"] = torch.tensor(
+                [example["style_score_stats"] for example in examples],
+                dtype=torch.float32,
+            )
+            batch["style_perf_stats"] = torch.tensor(
+                [example["style_perf_stats"] for example in examples],
+                dtype=torch.float32,
+            )
+            batch["style_perf_is_pad"] = torch.tensor(
+                [bool(example["style_perf_is_pad"]) for example in examples],
+                dtype=torch.bool,
+            )
         if label_mask is not None:
             batch["label_mask"] = label_mask
         if labels_epr_bins_tensors is not None:
@@ -1953,6 +2352,8 @@ def create_model(train_config):
     )
     use_timing_scale_bit = timing_control_mode == "piecewise_scale_bit"
     note_embedding_mode = str(train_config.get("note_embedding_mode", "sine")).lower()
+    score_note_schema = score_note_input_schema(train_config)
+    decoder_note_schema = decoder_note_input_schema(train_config)
     if input_feature_mode != "integrated":
         raise ValueError(f"INR0624 only supports input_feature_mode=integrated, got {input_feature_mode}")
     if note_embedding_mode not in {"sine", "cine"}:
@@ -2088,9 +2489,14 @@ def create_model(train_config):
             "continuous" if task_type == "csr" else "categorical",
         )
     ).lower()
-    input_continuous_dim = train_config.get(
-        "input_continuous_dim",
-        integrated_epr_input_dim(
+    default_score_input_dim = (
+        score_musical_input_dim(
+            timing_control_mode=timing_control_mode,
+            use_timing_scale_bit=use_timing_scale_bit,
+            musical_feature_mode=musical_feature_mode,
+        )
+        if task_type == "epr" and score_note_schema == "score_musical"
+        else integrated_epr_input_dim(
             timing_control_mode=timing_control_mode,
             use_timing_scale_bit=use_timing_scale_bit,
             musical_feature_mode=musical_feature_mode,
@@ -2102,19 +2508,44 @@ def create_model(train_config):
             score_feature_dim=score_feature_dim,
             continuous_dim=train_config.get("continuous_dim", 7),
             musical_feature_mode=musical_feature_mode,
-        ),
-    )
-    if task_type in {"epr", "csr"} and input_feature_mode == "integrated":
-        expected_input_dim = integrated_epr_input_dim(
-            timing_control_mode=timing_control_mode,
-            use_timing_scale_bit=use_timing_scale_bit,
-            musical_feature_mode=musical_feature_mode,
         )
-        if int(input_continuous_dim) != expected_input_dim:
-            raise ValueError(
-                f"Integrated INR0624 {task_type.upper()} expects input_continuous_dim={expected_input_dim} "
-                f"for timing_control_mode={timing_control_mode}, got {input_continuous_dim}"
+    )
+    score_input_continuous_dim = train_config.get(
+        "score_input_continuous_dim",
+        train_config.get("input_continuous_dim", default_score_input_dim),
+    )
+    decoder_input_continuous_dim = train_config.get(
+        "decoder_input_continuous_dim",
+        decoder_perf_target_input_dim()
+        if task_type == "epr" and decoder_note_schema == "perf_target"
+        else score_input_continuous_dim,
+    )
+    input_continuous_dim = score_input_continuous_dim
+    if task_type in {"epr", "csr"} and input_feature_mode == "integrated":
+        if task_type == "epr" and score_note_schema == "score_musical":
+            expected_score_dim = score_musical_input_dim(
+                timing_control_mode=timing_control_mode,
+                use_timing_scale_bit=use_timing_scale_bit,
+                musical_feature_mode=musical_feature_mode,
             )
+        else:
+            expected_score_dim = integrated_epr_input_dim(
+                timing_control_mode=timing_control_mode,
+                use_timing_scale_bit=use_timing_scale_bit,
+                musical_feature_mode=musical_feature_mode,
+            )
+        if int(score_input_continuous_dim) != expected_score_dim:
+            raise ValueError(
+                f"Integrated INR0624 {task_type.upper()} expects score_input_continuous_dim={expected_score_dim} "
+                f"for score_note_schema={score_note_schema}, got {score_input_continuous_dim}"
+            )
+        if task_type == "epr" and decoder_note_schema == "perf_target":
+            expected_decoder_dim = decoder_perf_target_input_dim()
+            if int(decoder_input_continuous_dim) != expected_decoder_dim:
+                raise ValueError(
+                    f"Integrated INR0624 EPR expects decoder_input_continuous_dim={expected_decoder_dim} "
+                    f"for decoder_note_schema={decoder_note_schema}, got {decoder_input_continuous_dim}"
+                )
     model_config = IntegratedPianoT5GemmaConfig(
         backbone_type=backbone_type,
         hidden_size=train_config["hidden_size"],
@@ -2131,6 +2562,8 @@ def create_model(train_config):
         attn_implementation=train_config.get("attn_implementation", "sdpa"),
         continuous_dim=train_config["continuous_dim"],
         input_continuous_dim=input_continuous_dim,
+        score_input_continuous_dim=score_input_continuous_dim,
+        decoder_input_continuous_dim=decoder_input_continuous_dim,
         output_continuous_dim=train_config.get("output_continuous_dim", train_config["continuous_dim"]),
         score_feature_dim=score_feature_dim,
         max_time_ms=train_config["max_time_ms"],
@@ -2151,6 +2584,8 @@ def create_model(train_config):
         decoder_input_mode=train_config["decoder_input_mode"],
         input_feature_mode=input_feature_mode,
         note_embedding_mode=note_embedding_mode,
+        score_note_input_schema=score_note_schema,
+        decoder_note_input_schema=decoder_note_schema,
         special_note_vocab_size=train_config.get("special_note_vocab_size", 5),
         special_note_ids=train_config.get("special_note_ids"),
         use_full_type_embedding=train_config.get("use_full_type_embedding", True),
@@ -2187,10 +2622,18 @@ def create_model(train_config):
         musical_feature_mode=musical_feature_mode,
         prior_token_keep_prob=train_config.get("prior_token_keep_prob", 1.0),
         prior_token_dropout_mode=train_config.get("prior_token_dropout_mode", "mask"),
+        prior_attribute_keep_probs=train_config.get("prior_attribute_keep_probs"),
+        prior_attribute_noise_std=train_config.get("prior_attribute_noise_std", 0.05),
         piano_pitch_min=train_config.get("piano_pitch_min", 21),
         pedal_representation=train_config.get("pedal_representation", "continuous_4"),
         pedal_start_loss_weight=train_config.get("pedal_start_loss_weight", 1.0),
         pedal_ctrl_loss_weight=train_config.get("pedal_ctrl_loss_weight", 1.0),
+        use_style_tokens=train_config.get("use_style_tokens", False),
+        style_creator_vocab_size=train_config.get("style_creator_vocab_size", 1),
+        style_source_vocab_size=train_config.get("style_source_vocab_size", 1),
+        style_score_stat_dim=train_config.get("style_score_stat_dim", STYLE_STAT_DIM),
+        style_perf_stat_dim=train_config.get("style_perf_stat_dim", STYLE_STAT_DIM),
+        style_integration_mode=train_config.get("style_integration_mode", "prepend"),
         torch_dtype=dtype,
     )
 
@@ -2232,6 +2675,8 @@ def enable_eval_best_checkpointing(train_config):
     train_config.setdefault("load_best_model_at_end", True)
     train_config.setdefault("metric_for_best_model", "eval_loss")
     train_config.setdefault("greater_is_better", False)
+    if train_config["load_best_model_at_end"]:
+        train_config["save_total_limit"] = max(2, int(train_config.get("save_total_limit", 2) or 2))
 
     if train_config["load_best_model_at_end"] and eval_strategy == "steps" and save_strategy == "steps":
         eval_steps = train_config.get("eval_steps")
@@ -2282,6 +2727,18 @@ def main():
         )
     ).lower()
     train_config["musical_feature_mode"] = musical_feature_mode
+    if train_config.get("use_style_tokens", False):
+        composer_vocab = train_config.get("style_composer_vocab")
+        source_vocab = train_config.get("style_source_vocab")
+        if composer_vocab is None or source_vocab is None:
+            composer_vocab, source_vocab = build_style_vocabs(train_config["metadata_path"])
+            train_config["style_composer_vocab"] = composer_vocab
+            train_config["style_source_vocab"] = source_vocab
+        train_config["style_creator_vocab_size"] = len(train_config["style_composer_vocab"])
+        train_config["style_source_vocab_size"] = len(train_config["style_source_vocab"])
+        train_config.setdefault("style_score_stat_dim", STYLE_STAT_DIM)
+        train_config.setdefault("style_perf_stat_dim", STYLE_STAT_DIM)
+        train_config.setdefault("style_integration_mode", "prepend")
     train_config.setdefault(
         "input_continuous_dim",
         integrated_epr_input_dim(
@@ -2424,6 +2881,7 @@ def main():
         epr_value_bins=train_config.get("epr_value_bins", 128),
         pedal_representation=train_config.get("pedal_representation", "continuous_4"),
         musical_feature_mode=musical_feature_mode,
+        score_note_schema=train_config.get("score_note_input_schema", "integrated"),
         epr_timing_target=train_config.get("epr_timing_target", "absolute"),
         use_timing_scale_bit=train_config.get("use_timing_scale_bit", True),
         timing_control_mode=train_config.get("timing_control_mode"),
@@ -2434,6 +2892,10 @@ def main():
         precompute_items=train_config.get("precompute_dataset_items", False),
         use_prepared_sidecar=train_config.get("use_prepared_sidecar", True),
         prepared_sidecar_tag=train_config.get("prepared_sidecar_tag"),
+        use_style_tokens=train_config.get("use_style_tokens", False),
+        composer_vocab=train_config.get("style_composer_vocab"),
+        source_vocab=train_config.get("style_source_vocab"),
+        perf_style_stats_mode=train_config.get("perf_style_stats_mode", "prefix"),
     )
     eval_dataset = PianoCoReNodeSFTDataset(
         eval_manifest,
@@ -2451,6 +2913,7 @@ def main():
         epr_value_bins=train_config.get("epr_value_bins", 128),
         pedal_representation=train_config.get("pedal_representation", "continuous_4"),
         musical_feature_mode=musical_feature_mode,
+        score_note_schema=train_config.get("score_note_input_schema", "integrated"),
         epr_timing_target=train_config.get("epr_timing_target", "absolute"),
         use_timing_scale_bit=train_config.get("use_timing_scale_bit", True),
         timing_control_mode=train_config.get("timing_control_mode"),
@@ -2461,6 +2924,10 @@ def main():
         precompute_items=train_config.get("precompute_eval_dataset_items", train_config.get("precompute_dataset_items", False)),
         use_prepared_sidecar=train_config.get("use_prepared_sidecar", True),
         prepared_sidecar_tag=train_config.get("prepared_sidecar_tag"),
+        use_style_tokens=train_config.get("use_style_tokens", False),
+        composer_vocab=train_config.get("style_composer_vocab"),
+        source_vocab=train_config.get("style_source_vocab"),
+        perf_style_stats_mode=train_config.get("perf_style_stats_mode", "prefix"),
     )
 
     model = create_model(train_config)
@@ -2494,6 +2961,7 @@ def main():
         data_collator=NodeSFTDataCollator(
             pitch_pad_id=train_config["pitch_pad_id"],
             task_type=task_type,
+            use_style_tokens=train_config.get("use_style_tokens", False),
         ),
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
@@ -2501,9 +2969,17 @@ def main():
     if "eval_dataloader_num_workers" not in train_config:
         train_config["eval_dataloader_num_workers"] = train_config.get("dataloader_num_workers", 0)
     if "eval_dataloader_persistent_workers" not in train_config:
-        train_config["eval_dataloader_persistent_workers"] = bool(
-            int(train_config.get("eval_dataloader_num_workers", 0) or 0) > 0
+        train_config["eval_dataloader_persistent_workers"] = False
+    elif train_config.get("eval_dataloader_persistent_workers", False) and not train_config.get(
+        "allow_eval_persistent_workers",
+        False,
+    ):
+        print(
+            "Forcing eval_dataloader_persistent_workers=False to avoid accumulating eval workers. "
+            "Set allow_eval_persistent_workers=true to override.",
+            flush=True,
         )
+        train_config["eval_dataloader_persistent_workers"] = False
     if "eval_dataloader_prefetch_factor" not in train_config:
         train_config["eval_dataloader_prefetch_factor"] = train_config.get("dataloader_prefetch_factor", 2)
     if "eval_dataloader_pin_memory" not in train_config:
@@ -2517,6 +2993,7 @@ def main():
     trainer.loss_component_interval = int(
         train_config.get("loss_component_interval", train_config.get("logging_steps", 20)) or 0
     )
+    trainer.eval_record_components = bool(train_config.get("eval_record_components", True))
     trainer.eval_compute_wass = bool(train_config.get("eval_compute_wass", False))
 
     early_stopping_patience = train_config.get("early_stopping_patience")

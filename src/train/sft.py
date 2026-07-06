@@ -20,6 +20,35 @@ os.environ["WANDB_PROJECT"] = "pianist-transformer"
 
 
 class BestLastTrainer(Trainer):
+    def _sync_checkpoint_best_alias(self):
+        if not self.args.should_save:
+            return
+        best_path = getattr(self.state, "best_model_checkpoint", None)
+        if not best_path:
+            return
+        source = Path(best_path)
+        if not source.exists() or not source.is_dir():
+            return
+        output_dir = Path(self.args.output_dir)
+        best_dir = output_dir / "checkpoint-best"
+        try:
+            if source.resolve() == best_dir.resolve():
+                return
+        except FileNotFoundError:
+            pass
+        tmp_dir = output_dir / f".checkpoint-best.tmp-{os.getpid()}"
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        shutil.copytree(source, tmp_dir)
+        if best_dir.exists():
+            shutil.rmtree(best_dir)
+        tmp_dir.rename(best_dir)
+
+    def _save_checkpoint(self, model, trial):
+        super()._save_checkpoint(model, trial)
+        self._sync_checkpoint_best_alias()
+        self._cleanup_checkpoints()
+
     def _cleanup_checkpoints(self, checkpoint_prefix="checkpoint", use_mtime=False):
         if not self.args.should_save:
             return
@@ -40,29 +69,7 @@ class BestLastTrainer(Trainer):
                 shutil.rmtree(checkpoint, ignore_errors=True)
 
     def evaluate(self, *args, **kwargs):
-        metrics = super().evaluate(*args, **kwargs)
-        metric_key = getattr(self.args, "metric_for_best_model", None) or "eval_loss"
-        metric_value = None
-        for key in (metric_key, f"eval_{metric_key}", "loss", "eval_loss"):
-            if key in metrics:
-                metric_value = metrics[key]
-                break
-        output_dir = Path(self.args.output_dir)
-        checkpoints = sorted(
-            [p for p in output_dir.glob("checkpoint-*") if p.name != "checkpoint-best"],
-            key=lambda p: int(p.name.split("-")[-1]),
-        )
-        latest = checkpoints[-1] if checkpoints else None
-        if metric_value is not None and latest is not None:
-            if self.state.best_metric is None or metric_value < self.state.best_metric:
-                best_dir = output_dir / "checkpoint-best"
-                if best_dir.exists():
-                    shutil.rmtree(best_dir)
-                shutil.copytree(latest, best_dir)
-                self.state.best_metric = metric_value
-                self.state.best_model_checkpoint = str(best_dir)
-        self._cleanup_checkpoints()
-        return metrics
+        return super().evaluate(*args, **kwargs)
 
 
 def group_ids(examples, block_size, overlap_ratio, include_random_cut=True):
