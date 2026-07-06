@@ -317,11 +317,8 @@ def normalize_target_ioi_dev(score_ioi_ms, perf_ioi_ms, config):
     return normalize_train_ioi_dev(
         score_ioi_ms,
         perf_ioi_ms,
-        epr_timing_target=config.get("epr_timing_target", "deviation"),
+        epr_timing_target=config.get("epr_timing_target", "log_deviation"),
         log_scale=float(config.get("timing_log_scale", 50.0)),
-        split_zero_ioi_head=bool(config.get("split_zero_ioi_head", False)),
-        nonzero_scale=float(config.get("ioi_nonzero_dev_scale", 2.0)),
-        zero_scale=float(config.get("ioi_zero_dev_scale", 4.0)),
     )
 
 
@@ -329,7 +326,7 @@ def normalize_target_duration_dev(score_duration_ms, perf_duration_ms, config):
     return normalize_train_duration_dev(
         score_duration_ms,
         perf_duration_ms,
-        epr_timing_target=config.get("epr_timing_target", "deviation"),
+        epr_timing_target=config.get("epr_timing_target", "log_deviation"),
         log_scale=float(config.get("timing_log_scale", 50.0)),
     )
 
@@ -410,10 +407,10 @@ def extract_pred_dev_arrays(raw_output_paths, score_source_to_work_path):
                 work = json.load(file)
             score_raw_cache[score_source] = work["score"]["score_raw"]
         score_raw = score_raw_cache[score_source]
-        target5 = payload.get("predicted_target5", [])
-        if len(target5) != len(score_raw):
+        target = payload.get("predicted_target7") or []
+        if len(target) != len(score_raw):
             continue
-        for score_row, row in zip(score_raw, target5):
+        for score_row, row in zip(score_raw, target):
             group = dev_group_name(score_row[0])
             groups[group]["dev_ioi"].append(float(row[0]))
             groups[group]["dev_duration"].append(float(row[1]))

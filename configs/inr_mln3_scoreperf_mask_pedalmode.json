@@ -105,7 +105,7 @@
   "feature_embedding_dim": 680,
   "piano_pitch_min": 21,
   "prior_token_dropout_mode": "mask",
-  "pedal_representation": "mode_start",
+  "pedal_representation": "binary_4",
   "pedal_mode_classes": [
     "hold",
     "ramp_up",
@@ -115,6 +115,5 @@
     "complex"
   ],
   "pedal_mode_tolerance": 4.0,
-  "pedal_mode_loss_weight": 1.0,
-  "pedal_start_loss_weight": 1.0
+  "pedal_mode_loss_weight": 1.0
 }

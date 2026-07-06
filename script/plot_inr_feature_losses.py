@@ -210,7 +210,7 @@ def normalize_train_config(train_config: dict) -> dict:
     cfg["input_feature_mode"] = input_feature_mode
     timing_control_mode = resolve_timing_control_mode(
         timing_control_mode=cfg.get("timing_control_mode"),
-        use_timing_scale_bit=cfg.get("use_timing_scale_bit", True),
+        use_timing_scale_bit=cfg.get("use_timing_scale_bit", False),
     )
     musical_feature_mode = str(
         cfg.get("musical_feature_mode", "continuous" if task_type == "csr" else "categorical")
@@ -220,8 +220,9 @@ def normalize_train_config(train_config: dict) -> dict:
         "input_continuous_dim",
         integrated_epr_input_dim(
             timing_control_mode=timing_control_mode,
-            use_timing_scale_bit=cfg.get("use_timing_scale_bit", True),
+            use_timing_scale_bit=cfg.get("use_timing_scale_bit", False),
             musical_feature_mode=musical_feature_mode,
+            pedal_control_dim=4,
         )
         if task_type in {"epr", "csr"} and input_feature_mode == "integrated"
         else default_input_continuous_dim(
@@ -273,15 +274,12 @@ def build_eval_dataset(train_config: dict) -> PianoCoReNodeSFTDataset:
         max_time_ms=cfg.get("max_time_ms", 10000.0),
         epr_timing_bins=cfg.get("epr_timing_bins", 5000),
         epr_value_bins=cfg.get("epr_value_bins", 128),
-        pedal_representation=cfg.get("pedal_representation", "continuous_4"),
+        pedal_representation=cfg.get("pedal_representation", "binary_4"),
         musical_feature_mode=musical_feature_mode,
-        epr_timing_target=cfg.get("epr_timing_target", "absolute"),
-        use_timing_scale_bit=cfg.get("use_timing_scale_bit", True),
-        timing_control_mode=cfg.get("timing_control_mode"),
+        epr_timing_target=cfg.get("epr_timing_target", "log_deviation"),
+        use_timing_scale_bit=cfg.get("use_timing_scale_bit", False),
+        timing_control_mode=cfg.get("timing_control_mode", "log_scaled"),
         timing_log_scale=cfg.get("timing_log_scale", 50.0),
-        split_zero_ioi_head=cfg.get("split_zero_ioi_head", False),
-        ioi_nonzero_dev_scale=cfg.get("ioi_nonzero_dev_scale", 2.0),
-        ioi_zero_dev_scale=cfg.get("ioi_zero_dev_scale", 4.0),
         precompute_items=cfg.get(
             "precompute_eval_dataset_items",
             cfg.get("precompute_dataset_items", False),

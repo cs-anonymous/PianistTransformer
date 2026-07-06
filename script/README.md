@@ -6,14 +6,14 @@
 
 ### 1. EPR 主流水线
 
-主入口：`script/run_inr_pipeline.sh`
+主入口：`script/run_inr_epr_pipeline.sh`
 
 最小启动方式：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 \
 CONFIG=configs/inr0624_epr_mln3_cine_mslog.json \
-bash script/run_inr_pipeline.sh
+bash script/run_inr_epr_pipeline.sh
 ```
 
 常用可选环境变量：
@@ -24,7 +24,7 @@ bash script/run_inr_pipeline.sh
 
 ### 2. 当前这次双双卡任务
 
-当前实际使用的是 `tmux + script/run_inr_pipeline.sh`，不是 `setsid`。
+当前实际使用的是 `tmux + script/run_inr_epr_pipeline.sh`，不是 `setsid`。
 
 `cine`：
 
@@ -34,7 +34,7 @@ tmux new-session -d -s inr0624_cine_d4w1 \
    CUDA_VISIBLE_DEVICES='0,1' \
    CONFIG='results/inr0624_musical51_mln3_d4w1_dual/configs/inr0624_epr_mln3_cine_musical51_s50_d4w1_splitzero_seed42.json' \
    RUN_DIR_OVERRIDE='results/inr0624_musical51_mln3_d4w1_dual/inr0624_epr_mln3_cine_musical51_s50_d4w1_splitzero_seed42_tmux' \
-   bash script/run_inr_pipeline.sh 2>&1 | tee 'results/inr0624_musical51_mln3_d4w1_dual/launcher_logs/cine_tmux.log'"
+   bash script/run_inr_epr_pipeline.sh 2>&1 | tee 'results/inr0624_musical51_mln3_d4w1_dual/launcher_logs/cine_tmux.log'"
 ```
 
 `sine`：
@@ -45,7 +45,7 @@ tmux new-session -d -s inr0624_sine_d4w1 \
    CUDA_VISIBLE_DEVICES='2,3' \
    CONFIG='results/inr0624_musical51_mln3_d4w1_dual/configs/inr0624_epr_mln3_sine_musical51_s50_d4w1_splitzero_seed42.json' \
    RUN_DIR_OVERRIDE='results/inr0624_musical51_mln3_d4w1_dual/inr0624_epr_mln3_sine_musical51_s50_d4w1_splitzero_seed42_tmux' \
-   bash script/run_inr_pipeline.sh 2>&1 | tee 'results/inr0624_musical51_mln3_d4w1_dual/launcher_logs/sine_tmux.log'"
+   bash script/run_inr_epr_pipeline.sh 2>&1 | tee 'results/inr0624_musical51_mln3_d4w1_dual/launcher_logs/sine_tmux.log'"
 ```
 
 查看：

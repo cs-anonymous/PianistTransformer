@@ -50,9 +50,9 @@ def cached_raw_output_pedal_arrays(path: str):
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     rows = payload.get("predicted_target")
     if rows is None:
-        rows = payload.get("predicted_target5")
+        rows = payload.get("predicted_target7")
     if rows is None:
-        raise KeyError(f"No predicted_target or predicted_target5 in {path}")
+        raise KeyError(f"No predicted_target or predicted_target7 in {path}")
     rows = np.asarray(rows, dtype=np.float64)
     if rows.ndim != 2 or rows.shape[1] < 7:
         raise ValueError(f"Unexpected predicted target shape for {path}: {rows.shape}")

@@ -82,18 +82,15 @@ def build_dataset(config, manifest, split):
         max_time_ms=config.get("max_time_ms", 10000.0),
         epr_timing_bins=config.get("epr_timing_bins", 5000),
         epr_value_bins=config.get("epr_value_bins", 128),
-        pedal_representation=config.get("pedal_representation", "continuous_4"),
+        pedal_representation=config.get("pedal_representation", "binary_4"),
         musical_feature_mode=config.get(
             "musical_feature_mode",
             "continuous" if str(config.get("task_type", "epr")).lower() == "csr" else "categorical",
         ),
-        epr_timing_target=config.get("epr_timing_target", "absolute"),
-        use_timing_scale_bit=config.get("use_timing_scale_bit", True),
-        timing_control_mode=config.get("timing_control_mode"),
+        epr_timing_target=config.get("epr_timing_target", "log_deviation"),
+        use_timing_scale_bit=config.get("use_timing_scale_bit", False),
+        timing_control_mode=config.get("timing_control_mode", "log_scaled"),
         timing_log_scale=config.get("timing_log_scale", 50.0),
-        split_zero_ioi_head=config.get("split_zero_ioi_head", False),
-        ioi_nonzero_dev_scale=config.get("ioi_nonzero_dev_scale", 2.0),
-        ioi_zero_dev_scale=config.get("ioi_zero_dev_scale", 4.0),
         use_prepared_sidecar=True,
         prepared_sidecar_tag=config.get("prepared_sidecar_tag"),
     )
@@ -127,15 +124,12 @@ def main():
     parser.add_argument("--input-feature-mode", default="integrated")
     parser.add_argument("--timing-input-normalization", default="log1p_t_over_50_5000")
     parser.add_argument("--max-time-ms", type=float, default=10000.0)
-    parser.add_argument("--pedal-representation", default="start_ctrl")
+    parser.add_argument("--pedal-representation", default="binary_4")
     parser.add_argument("--musical-feature-mode", default="musical51")
-    parser.add_argument("--epr-timing-target", default="absolute")
-    parser.add_argument("--use-timing-scale-bit", type=int, default=1)
-    parser.add_argument("--timing-control-mode", default=None)
+    parser.add_argument("--epr-timing-target", default="log_deviation")
+    parser.add_argument("--use-timing-scale-bit", type=int, default=0)
+    parser.add_argument("--timing-control-mode", default="log_scaled")
     parser.add_argument("--timing-log-scale", type=float, default=50.0)
-    parser.add_argument("--split-zero-ioi-head", type=int, default=0)
-    parser.add_argument("--ioi-nonzero-dev-scale", type=float, default=2.0)
-    parser.add_argument("--ioi-zero-dev-scale", type=float, default=4.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--node-cache-size", type=int, default=8)
     parser.add_argument("--fixed-window-split-scheme", default="train_valid_asap3_nonasap05_v1")
@@ -172,9 +166,6 @@ def main():
         "use_timing_scale_bit": bool(args.use_timing_scale_bit),
         "timing_control_mode": args.timing_control_mode,
         "timing_log_scale": args.timing_log_scale,
-        "split_zero_ioi_head": bool(args.split_zero_ioi_head),
-        "ioi_nonzero_dev_scale": args.ioi_nonzero_dev_scale,
-        "ioi_zero_dev_scale": args.ioi_zero_dev_scale,
         "seed": args.seed,
         "node_cache_size": args.node_cache_size,
         "fixed_window_split_scheme": args.fixed_window_split_scheme,

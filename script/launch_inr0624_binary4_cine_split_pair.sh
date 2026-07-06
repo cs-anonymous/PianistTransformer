@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
-RUN_SCRIPT="script/run_inr_binary4_adapt_pipeline.sh"
+RUN_SCRIPT="script/run_inr_epr_pipeline.sh"
 BASE_DIR="results/inr0624_binary4_prior_ablation_4gpu"
 
 CONFIG_NOSPLIT="${BASE_DIR}/configs/cine_kp05_nosplit.json"

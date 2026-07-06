@@ -47,7 +47,6 @@
   "csr_grid_step": 0.041666666666666664,
   "csr_grid_soft_ce_tau": 1.5,
   "csr_mo_max": 6.0,
-  "csr_mioi_max": 6.0,
   "csr_md_max": 6.0,
   "csr_ml_max": 6.0,
   "huber_delta": 0.05,
@@ -59,7 +58,6 @@
   },
   "csr_loss_weights": {
     "mo": 1.0,
-    "mioi": 1.0,
     "md": 1.0,
     "ml": 1.0,
     "tempo": 0.5,
@@ -68,7 +66,8 @@
     "trill": 0.4,
     "grace": 0.4,
     "stacc": 0.3,
-    "stem": 0.2
+    "stem": 0.2,
+    "ioi_zero": 1.0
   },
   "encoder_layers_num": 10,
   "decoder_layers_num": 2,
@@ -117,7 +116,7 @@
   "adapt_num_train_epochs": 2,
   "piano_pitch_min": 21,
   "prior_token_dropout_mode": "mask",
-  "pedal_representation": "start_ctrl",
+  "pedal_representation": "binary_4",
   "dataloader_pin_memory": true,
   "dataloader_persistent_workers": true
 }

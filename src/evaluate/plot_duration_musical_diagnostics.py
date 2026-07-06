@@ -202,7 +202,7 @@ def collect_pred(manifest_path, processed_dir, log_scale, log_max_ms, label):
         arrays = score_arrays(work, log_scale, log_max_ms)
         if arrays is None:
             continue
-        target = np.asarray(raw.get("predicted_target5") or [], dtype=np.float64)
+        target = np.asarray(raw.get("predicted_target7") or [], dtype=np.float64)
         raw7 = np.asarray(raw.get("reconstructed_raw7") or [], dtype=np.float64)
         n = len(arrays["score_duration_norm"])
         if target.ndim != 2 or target.shape[1] < 2 or len(target) != n:

@@ -62,7 +62,6 @@ Latest required raw fields include:
 - `score.score_raw`
 - `performances[].label_shared_raw`
 - `performances[].label_pedal4_raw`
-- `performances[].label_pedal2_raw`
 - `performances[].interpolated`
 
 ### 2. Update JSON Score Feature With XML

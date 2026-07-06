@@ -25,13 +25,12 @@ from src.train.train_inr import (
     build_style_vocabs,
     create_model,
     infer_input_feature_mode,
-    performance_dev_velocity_pedal2_rows,
     performance_dev_velocity_pedal4_binary_rows,
     perf_style_stats_range_from_cache,
     perf_style_stats_from_cache,
     score_style_stats,
 )
-from src.model.integrated_pianoformer import _target5_to_raw7
+from src.model.integrated_pianoformer import _target7_to_raw7
 from src.utils.inr_midi import note_features_to_midi
 
 
@@ -175,8 +174,8 @@ def list_gt_midis(
 
 def load_score_from_node(
     path: Path,
-    use_timing_scale_bit=True,
-    timing_control_mode=None,
+    use_timing_scale_bit=False,
+    timing_control_mode="log_scaled",
     timing_log_scale=50.0,
     musical_feature_mode="categorical",
     score_note_schema="integrated",
@@ -495,7 +494,7 @@ def csr_metric_summary(pred_rows, target_rows, mask):
     return {
         "valid_notes": int(valid.sum().item()),
         "mo_mae_quarter": mae(0, 6.0),
-        "mioi_mae_quarter": mae(1, 6.0),
+        "ioi_zero_acc": acc(1),
         "md_mae_quarter": mae(2, 6.0),
         "ml_mae_quarter": mae(3, 6.0),
         "tempo_mae_norm": mae(4, 1.0),
@@ -509,27 +508,15 @@ def csr_metric_summary(pred_rows, target_rows, mask):
 
 
 def labels_for_perf(config, perf, score_shared_raw):
-    if str(config.get("pedal_representation", "")).lower() == "binary_4":
-        labels = performance_dev_velocity_pedal4_binary_rows(
-            perf,
-            score_shared_raw,
-            epr_timing_target=config.get("epr_timing_target", "deviation"),
-            log_scale=float(config.get("timing_log_scale", 50.0)),
-            split_zero_ioi_head=bool(config.get("split_zero_ioi_head", False)),
-            ioi_nonzero_dev_scale=float(config.get("ioi_nonzero_dev_scale", 2.0)),
-            ioi_zero_dev_scale=float(config.get("ioi_zero_dev_scale", 4.0)),
-            pedal_binary_threshold=float(config.get("pedal_binary_threshold", 64.0)),
-        )
-    else:
-        labels = performance_dev_velocity_pedal2_rows(
-            perf,
-            score_shared_raw,
-            epr_timing_target=config.get("epr_timing_target", "deviation"),
-            log_scale=float(config.get("timing_log_scale", 50.0)),
-            split_zero_ioi_head=bool(config.get("split_zero_ioi_head", False)),
-            ioi_nonzero_dev_scale=float(config.get("ioi_nonzero_dev_scale", 2.0)),
-            ioi_zero_dev_scale=float(config.get("ioi_zero_dev_scale", 4.0)),
-        )
+    if str(config.get("pedal_representation", "")).lower() != "binary_4":
+        raise ValueError("EPR inference expects pedal_representation=binary_4")
+    labels = performance_dev_velocity_pedal4_binary_rows(
+        perf,
+        score_shared_raw,
+        epr_timing_target=config.get("epr_timing_target", "log_deviation"),
+        log_scale=float(config.get("timing_log_scale", 50.0)),
+        pedal_binary_threshold=float(config.get("pedal_binary_threshold", 64.0)),
+    )
     if labels is None:
         raise ValueError(f"Could not build labels for {perf.get('performance_source')}")
     return labels
@@ -548,8 +535,8 @@ def predict_one_csr_work(model, device, config, work, args):
     performance_source = selected_sources[0]
     pitch, continuous, score_shared_raw, loaded = load_score_from_node(
         Path(work["path"]),
-        use_timing_scale_bit=config.get("use_timing_scale_bit", True),
-        timing_control_mode=config.get("timing_control_mode"),
+        use_timing_scale_bit=config.get("use_timing_scale_bit", False),
+        timing_control_mode=config.get("timing_control_mode", "log_scaled"),
         timing_log_scale=config.get("timing_log_scale", 50.0),
         musical_feature_mode="continuous",
         score_note_schema=config.get("score_note_input_schema", "integrated"),
@@ -629,8 +616,8 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
     score_source = work["score_source"]
     pitch, continuous, score_shared_raw, loaded = load_score_from_node(
         Path(work["path"]),
-        use_timing_scale_bit=config.get("use_timing_scale_bit", True),
-        timing_control_mode=config.get("timing_control_mode"),
+        use_timing_scale_bit=config.get("use_timing_scale_bit", False),
+        timing_control_mode=config.get("timing_control_mode", "log_scaled"),
         timing_log_scale=config.get("timing_log_scale", 50.0),
         musical_feature_mode=config.get("musical_feature_mode", "categorical"),
         score_note_schema=config.get("score_note_input_schema", "integrated"),
@@ -744,7 +731,7 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
             ),
             style_perf_stats_mode=perf_style_stats_mode,
         )
-        raw_rows = _target5_to_raw7(
+        raw_rows = _target7_to_raw7(
             torch.tensor(score_shared_raw, dtype=torch.float32),
             pred_continuous.float().cpu(),
             config=config,
@@ -766,13 +753,9 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
             "sample_idx": sample_idx,
             "seed": sample_seed,
             "oracle_gt_prefix_mode": args.oracle_gt_prefix_mode,
-            "timing_representation": (
-                "target7_dev_velocity_binary4"
-                if str(config.get("pedal_representation", "")).lower() == "binary_4"
-                else "target5_dev_velocity_pedal2"
-            ),
+            "timing_representation": "target7_dev_velocity_binary4",
             "pitch": [int(value) for value in pitch],
-            "predicted_target5": pred_continuous.tolist(),
+            "predicted_target7": pred_continuous.tolist(),
             "reconstructed_raw7": raw_rows.tolist(),
             "ground_truth_paths": gt_rel_paths,
         }

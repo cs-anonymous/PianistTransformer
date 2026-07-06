@@ -105,9 +105,7 @@
   "feature_embedding_dim": 680,
   "piano_pitch_min": 21,
   "prior_token_dropout_mode": "mask",
-  "pedal_representation": "start_ctrl",
-  "pedal_start_loss_weight": 1.0,
-  "pedal_ctrl_loss_weight": 1.0,
+  "pedal_representation": "binary_4",
   "dataloader_pin_memory": true,
   "dataloader_persistent_workers": true
 }

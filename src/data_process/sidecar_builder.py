@@ -52,10 +52,8 @@ def build_sidecar_for_work(dataset, path, selected_sources=None):
         }
         for key in (
             "label_shared_raw",
-            "label_pedal2_raw",
             "label_pedal4_raw",
             "label_raw",
-            "pedal2_raw",
             "pedal4_raw",
         ):
             if key in perf:

@@ -105,5 +105,5 @@
   "feature_embedding_dim": 680,
   "piano_pitch_min": 21,
   "prior_token_dropout_mode": "mask",
-  "pedal_representation": "continuous_4"
+  "pedal_representation": "binary_4"
 }
