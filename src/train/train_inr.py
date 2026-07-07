@@ -1,6 +1,7 @@
 import argparse
 import bisect
 import datetime
+import gc
 import hashlib
 import json
 import math
@@ -8,6 +9,7 @@ import os
 import random
 import shutil
 import re
+import subprocess
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -16,9 +18,9 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torch.utils.data.sampler import SequentialSampler
-from scipy.stats import wasserstein_distance
+from tqdm.auto import tqdm
 from transformers import EarlyStoppingCallback, Trainer, TrainingArguments
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -30,10 +32,7 @@ from src.model.integrated_pianoformer import (
     IntegratedPianoT5GemmaConfig,
     IntegratedPianoTransformer,
     _compute_integrated_loss_components,
-    _materialize_csr_prediction,
     _materialize_epr_prediction,
-    _target7_to_raw7,
-    _uses_inr_epr_targets,
 )
 from src.data_process.work_manifest import build_work_manifest
 from src.utils.func import filter_valid_args
@@ -41,6 +40,12 @@ from src.utils.inr_midi import raw_rows_to_epr_bins, raw_rows_to_model_continuou
 
 
 os.environ["WANDB_PROJECT"] = "pianist-transformer"
+
+
+def release_cuda_cache():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def print_model_parameters(model):
@@ -246,6 +251,40 @@ def decoder_note_input_schema(config_or_value=None):
     if config_or_value is None:
         return "integrated"
     return str(config_or_value).lower()
+
+
+def dagger_target_columns(mode, output_dim=7):
+    mode = str(mode or "full").lower()
+    if mode == "full":
+        return list(range(int(output_dim)))
+    if mode == "timing":
+        return [0, 1]
+    if mode == "ioi":
+        return [0]
+    if mode == "duration":
+        return [1]
+    if mode == "velocity":
+        return [2]
+    if mode == "pedal":
+        return list(range(3, min(int(output_dim), 7)))
+    raise ValueError(f"Unsupported DAgger replacement mode: {mode}")
+
+
+def normalize_dagger_replacement_weights(weights=None):
+    default = {
+        "full": 0.30,
+        "timing": 0.20,
+        "ioi": 0.10,
+        "duration": 0.10,
+        "velocity": 0.15,
+        "pedal": 0.15,
+    }
+    raw = dict(default if weights is None else weights)
+    cleaned = {str(key).lower(): float(value) for key, value in raw.items() if float(value) > 0.0}
+    total = sum(cleaned.values())
+    if total <= 0.0:
+        raise ValueError("DAgger replacement weights must contain at least one positive value")
+    return {key: value / total for key, value in cleaned.items()}
 
 
 def integrated_epr_input_dim(
@@ -1012,16 +1051,6 @@ def distributed_info():
     return 0, 1
 
 
-def finite_wasserstein_distance(pred_values, target_values):
-    pred = np.asarray(pred_values, dtype=np.float64)
-    target = np.asarray(target_values, dtype=np.float64)
-    pred = pred[np.isfinite(pred)]
-    target = target[np.isfinite(target)]
-    if len(pred) == 0 or len(target) == 0:
-        return float("nan")
-    return float(wasserstein_distance(pred, target))
-
-
 def configure_eval_schedule(train_config, train_examples):
     eval_every_steps = train_config.get("eval_every_steps")
     eval_every_epochs = train_config.get("eval_every_epochs")
@@ -1178,8 +1207,25 @@ class PianoCoReNodeSFTDataset(Dataset):
         self._prepared_sidecar_signature = self._build_prepared_sidecar_signature()
         self._cache = OrderedDict()
         self._prepared_cache = OrderedDict()
+        self._dagger_prefix_cache = {}
+        self._dagger_mask_cache = set()
+        self._dagger_cache_version = 0
         if self.precompute_items:
             self._precompute_items()
+
+    def set_dagger_prefix_cache(self, cache):
+        self._dagger_prefix_cache.clear()
+        self._dagger_prefix_cache = dict(cache or {})
+        self._dagger_mask_cache.clear()
+        self._dagger_cache_version += 1
+
+    def set_dagger_mask_cache(self, indices):
+        self._dagger_prefix_cache.clear()
+        self._dagger_mask_cache = {int(index) for index in (indices or [])}
+        self._dagger_cache_version += 1
+
+    def clear_dagger_prefix_cache(self):
+        self.set_dagger_prefix_cache({})
 
     def _build_prepared_sidecar_signature(self):
         signature = {
@@ -1661,6 +1707,7 @@ class PianoCoReNodeSFTDataset(Dataset):
             raise ValueError(f"Unsupported task_type: {self.task_type}")
 
         sample = {
+            "example_index": index,
             "pitch_ids": score["pitch"][start:end],
             "continuous": continuous,
             "labels_continuous": labels_continuous,
@@ -1669,6 +1716,11 @@ class PianoCoReNodeSFTDataset(Dataset):
             "performance_dataset": perf.get("performance_dataset", "unknown"),
             "performance_id": perf.get("performance_id", "unknown"),
         }
+        dagger_prefix = self._dagger_prefix_cache.get(index)
+        if dagger_prefix is not None:
+            sample["dagger_prefix_continuous"] = dagger_prefix
+        if index in self._dagger_mask_cache:
+            sample["dagger_feedback_mask_enabled"] = True
         if self.use_style_tokens:
             sample.update(
                 {
@@ -1690,204 +1742,441 @@ class NodeSFTTrainer(Trainer):
     def _model_config(self, model):
         return model.module.config if hasattr(model, "module") else model.config
 
-    def _reduced_eval_totals(self):
-        component_keys = ("loss_ioi", "loss_duration", "loss_velocity", "loss_pedal")
-        wass_keys = ("eval_wass_ioi", "eval_wass_duration", "eval_wass_velocity", "eval_wass_pedal")
-        component_sums = {
-            key: float(getattr(self, "_eval_component_sums", {}).get(key, 0.0))
-            for key in component_keys
-        }
-        component_weight = float(getattr(self, "_eval_component_weight", 0.0))
-        wass_sums = {
-            key: float(getattr(self, "_eval_wass_sums", {}).get(key, 0.0))
-            for key in wass_keys
-        }
-        wass_count = float(getattr(self, "_eval_wass_count", 0.0))
+    def _dagger_enabled(self):
+        return bool(getattr(self, "dagger_prefix_training", False))
 
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            values = [
-                component_sums["loss_ioi"],
-                component_sums["loss_duration"],
-                component_sums["loss_velocity"],
-                component_sums["loss_pedal"],
-                component_weight,
-                wass_sums["eval_wass_ioi"],
-                wass_sums["eval_wass_duration"],
-                wass_sums["eval_wass_velocity"],
-                wass_sums["eval_wass_pedal"],
-                wass_count,
-            ]
-            reduce_device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
-            totals = torch.tensor(values, dtype=torch.float64, device=reduce_device)
-            torch.distributed.all_reduce(totals, op=torch.distributed.ReduceOp.SUM)
-            component_sums = {
-                "loss_ioi": float(totals[0].item()),
-                "loss_duration": float(totals[1].item()),
-                "loss_velocity": float(totals[2].item()),
-                "loss_pedal": float(totals[3].item()),
-            }
-            component_weight = float(totals[4].item())
-            wass_sums = {
-                "eval_wass_ioi": float(totals[5].item()),
-                "eval_wass_duration": float(totals[6].item()),
-                "eval_wass_velocity": float(totals[7].item()),
-                "eval_wass_pedal": float(totals[8].item()),
-            }
-            wass_count = float(totals[9].item())
-        return component_sums, component_weight, wass_sums, wass_count
+    def _dagger_log(self, payload):
+        if self.is_world_process_zero():
+            data = {"step": self.state.global_step}
+            data.update(payload)
+            print(json.dumps(data, ensure_ascii=False, sort_keys=True), flush=True)
 
-    def _inject_eval_metrics(self, metrics):
-        if metrics is None:
-            return metrics
-        if not bool(getattr(self, "eval_record_components", True)) and not bool(getattr(self, "eval_compute_wass", False)):
-            return metrics
-        component_sums, component_weight, wass_sums, wass_count = self._reduced_eval_totals()
-        if component_weight > 0.0:
-            for key, total in component_sums.items():
-                metrics[f"eval_{key}"] = total / component_weight
-        if wass_count > 0.0:
-            for key, total in wass_sums.items():
-                metrics[key] = total / wass_count
-        return metrics
-
-    def _init_eval_component_state(self):
-        self._eval_component_sums = {
-            "loss_ioi": 0.0,
-            "loss_duration": 0.0,
-            "loss_velocity": 0.0,
-            "loss_pedal": 0.0,
-        }
-        self._eval_component_weight = 0.0
-        self._eval_wass_sums = {
-            "eval_wass_ioi": 0.0,
-            "eval_wass_duration": 0.0,
-            "eval_wass_velocity": 0.0,
-            "eval_wass_pedal": 0.0,
-        }
-        self._eval_wass_count = 0.0
-
-    def _materialize_eval_predictions(self, config, outputs, inputs):
-        logits = outputs.logits.detach()
-        attention_mask = inputs["attention_mask"].detach()
-        if config.task_type == "csr":
-            return _materialize_csr_prediction(config, logits)
-        return _materialize_epr_prediction(
-            config,
-            logits,
-            sampling_strategy="mean",
-            score_shared_raw=inputs.get("score_shared_raw"),
+    def _dagger_next_interval_indices(self, total):
+        total = int(total)
+        if total <= 0:
+            return []
+        rank, world_size = distributed_info()
+        interval_steps = getattr(self.args, "eval_steps", None)
+        if interval_steps is None:
+            interval_steps = getattr(self, "dagger_cache_interval_steps", None)
+        interval_steps = max(1, int(interval_steps or 1))
+        per_device = int(getattr(self.args, "per_device_train_batch_size", 1) or 1)
+        grad_accum = int(getattr(self.args, "gradient_accumulation_steps", 1) or 1)
+        global_batch_size = int(
+            getattr(self, "dagger_global_batch_size", 0)
+            or per_device * max(1, int(world_size)) * max(1, grad_accum)
         )
+        global_batch_size = max(1, global_batch_size)
+        steps_per_epoch = max(1, math.ceil(total / global_batch_size))
+        start_step = int(self.state.global_step)
 
-    def _record_eval_metrics(self, model, outputs, inputs):
-        if not hasattr(outputs, "logits"):
-            return
-        if "labels_continuous" not in inputs or "attention_mask" not in inputs:
-            return
-        if not hasattr(self, "_eval_component_sums"):
-            self._init_eval_component_state()
+        indices = []
+        seen = set()
+        for offset in range(interval_steps):
+            step_in_epoch = (start_step + offset) % steps_per_epoch
+            start = min(step_in_epoch * global_batch_size, total)
+            end = min(start + global_batch_size, total)
+            for index in range(start, end):
+                if index not in seen:
+                    seen.add(index)
+                    indices.append(index)
+        self._dagger_last_scope_info = {
+            "interval_steps": interval_steps,
+            "global_batch_size": global_batch_size,
+            "steps_per_epoch": steps_per_epoch,
+            "start_step": start_step,
+            "selected_examples": len(indices),
+        }
+        return indices
 
-        config = self._model_config(model)
-        loss_mask = inputs.get("label_mask", inputs["attention_mask"]).detach()
-        components = _compute_integrated_loss_components(
-            config,
-            outputs.logits.detach(),
-            inputs["labels_continuous"].detach(),
-            loss_mask,
-            labels_epr_bins=inputs.get("labels_epr_bins"),
-            score_shared_raw=inputs.get("score_shared_raw"),
+    def _estimated_total_train_steps(self, steps_per_epoch=None):
+        state_max = int(getattr(getattr(self, "state", None), "max_steps", 0) or 0)
+        if state_max > 0:
+            return state_max
+        args_max = int(getattr(self.args, "max_steps", 0) or 0)
+        if args_max > 0:
+            return args_max
+        if steps_per_epoch is None:
+            total = len(self.train_dataset) if self.train_dataset is not None else 0
+            per_device = int(getattr(self.args, "per_device_train_batch_size", 1) or 1)
+            grad_accum = int(getattr(self.args, "gradient_accumulation_steps", 1) or 1)
+            _, world_size = distributed_info()
+            steps_per_epoch = max(1, math.ceil(int(total) / max(1, per_device * grad_accum * world_size)))
+        return max(1, int(round(float(getattr(self.args, "num_train_epochs", 1.0) or 1.0) * int(steps_per_epoch))))
+
+    def _dagger_window_curriculum_ratio(self, steps_per_epoch=None):
+        mode = str(getattr(self, "dagger_window_curriculum", "none") or "none").lower()
+        if mode in {"", "none", "off", "false"}:
+            return 1.0
+        if mode not in {"linear", "linear_window", "window_linear"}:
+            raise ValueError(f"Unsupported dagger_window_curriculum={mode}")
+        start = float(getattr(self, "dagger_window_curriculum_start", 0.0))
+        end = float(getattr(self, "dagger_window_curriculum_end", 1.0))
+        total_steps = int(
+            getattr(self, "dagger_window_curriculum_steps", 0)
+            or self._estimated_total_train_steps(steps_per_epoch=steps_per_epoch)
         )
-        batch_weight = float(inputs["attention_mask"].shape[0])
-        self._eval_component_weight += batch_weight
-        for key in ("ioi", "duration", "velocity", "pedal"):
-            self._eval_component_sums[f"loss_{key}"] += float(components[key].detach().float().cpu()) * batch_weight
+        progress = min(max(float(int(self.state.global_step)) / max(float(total_steps), 1.0), 0.0), 1.0)
+        return min(max(start + (end - start) * progress, 0.0), 1.0)
 
-        if not bool(getattr(self, "eval_compute_wass", False)):
+    def _dagger_training_progress(self, steps_per_epoch=None):
+        total_steps = int(
+            getattr(self, "dagger_schedule_total_steps", 0)
+            or getattr(self, "dagger_window_curriculum_steps", 0)
+            or self._estimated_total_train_steps(steps_per_epoch=steps_per_epoch)
+        )
+        return min(max(float(int(self.state.global_step)) / max(float(total_steps), 1.0), 0.0), 1.0)
+
+    def _dagger_scheduled_window_ratio(self, steps_per_epoch=None):
+        schedule = str(getattr(self, "dagger_cache_schedule", "window_curriculum") or "window_curriculum").lower()
+        if schedule in {"", "none", "window_curriculum"}:
+            return self._dagger_window_curriculum_ratio(steps_per_epoch=steps_per_epoch)
+        progress = self._dagger_training_progress(steps_per_epoch=steps_per_epoch)
+        if schedule in {"two_stage_tf50", "tf50"}:
+            return min(0.5, progress)
+        if schedule in {"two_stage_tf50_k1mix50", "tf50_k1mix50"}:
+            return min(0.5, progress)
+        raise ValueError(f"Unsupported dagger_cache_schedule={schedule}")
+
+    def _dagger_scheduled_k1_fraction(self, steps_per_epoch=None):
+        schedule = str(getattr(self, "dagger_cache_schedule", "window_curriculum") or "window_curriculum").lower()
+        if schedule not in {"two_stage_tf50_k1mix50", "tf50_k1mix50"}:
+            return 0.0
+        progress = self._dagger_training_progress(steps_per_epoch=steps_per_epoch)
+        if progress <= 0.5:
+            return 0.0
+        return min(0.5, (progress - 0.5) / 0.5 * 0.5)
+
+    def _apply_dagger_window_curriculum(self, indices, scope_info):
+        ratio = self._dagger_scheduled_window_ratio(steps_per_epoch=scope_info.get("steps_per_epoch"))
+        mode = str(getattr(self, "dagger_window_curriculum", "none") or "none").lower()
+        schedule = str(getattr(self, "dagger_cache_schedule", "window_curriculum") or "window_curriculum").lower()
+        scope_info["window_curriculum"] = mode
+        scope_info["cache_schedule"] = schedule
+        scope_info["window_curriculum_ratio"] = ratio
+        if schedule in {"", "none", "window_curriculum"} and mode in {"", "none", "off", "false"}:
+            return indices
+        keep_count = int(round(len(indices) * ratio))
+        scope_info["window_curriculum_requested_examples_before"] = len(indices)
+        scope_info["window_curriculum_kept_examples"] = keep_count
+        if keep_count <= 0:
+            return []
+        if keep_count >= len(indices):
+            return indices
+        seed = int(getattr(self, "dagger_cache_seed", 20260707)) + int(self.state.global_step) + 9173
+        rng = random.Random(seed)
+        selected = list(indices)
+        rng.shuffle(selected)
+        return sorted(selected[:keep_count])
+
+    def _split_dagger_cache_indices(self, indices, scope_info):
+        k1_fraction = self._dagger_scheduled_k1_fraction(steps_per_epoch=scope_info.get("steps_per_epoch"))
+        scope_info["k1_twopass_fraction"] = k1_fraction
+        if k1_fraction <= 0.0:
+            return list(indices), []
+        count = int(round(len(indices) * min(max(k1_fraction, 0.0), 1.0)))
+        if count <= 0:
+            return list(indices), []
+        seed = int(getattr(self, "dagger_cache_seed", 20260707)) + int(self.state.global_step) + 23117
+        rng = random.Random(seed)
+        shuffled = list(indices)
+        rng.shuffle(shuffled)
+        k1_set = set(shuffled[:count])
+        tf_indices = [index for index in indices if index not in k1_set]
+        k1_indices = [index for index in indices if index in k1_set]
+        scope_info["tf_pred_examples"] = len(tf_indices)
+        scope_info["k1_twopass_examples"] = len(k1_indices)
+        return tf_indices, k1_indices
+
+    def refresh_dagger_prefix_cache(self, reason="manual"):
+        if not self._dagger_enabled():
             return
+        dataset = self.train_dataset
+        if dataset is None or not hasattr(dataset, "set_dagger_prefix_cache"):
+            self._dagger_log({"event": "dagger_cache_skip", "reason": "unsupported_dataset"})
+            return
+        cache_type = str(getattr(self, "dagger_cache_type", "tf_pred")).lower()
+        if cache_type not in {"tf_pred", "k1_twopass", "mask"}:
+            raise ValueError(
+                f"Unsupported dagger_cache_type={cache_type}; expected tf_pred, k1_twopass, or mask"
+            )
+        if str(getattr(self.args, "prediction_loss_only", False)).lower() == "true":
+            # The cache path calls the model directly and still obtains logits;
+            # this guard only documents that Trainer prediction settings are not used here.
+            pass
 
-        pred = self._materialize_eval_predictions(config, outputs, inputs)
-        labels = inputs["labels_continuous"].detach()
-        mask = loss_mask.detach().bool()
-        if config.task_type == "epr" and _uses_inr_epr_targets(config):
-            if labels.shape[-1] != 7:
-                return
-            pred_raw = _target7_to_raw7(inputs["score_shared_raw"].detach(), pred, config=config)
-            target_raw = _target7_to_raw7(inputs["score_shared_raw"].detach(), labels, config=config)
-
-            pred_cpu = pred_raw.float().cpu().numpy()
-            target_cpu = target_raw.float().cpu().numpy()
-            mask_cpu = mask.cpu().numpy().astype(bool)
-            pedal_mask = np.repeat(mask_cpu[..., None], pred_cpu[..., 3:7].shape[-1], axis=-1).reshape(-1)
-            feature_pairs = {
-                "eval_wass_ioi": (pred_cpu[..., 0], target_cpu[..., 0]),
-                "eval_wass_duration": (pred_cpu[..., 1], target_cpu[..., 1]),
-                "eval_wass_velocity": (pred_cpu[..., 2], target_cpu[..., 2]),
-                "eval_wass_pedal": (pred_cpu[..., 3:7].reshape(-1), target_cpu[..., 3:7].reshape(-1), pedal_mask),
-            }
+        total = len(dataset)
+        cache_scope = str(getattr(self, "dagger_cache_scope", "random")).lower()
+        max_items = getattr(self, "dagger_cache_max_items", None)
+        max_interval_fraction = getattr(self, "dagger_cache_max_interval_fraction", None)
+        scope_info = {}
+        if cache_scope == "next_interval":
+            indices = self._dagger_next_interval_indices(total)
+            scope_info = getattr(self, "_dagger_last_scope_info", {})
+            if max_interval_fraction is not None:
+                fraction = max(0.0, min(1.0, float(max_interval_fraction)))
+                cap = int(round(len(indices) * fraction))
+                scope_info["max_interval_fraction"] = fraction
+                scope_info["max_interval_fraction_cap"] = cap
+                if cap < len(indices):
+                    seed = int(getattr(self, "dagger_cache_seed", 20260707)) + int(self.state.global_step) + 6131
+                    rng = random.Random(seed)
+                    capped_indices = list(indices)
+                    rng.shuffle(capped_indices)
+                    indices = sorted(capped_indices[:cap])
+            if max_items is not None:
+                indices = indices[: int(max_items)]
+        elif cache_scope == "random":
+            fraction = max(0.0, min(1.0, float(getattr(self, "dagger_cache_fraction", 0.5))))
+            count = int(round(total * fraction))
+            if max_items is not None:
+                count = min(count, int(max_items))
+            seed = int(getattr(self, "dagger_cache_seed", 20260707)) + int(self.state.global_step)
+            rng = random.Random(seed)
+            indices = list(range(total))
+            rng.shuffle(indices)
+            indices = sorted(indices[:count])
+            scope_info = {"fraction": fraction}
         else:
-            pred_cpu = pred.float().cpu().numpy()
-            target_cpu = labels.float().cpu().numpy()
-            mask_cpu = mask.cpu().numpy().astype(bool)
-            pedal_mask = np.repeat(mask_cpu[..., None], pred_cpu[..., 3:7].shape[-1], axis=-1).reshape(-1)
-            feature_pairs = {
-                "eval_wass_ioi": (pred_cpu[..., 0], target_cpu[..., 0]),
-                "eval_wass_duration": (pred_cpu[..., 1], target_cpu[..., 1]),
-                "eval_wass_velocity": (pred_cpu[..., 2], target_cpu[..., 2]),
-                "eval_wass_pedal": (pred_cpu[..., 3:7].reshape(-1), target_cpu[..., 3:7].reshape(-1), pedal_mask),
+            raise ValueError(f"Unsupported dagger_cache_scope={cache_scope}; expected random or next_interval")
+
+        if len(indices) <= 0:
+            dataset.clear_dagger_prefix_cache()
+            release_cuda_cache()
+            self._dagger_log({"event": "dagger_cache_cleared", "reason": reason, **scope_info})
+            return
+
+        indices = self._apply_dagger_window_curriculum(indices, scope_info)
+        if len(indices) <= 0:
+            dataset.clear_dagger_prefix_cache()
+            release_cuda_cache()
+            self._dagger_log({"event": "dagger_cache_cleared", "reason": reason, **scope_info})
+            return
+
+        tf_indices, k1_indices = self._split_dagger_cache_indices(indices, scope_info)
+        cache_type_by_index = {}
+        if k1_indices:
+            cache_type_by_index.update({int(index): "k1_twopass" for index in k1_indices})
+            cache_type_by_index.update({int(index): cache_type for index in tf_indices})
+
+        rank, world_size = distributed_info()
+        dist_ready = torch.distributed.is_available() and torch.distributed.is_initialized()
+        cache_rank = rank if dist_ready else 0
+        cache_world_size = world_size if dist_ready else 1
+        local_indices = indices[cache_rank::cache_world_size]
+        self._dagger_log(
+            {
+                "event": "dagger_cache_start",
+                "reason": reason,
+                "cache_type": cache_type,
+                "cache_scope": cache_scope,
+                "requested_examples": len(indices),
+                "local_examples": len(local_indices),
+                "world_size": cache_world_size,
+                **scope_info,
             }
-
-        for metric_name, payload in feature_pairs.items():
-            if len(payload) == 2:
-                pred_values, target_values = payload
-                valid_mask = mask_cpu.reshape(-1)
-                pred_values = pred_values.reshape(-1)[valid_mask]
-                target_values = target_values.reshape(-1)[valid_mask]
-            else:
-                pred_values, target_values, valid_mask = payload
-                pred_values = pred_values[valid_mask]
-                target_values = target_values[valid_mask]
-            metric_value = finite_wasserstein_distance(pred_values, target_values)
-            if math.isfinite(metric_value):
-                self._eval_wass_sums[metric_name] += metric_value * batch_weight
-        self._eval_wass_count += batch_weight
-
-    def _record_loss_components(self, model, outputs, inputs):
-        if not hasattr(outputs, "logits"):
-            return
-        if "labels_continuous" not in inputs or "attention_mask" not in inputs:
-            return
-        loss_mask = inputs.get("label_mask", inputs["attention_mask"]).detach()
-        components = _compute_integrated_loss_components(
-            self._model_config(model),
-            outputs.logits.detach(),
-            inputs["labels_continuous"].detach(),
-            loss_mask,
-            labels_epr_bins=inputs.get("labels_epr_bins"),
-            score_shared_raw=inputs.get("score_shared_raw"),
         )
-        if not getattr(self, "_loss_component_sums", None):
-            self._loss_component_sums = {name: 0.0 for name in components}
-            self._loss_component_count = 0
-        for name, value in components.items():
-            self._loss_component_sums[name] += float(value.detach().float().cpu())
-        self._loss_component_count += 1
+        if cache_type == "mask":
+            cache_indices = set(int(index) for index in local_indices)
+            if dist_ready and cache_world_size > 1:
+                gathered = [None for _ in range(cache_world_size)]
+                torch.distributed.all_gather_object(gathered, cache_indices)
+                merged_indices = set()
+                for shard in gathered:
+                    if shard:
+                        merged_indices.update(int(index) for index in shard)
+                cache_indices = merged_indices
+            if hasattr(dataset, "set_dagger_mask_cache"):
+                dataset.set_dagger_mask_cache(cache_indices)
+            else:
+                dataset.clear_dagger_prefix_cache()
+            release_cuda_cache()
+            self._dagger_log(
+                {
+                    "event": "dagger_cache_refreshed",
+                    "reason": reason,
+                    "cache_type": cache_type,
+                    "cache_scope": cache_scope,
+                    "requested_examples": len(indices),
+                    "local_examples": len(local_indices),
+                    "cached_examples": len(cache_indices),
+                    "world_size": cache_world_size,
+                    "seconds": 0.0,
+                    **scope_info,
+                }
+            )
+            return
+
+        batch_size = int(
+            getattr(
+                self,
+                "dagger_cache_batch_size",
+                max(1, int(getattr(self.args, "per_device_eval_batch_size", 1) or 1)),
+            )
+        )
+        num_workers = int(getattr(self, "dagger_cache_num_workers", 0) or 0)
+        collator = NodeSFTDataCollator(
+            pitch_pad_id=int(self._model_config(self.model).pitch_pad_id),
+            task_type=str(getattr(self._model_config(self.model), "task_type", "epr")).lower(),
+            use_style_tokens=bool(getattr(self._model_config(self.model), "use_style_tokens", False)),
+            dagger_prefix_training=False,
+        )
+        loader = DataLoader(
+            Subset(dataset, local_indices),
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=collator,
+            num_workers=num_workers,
+            pin_memory=bool(getattr(self.args, "dataloader_pin_memory", False)),
+        )
+
+        cache = {}
+        was_training = self.model.training
+        self.model.eval()
+        strategy = str(getattr(self, "dagger_materialize_strategy", "sample")).lower()
+        started = time.time()
+        try:
+            progress = tqdm(
+                loader,
+                desc=f"dagger {cache_type} cache r{rank}",
+                total=len(loader),
+                dynamic_ncols=True,
+                leave=False,
+                disable=(not self.is_world_process_zero()) or bool(getattr(self.args, "disable_tqdm", False)),
+            )
+            for batch in progress:
+                example_indices = batch["example_index"].detach().cpu().tolist()
+                batch = self._prepare_inputs(batch)
+                with torch.no_grad(), self.autocast_smart_context_manager():
+                    outputs = self.model(
+                        pitch_ids=batch["pitch_ids"],
+                        continuous=batch["continuous"],
+                        score_shared_raw=batch["score_shared_raw"],
+                        labels_continuous=batch["labels_continuous"],
+                        labels_epr_bins=batch.get("labels_epr_bins"),
+                        label_mask=batch.get("label_mask"),
+                        attention_mask=batch["attention_mask"],
+                        continuous_sampling_strategy=strategy,
+                    )
+                    pred_tf = _materialize_epr_prediction(
+                        self._model_config(self.model),
+                        outputs.logits,
+                        sampling_strategy=strategy,
+                        score_shared_raw=batch["score_shared_raw"],
+                    )
+                    effective_cache_types = [cache_type_by_index.get(int(index), cache_type) for index in example_indices]
+                    needs_k1 = any(item == "k1_twopass" for item in effective_cache_types)
+                    if needs_k1:
+                        outputs = self.model(
+                            pitch_ids=batch["pitch_ids"],
+                            continuous=batch["continuous"],
+                            score_shared_raw=batch["score_shared_raw"],
+                            labels_continuous=batch["labels_continuous"],
+                            decoder_feedback_continuous=pred_tf.detach(),
+                            labels_epr_bins=batch.get("labels_epr_bins"),
+                            label_mask=batch.get("label_mask"),
+                            attention_mask=batch["attention_mask"],
+                            continuous_sampling_strategy=strategy,
+                        )
+                        pred = _materialize_epr_prediction(
+                            self._model_config(self.model),
+                            outputs.logits,
+                            sampling_strategy=strategy,
+                            score_shared_raw=batch["score_shared_raw"],
+                        )
+                        if any(item != "k1_twopass" for item in effective_cache_types):
+                            keep_k1 = torch.tensor(
+                                [item == "k1_twopass" for item in effective_cache_types],
+                                dtype=torch.bool,
+                                device=pred.device,
+                            ).view(-1, 1, 1)
+                            pred = torch.where(keep_k1, pred, pred_tf)
+                    else:
+                        pred = pred_tf
+                lengths = batch["attention_mask"].detach().sum(dim=1).cpu().tolist()
+                pred_cpu = pred.detach().float().cpu()
+                for item_index, length, values in zip(example_indices, lengths, pred_cpu):
+                    cache[int(item_index)] = values[: int(length)].contiguous()
+        finally:
+            if was_training:
+                self.model.train()
+
+        if dist_ready and cache_world_size > 1:
+            gathered = [None for _ in range(cache_world_size)]
+            torch.distributed.all_gather_object(gathered, cache)
+            merged_cache = {}
+            for shard in gathered:
+                if shard:
+                    merged_cache.update(shard)
+            cache = merged_cache
+
+        dataset.set_dagger_prefix_cache(cache)
+        release_cuda_cache()
+        self._dagger_log(
+            {
+                "event": "dagger_cache_refreshed",
+                "reason": reason,
+                "cache_type": cache_type,
+                "cache_scope": cache_scope,
+                "materialize_strategy": strategy,
+                "requested_examples": len(indices),
+                "local_examples": len(local_indices),
+                "cached_examples": len(cache),
+                "world_size": cache_world_size,
+                "seconds": round(time.time() - started, 3),
+                **scope_info,
+            }
+        )
+
+    def _maybe_log_train_loss_components(self, inputs, outputs):
+        interval = int(getattr(self, "loss_component_logging_steps", 0) or 0)
+        if interval <= 0 or not self.is_world_process_zero():
+            return
+        step = int(getattr(self.state, "global_step", 0) or 0)
+        if step <= 0 or step % interval != 0:
+            return
+        if int(getattr(self, "_last_loss_component_log_step", -1)) == step:
+            return
+        self._last_loss_component_log_step = step
+        labels = inputs.get("labels_continuous")
+        attention_mask = inputs.get("attention_mask")
+        if labels is None or attention_mask is None or getattr(outputs, "logits", None) is None:
+            return
+        try:
+            loss_mask = inputs.get("label_mask") if str(getattr(self._model_config(self.model), "task_type", "epr")).lower() == "csr" and inputs.get("label_mask") is not None else attention_mask
+            components = _compute_integrated_loss_components(
+                self._model_config(self.model),
+                outputs.logits,
+                labels,
+                loss_mask,
+                labels_epr_bins=inputs.get("labels_epr_bins"),
+                score_shared_raw=inputs.get("score_shared_raw"),
+            )
+            payload = {
+                "step": step,
+                "event": "train_loss_components",
+            }
+            for name, value in components.items():
+                if torch.is_tensor(value):
+                    payload[f"train_loss_{name}"] = float(value.detach().float().cpu().item())
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(
+                json.dumps(
+                    {"step": step, "event": "train_loss_components_failed", "reason": str(exc)},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         outputs = model(**inputs)
         loss = outputs.loss
-        interval = int(getattr(self, "loss_component_interval", 1) or 0)
-        if interval > 0 and self.state.global_step % interval == 0:
-            self._record_loss_components(model, outputs, inputs)
+        self._maybe_log_train_loss_components(inputs, outputs)
         return (loss, outputs) if return_outputs else loss
 
     def log(self, logs, *args, **kwargs):
-        count = getattr(self, "_loss_component_count", 0)
-        if count and "loss" in logs:
-            for name, total in self._loss_component_sums.items():
-                logs[f"loss_{name}"] = total / count
-            self._loss_component_sums = {}
-            self._loss_component_count = 0
-        if "eval_loss" in logs:
-            self._inject_eval_metrics(logs)
         if self.is_world_process_zero():
             printable_logs = {"step": self.state.global_step}
             printable_logs.update(logs)
@@ -1906,48 +2195,6 @@ class NodeSFTTrainer(Trainer):
     def _clear_eval_dataloader_cache(self):
         if hasattr(self, "_eval_dataloaders"):
             delattr(self, "_eval_dataloaders")
-
-    def evaluation_loop(self, *args, **kwargs):
-        self._init_eval_component_state()
-        output = super().evaluation_loop(*args, **kwargs)
-        if getattr(output, "metrics", None) is not None:
-            self._inject_eval_metrics(output.metrics)
-        return output
-
-    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
-        loss, logits, labels = super().prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
-        if not bool(getattr(self, "eval_record_components", True)) and not bool(getattr(self, "eval_compute_wass", False)):
-            return loss, logits, labels
-        if loss is not None and hasattr(model, "training") and not model.training:
-            try:
-                metric_logits = logits
-                if metric_logits is None:
-                    with torch.no_grad():
-                        metric_outputs = model(**inputs)
-                    metric_logits = getattr(metric_outputs, "logits", None)
-                if metric_logits is None:
-                    return loss, logits, labels
-
-                class _EvalOutputs:
-                    def __init__(self, logits):
-                        self.logits = logits
-
-                self._record_eval_metrics(model, _EvalOutputs(metric_logits), inputs)
-            except Exception as exc:
-                if self.is_world_process_zero():
-                    print(
-                        json.dumps(
-                            {
-                                "step": self.state.global_step,
-                                "event": "eval_metric_record_failed",
-                                "reason": str(exc),
-                            },
-                            ensure_ascii=False,
-                            sort_keys=True,
-                        ),
-                        flush=True,
-                    )
-        return loss, logits, labels
 
     def _eval_loader_settings(self):
         num_workers = int(getattr(self, "eval_dataloader_num_workers", 0) or 0)
@@ -2032,17 +2279,29 @@ class NodeSFTTrainer(Trainer):
 
         output_dir = Path(self.args.output_dir)
         best_dir = output_dir / "checkpoint-best"
+        marker_path = best_dir / ".best_source"
+        try:
+            source_marker = str(source.resolve())
+        except FileNotFoundError:
+            source_marker = str(source)
         try:
             if source.resolve() == best_dir.resolve():
                 return
         except FileNotFoundError:
             pass
+        if best_dir.exists() and marker_path.exists():
+            try:
+                if marker_path.read_text().strip() == source_marker:
+                    return
+            except OSError:
+                pass
 
         tmp_dir = output_dir / f".checkpoint-best.tmp-{os.getpid()}"
         if tmp_dir.exists():
             shutil.rmtree(tmp_dir, ignore_errors=True)
         try:
             shutil.copytree(source, tmp_dir)
+            (tmp_dir / ".best_source").write_text(source_marker + "\n")
             if best_dir.exists():
                 shutil.rmtree(best_dir)
             tmp_dir.rename(best_dir)
@@ -2080,7 +2339,124 @@ class NodeSFTTrainer(Trainer):
         super()._save_checkpoint(model, trial)
         self._sync_checkpoint_best_alias()
 
+    def _rollout_eval_enabled(self):
+        return bool(getattr(self, "rollout_eval_enabled", False))
+
+    def _materialize_rollout_feedback(self, logits, score_shared_raw=None):
+        strategy = str(getattr(self, "rollout_eval_feedback_strategy", "sample")).lower()
+        return _materialize_epr_prediction(
+            self._model_config(self.model),
+            logits,
+            sampling_strategy=strategy,
+            score_shared_raw=score_shared_raw,
+        )
+
+    def _rollout_eval_loss_for_k(self, rollout_k):
+        rollout_k = int(rollout_k)
+        if rollout_k <= 0:
+            return None
+        loader = self.get_eval_dataloader()
+        was_training = self.model.training
+        self.model.eval()
+        total_loss = 0.0
+        total_weight = 0.0
+        try:
+            for batch in loader:
+                batch = self._prepare_inputs(batch)
+                attention_mask = batch["attention_mask"]
+                batch_weight = float(attention_mask.detach().sum().float().cpu().item())
+                labels = batch["labels_continuous"]
+                feedback = None
+                step_loss = None
+                with torch.no_grad(), self.autocast_smart_context_manager():
+                    for pass_idx in range(rollout_k + 1):
+                        outputs = self.model(
+                            pitch_ids=batch["pitch_ids"],
+                            continuous=batch["continuous"],
+                            score_shared_raw=batch["score_shared_raw"],
+                            labels_continuous=labels,
+                            decoder_feedback_continuous=feedback,
+                            labels_epr_bins=batch.get("labels_epr_bins"),
+                            label_mask=batch.get("label_mask"),
+                            attention_mask=attention_mask,
+                            continuous_sampling_strategy=str(getattr(self, "rollout_eval_materialize_strategy", "sample")),
+                        )
+                        step_loss = outputs.loss
+                        if pass_idx < rollout_k:
+                            pred = self._materialize_rollout_feedback(
+                                outputs.logits,
+                                score_shared_raw=batch["score_shared_raw"],
+                            )
+                            feedback = pred.detach()
+                if step_loss is not None and batch_weight > 0.0:
+                    total_loss += float(step_loss.detach().float().cpu().item()) * batch_weight
+                    total_weight += batch_weight
+        finally:
+            if was_training:
+                self.model.train()
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+            values = torch.tensor([total_loss, total_weight], dtype=torch.float64, device=device)
+            torch.distributed.all_reduce(values, op=torch.distributed.ReduceOp.SUM)
+            total_loss = float(values[0].item())
+            total_weight = float(values[1].item())
+        if total_weight <= 0.0:
+            return None
+        return total_loss / total_weight
+
+    def _inject_rollout_eval_metrics(self, metrics):
+        if not self._rollout_eval_enabled():
+            return metrics
+        if metrics is None:
+            metrics = {}
+        rollout_k = int(getattr(self, "rollout_eval_k", 1) or 1)
+        rollout_started = time.time()
+        if self.is_world_process_zero():
+            print(
+                json.dumps(
+                    {"step": self.state.global_step, "event": "rollout_eval_start", "rollout_k": rollout_k},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        rollout_loss = self._rollout_eval_loss_for_k(rollout_k)
+        if rollout_loss is None:
+            return metrics
+        tf_loss = float(metrics.get("eval_loss", 0.0))
+        weight = float(getattr(self, "rollout_eval_weight", 1.0))
+        combined = tf_loss + weight * float(rollout_loss)
+        metrics[f"eval_rollout_k{rollout_k}_loss"] = float(rollout_loss)
+        metrics["eval_tf_loss"] = tf_loss
+        metrics["eval_loss"] = float(combined)
+        if self.is_world_process_zero():
+            print(
+                json.dumps(
+                    {
+                        "step": self.state.global_step,
+                        "event": "rollout_eval_done",
+                        "rollout_k": rollout_k,
+                        "seconds": round(time.time() - rollout_started, 3),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        return metrics
+
     def evaluate(self, *args, **kwargs):
+        eval_started = time.time()
+        if self.is_world_process_zero():
+            print(
+                json.dumps(
+                    {"step": self.state.global_step, "event": "eval_start"},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
         self._clear_eval_dataloader_cache()
         try:
             try:
@@ -2126,19 +2502,57 @@ class NodeSFTTrainer(Trainer):
                 self.eval_dataloader_prefetch_factor = original_prefetch_factor
                 self._clear_eval_dataloader_cache()
 
+        metrics = self._inject_rollout_eval_metrics(metrics)
+        if self._dagger_enabled() and bool(getattr(self, "dagger_refresh_on_eval", True)):
+            self.refresh_dagger_prefix_cache(reason="eval")
         if not self.is_world_process_zero():
             return metrics
-        metrics = self._inject_eval_metrics(metrics)
+        print(
+            json.dumps(
+                {
+                    "step": self.state.global_step,
+                    "event": "eval_done",
+                    "seconds": round(time.time() - eval_started, 3),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
         printable_metrics = {"step": self.state.global_step}
         printable_metrics.update(metrics)
         print(json.dumps(printable_metrics, ensure_ascii=False, sort_keys=True), flush=True)
         return metrics
 
 class NodeSFTDataCollator:
-    def __init__(self, pitch_pad_id=128, task_type="epr", use_style_tokens=False):
+    def __init__(
+        self,
+        pitch_pad_id=128,
+        task_type="epr",
+        use_style_tokens=False,
+        dagger_prefix_training=False,
+        dagger_apply_prob=1.0,
+        dagger_replacement_weights=None,
+        dagger_seed=42,
+    ):
         self.pitch_pad_id = pitch_pad_id
         self.task_type = task_type
         self.use_style_tokens = bool(use_style_tokens)
+        self.dagger_prefix_training = bool(dagger_prefix_training)
+        self.dagger_apply_prob = float(dagger_apply_prob)
+        self.dagger_replacement_weights = normalize_dagger_replacement_weights(dagger_replacement_weights)
+        self._dagger_rng = random.Random(int(dagger_seed))
+
+    def _sample_dagger_mode(self):
+        draw = self._dagger_rng.random()
+        running = 0.0
+        last_key = None
+        for key, weight in self.dagger_replacement_weights.items():
+            running += float(weight)
+            last_key = key
+            if draw <= running:
+                return key
+        return last_key or "full"
 
     def __call__(self, examples):
         pitch_tensors = [torch.tensor(example["pitch_ids"], dtype=torch.long) for example in examples]
@@ -2159,6 +2573,18 @@ class NodeSFTDataCollator:
             labels_epr_bins_tensors = [
                 torch.tensor(example["labels_epr_bins"], dtype=torch.long) for example in examples
             ]
+        dagger_prefix_tensors = None
+        if self.dagger_prefix_training:
+            dagger_prefix_tensors = []
+            for example in examples:
+                if "dagger_prefix_continuous" in example:
+                    prefix = example["dagger_prefix_continuous"]
+                    if torch.is_tensor(prefix):
+                        dagger_prefix_tensors.append(prefix.detach().clone().to(dtype=torch.float32))
+                    else:
+                        dagger_prefix_tensors.append(torch.tensor(prefix, dtype=torch.float32))
+                else:
+                    dagger_prefix_tensors.append(torch.empty(0, dtype=torch.float32))
 
         pitch_ids = pad_sequence(pitch_tensors, batch_first=True, padding_value=self.pitch_pad_id)
         continuous = pad_sequence(continuous_tensors, batch_first=True, padding_value=0.0)
@@ -2174,6 +2600,7 @@ class NodeSFTDataCollator:
             label_mask = pad_sequence(label_mask_tensors, batch_first=True, padding_value=0)
 
         batch = {
+            "example_index": torch.tensor([int(example["example_index"]) for example in examples], dtype=torch.long),
             "pitch_ids": pitch_ids,
             "continuous": continuous,
             "labels_continuous": labels_continuous,
@@ -2181,6 +2608,33 @@ class NodeSFTDataCollator:
             "attention_mask": attention_mask,
             "interpolated": interpolated,
         }
+        if dagger_prefix_tensors is not None:
+            decoder_feedback_continuous = labels_continuous.clone()
+            decoder_feedback_mask = torch.zeros_like(labels_continuous)
+            used_any = False
+            for row_idx, prefix_tensor in enumerate(dagger_prefix_tensors):
+                mask_enabled = bool(examples[row_idx].get("dagger_feedback_mask_enabled", False))
+                if prefix_tensor.numel() == 0 and not mask_enabled:
+                    continue
+                if self._dagger_rng.random() > self.dagger_apply_prob:
+                    continue
+                prefix_len = int(prefix_tensor.shape[0]) if prefix_tensor.numel() > 0 else int(attention_mask[row_idx].sum().item())
+                length = min(prefix_len, int(attention_mask[row_idx].sum().item()))
+                if length <= 0:
+                    continue
+                mode = self._sample_dagger_mode()
+                cols = dagger_target_columns(mode, output_dim=labels_continuous.shape[-1])
+                if not cols:
+                    continue
+                if mask_enabled:
+                    decoder_feedback_mask[row_idx, :length, cols] = 1.0
+                else:
+                    decoder_feedback_continuous[row_idx, :length, cols] = prefix_tensor[:length, cols]
+                used_any = True
+            if used_any:
+                batch["decoder_feedback_continuous"] = decoder_feedback_continuous
+                if decoder_feedback_mask.any():
+                    batch["decoder_feedback_mask"] = decoder_feedback_mask
         if self.use_style_tokens:
             batch["style_creator_ids"] = torch.tensor(
                 [int(example["style_creator_id"]) for example in examples],
@@ -2536,9 +2990,199 @@ def enable_eval_best_checkpointing(train_config):
             train_config["save_steps"] = eval_steps
 
 
+def _visible_cuda_devices_for_child():
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if raw:
+        return [item.strip() for item in raw.split(",") if item.strip()]
+    count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    return [str(index) for index in range(count)]
+
+
+def _as_bool(value, default=False):
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _resolve_auto_rollout_score_source_list(train_config):
+    configured = train_config.get("auto_rollout_score_source_list") or train_config.get("cheap15_score_source_list")
+    candidates = []
+    if configured:
+        candidates.append(Path(configured))
+    candidates.append(ROOT_DIR / "results/current_inr_asap_simplified_20260706/cheap15_score_sources.txt")
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
+
+
+def _auto_rollout_root_dir(output_dir):
+    output_dir = Path(output_dir)
+    if output_dir.parent.name == "training":
+        return output_dir.parent.parent
+    return output_dir.parent
+
+
+def _auto_rollout_device_label(device):
+    text = str(device or "cpu").strip()
+    if not text:
+        return "cpu"
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", text)
+
+
+def run_auto_rollout_eval_after_train(train_config, output_dir):
+    if not _as_bool(train_config.get("auto_rollout_eval_after_train", True), default=True):
+        print(json.dumps({"event": "auto_rollout_eval_skip", "reason": "disabled"}), flush=True)
+        return
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        if int(torch.distributed.get_rank()) != 0:
+            return
+
+    checkpoint = output_dir / "checkpoint-best"
+    if not checkpoint.exists():
+        checkpoint = output_dir
+    config_path = output_dir / "train_config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"auto rollout eval requires {config_path}")
+
+    devices = _visible_cuda_devices_for_child()
+    workers = int(train_config.get("auto_rollout_workers_per_gpu", 8) or 8)
+    eval_split = train_config.get("auto_rollout_split", train_config.get("eval_split", "test"))
+    performance_dataset = train_config.get(
+        "auto_rollout_performance_dataset",
+        train_config.get("eval_performance_dataset", train_config.get("performance_dataset", "ASAP")),
+    )
+    score_source_list = _resolve_auto_rollout_score_source_list(train_config)
+
+    base_cmd = [
+        os.sys.executable,
+        "src/evaluate/eval_inr_rollout_current.py",
+        "--config",
+        str(config_path),
+        "--checkpoint",
+        str(checkpoint),
+        "--split",
+        str(eval_split),
+        "--performance-dataset",
+        str(performance_dataset),
+        "--batch-size-windows",
+        str(int(train_config.get("auto_rollout_batch_size_windows", 8) or 8)),
+        "--num-workers",
+        str(workers),
+        "--materialize-strategy",
+        str(train_config.get("auto_rollout_materialize_strategy", "sample")),
+        "--feedback-strategy",
+        str(train_config.get("auto_rollout_feedback_strategy", "sample")),
+    ]
+    if score_source_list is not None:
+        base_cmd.extend(["--score-source-list", str(score_source_list)])
+
+    eval_root = _auto_rollout_root_dir(output_dir)
+    fast_device = devices[0] if devices else ""
+    ar_device = devices[1] if len(devices) > 1 else fast_device
+    fast_suffix = str(
+        train_config.get(
+            "auto_rollout_fast_output_suffix",
+            f"auto_g{_auto_rollout_device_label(fast_device)}w{workers}",
+        )
+    )
+    ar_suffix = str(
+        train_config.get(
+            "auto_rollout_ar_output_suffix",
+            f"auto_g{_auto_rollout_device_label(ar_device)}w{workers}",
+        )
+    )
+
+    jobs = [
+        {
+            "name": "fast_kpass",
+            "device": fast_device,
+            "output_dir": eval_root / f"cheap15_fast_kpass_{fast_suffix}",
+            "cmd_extra": ["--rollout-ks", str(train_config.get("auto_rollout_fast_ks", "0,1,2")), "--fast-kpass"],
+            "log": eval_root / f"eval_fast_kpass_{fast_suffix}.log",
+        },
+        {
+            "name": "full_ar",
+            "device": ar_device,
+            "output_dir": eval_root / f"cheap15_ar_sample_{ar_suffix}",
+            "cmd_extra": ["--rollout-ks", "full"],
+            "log": eval_root / f"eval_ar_sample_{ar_suffix}.log",
+        },
+    ]
+
+    procs = []
+    for job in jobs:
+        cmd = [*base_cmd, "--output-dir", str(job["output_dir"]), *job["cmd_extra"]]
+        env = os.environ.copy()
+        if job["device"]:
+            env["CUDA_VISIBLE_DEVICES"] = str(job["device"])
+        log_path = Path(job["log"])
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_file = log_path.open("w", encoding="utf-8")
+        print(
+            json.dumps(
+                {
+                    "event": "auto_rollout_eval_start",
+                    "job": job["name"],
+                    "device": job["device"],
+                    "child_cuda_visible_devices": str(job["device"] or os.environ.get("CUDA_VISIBLE_DEVICES", "")),
+                    "workers": workers,
+                    "output_dir": str(job["output_dir"]),
+                    "log": str(log_path),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        proc = subprocess.Popen(cmd, cwd=str(ROOT_DIR), env=env, stdout=log_file, stderr=subprocess.STDOUT)
+        procs.append((job, proc, log_file))
+
+        # With one visible GPU, avoid two eval pools fighting on the same card.
+        if len(devices) <= 1:
+            code = proc.wait()
+            log_file.close()
+            job["closed_log"] = True
+            if code != 0:
+                raise RuntimeError(f"auto rollout eval {job['name']} failed with exit code {code}; see {job['log']}")
+            print(
+                json.dumps(
+                    {"event": "auto_rollout_eval_done", "job": job["name"], "output_dir": str(job["output_dir"])},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+
+    failures = []
+    for job, proc, log_file in procs:
+        if len(devices) <= 1 and proc.poll() is not None:
+            continue
+        code = proc.wait()
+        if not job.get("closed_log"):
+            log_file.close()
+        if code != 0:
+            failures.append((job["name"], code, str(job["log"])))
+        else:
+            print(
+                json.dumps(
+                    {"event": "auto_rollout_eval_done", "job": job["name"], "output_dir": str(job["output_dir"])},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+    if failures:
+        raise RuntimeError(f"auto rollout eval failures: {failures}")
+
+
 def main():
     current_datetime = datetime.datetime.now()
-    outname = "inr_" + current_datetime.strftime("%Y-%m-%d-%H-%M-%S")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/inr_config_pianocore.json")
@@ -2565,6 +3209,7 @@ def main():
 
     with open(args.config, "r", encoding="utf-8") as file:
         train_config = json.load(file)
+    outname = str(train_config.get("run_name") or ("inr_" + current_datetime.strftime("%Y-%m-%d-%H-%M-%S")))
     task_type = train_config.get("task_type", "epr").lower()
     input_feature_mode = infer_input_feature_mode(train_config)
     train_config["input_feature_mode"] = input_feature_mode
@@ -2807,9 +3452,13 @@ def main():
         # Keep workers alive after dataloader warmup; this reduces CPU/input
         # stalls for the bs32/acc1 DDP recipe used by the pedal2 experiments.
         training_args_dict.setdefault("dataloader_persistent_workers", True)
+    dagger_prefix_training = bool(train_config.get("dagger_prefix_training", False))
+    if dagger_prefix_training:
+        training_args_dict["dataloader_persistent_workers"] = False
+        train_config["dataloader_persistent_workers"] = False
+    if int(training_args_dict.get("dataloader_num_workers", 0) or 0) <= 0:
+        training_args_dict["dataloader_prefetch_factor"] = None
     training_args_dict.setdefault("dataloader_pin_memory", torch.cuda.is_available())
-    if bool(train_config.get("eval_compute_wass", False)):
-        training_args_dict["prediction_loss_only"] = False
     if torch.cuda.device_count() > 1:
         training_args_dict.setdefault("ddp_find_unused_parameters", False)
         training_args_dict.setdefault("ddp_broadcast_buffers", False)
@@ -2822,9 +3471,43 @@ def main():
             pitch_pad_id=train_config["pitch_pad_id"],
             task_type=task_type,
             use_style_tokens=train_config.get("use_style_tokens", False),
+            dagger_prefix_training=dagger_prefix_training,
+            dagger_apply_prob=train_config.get("dagger_apply_prob", 1.0),
+            dagger_replacement_weights=train_config.get("dagger_replacement_weights"),
+            dagger_seed=train_config.get("dagger_seed", train_config.get("seed", 42)),
         ),
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
+    )
+    trainer.dagger_prefix_training = dagger_prefix_training
+    trainer.dagger_cache_type = train_config.get("dagger_cache_type", "tf_pred")
+    trainer.dagger_cache_scope = train_config.get("dagger_cache_scope", "random")
+    trainer.dagger_cache_fraction = train_config.get("dagger_cache_fraction", 0.5)
+    trainer.dagger_cache_max_items = train_config.get("dagger_cache_max_items")
+    trainer.dagger_cache_max_interval_fraction = train_config.get("dagger_cache_max_interval_fraction")
+    trainer.dagger_cache_seed = train_config.get("dagger_cache_seed", train_config.get("seed", 42))
+    trainer.dagger_global_batch_size = train_config.get("global_batch_size")
+    trainer.dagger_window_curriculum = train_config.get("dagger_window_curriculum", "none")
+    trainer.dagger_window_curriculum_start = train_config.get("dagger_window_curriculum_start", 0.0)
+    trainer.dagger_window_curriculum_end = train_config.get("dagger_window_curriculum_end", 1.0)
+    trainer.dagger_window_curriculum_steps = train_config.get("dagger_window_curriculum_steps", 0)
+    trainer.dagger_cache_schedule = train_config.get("dagger_cache_schedule", "window_curriculum")
+    trainer.dagger_schedule_total_steps = train_config.get("dagger_schedule_total_steps", 0)
+    trainer.dagger_cache_batch_size = train_config.get(
+        "dagger_cache_batch_size",
+        train_config.get("per_device_eval_batch_size", train_config.get("per_device_train_batch_size", 1)),
+    )
+    trainer.dagger_cache_num_workers = train_config.get("dagger_cache_num_workers", 0)
+    trainer.dagger_materialize_strategy = train_config.get("dagger_materialize_strategy", "sample")
+    trainer.dagger_refresh_on_eval = train_config.get("dagger_refresh_on_eval", True)
+    trainer.rollout_eval_enabled = bool(train_config.get("rollout_eval_enabled", False))
+    trainer.rollout_eval_k = int(train_config.get("rollout_eval_k", 1) or 1)
+    trainer.rollout_eval_weight = float(train_config.get("rollout_eval_weight", 1.0))
+    trainer.rollout_eval_materialize_strategy = train_config.get("rollout_eval_materialize_strategy", "sample")
+    trainer.rollout_eval_feedback_strategy = train_config.get("rollout_eval_feedback_strategy", "sample")
+    trainer.loss_component_logging_steps = train_config.get(
+        "loss_component_logging_steps",
+        train_config.get("logging_steps", 0),
     )
     if "eval_dataloader_num_workers" not in train_config:
         train_config["eval_dataloader_num_workers"] = train_config.get("dataloader_num_workers", 0)
@@ -2850,12 +3533,6 @@ def main():
     trainer.eval_dataloader_pin_memory = bool(
         train_config.get("eval_dataloader_pin_memory", training_args.dataloader_pin_memory)
     )
-    trainer.loss_component_interval = int(
-        train_config.get("loss_component_interval", train_config.get("logging_steps", 20)) or 0
-    )
-    trainer.eval_record_components = bool(train_config.get("eval_record_components", True))
-    trainer.eval_compute_wass = bool(train_config.get("eval_compute_wass", False))
-
     early_stopping_patience = train_config.get("early_stopping_patience")
     if early_stopping_patience is not None and int(early_stopping_patience) > 0:
         trainer.add_callback(
@@ -2867,8 +3544,30 @@ def main():
 
     resume_path = train_config.get("resume_path")
     resume_trainer_state = bool(train_config.get("resume_trainer_state", True))
+    if dagger_prefix_training and bool(train_config.get("dagger_refresh_at_train_start", True)):
+        trainer.refresh_dagger_prefix_cache(reason="train_start")
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
     trainer.train(resume_from_checkpoint=resume_path if resume_path and resume_trainer_state else None)
     trainer.save_model()
+    dist_ready = torch.distributed.is_available() and torch.distributed.is_initialized()
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+        rank = int(torch.distributed.get_rank())
+    else:
+        rank = 0
+    if dist_ready:
+        try:
+            torch.distributed.destroy_process_group()
+        except Exception as exc:  # noqa: BLE001
+            if rank == 0:
+                print(f"Warning: failed to destroy process group before auto eval: {exc}", flush=True)
+    if rank != 0:
+        return
+    del trainer
+    del model
+    release_cuda_cache()
+    run_auto_rollout_eval_after_train(train_config, output_dir)
 
 
 if __name__ == "__main__":

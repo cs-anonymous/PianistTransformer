@@ -461,6 +461,13 @@ class IntegratedNoteEncoder(nn.Module):
         self.mask_dim = int(getattr(config, "mask_feature_dim", 3))
         self.decoder_target_dim = 7
         self.decoder_target_mask_dim = 3
+        if self.role == "decoder":
+            self.performance_missing_embeddings = nn.Parameter(
+                torch.zeros(self.performance_control_dim, config.hidden_size)
+            )
+            nn.init.normal_(self.performance_missing_embeddings, mean=0.0, std=0.02)
+        else:
+            self.register_parameter("performance_missing_embeddings", None)
 
         self.pitch_projection = _make_mlp(
             self.pitch_factor_dim,
@@ -557,13 +564,27 @@ class IntegratedNoteEncoder(nn.Module):
             )
         return score_control, performance_control, musical, masks
 
-    def forward(self, pitch_ids, continuous, special_note_ids=None):
+    def forward(self, pitch_ids, continuous, special_note_ids=None, performance_missing_mask=None):
         projection_dtype = next(self.parameters()).dtype
         continuous = continuous.to(dtype=projection_dtype)
         pitch_factors = self._pitch_factors(pitch_ids).to(dtype=projection_dtype)
         pitch_embeds = self.pitch_projection(pitch_factors)
 
         score_control, performance_control, musical, masks = self._split_inr0624(continuous)
+        if performance_missing_mask is not None:
+            if self.performance_missing_embeddings is None:
+                raise ValueError("performance_missing_mask is only supported for decoder note inputs")
+            performance_missing_mask = performance_missing_mask.to(
+                dtype=projection_dtype,
+                device=performance_control.device,
+            )
+            if performance_missing_mask.shape != performance_control.shape:
+                raise ValueError(
+                    "performance_missing_mask shape mismatch: "
+                    f"got {tuple(performance_missing_mask.shape)}, expected {tuple(performance_control.shape)}"
+                )
+            performance_missing_mask = performance_missing_mask.clamp(0.0, 1.0)
+            performance_control = performance_control * (1.0 - performance_missing_mask)
         if self.mode == "cine":
             embeddings = self.continuous_mlp(
                 torch.cat([pitch_factors, score_control, performance_control, musical, masks], dim=-1)
@@ -583,6 +604,12 @@ class IntegratedNoteEncoder(nn.Module):
                 + musical_embeds
                 + mask_embeds
             )
+        if performance_missing_mask is not None:
+            missing_embeds = torch.matmul(
+                performance_missing_mask,
+                self.performance_missing_embeddings.to(dtype=projection_dtype),
+            )
+            embeddings = embeddings + missing_embeds
         embeddings = self.norm(embeddings)
         return self._apply_special_embeddings(embeddings, special_note_ids)
 
@@ -2110,6 +2137,8 @@ def _epr_bins_to_normalized(config, ioi_bins, duration_bins, velocity_bins, peda
 def _materialize_binary4_logits(logits, sampling_strategy="mean"):
     probs = torch.sigmoid(logits.float())
     mode_name = str(sampling_strategy).lower()
+    if mode_name in {"soft", "prob", "probs", "probability", "probabilities"}:
+        return probs
     if mode_name in {"sample", "sampling", "stochastic"}:
         return torch.bernoulli(probs)
     return (probs >= 0.5).to(dtype=probs.dtype)
@@ -2119,6 +2148,8 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean", s
     if not _uses_inr_epr_targets(config):
         raise ValueError("EPR materialization only supports INR log_deviation targets")
 
+    strategy_name = str(sampling_strategy).lower()
+    shared_strategy = "mean" if strategy_name in {"soft", "prob", "probs", "probability", "probabilities"} else sampling_strategy
     distribution = getattr(config, "epr_distribution", "point").lower()
     if distribution == "beta_mu_kappa":
         params = _split_epr_distribution_params(raw_outputs)
@@ -2128,7 +2159,7 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean", s
             eps=getattr(config, "beta_eps", 1e-5),
             kappa_min=getattr(config, "beta_kappa_min", 1e-3),
         )
-        mode_name = str(sampling_strategy).lower()
+        mode_name = str(shared_strategy).lower()
         shared = (
             torch.distributions.Beta(shared_alpha, shared_beta).sample()
             if mode_name in {"sample", "sampling", "stochastic"}
@@ -2148,7 +2179,7 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean", s
                 a,
                 b,
                 c,
-                sampling_strategy=sampling_strategy,
+                sampling_strategy=shared_strategy,
             )
 
         shared = torch.stack([decode_shared(0), decode_shared(1), decode_shared(2)], dim=-1)
@@ -2171,6 +2202,36 @@ def _shift_continuous_right(continuous, attention_mask):
         shifted[:, 1:] = prev_values * prev_mask
     shifted = shifted * attention_mask.to(dtype=continuous.dtype).unsqueeze(-1)
     return shifted
+
+
+def _shift_feedback_mask_right(feedback_mask, attention_mask):
+    if feedback_mask is None:
+        return None
+    shifted = torch.zeros_like(feedback_mask)
+    if feedback_mask.shape[1] > 1:
+        prev_values = feedback_mask[:, :-1]
+        prev_mask = attention_mask[:, :-1].to(dtype=feedback_mask.dtype).unsqueeze(-1)
+        shifted[:, 1:] = prev_values * prev_mask
+    shifted = shifted * attention_mask.to(dtype=feedback_mask.dtype).unsqueeze(-1)
+    return shifted
+
+
+def _target_feedback_mask_to_decoder_performance_mask(config, feedback_mask):
+    if feedback_mask is None:
+        return None
+    performance_dim = int(
+        getattr(config, "performance_control_feature_dim", getattr(config, "control_feature_dim", 3) + 4)
+    )
+    if feedback_mask.shape[-1] == performance_dim:
+        return feedback_mask
+    if feedback_mask.shape[-1] < 7:
+        raise ValueError(f"decoder_feedback_mask expects target7 or performance-control mask, got {tuple(feedback_mask.shape)}")
+    decoder_mask = feedback_mask.new_zeros(*feedback_mask.shape[:-1], performance_dim)
+    decoder_mask[..., 0:1] = feedback_mask[..., 0:1]
+    decoder_mask[..., 1:2] = feedback_mask[..., 1:2]
+    decoder_mask[..., 2:3] = feedback_mask[..., 2:3]
+    decoder_mask[..., 3:7] = feedback_mask[..., 3:7]
+    return decoder_mask
 
 
 def _shift_pitch_right(config, pitch_ids, attention_mask):
@@ -3041,7 +3102,10 @@ class IntegratedPianoTransformer(IntegratedStyleTokenMixin, nn.Module):
         continuous: Optional[torch.FloatTensor] = None,
         score_shared_raw: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
+        example_index: Optional[torch.LongTensor] = None,
         labels_continuous: Optional[torch.FloatTensor] = None,
+        decoder_feedback_continuous: Optional[torch.FloatTensor] = None,
+        decoder_feedback_mask: Optional[torch.FloatTensor] = None,
         labels_epr_bins: Optional[torch.LongTensor] = None,
         label_mask: Optional[torch.LongTensor] = None,
         interpolated: Optional[torch.BoolTensor] = None,
@@ -3053,7 +3117,7 @@ class IntegratedPianoTransformer(IntegratedStyleTokenMixin, nn.Module):
         continuous_sampling_strategy: str = "mean",
         **kwargs,
     ) -> Seq2SeqLMOutput:
-        del interpolated, kwargs
+        del interpolated, example_index, kwargs
         if pitch_ids is None or continuous is None:
             raise ValueError("pitch_ids and continuous are required")
         if _uses_inr_epr_targets(self.config) and score_shared_raw is None:
@@ -3085,13 +3149,18 @@ class IntegratedPianoTransformer(IntegratedStyleTokenMixin, nn.Module):
             if self.backbone_type != "gpt":
                 raise ValueError("decoder_input_mode='ar' is supported for gpt in IntegratedPianoTransformer")
             if labels_continuous is not None:
+                feedback_continuous = decoder_feedback_continuous if decoder_feedback_continuous is not None else labels_continuous
                 decoder_target_continuous = _build_ar_note_continuous(
                     self.config,
-                    labels_continuous,
+                    feedback_continuous,
                     score_shared_raw=score_shared_raw,
                     task_type=self.config.task_type,
                 )
                 decoder_input_continuous = _shift_continuous_right(decoder_target_continuous, attention_mask)
+                decoder_missing_mask = _shift_feedback_mask_right(
+                    _target_feedback_mask_to_decoder_performance_mask(self.config, decoder_feedback_mask),
+                    attention_mask,
+                )
                 special_note_ids = _build_ar_special_note_ids(self.config, attention_mask)
                 if self.training:
                     decoder_input_continuous, special_note_ids = _apply_prior_note_dropout(
@@ -3105,6 +3174,7 @@ class IntegratedPianoTransformer(IntegratedStyleTokenMixin, nn.Module):
                     decoder_pitch_ids,
                     decoder_input_continuous,
                     special_note_ids=special_note_ids,
+                    performance_missing_mask=decoder_missing_mask,
                 )
                 performance_embeds = self._apply_style_to_decoder_inputs(
                     performance_embeds,
@@ -3351,6 +3421,8 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
         score_note_embeds,
         attention_mask,
         labels_continuous=None,
+        decoder_feedback_continuous=None,
+        decoder_feedback_mask=None,
     ):
         decoder_mode = self.config.decoder_input_mode.lower()
         if decoder_mode == "score":
@@ -3358,13 +3430,18 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
         if decoder_mode == "ar":
             if labels_continuous is None:
                 return None, None
+            feedback_continuous = decoder_feedback_continuous if decoder_feedback_continuous is not None else labels_continuous
             decoder_target_continuous = _build_ar_note_continuous(
                 self.config,
-                labels_continuous,
+                feedback_continuous,
                 score_shared_raw=score_shared_raw,
                 task_type=self.config.task_type,
             )
             decoder_input_continuous = _shift_continuous_right(decoder_target_continuous, attention_mask)
+            decoder_missing_mask = _shift_feedback_mask_right(
+                _target_feedback_mask_to_decoder_performance_mask(self.config, decoder_feedback_mask),
+                attention_mask,
+            )
             special_note_ids = _build_ar_special_note_ids(self.config, attention_mask)
             if self.training:
                 decoder_input_continuous, special_note_ids = _apply_prior_note_dropout(
@@ -3378,6 +3455,7 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
                 decoder_pitch_ids,
                 decoder_input_continuous,
                 special_note_ids=special_note_ids,
+                performance_missing_mask=decoder_missing_mask,
             )
             return decoder_inputs_embeds, attention_mask
         raise ValueError(f"Unsupported decoder_input_mode: {self.config.decoder_input_mode}")
@@ -3388,7 +3466,10 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
         continuous: Optional[torch.FloatTensor] = None,
         score_shared_raw: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
+        example_index: Optional[torch.LongTensor] = None,
         labels_continuous: Optional[torch.FloatTensor] = None,
+        decoder_feedback_continuous: Optional[torch.FloatTensor] = None,
+        decoder_feedback_mask: Optional[torch.FloatTensor] = None,
         labels_epr_bins: Optional[torch.LongTensor] = None,
         label_mask: Optional[torch.LongTensor] = None,
         interpolated: Optional[torch.BoolTensor] = None,
@@ -3407,7 +3488,7 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
         continuous_sampling_strategy: str = "mean",
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple[torch.FloatTensor], Seq2SeqLMOutput]:
-        del interpolated
+        del interpolated, example_index
 
         if self.training and self.config._attn_implementation != "eager":
             msg = (
@@ -3447,6 +3528,8 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
             score_note_embeds,
             attention_mask,
             labels_continuous=labels_continuous,
+            decoder_feedback_continuous=decoder_feedback_continuous,
+            decoder_feedback_mask=decoder_feedback_mask,
         )
         if decoder_inputs_embeds is not None:
             decoder_inputs_embeds = self._apply_style_to_decoder_inputs(

@@ -41,6 +41,12 @@ def parse_args():
     parser.add_argument("--split", type=str, default="test")
     parser.add_argument("--protocol", choices=["deterministic", "sampling"], default="deterministic")
     parser.add_argument(
+        "--sampling-strategy",
+        choices=["mean", "greedy", "sample"],
+        default=None,
+        help="Override output materialization.",
+    )
+    parser.add_argument(
         "--deterministic-strategy",
         choices=["greedy", "mean"],
         default="greedy",
@@ -88,6 +94,8 @@ def parse_args():
 
 
 def resolve_sampling_strategy(args):
+    if args.sampling_strategy is not None:
+        return str(args.sampling_strategy).lower()
     if args.protocol == "sampling":
         return "sample"
     return str(args.deterministic_strategy).lower()
@@ -749,6 +757,7 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
             "score_source": score_source,
             "performance_source": plan.get("performance_source"),
             "protocol": args.protocol,
+            "sampling_strategy": sampling_strategy,
             "deterministic_strategy": args.deterministic_strategy if args.protocol == "deterministic" else None,
             "sample_idx": sample_idx,
             "seed": sample_seed,
