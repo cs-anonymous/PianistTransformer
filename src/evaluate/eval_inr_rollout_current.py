@@ -22,8 +22,12 @@ from src.inference.infer_inr_testset import select_device, select_worker_device
 from src.model.integrated_pianoformer import (
     _build_ar_note_continuous,
     _build_ar_special_note_ids,
+    _decode_mixture_value,
+    _logistic_normal_params,
     _materialize_epr_prediction,
     _shift_pitch_right,
+    _shared_scalar_params,
+    _split_epr_mixture_params,
     _target7_to_raw7,
 )
 from src.train.train_inr import (
@@ -64,6 +68,8 @@ TARGET_DISTRIBUTION_KEYS = [
     ("pedal_75", "Pedal 75%"),
 ]
 
+TIMING_HEAD_FEATURES = [("ioi", 0), ("duration", 1)]
+
 POSITION_FEATURES = [
     ("ioi_log_dev", 0),
     ("duration_log_dev", 1),
@@ -73,6 +79,216 @@ POSITION_FEATURES = [
     ("pedal_50", 5),
     ("pedal_75", 6),
 ]
+
+
+def _temperature_mixture_value(config, logits, raw_mu, raw_log_sigma, sampling_strategy="mean", temperature=1.0):
+    temperature = float(temperature)
+    mode = str(sampling_strategy).lower()
+    if temperature == 1.0 or mode not in {"sample", "sampling", "stochastic"}:
+        return _decode_mixture_value(
+            config,
+            logits,
+            raw_mu,
+            raw_log_sigma,
+            None,
+            sampling_strategy=sampling_strategy,
+        )
+
+    mu, sigma = _logistic_normal_params(
+        raw_mu,
+        raw_log_sigma,
+        sigma_min=getattr(config, "logistic_normal_sigma_min", 1e-3),
+        sigma_max=getattr(config, "logistic_normal_sigma_max", 10.0),
+    )
+    probs = torch.softmax(logits.float(), dim=-1)
+    if temperature <= 0.0:
+        return torch.sum(probs * torch.sigmoid(mu), dim=-1)
+
+    component_probs = torch.softmax(logits.float() / max(temperature, 1e-6), dim=-1)
+    index = torch.distributions.Categorical(probs=component_probs).sample().unsqueeze(-1)
+    sampled_mu = mu.gather(dim=-1, index=index).squeeze(-1)
+    sampled_sigma = sigma.gather(dim=-1, index=index).squeeze(-1)
+    return torch.sigmoid(torch.distributions.Normal(sampled_mu, sampled_sigma * temperature).sample())
+
+
+def materialize_epr_prediction_eval(
+    config,
+    raw_outputs,
+    sampling_strategy="mean",
+    score_shared_raw=None,
+    continuous_temperature=1.0,
+):
+    temperature = float(continuous_temperature)
+    if temperature == 1.0:
+        return _materialize_epr_prediction(
+            config,
+            raw_outputs,
+            sampling_strategy=sampling_strategy,
+            score_shared_raw=score_shared_raw,
+        )
+
+    distribution = str(getattr(config, "epr_distribution", "point")).lower()
+    if distribution != "mixture_logistic_normal":
+        return _materialize_epr_prediction(
+            config,
+            raw_outputs,
+            sampling_strategy=sampling_strategy,
+            score_shared_raw=score_shared_raw,
+        )
+
+    params = _split_epr_mixture_params(config, raw_outputs)
+    shared_values = []
+    for index in range(3):
+        logits, raw_mu, raw_log_sigma, raw_extra = _shared_scalar_params(config, params, index)
+        if raw_extra is not None:
+            return _materialize_epr_prediction(
+                config,
+                raw_outputs,
+                sampling_strategy=sampling_strategy,
+                score_shared_raw=score_shared_raw,
+            )
+        shared_values.append(
+            _temperature_mixture_value(
+                config,
+                logits,
+                raw_mu,
+                raw_log_sigma,
+                sampling_strategy=sampling_strategy,
+                temperature=temperature,
+            )
+        )
+    shared = torch.stack(shared_values, dim=-1)
+    pedal = _materialize_epr_prediction(
+        config,
+        raw_outputs,
+        sampling_strategy=sampling_strategy,
+        score_shared_raw=score_shared_raw,
+    )[..., 3:7]
+    return torch.cat([shared, pedal], dim=-1)
+
+
+def empty_head_stats(config):
+    components = int(config.get("epr_mixture_components", 1)) if isinstance(config, dict) else int(getattr(config, "epr_mixture_components", 1))
+    base_keys = [
+        "pred_mean_norm",
+        "pred_mode_norm",
+        "pred_std_norm",
+        "weighted_mu_z",
+        "weighted_sigma_z",
+        "top_weight",
+        "weight_entropy",
+    ]
+    store = {}
+    for feature, _ in TIMING_HEAD_FEATURES:
+        stats = {"n": 0.0, **{key: 0.0 for key in base_keys}}
+        for idx in range(components):
+            stats[f"comp{idx}_weight"] = 0.0
+            stats[f"comp{idx}_mu_z"] = 0.0
+            stats[f"comp{idx}_sigma_z"] = 0.0
+            stats[f"comp{idx}_loc_norm"] = 0.0
+        store[feature] = stats
+    return store
+
+
+def update_head_stats(store, config, raw_outputs, attention_mask):
+    if store is None:
+        return
+    distribution = str(getattr(config, "epr_distribution", "point")).lower()
+    if distribution != "mixture_logistic_normal":
+        return
+
+    params = _split_epr_mixture_params(config, raw_outputs)
+    mask = attention_mask.detach().bool()
+    if mask.ndim == 3:
+        mask = mask.squeeze(-1)
+    if not mask.any():
+        return
+
+    for feature, index in TIMING_HEAD_FEATURES:
+        logits, raw_mu, raw_log_sigma, raw_extra = _shared_scalar_params(config, params, index)
+        if raw_extra is not None:
+            continue
+        mu, sigma = _logistic_normal_params(
+            raw_mu,
+            raw_log_sigma,
+            sigma_min=getattr(config, "logistic_normal_sigma_min", 1e-3),
+            sigma_max=getattr(config, "logistic_normal_sigma_max", 10.0),
+        )
+        probs = torch.softmax(logits.float(), dim=-1)
+        loc_norm = torch.sigmoid(mu)
+        pred_mean = torch.sum(probs * loc_norm, dim=-1)
+        top_index = probs.argmax(dim=-1, keepdim=True)
+        pred_mode = loc_norm.gather(dim=-1, index=top_index).squeeze(-1)
+        top_weight = probs.gather(dim=-1, index=top_index).squeeze(-1)
+        derivative = loc_norm * (1.0 - loc_norm)
+        component_var = (derivative * sigma).square()
+        pred_var = torch.sum(probs * (component_var + (loc_norm - pred_mean.unsqueeze(-1)).square()), dim=-1)
+        pred_std = pred_var.clamp_min(0.0).sqrt()
+        weighted_mu = torch.sum(probs * mu, dim=-1)
+        weighted_sigma = torch.sum(probs * sigma, dim=-1)
+        entropy = -torch.sum(probs * torch.log(probs.clamp_min(1e-12)), dim=-1)
+
+        masked_count = float(mask.sum().detach().cpu().item())
+        stats = store[feature]
+        stats["n"] += masked_count
+        for key, values in (
+            ("pred_mean_norm", pred_mean),
+            ("pred_mode_norm", pred_mode),
+            ("pred_std_norm", pred_std),
+            ("weighted_mu_z", weighted_mu),
+            ("weighted_sigma_z", weighted_sigma),
+            ("top_weight", top_weight),
+            ("weight_entropy", entropy),
+        ):
+            stats[key] += float(values.detach()[mask].float().sum().cpu().item())
+        for comp_idx in range(probs.shape[-1]):
+            for key, values in (
+                (f"comp{comp_idx}_weight", probs[..., comp_idx]),
+                (f"comp{comp_idx}_mu_z", mu[..., comp_idx]),
+                (f"comp{comp_idx}_sigma_z", sigma[..., comp_idx]),
+                (f"comp{comp_idx}_loc_norm", loc_norm[..., comp_idx]),
+            ):
+                stats[key] += float(values.detach()[mask].float().sum().cpu().item())
+
+
+def finalize_head_stats(store):
+    if store is None:
+        return None
+    output = {}
+    for feature, stats in store.items():
+        n = float(stats.get("n", 0.0))
+        if n <= 0.0:
+            output[feature] = {"n": 0}
+            continue
+        output[feature] = {key: (int(n) if key == "n" else float(value) / n) for key, value in stats.items()}
+    return output
+
+
+def aggregate_head_stats(items, rollout_ks):
+    rows = []
+    for rollout_k in rollout_ks:
+        label = k_label(rollout_k)
+        by_feature = {feature: {} for feature, _ in TIMING_HEAD_FEATURES}
+        for item in items:
+            head_stats = item.get("by_k", {}).get(label, {}).get("head_stats") or {}
+            for feature, stats in head_stats.items():
+                n = float(stats.get("n", 0.0))
+                if n <= 0.0:
+                    continue
+                accum = by_feature.setdefault(feature, {})
+                accum["n"] = accum.get("n", 0.0) + n
+                for key, value in stats.items():
+                    if key == "n":
+                        continue
+                    accum[key] = accum.get(key, 0.0) + float(value) * n
+        for feature, accum in by_feature.items():
+            n = float(accum.get("n", 0.0))
+            if n <= 0.0:
+                continue
+            row = {"k": label, "feature": feature, "n": int(n)}
+            row.update({key: float(value) / n for key, value in sorted(accum.items()) if key != "n"})
+            rows.append(row)
+    return rows
 
 
 def parse_args():
@@ -125,6 +341,17 @@ def parse_args():
     parser.add_argument("--plot-distributions", action="store_true")
     parser.add_argument("--save-distribution-values", action="store_true")
     parser.add_argument("--window-position-stats", action="store_true")
+    parser.add_argument(
+        "--head-stats",
+        action="store_true",
+        help="Aggregate timing-head distribution parameters by rollout k.",
+    )
+    parser.add_argument(
+        "--continuous-temperature",
+        type=float,
+        default=1.0,
+        help="Sampling temperature for EPR shared continuous heads; 0 uses deterministic means.",
+    )
     return parser.parse_args()
 
 
@@ -142,6 +369,27 @@ def feature_wasserstein(pred_values, gt_values):
     if len(pred_values) == 0 or len(gt_values) == 0:
         return float("nan")
     return float(wasserstein_distance(pred_values, gt_values))
+
+
+def finite_std(values):
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    return float(np.std(values)) if len(values) else float("nan")
+
+
+def finite_mean_shift(pred_values, gt_values):
+    pred_values, gt_values = finite_pairs(pred_values, gt_values)
+    if len(pred_values) == 0:
+        return float("nan")
+    return float(np.mean(pred_values - gt_values))
+
+
+def finite_std_ratio(pred_values, gt_values):
+    pred_std = finite_std(pred_values)
+    gt_std = finite_std(gt_values)
+    if not np.isfinite(pred_std) or not np.isfinite(gt_std) or gt_std <= 1e-12:
+        return float("nan")
+    return float(pred_std / gt_std)
 
 
 def parse_rollout_ks(text):
@@ -426,7 +674,29 @@ def aggregate_score_metrics(rows, section):
 
 
 def aggregate_pairwise(rows):
-    keys = ["loss", "ioi_wass", "duration_wass", "velocity_wass", "pedal_wass"]
+    keys = [
+        "loss",
+        "ioi_wass",
+        "duration_wass",
+        "velocity_wass",
+        "pedal_wass",
+        "ioi_ms_mean_shift",
+        "duration_ms_mean_shift",
+        "ioi_ms_std_ratio",
+        "duration_ms_std_ratio",
+        "ioi_logdev_mean_shift",
+        "duration_logdev_mean_shift",
+        "ioi_logdev_std_ratio",
+        "duration_logdev_std_ratio",
+        "ioi_logdev_pred_mean",
+        "duration_logdev_pred_mean",
+        "ioi_logdev_gt_mean",
+        "duration_logdev_gt_mean",
+        "ioi_logdev_pred_std",
+        "duration_logdev_pred_std",
+        "ioi_logdev_gt_std",
+        "duration_logdev_gt_std",
+    ]
     total_weight = float(sum(max(0, int(row.get("num_rows", 0))) for row in rows))
     output = {"num_rows": int(total_weight)}
     for key in keys:
@@ -443,6 +713,24 @@ def aggregate_pairwise(rows):
 
 
 def pairwise_summary(rows):
+    timing_keys = [
+        "ioi_ms_mean_shift",
+        "duration_ms_mean_shift",
+        "ioi_ms_std_ratio",
+        "duration_ms_std_ratio",
+        "ioi_logdev_mean_shift",
+        "duration_logdev_mean_shift",
+        "ioi_logdev_std_ratio",
+        "duration_logdev_std_ratio",
+        "ioi_logdev_pred_mean",
+        "duration_logdev_pred_mean",
+        "ioi_logdev_gt_mean",
+        "duration_logdev_gt_mean",
+        "ioi_logdev_pred_std",
+        "duration_logdev_pred_std",
+        "ioi_logdev_gt_std",
+        "duration_logdev_gt_std",
+    ]
     return {
         "num_rows": int(len(rows)),
         "loss": finite_mean([row.get("loss", float("nan")) for row in rows]),
@@ -450,10 +738,21 @@ def pairwise_summary(rows):
         "duration_wass": finite_mean([row.get("duration_wass", float("nan")) for row in rows]),
         "velocity_wass": finite_mean([row.get("velocity_wass", float("nan")) for row in rows]),
         "pedal_wass": finite_mean([row.get("pedal_wass", float("nan")) for row in rows]),
+        **{key: finite_mean([row.get(key, float("nan")) for row in rows]) for key in timing_keys},
     }
 
 
-def predict_tf_batch(model, pitch_ids, continuous, score_shared_raw, labels_continuous, attention_mask, sampling_strategy):
+def predict_tf_batch(
+    model,
+    pitch_ids,
+    continuous,
+    score_shared_raw,
+    labels_continuous,
+    attention_mask,
+    sampling_strategy,
+    continuous_temperature=1.0,
+    head_stats=None,
+):
     with torch.no_grad():
         outputs = model(
             pitch_ids=pitch_ids,
@@ -463,11 +762,13 @@ def predict_tf_batch(model, pitch_ids, continuous, score_shared_raw, labels_cont
             attention_mask=attention_mask,
             continuous_sampling_strategy=sampling_strategy,
         )
-        pred = _materialize_epr_prediction(
+        update_head_stats(head_stats, model.config, outputs.logits, attention_mask)
+        pred = materialize_epr_prediction_eval(
             model.config,
             outputs.logits,
             sampling_strategy=sampling_strategy,
             score_shared_raw=score_shared_raw,
+            continuous_temperature=continuous_temperature,
         )
     loss_value = float(outputs.loss.detach().float().cpu()) if outputs.loss is not None else float("nan")
     return pred.detach().float().cpu(), loss_value
@@ -497,6 +798,8 @@ def predict_partial_t5_batch(
     feedback_strategy,
     feedback_mode,
     feedback_targets,
+    continuous_temperature=1.0,
+    head_stats=None,
 ):
     config = model.config
     batch_size, seq_len = pitch_ids.shape
@@ -549,20 +852,23 @@ def predict_partial_t5_batch(
             decoder_inputs_embeds=decoder_inputs_embeds,
         )
         step_raw = model.continuous_decoder(decoder_outputs.last_hidden_state[:, -1:, :])
-        step_pred = _materialize_epr_prediction(
+        update_head_stats(head_stats, config, step_raw, attention_mask[:, step : step + 1])
+        step_pred = materialize_epr_prediction_eval(
             config,
             step_raw,
             sampling_strategy=sampling_strategy,
             score_shared_raw=score_shared_raw[:, step : step + 1],
+            continuous_temperature=continuous_temperature,
         )
         if feedback_strategy == sampling_strategy:
             step_feedback = step_pred
         else:
-            step_feedback = _materialize_epr_prediction(
+            step_feedback = materialize_epr_prediction_eval(
                 config,
                 step_raw,
                 sampling_strategy=feedback_strategy,
                 score_shared_raw=score_shared_raw[:, step : step + 1],
+                continuous_temperature=continuous_temperature,
             )
         predictions[:, step : step + 1] = torch.where(
             active.view(batch_size, 1, 1),
@@ -589,6 +895,8 @@ def predict_batch(
     feedback_strategy,
     feedback_mode,
     feedback_targets,
+    continuous_temperature=1.0,
+    head_stats=None,
 ):
     if rollout_k == 0:
         return predict_tf_batch(
@@ -599,9 +907,13 @@ def predict_batch(
             labels_continuous,
             attention_mask,
             sampling_strategy,
+            continuous_temperature=continuous_temperature,
+            head_stats=head_stats,
         )
     if (
         rollout_k is None
+        and float(continuous_temperature) == 1.0
+        and head_stats is None
         and str(feedback_mode).lower() == "pollute"
         and str(feedback_targets).lower() == "all"
         and str(feedback_strategy).lower() == str(sampling_strategy).lower()
@@ -622,6 +934,8 @@ def predict_batch(
             feedback_strategy,
             feedback_mode,
             feedback_targets,
+            continuous_temperature=continuous_temperature,
+            head_stats=head_stats,
         )
 
 
@@ -728,6 +1042,8 @@ def predict_score_for_k(
     feedback_mode,
     feedback_targets,
     collect_position_stats=False,
+    continuous_temperature=1.0,
+    head_stats=None,
 ):
     total_notes = len(pitch)
     pred_sum = None
@@ -764,6 +1080,8 @@ def predict_score_for_k(
             feedback_strategy,
             feedback_mode,
             feedback_targets,
+            continuous_temperature=continuous_temperature,
+            head_stats=head_stats,
         )
         if np.isfinite(loss_value):
             losses.append(loss_value)
@@ -902,6 +1220,7 @@ def predict_work(model, device, config, item, args, rollout_ks):
         pair_rows = []
         distributions = empty_distributions() if (args.plot_distributions or args.save_distribution_values) else None
         window_position = empty_position_values() if args.window_position_stats else None
+        head_stats = empty_head_stats(config) if args.head_stats else None
         for perf in perfs:
             labels = labels_for_perf(config, perf, score_shared_raw)
             if rollout_k is not None and int(rollout_k) in kpass_results.get(perf.get("performance_source"), {}):
@@ -928,6 +1247,8 @@ def predict_work(model, device, config, item, args, rollout_ks):
                     args.feedback_mode,
                     args.feedback_targets,
                     collect_position_stats=args.window_position_stats,
+                    continuous_temperature=args.continuous_temperature,
+                    head_stats=head_stats,
                 )
             score_raw_tensor = torch.tensor(score_shared_raw, dtype=torch.float32)
             pred_raw = _target7_to_raw7(score_raw_tensor, pred_target.float(), config=config).cpu().numpy()
@@ -954,6 +1275,22 @@ def predict_work(model, device, config, item, args, rollout_ks):
                             for key in ("pedal_0", "pedal_25", "pedal_50", "pedal_75")
                         ]
                     ),
+                    "ioi_ms_mean_shift": finite_mean_shift(pred_raw[:, 0], target_raw[:, 0]),
+                    "duration_ms_mean_shift": finite_mean_shift(pred_raw[:, 1], target_raw[:, 1]),
+                    "ioi_ms_std_ratio": finite_std_ratio(pred_raw[:, 0], target_raw[:, 0]),
+                    "duration_ms_std_ratio": finite_std_ratio(pred_raw[:, 1], target_raw[:, 1]),
+                    "ioi_logdev_mean_shift": finite_mean_shift(pred_target[:, 0], target_tensor[:, 0]),
+                    "duration_logdev_mean_shift": finite_mean_shift(pred_target[:, 1], target_tensor[:, 1]),
+                    "ioi_logdev_std_ratio": finite_std_ratio(pred_target[:, 0], target_tensor[:, 0]),
+                    "duration_logdev_std_ratio": finite_std_ratio(pred_target[:, 1], target_tensor[:, 1]),
+                    "ioi_logdev_pred_mean": finite_mean(pred_target[:, 0]),
+                    "duration_logdev_pred_mean": finite_mean(pred_target[:, 1]),
+                    "ioi_logdev_gt_mean": finite_mean(target_tensor[:, 0]),
+                    "duration_logdev_gt_mean": finite_mean(target_tensor[:, 1]),
+                    "ioi_logdev_pred_std": finite_std(pred_target[:, 0]),
+                    "duration_logdev_pred_std": finite_std(pred_target[:, 1]),
+                    "ioi_logdev_gt_std": finite_std(target_tensor[:, 0]),
+                    "duration_logdev_gt_std": finite_std(target_tensor[:, 1]),
                 }
             )
         by_k[label] = {
@@ -967,6 +1304,8 @@ def predict_work(model, device, config, item, args, rollout_ks):
             by_k[label]["distributions"] = distributions
         if window_position is not None:
             by_k[label]["window_position"] = window_position
+        if head_stats is not None:
+            by_k[label]["head_stats"] = finalize_head_stats(head_stats)
     return {"score_source": item["score_source"], "by_k": by_k}
 
 
@@ -997,6 +1336,22 @@ def write_curve_csv(path, aggregate_by_k, rollout_ks):
                 "pairwise_duration_wass": agg["pairwise"].get("duration_wass"),
                 "pairwise_velocity_wass": agg["pairwise"].get("velocity_wass"),
                 "pairwise_pedal_wass": agg["pairwise"].get("pedal_wass"),
+                "pairwise_ioi_ms_mean_shift": agg["pairwise"].get("ioi_ms_mean_shift"),
+                "pairwise_duration_ms_mean_shift": agg["pairwise"].get("duration_ms_mean_shift"),
+                "pairwise_ioi_ms_std_ratio": agg["pairwise"].get("ioi_ms_std_ratio"),
+                "pairwise_duration_ms_std_ratio": agg["pairwise"].get("duration_ms_std_ratio"),
+                "pairwise_ioi_logdev_mean_shift": agg["pairwise"].get("ioi_logdev_mean_shift"),
+                "pairwise_duration_logdev_mean_shift": agg["pairwise"].get("duration_logdev_mean_shift"),
+                "pairwise_ioi_logdev_std_ratio": agg["pairwise"].get("ioi_logdev_std_ratio"),
+                "pairwise_duration_logdev_std_ratio": agg["pairwise"].get("duration_logdev_std_ratio"),
+                "pairwise_ioi_logdev_pred_mean": agg["pairwise"].get("ioi_logdev_pred_mean"),
+                "pairwise_duration_logdev_pred_mean": agg["pairwise"].get("duration_logdev_pred_mean"),
+                "pairwise_ioi_logdev_gt_mean": agg["pairwise"].get("ioi_logdev_gt_mean"),
+                "pairwise_duration_logdev_gt_mean": agg["pairwise"].get("duration_logdev_gt_mean"),
+                "pairwise_ioi_logdev_pred_std": agg["pairwise"].get("ioi_logdev_pred_std"),
+                "pairwise_duration_logdev_pred_std": agg["pairwise"].get("duration_logdev_pred_std"),
+                "pairwise_ioi_logdev_gt_std": agg["pairwise"].get("ioi_logdev_gt_std"),
+                "pairwise_duration_logdev_gt_std": agg["pairwise"].get("duration_logdev_gt_std"),
                 "pp_ioi_wass": agg["pp_wass"].get("ioi_wass"),
                 "pp_duration_wass": agg["pp_wass"].get("duration_wass"),
                 "pp_velocity_wass": agg["pp_wass"].get("velocity_wass"),
@@ -1010,6 +1365,19 @@ def write_curve_csv(path, aggregate_by_k, rollout_ks):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_head_stats_csv(path, rows):
+    if not rows:
+        return
+    fieldnames = ["k", "feature", "n"]
+    extra = sorted({key for row in rows for key in row.keys() if key not in set(fieldnames)})
+    fieldnames.extend(extra)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -1296,10 +1664,13 @@ def main():
     manifest = filter_manifest(manifest, load_score_source_filter(args))
     items = run_pool(args, config, manifest, rollout_ks) if int(args.num_workers) > 1 else run_single(args, config, manifest, rollout_ks)
     aggregate_by_k = aggregate_items(items, rollout_ks)
+    head_stats_rows = aggregate_head_stats(items, rollout_ks) if args.head_stats else []
     if args.plot_distributions:
         write_distribution_plots(args.output_dir, items, rollout_ks)
     if args.window_position_stats:
         write_window_position_stats(args.output_dir / "window_position_stats.csv", items, rollout_ks)
+    if args.head_stats:
+        write_head_stats_csv(args.output_dir / "timing_head_stats.csv", head_stats_rows)
     if args.plot_distributions and not args.save_distribution_values:
         strip_distributions(items)
     if args.window_position_stats:
@@ -1313,9 +1684,11 @@ def main():
         "feedback_strategy": args.feedback_strategy or args.materialize_strategy,
         "feedback_mode": args.feedback_mode,
         "feedback_targets": args.feedback_targets,
+        "continuous_temperature": args.continuous_temperature,
         "rollout_ks": [k_label(value) for value in rollout_ks],
         "num_scores": len(items),
         "aggregate_by_k": aggregate_by_k,
+        "head_stats": head_stats_rows,
         "items": items,
     }
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
