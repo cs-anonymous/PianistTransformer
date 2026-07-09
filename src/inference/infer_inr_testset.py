@@ -1204,6 +1204,7 @@ def main():
         min_notes=config["min_notes"],
         max_works=None if (args.performance_dataset is not None or args.exclude_performance_dataset is not None) else args.max_works,
         skip_work_paths=config.get("skip_work_paths"),
+        prepared_sidecar_tag=config.get("prepared_sidecar_tag"),
     )
     manifest = filter_manifest_by_performance_dataset(
         manifest,

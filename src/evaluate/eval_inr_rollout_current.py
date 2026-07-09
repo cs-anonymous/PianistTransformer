@@ -1910,6 +1910,7 @@ def main():
         max_works=args.max_works,
         skip_work_paths=config.get("skip_work_paths"),
         performance_dataset=args.performance_dataset,
+        prepared_sidecar_tag=config.get("prepared_sidecar_tag"),
     )
     manifest = filter_manifest(manifest, load_score_source_filter(args))
     items = run_pool(args, config, manifest, rollout_ks) if int(args.num_workers) > 1 else run_single(args, config, manifest, rollout_ks)

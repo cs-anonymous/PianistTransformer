@@ -3788,6 +3788,7 @@ def main():
             window_split_scheme=fixed_window_split_scheme,
             window_split_name=train_config.get("fixed_window_train_split_name", "train"),
             window_split_summary_path=fixed_window_split_summary_path,
+            prepared_sidecar_tag=train_config.get("prepared_sidecar_tag"),
         )
     else:
         train_manifest = build_work_manifest(
@@ -3801,6 +3802,7 @@ def main():
             skip_work_paths=train_config.get("skip_work_paths"),
             performance_dataset=train_config.get("train_performance_dataset"),
             exclude_performance_dataset=train_config.get("train_exclude_performance_dataset"),
+            prepared_sidecar_tag=train_config.get("prepared_sidecar_tag"),
         )
     if fixed_window_split_scheme:
         eval_manifest = build_work_manifest(
@@ -3820,6 +3822,7 @@ def main():
             window_split_scheme=fixed_window_split_scheme,
             window_split_name=train_config.get("fixed_window_eval_split_name", "valid"),
             window_split_summary_path=fixed_window_split_summary_path,
+            prepared_sidecar_tag=train_config.get("prepared_sidecar_tag"),
         )
         train_config["eval_split"] = train_config.get("fixed_window_eval_split_name", "valid")
     else:
@@ -3837,6 +3840,7 @@ def main():
             skip_work_paths=train_config.get("skip_work_paths"),
             performance_dataset=train_config.get("eval_performance_dataset"),
             exclude_performance_dataset=train_config.get("eval_exclude_performance_dataset"),
+            prepared_sidecar_tag=train_config.get("prepared_sidecar_tag"),
         )
 
     max_train_epochs = float(train_config.get("max_train_epochs", 8.0))

@@ -45,9 +45,19 @@ def make_windows(total_notes, block_notes, overlap_ratio, min_notes):
     return deduped
 
 
-def work_token_count(path, metadata_note_count):
-    sidecar_path = Path(path).with_suffix(".pt")
-    if sidecar_path.exists():
+def work_token_count(path, metadata_note_count, prepared_sidecar_tag=None):
+    source = Path(path)
+    sidecar_paths = []
+    if prepared_sidecar_tag:
+        sidecar_paths.append(source.with_suffix(f".{prepared_sidecar_tag}.pt"))
+    sidecar_paths.append(source.with_suffix(".pt"))
+
+    seen = set()
+    for sidecar_path in sidecar_paths:
+        sidecar_path = Path(sidecar_path)
+        if str(sidecar_path) in seen or not sidecar_path.exists():
+            continue
+        seen.add(str(sidecar_path))
         try:
             payload = torch.load(sidecar_path, map_location="cpu", weights_only=False)
         except TypeError:
@@ -95,6 +105,7 @@ def build_work_manifest(
     window_split_scheme=None,
     window_split_name=None,
     window_split_summary_path=None,
+    prepared_sidecar_tag=None,
 ):
     columns = [
         "tier_a",
@@ -143,7 +154,11 @@ def build_work_manifest(
         if str(path) in skip_work_paths or score_rel_path in skip_work_paths:
             print(f"Skipping configured work JSON: {path}", flush=True)
             continue
-        note_count = work_token_count(path, group["refined_score_note_count"].iloc[0])
+        note_count = work_token_count(
+            path,
+            group["refined_score_note_count"].iloc[0],
+            prepared_sidecar_tag=prepared_sidecar_tag,
+        )
         windows = make_windows(note_count, block_notes, overlap_ratio, min_notes)
         if window_split_scheme is not None and window_split_name is not None:
             windows = load_windows_from_fixed_split(
