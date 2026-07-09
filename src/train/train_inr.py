@@ -3078,9 +3078,9 @@ def create_model(train_config):
     decoder_note_schema = decoder_note_input_schema(train_config)
     if input_feature_mode != "integrated":
         raise ValueError(f"INR0624 only supports input_feature_mode=integrated, got {input_feature_mode}")
-    if note_embedding_mode not in {"sine", "cine", "split_score_perf"}:
+    if note_embedding_mode not in {"sine", "cine", "slot_attribute"}:
         raise ValueError(
-            f"INR0624 only supports note_embedding_mode in {{'sine', 'cine', 'split_score_perf'}}, "
+            f"INR0624 only supports note_embedding_mode in {{'sine', 'cine', 'slot_attribute'}}, "
             f"got {note_embedding_mode}"
         )
     if task_type == "epr":
@@ -3330,6 +3330,10 @@ def create_model(train_config):
         head_depth=train_config.get("head_depth", 2),
         head_width_multiplier=train_config.get("head_width_multiplier", 1.0),
         head_activation=train_config.get("head_activation", "gelu"),
+        slot_version=train_config.get("slot_version"),
+        slot_dim=train_config.get("slot_dim"),
+        slot_fusion=train_config.get("slot_fusion", "mlp"),
+        slot_gates=train_config.get("slot_gates", False),
         decoder_head_layout=train_config.get("decoder_head_layout", "pyramid4"),
         decoder_head_expand_ratio=train_config.get("decoder_head_expand_ratio", 2.0),
         decoder_head_shrink_ratio=train_config.get("decoder_head_shrink_ratio", 0.5),
@@ -3355,6 +3359,7 @@ def create_model(train_config):
         soft_ce_tau=train_config.get("soft_ce_tau"),
         timing_input_normalization=train_config.get("timing_input_normalization", "scaled_log_5000_s10"),
         musical_feature_mode=musical_feature_mode,
+        musical_gate_init=train_config.get("musical_gate_init", 1.0),
         prior_token_keep_prob=train_config.get("prior_token_keep_prob", 1.0),
         prior_token_dropout_mode=train_config.get("prior_token_dropout_mode", "mask"),
         prior_attribute_keep_probs=train_config.get("prior_attribute_keep_probs"),

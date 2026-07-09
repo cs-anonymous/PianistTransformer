@@ -304,10 +304,10 @@ def midi_to_note_features(
     result = {
         "pitch": pitches,
         "continuous": continuous,
+        "shared": [row[:3] for row in continuous],
+        "pedal4": [row[3:7] for row in continuous],
     }
     if include_pedal2:
-        result["shared"] = [row[:3] for row in continuous]
-        result["pedal4"] = [row[3:7] for row in continuous]
         result["pedal2"] = pedal2
     return result
 
@@ -321,6 +321,12 @@ def note_features_to_midi(
     normalized=True,
 ):
     """Build a MIDI object from pitch and predicted continuous features."""
+    def _maybe_scale_midi_value(value):
+        numeric = float(value)
+        if 0.0 <= numeric <= 1.0:
+            numeric *= 127.0
+        return min(max(numeric, 0.0), 127.0)
+
     notes = []
     control_changes = []
 
@@ -347,8 +353,8 @@ def note_features_to_midi(
         else:
             ioi_ms = max(float(row[0]), 0.0)
             duration_ms = max(float(row[1]), 0.0)
-            velocity = int(round(min(max(float(row[2]), 0.0), 127.0)))
-            pedals = [int(round(min(max(float(value), 0.0), 127.0))) for value in row[3:7]]
+            velocity = int(round(_maybe_scale_midi_value(row[2])))
+            pedals = [int(round(_maybe_scale_midi_value(value))) for value in row[3:7]]
         ioi_values.append(ioi_ms)
         duration_values.append(duration_ms)
         velocity_values.append(velocity)
@@ -358,7 +364,8 @@ def note_features_to_midi(
         current_ms += ioi_values[idx]
         start_tick = int(round(current_ms))
         end_tick = max(start_tick + 1, int(round(current_ms + duration_values[idx])))
-        notes.append(Note(velocity_values[idx], int(pitch_value), start_tick, end_tick))
+        note_velocity = max(1, velocity_values[idx])
+        notes.append(Note(note_velocity, int(pitch_value), start_tick, end_tick))
 
         next_ioi = ioi_values[idx + 1] if idx + 1 < len(ioi_values) else 4990.0
         sample_times = [

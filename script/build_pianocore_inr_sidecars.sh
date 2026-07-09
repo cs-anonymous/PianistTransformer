@@ -27,6 +27,7 @@ python src/data_process/update_json_score_feature_with_xml.py \
   --json-dir "${PROCESSED_DIR}" \
   --subset a \
   --num-proc "${WORKERS}" \
+  --work-timeout-sec 900 \
   --summary-path "${PROCESSED_DIR}/processed_score_feature_update_summary.json" \
   --details-path "${PROCESSED_DIR}/processed_score_feature_update_details.jsonl"
 

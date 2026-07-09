@@ -110,6 +110,17 @@ def musical_feature_dim(musical_feature_mode="categorical"):
     raise ValueError(f"Unsupported musical_feature_mode={musical_feature_mode}")
 
 
+def normalize_slot_version(slot_version=None):
+    if slot_version is None:
+        return "slot8"
+    value = str(slot_version).lower()
+    if value in {"slot8", "8slot", "8slot_rawlog_nomus_0709"}:
+        return "slot8"
+    if value in {"slot12", "12slot", "12slot_rawlog_musical_0709"}:
+        return "slot12"
+    raise ValueError(f"Unsupported slot_version={slot_version}")
+
+
 def score_note_input_schema(config_or_value=None):
     if isinstance(config_or_value, dict):
         mode = str(config_or_value.get("score_note_input_schema", "integrated")).lower()
@@ -207,6 +218,11 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         soft_ce_tau=None,
         timing_input_normalization="scaled_log_5000_s10",
         musical_feature_mode="categorical",
+        slot_version=None,
+        slot_dim=None,
+        slot_fusion="mlp",
+        slot_gates=False,
+        musical_gate_init=1.0,
         prior_token_keep_prob=1.0,
         prior_token_dropout_mode="mask",
         prior_attribute_keep_probs=None,
@@ -346,6 +362,11 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.musical_feature_mode = str(musical_feature_mode).lower()
         self.musical_feature_dim = musical_feature_dim(self.musical_feature_mode)
         self.mask_feature_dim = 2 if self.musical_feature_dim == 0 else 3
+        self.slot_version = normalize_slot_version(slot_version) if str(note_embedding_mode).lower() == "slot_attribute" else None
+        self.slot_dim = None if slot_dim is None else int(slot_dim)
+        self.slot_fusion = str(slot_fusion).lower()
+        self.slot_gates = bool(slot_gates)
+        self.musical_gate_init = float(musical_gate_init)
         self.soft_ce_tau = soft_ce_tau or {
             "ioi": 10.0,
             "duration": 30.0,
@@ -506,6 +527,13 @@ class IntegratedNoteEncoder(nn.Module):
         self.embedding_depth = getattr(config, "embedding_depth", 2)
         self.activation = getattr(config, "head_activation", "gelu")
         self.pitch_factor_dim = 20
+        self.slot_version = normalize_slot_version(getattr(config, "slot_version", None)) if self.mode == "slot_attribute" else None
+        self.slot_num = 8 if self.slot_version == "slot8" else 12 if self.slot_version == "slot12" else 0
+        self.slot_dim = (
+            int(getattr(config, "slot_dim", 0))
+            if getattr(config, "slot_dim", None) is not None
+            else (config.hidden_size // self.slot_num if self.slot_num > 0 else 0)
+        )
         self.score_control_dim = int(
             getattr(config, "score_control_feature_dim", getattr(config, "control_feature_dim", 5))
         )
@@ -540,17 +568,33 @@ class IntegratedNoteEncoder(nn.Module):
             if getattr(config, "pitch_representation", "id") == "multihot"
             else self.pitch_factor_dim
         )
+        if self.mode not in {"sine", "cine", "slot_attribute"}:
+            raise ValueError(
+                f"Unsupported note_embedding_mode: {self.mode}. Expected one of: sine, cine, slot_attribute"
+            )
+        if self.mode == "slot_attribute":
+            if self.schema == "perf_target":
+                raise ValueError("slot_attribute only supports decoder_note_input_schema='integrated'")
+            if self.score_offset_dim > 0 or self.performance_offset_dim > 0:
+                raise ValueError("slot_attribute does not support chord offset features")
+            if self.slot_num <= 0 or self.slot_dim <= 0:
+                raise ValueError(
+                    f"slot_attribute requires a valid slot_version/slot_dim, got slot_version={self.slot_version}, "
+                    f"slot_dim={self.slot_dim}"
+                )
+            if self.slot_num * self.slot_dim != int(config.hidden_size):
+                raise ValueError(
+                    f"slot_attribute expects slot_num * slot_dim == hidden_size, got "
+                    f"{self.slot_num} * {self.slot_dim} != {config.hidden_size}"
+                )
+        pitch_output_dim = self.slot_dim if self.mode == "slot_attribute" else config.hidden_size
         self.pitch_projection = _make_mlp(
             self.pitch_input_dim,
-            config.hidden_size,
-            config.hidden_size,
+            pitch_output_dim,
+            pitch_output_dim,
             self.embedding_depth,
             self.activation,
         )
-        if self.mode not in {"sine", "cine", "split_score_perf"}:
-            raise ValueError(
-                f"Unsupported note_embedding_mode: {self.mode}. Expected one of: sine, cine, split_score_perf"
-            )
 
         self.score_control_projection = None
         self.score_offset_projection = None
@@ -559,6 +603,21 @@ class IntegratedNoteEncoder(nn.Module):
         self.mask_projection = None
         self.continuous_mlp = None
         self.decoder_target_projection = None
+        self.slot_score_ioi_projection = None
+        self.slot_score_duration_projection = None
+        self.slot_score_velocity_projection = None
+        self.slot_perf_ioi_projection = None
+        self.slot_perf_duration_projection = None
+        self.slot_perf_velocity_projection = None
+        self.slot_perf_pedal_projection = None
+        self.slot_musical_onset_projection = None
+        self.slot_musical_duration_projection = None
+        self.slot_musical_length_projection = None
+        self.slot_musical_binary_projection = None
+        self.slot_mask_embeddings = None
+        self.slot_fusion = None
+        self.slot_gate_logits = None
+        self.slot_timing_dim = max(1, (self.score_control_dim - 1) // 2) if self.mode == "slot_attribute" else 0
 
         if self.role == "decoder" and self.schema == "perf_target":
             self.decoder_target_projection = _make_mlp(
@@ -574,14 +633,6 @@ class IntegratedNoteEncoder(nn.Module):
                 config.hidden_size,
                 self.embedding_depth,
                 self.activation,
-            )
-            if self.mode == "split_score_perf":
-                self.score_control_projection = _make_mlp(
-                    self.score_control_dim,
-                    config.hidden_size,
-                    config.hidden_size,
-                    self.embedding_depth,
-                    self.activation,
                 )
         elif self.mode == "sine":
             self.score_control_projection = _make_mlp(
@@ -638,21 +689,115 @@ class IntegratedNoteEncoder(nn.Module):
                 self.activation,
             )
         else:
-            self.score_control_projection = _make_mlp(
-                self.score_control_dim,
-                config.hidden_size,
-                config.hidden_size,
+            expected_perf_dim = self.slot_timing_dim * 2 + 1 + 4
+            if self.score_control_dim != self.slot_timing_dim * 2 + 1:
+                raise ValueError(
+                    f"slot_attribute expects score_control_dim = 2 * timing_dim + 1, got {self.score_control_dim}"
+                )
+            if self.performance_control_dim != expected_perf_dim:
+                raise ValueError(
+                    f"slot_attribute expects performance_control_dim={expected_perf_dim}, got {self.performance_control_dim}"
+                )
+            if self.slot_version == "slot12" and self.musical_dim not in {0, 51}:
+                raise ValueError(
+                    f"slot12 expects musical_feature_dim in {{0, 51}}, got {self.musical_dim}. "
+                    "Use musical_feature_mode='musical51' or disable musical features."
+                )
+            self.slot_score_ioi_projection = _make_mlp(
+                self.slot_timing_dim,
+                self.slot_dim,
+                self.slot_dim,
                 self.embedding_depth,
                 self.activation,
             )
-            if self.score_offset_dim > 0:
-                self.score_offset_projection = _make_mlp(
-                    self.score_offset_dim,
-                    config.hidden_size,
-                    config.hidden_size,
+            self.slot_score_duration_projection = _make_mlp(
+                self.slot_timing_dim,
+                self.slot_dim,
+                self.slot_dim,
+                self.embedding_depth,
+                self.activation,
+            )
+            self.slot_score_velocity_projection = _make_mlp(
+                1,
+                self.slot_dim,
+                self.slot_dim,
+                self.embedding_depth,
+                self.activation,
+            )
+            self.slot_perf_ioi_projection = _make_mlp(
+                self.slot_timing_dim,
+                self.slot_dim,
+                self.slot_dim,
+                self.embedding_depth,
+                self.activation,
+            )
+            self.slot_perf_duration_projection = _make_mlp(
+                self.slot_timing_dim,
+                self.slot_dim,
+                self.slot_dim,
+                self.embedding_depth,
+                self.activation,
+            )
+            self.slot_perf_velocity_projection = _make_mlp(
+                1,
+                self.slot_dim,
+                self.slot_dim,
+                self.embedding_depth,
+                self.activation,
+            )
+            self.slot_perf_pedal_projection = _make_mlp(
+                4,
+                self.slot_dim,
+                self.slot_dim,
+                self.embedding_depth,
+                self.activation,
+            )
+            if self.slot_version == "slot12":
+                self.slot_musical_onset_projection = _make_mlp(
+                    17,
+                    self.slot_dim,
+                    self.slot_dim,
                     self.embedding_depth,
                     self.activation,
                 )
+                self.slot_musical_duration_projection = _make_mlp(
+                    17,
+                    self.slot_dim,
+                    self.slot_dim,
+                    self.embedding_depth,
+                    self.activation,
+                )
+                self.slot_musical_length_projection = _make_mlp(
+                    10,
+                    self.slot_dim,
+                    self.slot_dim,
+                    self.embedding_depth,
+                    self.activation,
+                )
+                self.slot_musical_binary_projection = _make_mlp(
+                    6,
+                    self.slot_dim,
+                    self.slot_dim,
+                    self.embedding_depth,
+                    self.activation,
+                )
+            self.slot_mask_embeddings = nn.Parameter(torch.zeros(self.slot_num, self.slot_dim))
+            nn.init.normal_(self.slot_mask_embeddings, mean=0.0, std=0.02)
+            self.slot_fusion = _make_mlp(
+                self.slot_num * self.slot_dim,
+                config.hidden_size,
+                config.hidden_size,
+                max(2, self.embedding_depth),
+                self.activation,
+            )
+            if bool(getattr(config, "slot_gates", False)):
+                self.slot_gate_logits = nn.Parameter(torch.ones(self.slot_num))
+                if self.slot_version == "slot12":
+                    musical_gate_init = float(getattr(config, "musical_gate_init", 1.0))
+                    musical_gate_init = min(max(musical_gate_init, 1e-4), 1.0 - 1e-4)
+                    musical_logit = math.log(musical_gate_init / (1.0 - musical_gate_init))
+                    with torch.no_grad():
+                        self.slot_gate_logits[8:] = musical_logit
         self.norm = nn.LayerNorm(config.hidden_size)
 
     def _pitch_factors(self, pitch_ids, pitch_multihot=None):
@@ -717,6 +862,104 @@ class IntegratedNoteEncoder(nn.Module):
             )
         return target_features, masks
 
+    def _slot_missing_embedding(self, slot_index, reference):
+        value = self.slot_mask_embeddings[slot_index].to(dtype=reference.dtype, device=reference.device)
+        return value.view(*([1] * (reference.ndim - 1)), self.slot_dim)
+
+    def _slot_encode(self, projection, features, mask, slot_index):
+        encoded = projection(features)
+        if mask is None:
+            return encoded
+        mask = mask.to(dtype=encoded.dtype, device=encoded.device)
+        return encoded * mask + self._slot_missing_embedding(slot_index, encoded) * (1.0 - mask)
+
+    def _slot_apply_gate(self, slot_index, embedding):
+        if self.slot_gate_logits is None:
+            return embedding
+        gate = torch.sigmoid(self.slot_gate_logits[slot_index]).to(dtype=embedding.dtype, device=embedding.device)
+        return embedding * gate
+
+    def _split_slot_performance(self, performance_control):
+        timing = self.slot_timing_dim
+        perf_ioi = performance_control[..., 0:timing]
+        perf_duration = performance_control[..., timing : timing * 2]
+        perf_velocity = performance_control[..., timing * 2 : timing * 2 + 1]
+        perf_pedal = performance_control[..., timing * 2 + 1 : timing * 2 + 5]
+        return perf_ioi, perf_duration, perf_velocity, perf_pedal
+
+    def _split_slot_score(self, score_control):
+        timing = self.slot_timing_dim
+        score_ioi = score_control[..., 0:timing]
+        score_duration = score_control[..., timing : timing * 2]
+        score_velocity = score_control[..., timing * 2 : timing * 2 + 1]
+        return score_ioi, score_duration, score_velocity
+
+    def _split_slot_musical51(self, musical):
+        if musical.shape[-1] < 51:
+            raise ValueError(f"slot12 expects musical51-compatible rows, got dim={musical.shape[-1]}")
+        musical_duration = musical[..., 0:17]
+        musical_length = musical[..., 17:27]
+        musical_onset = musical[..., 27:44]
+        musical_binary = musical[..., 45:51]
+        return musical_onset, musical_duration, musical_length, musical_binary
+
+    def _forward_slot_attribute(
+        self,
+        pitch_embeds,
+        score_control,
+        performance_control,
+        musical,
+        masks,
+    ):
+        m_score = masks[..., 0:1] if self.mask_dim >= 1 else None
+        m_perf = masks[..., 1:2] if self.mask_dim >= 2 else None
+        m_musical = masks[..., 2:3] if self.mask_dim >= 3 else None
+
+        score_ioi, score_duration, score_velocity = self._split_slot_score(score_control)
+        perf_ioi, perf_duration, perf_velocity, perf_pedal = self._split_slot_performance(performance_control)
+
+        slot_embeddings = [
+            self._slot_apply_gate(0, pitch_embeds),
+            self._slot_apply_gate(1, self._slot_encode(self.slot_score_ioi_projection, score_ioi, m_score, 1)),
+            self._slot_apply_gate(2, self._slot_encode(self.slot_score_duration_projection, score_duration, m_score, 2)),
+            self._slot_apply_gate(3, self._slot_encode(self.slot_score_velocity_projection, score_velocity, m_score, 3)),
+            self._slot_apply_gate(4, self._slot_encode(self.slot_perf_ioi_projection, perf_ioi, m_perf, 4)),
+            self._slot_apply_gate(5, self._slot_encode(self.slot_perf_duration_projection, perf_duration, m_perf, 5)),
+            self._slot_apply_gate(6, self._slot_encode(self.slot_perf_velocity_projection, perf_velocity, m_perf, 6)),
+            self._slot_apply_gate(7, self._slot_encode(self.slot_perf_pedal_projection, perf_pedal, m_perf, 7)),
+        ]
+        if self.slot_version == "slot12":
+            if self.musical_dim <= 0:
+                batch_shape = score_control.shape[:-1]
+                musical_onset = score_control.new_zeros(*batch_shape, 17)
+                musical_duration = score_control.new_zeros(*batch_shape, 17)
+                musical_length = score_control.new_zeros(*batch_shape, 10)
+                musical_binary = score_control.new_zeros(*batch_shape, 6)
+            else:
+                musical_onset, musical_duration, musical_length, musical_binary = self._split_slot_musical51(musical)
+            slot_embeddings.extend(
+                [
+                    self._slot_apply_gate(
+                        8,
+                        self._slot_encode(self.slot_musical_onset_projection, musical_onset, m_musical, 8),
+                    ),
+                    self._slot_apply_gate(
+                        9,
+                        self._slot_encode(self.slot_musical_duration_projection, musical_duration, m_musical, 9),
+                    ),
+                    self._slot_apply_gate(
+                        10,
+                        self._slot_encode(self.slot_musical_length_projection, musical_length, m_musical, 10),
+                    ),
+                    self._slot_apply_gate(
+                        11,
+                        self._slot_encode(self.slot_musical_binary_projection, musical_binary, m_musical, 11),
+                    ),
+                ]
+            )
+        fused = torch.cat(slot_embeddings, dim=-1)
+        return self.slot_fusion(fused)
+
     def forward(self, pitch_ids, continuous, special_note_ids=None, performance_missing_mask=None, pitch_multihot=None):
         try:
             projection_dtype = next(self.parameters()).dtype
@@ -729,11 +972,8 @@ class IntegratedNoteEncoder(nn.Module):
         if self.role == "decoder" and self.schema == "perf_target":
             target_features, masks = self._split_perf_target(continuous)
             target_embeds = self.decoder_target_projection(target_features)
-            if self.mode == "split_score_perf":
-                embeddings = target_embeds
-            else:
-                mask_embeds = self.mask_projection(masks)
-                embeddings = pitch_embeds + target_embeds + mask_embeds
+            mask_embeds = self.mask_projection(masks)
+            embeddings = pitch_embeds + target_embeds + mask_embeds
             embeddings = self.norm(embeddings)
             return self._apply_special_embeddings(embeddings, special_note_ids)
 
@@ -763,10 +1003,14 @@ class IntegratedNoteEncoder(nn.Module):
             embeddings = self.continuous_mlp(
                 torch.cat([pitch_factors, score_control, score_offset, performance_control_for_cine, musical, masks], dim=-1)
             )
-        elif self.mode == "split_score_perf":
-            embeddings = pitch_embeds + self.score_control_projection(score_control)
-            if self.score_offset_projection is not None:
-                embeddings = embeddings + self.score_offset_projection(score_offset)
+        elif self.mode == "slot_attribute":
+            embeddings = self._forward_slot_attribute(
+                pitch_embeds,
+                score_control,
+                performance_control,
+                musical,
+                masks,
+            )
         else:
             m_score_control = masks[..., 0:1]
             m_performance_control = masks[..., 1:2]

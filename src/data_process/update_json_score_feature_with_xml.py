@@ -230,91 +230,92 @@ def update_one(task: dict[str, Any]) -> dict[str, Any]:
 
     tmp_path = json_path.with_name(json_path.name + ".tmp")
     try:
-        with json_path.open(encoding="utf-8") as file:
-            payload = json.load(file)
+        with score_xml_alignment.time_limit(args.work_timeout_sec):
+            with json_path.open(encoding="utf-8") as file:
+                payload = json.load(file)
 
-        score = payload["score"]
-        pitch = [int(value) for value in score["pitch"]]
-        old_score_continuous_dim = len(score["score_continuous"][0]) if score.get("score_continuous") else 0
-        if "score_continuous" in score:
-            score["score_continuous"] = normalize_existing_score_continuous(
-                score["score_continuous"],
-                args.float_precision,
-            )
+            score = payload["score"]
+            pitch = [int(value) for value in score["pitch"]]
+            old_score_continuous_dim = len(score["score_continuous"][0]) if score.get("score_continuous") else 0
+            if "score_continuous" in score:
+                score["score_continuous"] = normalize_existing_score_continuous(
+                    score["score_continuous"],
+                    args.float_precision,
+                )
 
-        try:
-            feature_payload = build_score_features(
-                task["score_xml_path"],
-                task["score_midi_path"],
-                pitch,
-                args,
-            )
-        except Exception as exc:  # noqa: BLE001
-            feature_payload = {
-                "status": "error",
-                "error": f"{type(exc).__name__}: {exc}",
-                "raw_refined_relation": None,
-                "xml_raw_relation": None,
-                "xml_note_count": None,
-                "raw_note_count": None,
-                "refined_note_count": len(pitch),
-                "matched": 0,
-                "unmatched": len(pitch),
-                "coverage": 0.0,
-                "score_feature": [[0.0] * FEATURE_WIDTH for _ in pitch],
-                "has_score_feature": [0] * len(pitch),
-                "unknown_staff_count": 0,
-                "trill_count": 0,
-                "grace_count": 0,
-                "staccato_count": 0,
+            try:
+                feature_payload = build_score_features(
+                    task["score_xml_path"],
+                    task["score_midi_path"],
+                    pitch,
+                    args,
+                )
+            except Exception as exc:  # noqa: BLE001
+                feature_payload = {
+                    "status": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "raw_refined_relation": None,
+                    "xml_raw_relation": None,
+                    "xml_note_count": None,
+                    "raw_note_count": None,
+                    "refined_note_count": len(pitch),
+                    "matched": 0,
+                    "unmatched": len(pitch),
+                    "coverage": 0.0,
+                    "score_feature": [[0.0] * FEATURE_WIDTH for _ in pitch],
+                    "has_score_feature": [0] * len(pitch),
+                    "unknown_staff_count": 0,
+                    "trill_count": 0,
+                    "grace_count": 0,
+                    "staccato_count": 0,
+                }
+
+            score["score_feature"] = feature_payload.pop("score_feature")
+            score["has_score_feature"] = feature_payload.pop("has_score_feature")
+            score["note_count"] = len(pitch)
+
+            meta = payload.setdefault("meta", {})
+            meta["schema"] = SCHEMA_VERSION
+            meta["score_xml_source"] = task["score_xml_path"]
+            meta["score_midi_source"] = task["score_midi_path"]
+            meta["old_score_continuous_dim"] = old_score_continuous_dim
+            if "score_raw" in score:
+                meta["score_raw_keys"] = ["ioi_ms", "duration_ms", "velocity", "pedal_0", "pedal_25", "pedal_50", "pedal_75"]
+            if "score_continuous" in score:
+                meta["score_continuous_keys"] = ["ioi", "duration", "velocity"]
+            meta["score_feature_keys"] = ["mo", "md", "ml", "first", "staff", "trill", "grace", "staccato"]
+            meta["score_feature_unit"] = "quarter_length_raw_grid_1/24"
+            meta["note_type_keys"] = ["has_score_feature", "has_pedal_feature"]
+            meta["xml_to_refined_score_alignment"] = {
+                "method": "midi2scoretransformer_parse_mxl + pitch_aware_monotonic_alignment",
+                **feature_payload,
             }
+            payload["schema"] = SCHEMA_VERSION
 
-        score["score_feature"] = feature_payload.pop("score_feature")
-        score["has_score_feature"] = feature_payload.pop("has_score_feature")
-        score["note_count"] = len(pitch)
+            if not args.dry_run:
+                with tmp_path.open("w", encoding="utf-8") as file:
+                    json.dump(clean_json_value(payload), file, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+                    file.write("\n")
+                os.replace(tmp_path, json_path)
 
-        meta = payload.setdefault("meta", {})
-        meta["schema"] = SCHEMA_VERSION
-        meta["score_xml_source"] = task["score_xml_path"]
-        meta["score_midi_source"] = task["score_midi_path"]
-        meta["old_score_continuous_dim"] = old_score_continuous_dim
-        if "score_raw" in score:
-            meta["score_raw_keys"] = ["ioi_ms", "duration_ms", "velocity", "pedal_0", "pedal_25", "pedal_50", "pedal_75"]
-        if "score_continuous" in score:
-            meta["score_continuous_keys"] = ["ioi", "duration", "velocity"]
-        meta["score_feature_keys"] = ["mo", "md", "ml", "first", "staff", "trill", "grace", "staccato"]
-        meta["score_feature_unit"] = "quarter_length_raw_grid_1/24"
-        meta["note_type_keys"] = ["has_score_feature", "has_pedal_feature"]
-        meta["xml_to_refined_score_alignment"] = {
-            "method": "midi2scoretransformer_parse_mxl + pitch_aware_monotonic_alignment",
-            **feature_payload,
-        }
-        payload["schema"] = SCHEMA_VERSION
-
-        if not args.dry_run:
-            with tmp_path.open("w", encoding="utf-8") as file:
-                json.dump(clean_json_value(payload), file, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-                file.write("\n")
-            os.replace(tmp_path, json_path)
-
-        matched = int(meta["xml_to_refined_score_alignment"]["matched"])
-        note_count = len(pitch)
-        result.update(
-            {
-                "status": meta["xml_to_refined_score_alignment"]["status"],
-                "note_count": note_count,
-                "matched": matched,
-                "unmatched": note_count - matched,
-                "coverage": float(matched / note_count) if note_count else 1.0,
-                "raw_refined_relation": meta["xml_to_refined_score_alignment"]["raw_refined_relation"],
-                "xml_raw_relation": meta["xml_to_refined_score_alignment"]["xml_raw_relation"],
-                "old_score_continuous_dim": old_score_continuous_dim,
-                "elapsed_sec": round(time.time() - started, 3),
-            }
-        )
-        if "error" in meta["xml_to_refined_score_alignment"]:
-            result["error"] = meta["xml_to_refined_score_alignment"]["error"]
-        return result
+            matched = int(meta["xml_to_refined_score_alignment"]["matched"])
+            note_count = len(pitch)
+            result.update(
+                {
+                    "status": meta["xml_to_refined_score_alignment"]["status"],
+                    "note_count": note_count,
+                    "matched": matched,
+                    "unmatched": note_count - matched,
+                    "coverage": float(matched / note_count) if note_count else 1.0,
+                    "raw_refined_relation": meta["xml_to_refined_score_alignment"]["raw_refined_relation"],
+                    "xml_raw_relation": meta["xml_to_refined_score_alignment"]["xml_raw_relation"],
+                    "old_score_continuous_dim": old_score_continuous_dim,
+                    "elapsed_sec": round(time.time() - started, 3),
+                }
+            )
+            if "error" in meta["xml_to_refined_score_alignment"]:
+                result["error"] = meta["xml_to_refined_score_alignment"]["error"]
+            return result
     except Exception as exc:  # noqa: BLE001
         if not args.dry_run:
             tmp_path.unlink(missing_ok=True)
@@ -357,6 +358,12 @@ def main() -> None:
     parser.add_argument("--num-proc", type=int, default=20)
     parser.add_argument("--limit-works", type=int, default=None)
     parser.add_argument("--timeout-sec", type=float, default=180.0)
+    parser.add_argument(
+        "--work-timeout-sec",
+        type=float,
+        default=None,
+        help="Optional wall-clock timeout for a whole score update. Useful if a single work hangs outside inner alignment timeouts.",
+    )
     parser.add_argument("--max-sequence-matcher-notes", type=int, default=13000)
     parser.add_argument("--disable-sequence-matcher", action="store_true")
     parser.add_argument("--float-precision", type=int, default=5)
@@ -434,6 +441,7 @@ def main() -> None:
     summary["json_dir"] = str(json_dir)
     summary["num_proc"] = args.num_proc
     summary["timeout_sec"] = args.timeout_sec
+    summary["work_timeout_sec"] = args.work_timeout_sec
     summary["max_sequence_matcher_notes"] = args.max_sequence_matcher_notes
     with args.summary_path.open("w", encoding="utf-8") as summary_file:
         json.dump(clean_json_value(summary), summary_file, ensure_ascii=False, indent=2, allow_nan=False)
