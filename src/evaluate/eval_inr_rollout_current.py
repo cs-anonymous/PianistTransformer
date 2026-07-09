@@ -29,6 +29,7 @@ from src.model.integrated_pianoformer import (
     _shared_scalar_params,
     _split_epr_mixture_params,
     _target7_to_raw7,
+    _target_predictions_to_feedback7,
 )
 from src.train.train_inr import (
     build_epr_score_input_rows,
@@ -471,8 +472,13 @@ def load_config(config_path, checkpoint):
         raise ValueError("This script only supports EPR")
     if str(config.get("pedal_representation", "binary_4")).lower() != "binary_4":
         raise ValueError("This script only supports pedal_representation=binary_4")
-    if str(config.get("epr_timing_target", "log_deviation")).lower() not in {"log_deviation", "log_dev"}:
-        raise ValueError("This script only supports epr_timing_target=log_deviation")
+    if str(config.get("epr_timing_target", "log_deviation")).lower() not in {
+        "log_deviation",
+        "log_dev",
+        "raw_log_deviation",
+        "raw_log_dev",
+    }:
+        raise ValueError("This script only supports log_deviation/raw_log_deviation timing targets")
     return config
 
 
@@ -514,7 +520,7 @@ def labels_for_perf(config, perf, score_shared_raw):
         pedal_binary_threshold=float(config.get("pedal_binary_threshold", 64.0)),
     )
     if labels is None:
-        raise ValueError(f"Could not build target7 labels for {perf.get('performance_source')}")
+        raise ValueError(f"Could not build target labels for {perf.get('performance_source')}")
     return labels
 
 
@@ -534,10 +540,16 @@ def raw_arrays_from_rows(rows):
 def metric_arrays(raw_rows, target_rows):
     arrays = raw_arrays_from_rows(raw_rows)
     target_rows = np.asarray(target_rows, dtype=np.float64)
-    arrays["pedal_0"] = target_rows[:, 3]
-    arrays["pedal_25"] = target_rows[:, 4]
-    arrays["pedal_50"] = target_rows[:, 5]
-    arrays["pedal_75"] = target_rows[:, 6]
+    if target_rows.shape[-1] >= 9:
+        arrays["pedal_0"] = target_rows[:, 5]
+        arrays["pedal_25"] = target_rows[:, 6]
+        arrays["pedal_50"] = target_rows[:, 7]
+        arrays["pedal_75"] = target_rows[:, 8]
+    else:
+        arrays["pedal_0"] = target_rows[:, 3]
+        arrays["pedal_25"] = target_rows[:, 4]
+        arrays["pedal_50"] = target_rows[:, 5]
+        arrays["pedal_75"] = target_rows[:, 6]
     return arrays
 
 
@@ -556,11 +568,11 @@ def distribution_arrays(raw_rows, target_rows):
     target = {
         "ioi_log_dev": target_rows[:, 0],
         "duration_log_dev": target_rows[:, 1],
-        "velocity_norm": target_rows[:, 2],
-        "pedal_0": target_rows[:, 3],
-        "pedal_25": target_rows[:, 4],
-        "pedal_50": target_rows[:, 5],
-        "pedal_75": target_rows[:, 6],
+        "velocity_norm": target_rows[:, 4] if target_rows.shape[-1] >= 9 else target_rows[:, 2],
+        "pedal_0": target_rows[:, 5] if target_rows.shape[-1] >= 9 else target_rows[:, 3],
+        "pedal_25": target_rows[:, 6] if target_rows.shape[-1] >= 9 else target_rows[:, 4],
+        "pedal_50": target_rows[:, 7] if target_rows.shape[-1] >= 9 else target_rows[:, 5],
+        "pedal_75": target_rows[:, 8] if target_rows.shape[-1] >= 9 else target_rows[:, 6],
     }
     return {"raw": raw, "target": target}
 
@@ -1251,15 +1263,19 @@ def predict_work(model, device, config, item, args, rollout_ks):
                     head_stats=head_stats,
                 )
             score_raw_tensor = torch.tensor(score_shared_raw, dtype=torch.float32)
-            pred_raw = _target7_to_raw7(score_raw_tensor, pred_target.float(), config=config).cpu().numpy()
             target_tensor = torch.tensor(labels, dtype=torch.float32)
+            pred_feedback = _target_predictions_to_feedback7(config, pred_target.float())
+            target_feedback = _target_predictions_to_feedback7(config, target_tensor)
+            pred_raw = _target7_to_raw7(score_raw_tensor, pred_feedback.float(), config=config).cpu().numpy()
             target_raw = _target7_to_raw7(score_raw_tensor, target_tensor, config=config).cpu().numpy()
-            pred_note_arrays = metric_arrays(pred_raw, pred_target.float().cpu().numpy())
-            gt_note_arrays = metric_arrays(target_raw, labels)
+            pred_target_np = pred_feedback.float().cpu().numpy()
+            gt_target_np = target_feedback.float().cpu().numpy()
+            pred_note_arrays = metric_arrays(pred_raw, pred_target_np)
+            gt_note_arrays = metric_arrays(target_raw, gt_target_np)
             pred_arrays.append(pred_note_arrays)
             gt_arrays.append(gt_note_arrays)
             if distributions is not None:
-                extend_distributions(distributions, pred_raw, target_raw, pred_target.float().cpu().numpy(), labels)
+                extend_distributions(distributions, pred_raw, target_raw, pred_target_np, gt_target_np)
             if position_values is not None:
                 merge_position_values(window_position, position_values)
             pair_rows.append(
@@ -1279,18 +1295,18 @@ def predict_work(model, device, config, item, args, rollout_ks):
                     "duration_ms_mean_shift": finite_mean_shift(pred_raw[:, 1], target_raw[:, 1]),
                     "ioi_ms_std_ratio": finite_std_ratio(pred_raw[:, 0], target_raw[:, 0]),
                     "duration_ms_std_ratio": finite_std_ratio(pred_raw[:, 1], target_raw[:, 1]),
-                    "ioi_logdev_mean_shift": finite_mean_shift(pred_target[:, 0], target_tensor[:, 0]),
-                    "duration_logdev_mean_shift": finite_mean_shift(pred_target[:, 1], target_tensor[:, 1]),
-                    "ioi_logdev_std_ratio": finite_std_ratio(pred_target[:, 0], target_tensor[:, 0]),
-                    "duration_logdev_std_ratio": finite_std_ratio(pred_target[:, 1], target_tensor[:, 1]),
-                    "ioi_logdev_pred_mean": finite_mean(pred_target[:, 0]),
-                    "duration_logdev_pred_mean": finite_mean(pred_target[:, 1]),
-                    "ioi_logdev_gt_mean": finite_mean(target_tensor[:, 0]),
-                    "duration_logdev_gt_mean": finite_mean(target_tensor[:, 1]),
-                    "ioi_logdev_pred_std": finite_std(pred_target[:, 0]),
-                    "duration_logdev_pred_std": finite_std(pred_target[:, 1]),
-                    "ioi_logdev_gt_std": finite_std(target_tensor[:, 0]),
-                    "duration_logdev_gt_std": finite_std(target_tensor[:, 1]),
+                    "ioi_logdev_mean_shift": finite_mean_shift(pred_feedback[:, 0], target_feedback[:, 0]),
+                    "duration_logdev_mean_shift": finite_mean_shift(pred_feedback[:, 1], target_feedback[:, 1]),
+                    "ioi_logdev_std_ratio": finite_std_ratio(pred_feedback[:, 0], target_feedback[:, 0]),
+                    "duration_logdev_std_ratio": finite_std_ratio(pred_feedback[:, 1], target_feedback[:, 1]),
+                    "ioi_logdev_pred_mean": finite_mean(pred_feedback[:, 0]),
+                    "duration_logdev_pred_mean": finite_mean(pred_feedback[:, 1]),
+                    "ioi_logdev_gt_mean": finite_mean(target_feedback[:, 0]),
+                    "duration_logdev_gt_mean": finite_mean(target_feedback[:, 1]),
+                    "ioi_logdev_pred_std": finite_std(pred_feedback[:, 0]),
+                    "duration_logdev_pred_std": finite_std(pred_feedback[:, 1]),
+                    "ioi_logdev_gt_std": finite_std(target_feedback[:, 0]),
+                    "duration_logdev_gt_std": finite_std(target_feedback[:, 1]),
                 }
             )
         by_k[label] = {
@@ -1460,33 +1476,42 @@ def plot_distribution_panel(path, items, rollout_ks, domain, keys):
 
     continuous_keys = keys[:3]
     pedal_keys = keys[3:]
-    colors = {
-        "GT": "#111111",
-        "k=0": "#2f6fbb",
-        "k=1": "#d9822b",
-        "full AR": "#b83232",
-    }
+    labels = ["GT", *[distribution_group_label(k_label(value)) for value in rollout_ks]]
+    base_palette = [
+        "#111111",
+        "#2f6fbb",
+        "#d9822b",
+        "#756bb1",
+        "#31a354",
+        "#e6550d",
+        "#3182bd",
+        "#b83232",
+    ]
+    colors = {label: base_palette[idx % len(base_palette)] for idx, label in enumerate(labels)}
     fig, axes = plt.subplots(2, 3, figsize=(16, 8.5))
     axes = axes.flatten()
     for axis, (feature, title) in zip(axes[:3], continuous_keys):
         groups = collect_distribution_groups(items, rollout_ks, domain, feature)
         lo, hi = clipped_range(groups)
         bins = np.linspace(lo, hi, 90)
-        for group, values in groups.items():
+        for group in labels:
+            values = groups.get(group, [])
             values = finite_values(values)
             values = values[(values >= lo) & (values <= hi)]
             if len(values) == 0:
                 continue
             hist, edges = np.histogram(values, bins=bins, density=True)
             centers = 0.5 * (edges[:-1] + edges[1:])
-            axis.plot(centers, hist, label=group, linewidth=2.0, color=colors.get(group))
+            linewidth = 2.4 if group in {"GT", "full AR"} else 1.7
+            alpha = 0.95 if group in {"GT", "full AR"} else 0.82
+            axis.plot(centers, hist, label=group, linewidth=linewidth, alpha=alpha, color=colors.get(group))
         axis.set_title(title)
         axis.set_ylabel("Density")
         axis.grid(alpha=0.18)
     axis = axes[3]
     x = np.arange(len(pedal_keys), dtype=np.float64)
-    width = 0.18
-    labels = [label for label in ["GT", "k=0", "k=1", "full AR"] if label in collect_distribution_groups(items, rollout_ks, domain, pedal_keys[0][0])]
+    width = min(0.12, 0.8 / max(1, len(labels)))
+    labels = [label for label in labels if label in collect_distribution_groups(items, rollout_ks, domain, pedal_keys[0][0])]
     offsets = (np.arange(len(labels)) - (len(labels) - 1) / 2.0) * width
     for offset, group in zip(offsets, labels):
         means = []

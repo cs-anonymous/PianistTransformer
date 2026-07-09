@@ -34,6 +34,7 @@ ALN_DISTRIBUTIONS = {"lan"}
 ACN_DISTRIBUTIONS = {"can"}
 IACN_DISTRIBUTIONS = {"ican"}
 ILN_DISTRIBUTIONS = {"iln"}
+SN_DISTRIBUTIONS = {"sn", "skew_normal"}
 
 
 def _is_scalar_distribution(distribution):
@@ -41,6 +42,7 @@ def _is_scalar_distribution(distribution):
         "logistic_normal",
         "mixture_logistic_normal",
         "mixture_beta",
+        *SN_DISTRIBUTIONS,
         *ALN_DISTRIBUTIONS,
         *ACN_DISTRIBUTIONS,
         *IACN_DISTRIBUTIONS,
@@ -49,7 +51,7 @@ def _is_scalar_distribution(distribution):
 
 
 def _scalar_distribution_dim(distribution):
-    if distribution in {*ACN_DISTRIBUTIONS, "logistic_normal", "mixture_logistic_normal", "mixture_beta"}:
+    if distribution in {*ACN_DISTRIBUTIONS, "logistic_normal", "mixture_logistic_normal", "mixture_beta", *SN_DISTRIBUTIONS}:
         return 3
     if distribution in IACN_DISTRIBUTIONS:
         return 5
@@ -61,7 +63,7 @@ def _scalar_distribution_dim(distribution):
 
 
 def _scalar_distribution_components(config, distribution):
-    if distribution in {*ALN_DISTRIBUTIONS, *ACN_DISTRIBUTIONS, *IACN_DISTRIBUTIONS, *ILN_DISTRIBUTIONS, "logistic_normal"}:
+    if distribution in {*SN_DISTRIBUTIONS, *ALN_DISTRIBUTIONS, *ACN_DISTRIBUTIONS, *IACN_DISTRIBUTIONS, *ILN_DISTRIBUTIONS, "logistic_normal"}:
         return 1
     return int(getattr(config, "epr_mixture_components", 1))
 
@@ -76,6 +78,7 @@ def resolve_timing_control_mode(timing_control_mode="log_scaled", use_timing_sca
         "dual_log_linear",
         "dual_clip_linear",
         "log_scaled",
+        "raw_log",
     }
     if mode not in valid_modes:
         raise ValueError(f"Unsupported timing_control_mode={timing_control_mode}")
@@ -87,6 +90,8 @@ def timing_control_feature_dim(timing_control_mode="log_scaled", use_timing_scal
         timing_control_mode=timing_control_mode,
         use_timing_scale_bit=use_timing_scale_bit,
     )
+    if mode == "raw_log":
+        return 5
     return 3 if mode in {"piecewise_single", "log_scaled"} else 5
 
 
@@ -124,8 +129,8 @@ def decoder_note_input_schema(config_or_value=None):
         mode = "integrated"
     else:
         mode = str(config_or_value).lower()
-    if mode != "integrated":
-        raise ValueError(f"Only integrated INR decoder-note schema is supported, got {mode}")
+    if mode not in {"integrated", "perf_target"}:
+        raise ValueError(f"Only integrated/perf_target INR decoder-note schemas are supported, got {mode}")
     return mode
 
 
@@ -185,6 +190,9 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         beta_eps=1e-5,
         beta_kappa_min=1e-3,
         beta_alpha_min=1e-4,
+        skew_normal_sigma_min=1e-4,
+        skew_normal_sigma_max=1e4,
+        raw_timing_loss_lambda=0.5,
         epr_inflated_features=None,
         epr_timing_bins=5000,
         epr_value_bins=128,
@@ -199,6 +207,17 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         prior_token_dropout_mode="mask",
         prior_attribute_keep_probs=None,
         prior_attribute_noise_std=0.05,
+        tf_embedding_mask_keep_prob=1.0,
+        tf_embedding_mask_score=False,
+        tf_embedding_mask_decoder=False,
+        stable_contract_loss=False,
+        stable_contract_alpha=1.0,
+        stable_contract_lambda=0.0,
+        stable_contract_ioi_alpha=None,
+        stable_contract_duration_alpha=None,
+        stable_contract_ioi_lambda=None,
+        stable_contract_duration_lambda=None,
+        stable_contract_eps=1e-6,
         piano_pitch_min=21,
         pedal_representation="binary_4",
         use_style_tokens=False,
@@ -290,6 +309,9 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.beta_eps = beta_eps
         self.beta_kappa_min = beta_kappa_min
         self.beta_alpha_min = beta_alpha_min
+        self.skew_normal_sigma_min = skew_normal_sigma_min
+        self.skew_normal_sigma_max = skew_normal_sigma_max
+        self.raw_timing_loss_lambda = raw_timing_loss_lambda
         self.epr_inflated_features = epr_inflated_features or {
             "ioi": "zero",
             "pedal": "zero_one",
@@ -323,6 +345,25 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.prior_token_dropout_mode = prior_token_dropout_mode
         self.prior_attribute_keep_probs = prior_attribute_keep_probs
         self.prior_attribute_noise_std = prior_attribute_noise_std
+        self.tf_embedding_mask_keep_prob = float(tf_embedding_mask_keep_prob)
+        self.tf_embedding_mask_score = bool(tf_embedding_mask_score)
+        self.tf_embedding_mask_decoder = bool(tf_embedding_mask_decoder)
+        self.stable_contract_loss = bool(stable_contract_loss)
+        self.stable_contract_alpha = float(stable_contract_alpha)
+        self.stable_contract_lambda = float(stable_contract_lambda)
+        self.stable_contract_ioi_alpha = (
+            None if stable_contract_ioi_alpha is None else float(stable_contract_ioi_alpha)
+        )
+        self.stable_contract_duration_alpha = (
+            None if stable_contract_duration_alpha is None else float(stable_contract_duration_alpha)
+        )
+        self.stable_contract_ioi_lambda = (
+            None if stable_contract_ioi_lambda is None else float(stable_contract_ioi_lambda)
+        )
+        self.stable_contract_duration_lambda = (
+            None if stable_contract_duration_lambda is None else float(stable_contract_duration_lambda)
+        )
+        self.stable_contract_eps = float(stable_contract_eps)
         self.piano_pitch_min = int(piano_pitch_min)
         self.pedal_representation = str(pedal_representation).lower()
         if self.pedal_representation != "binary_4":
@@ -459,9 +500,13 @@ class IntegratedNoteEncoder(nn.Module):
         )
         self.musical_dim = int(getattr(config, "musical_feature_dim", 12))
         self.mask_dim = int(getattr(config, "mask_feature_dim", 3))
-        self.decoder_target_dim = 7
+        self.decoder_target_dim = (
+            max(0, int(self.continuous_dim) - self.mask_dim)
+            if self.role == "decoder" and self.schema == "perf_target"
+            else 7
+        )
         self.decoder_target_mask_dim = 3
-        if self.role == "decoder":
+        if self.role == "decoder" and self.schema == "integrated":
             self.performance_missing_embeddings = nn.Parameter(
                 torch.zeros(self.performance_control_dim, config.hidden_size)
             )
@@ -476,10 +521,42 @@ class IntegratedNoteEncoder(nn.Module):
             self.embedding_depth,
             self.activation,
         )
-        if self.mode not in {"sine", "cine"}:
-            raise ValueError(f"Unsupported note_embedding_mode: {self.mode}. Expected one of: sine, cine")
+        if self.mode not in {"sine", "cine", "split_score_perf"}:
+            raise ValueError(
+                f"Unsupported note_embedding_mode: {self.mode}. Expected one of: sine, cine, split_score_perf"
+            )
 
-        if self.mode == "sine":
+        self.score_control_projection = None
+        self.performance_control_projection = None
+        self.musical_projection = None
+        self.mask_projection = None
+        self.continuous_mlp = None
+        self.decoder_target_projection = None
+
+        if self.role == "decoder" and self.schema == "perf_target":
+            self.decoder_target_projection = _make_mlp(
+                self.decoder_target_dim,
+                config.hidden_size,
+                config.hidden_size,
+                self.embedding_depth,
+                self.activation,
+            )
+            self.mask_projection = _make_mlp(
+                self.mask_dim,
+                config.hidden_size,
+                config.hidden_size,
+                self.embedding_depth,
+                self.activation,
+            )
+            if self.mode == "split_score_perf":
+                self.score_control_projection = _make_mlp(
+                    self.score_control_dim,
+                    config.hidden_size,
+                    config.hidden_size,
+                    self.embedding_depth,
+                    self.activation,
+                )
+        elif self.mode == "sine":
             self.score_control_projection = _make_mlp(
                 self.score_control_dim,
                 config.hidden_size,
@@ -508,7 +585,7 @@ class IntegratedNoteEncoder(nn.Module):
                 self.embedding_depth,
                 self.activation,
             )
-        else:
+        elif self.mode == "cine":
             flat_dim = (
                 self.pitch_factor_dim
                 + self.score_control_dim
@@ -518,6 +595,14 @@ class IntegratedNoteEncoder(nn.Module):
             )
             self.continuous_mlp = _make_mlp(
                 flat_dim,
+                config.hidden_size,
+                config.hidden_size,
+                self.embedding_depth,
+                self.activation,
+            )
+        else:
+            self.score_control_projection = _make_mlp(
+                self.score_control_dim,
                 config.hidden_size,
                 config.hidden_size,
                 self.embedding_depth,
@@ -564,11 +649,32 @@ class IntegratedNoteEncoder(nn.Module):
             )
         return score_control, performance_control, musical, masks
 
+    def _split_perf_target(self, continuous):
+        target_features = continuous[..., : self.decoder_target_dim]
+        masks = continuous[..., self.decoder_target_dim : self.decoder_target_dim + self.mask_dim]
+        if continuous.shape[-1] != self.decoder_target_dim + self.mask_dim:
+            raise ValueError(
+                f"Unexpected perf-target decoder dim {continuous.shape[-1]}, "
+                f"expected {self.decoder_target_dim + self.mask_dim}"
+            )
+        return target_features, masks
+
     def forward(self, pitch_ids, continuous, special_note_ids=None, performance_missing_mask=None):
         projection_dtype = next(self.parameters()).dtype
         continuous = continuous.to(dtype=projection_dtype)
         pitch_factors = self._pitch_factors(pitch_ids).to(dtype=projection_dtype)
         pitch_embeds = self.pitch_projection(pitch_factors)
+
+        if self.role == "decoder" and self.schema == "perf_target":
+            target_features, masks = self._split_perf_target(continuous)
+            target_embeds = self.decoder_target_projection(target_features)
+            if self.mode == "split_score_perf":
+                embeddings = target_embeds
+            else:
+                mask_embeds = self.mask_projection(masks)
+                embeddings = pitch_embeds + target_embeds + mask_embeds
+            embeddings = self.norm(embeddings)
+            return self._apply_special_embeddings(embeddings, special_note_ids)
 
         score_control, performance_control, musical, masks = self._split_inr0624(continuous)
         if performance_missing_mask is not None:
@@ -589,6 +695,8 @@ class IntegratedNoteEncoder(nn.Module):
             embeddings = self.continuous_mlp(
                 torch.cat([pitch_factors, score_control, performance_control, musical, masks], dim=-1)
             )
+        elif self.mode == "split_score_perf":
+            embeddings = pitch_embeds + self.score_control_projection(score_control)
         else:
             m_score_control = masks[..., 0:1]
             m_performance_control = masks[..., 1:2]
@@ -612,6 +720,10 @@ class IntegratedNoteEncoder(nn.Module):
             embeddings = embeddings + missing_embeds
         embeddings = self.norm(embeddings)
         return self._apply_special_embeddings(embeddings, special_note_ids)
+
+    def pad_embedding(self):
+        pad_id = int(self.config.special_note_ids.get("pad", 0))
+        return self.special_note_embeddings.weight[pad_id]
 
     def _apply_special_embeddings(self, embeddings, special_note_ids):
         if special_note_ids is None:
@@ -882,7 +994,11 @@ class IntegratedContinuousDecoder(nn.Module):
                 raise ValueError(f"epr_mixture_components must be >= 1, got {components}")
             per_component_dim = _scalar_distribution_dim(self.epr_distribution)
             per_feature_dim = components * per_component_dim
-            ioi_output_dim = duration_output_dim = velocity_output_dim = per_feature_dim
+            if self.epr_distribution in SN_DISTRIBUTIONS:
+                ioi_output_dim = duration_output_dim = per_feature_dim * 2
+                velocity_output_dim = per_feature_dim
+            else:
+                ioi_output_dim = duration_output_dim = velocity_output_dim = per_feature_dim
             if self.epr_distribution in ALN_DISTRIBUTIONS:
                 # ALN is timing-only split-normal with one component.
                 velocity_output_dim = components * 3
@@ -1007,6 +1123,8 @@ class IntegratedContinuousDecoder(nn.Module):
                 "can",
                 "ican",
                 "iln",
+                "sn",
+                "skew_normal",
                 "logistic_normal",
                 "mixture_logistic_normal",
                 "mixture_beta",
@@ -1035,6 +1153,8 @@ class IntegratedContinuousDecoder(nn.Module):
             "can",
             "ican",
             "iln",
+            "sn",
+            "skew_normal",
             "logistic_normal",
             "mixture_logistic_normal",
             "mixture_beta",
@@ -1100,6 +1220,30 @@ def _mask_count(mask):
 def _split_epr_mixture_params(config, raw_outputs):
     components = _epr_mixture_components(config)
     distribution = getattr(config, "epr_distribution", "point").lower()
+    if distribution in SN_DISTRIBUTIONS:
+        feature_dim = 3
+        ioi_base = raw_outputs[..., : feature_dim * 2].reshape(*raw_outputs.shape[:-1], 2, feature_dim)
+        cursor = feature_dim * 2
+        duration_base = raw_outputs[..., cursor : cursor + feature_dim * 2].reshape(
+            *raw_outputs.shape[:-1],
+            2,
+            feature_dim,
+        )
+        cursor += feature_dim * 2
+        velocity_base = raw_outputs[..., cursor : cursor + feature_dim]
+        cursor += feature_dim
+        return {
+            "timing_log_loc": torch.stack([ioi_base[..., 0, 0], duration_base[..., 0, 0]], dim=-1),
+            "timing_log_log_scale": torch.stack([ioi_base[..., 0, 1], duration_base[..., 0, 1]], dim=-1),
+            "timing_log_alpha": torch.stack([ioi_base[..., 0, 2], duration_base[..., 0, 2]], dim=-1),
+            "timing_raw_loc": torch.stack([ioi_base[..., 1, 0], duration_base[..., 1, 0]], dim=-1),
+            "timing_raw_log_scale": torch.stack([ioi_base[..., 1, 1], duration_base[..., 1, 1]], dim=-1),
+            "timing_raw_alpha": torch.stack([ioi_base[..., 1, 2], duration_base[..., 1, 2]], dim=-1),
+            "velocity_loc": velocity_base[..., 0],
+            "velocity_log_scale": velocity_base[..., 1],
+            "velocity_alpha": velocity_base[..., 2],
+            "pedal_binary_logits": raw_outputs[..., cursor : cursor + 4],
+        }
     if distribution in {*ACN_DISTRIBUTIONS, *IACN_DISTRIBUTIONS}:
         per_feature_dim = _scalar_distribution_dim(distribution)
         shared_feature_count = 3
@@ -1329,12 +1473,24 @@ def _uses_inr_epr_targets(config):
     return (
         _config_value(config, "task_type", "epr") == "epr"
         and str(_config_value(config, "epr_timing_target", "absolute")).lower()
-        in {"log_deviation", "log_dev"}
+        in {"log_deviation", "log_dev", "raw_log_deviation", "raw_log_dev"}
     )
 
 
 def _uses_log_deviation_targets(config):
-    return str(_config_value(config, "epr_timing_target", "absolute")).lower() in {"log_deviation", "log_dev"}
+    return str(_config_value(config, "epr_timing_target", "absolute")).lower() in {
+        "log_deviation",
+        "log_dev",
+        "raw_log_deviation",
+        "raw_log_dev",
+    }
+
+
+def _uses_raw_log_deviation_targets(config):
+    return str(_config_value(config, "epr_timing_target", "absolute")).lower() in {
+        "raw_log_deviation",
+        "raw_log_dev",
+    }
 
 
 def _config_value(config, name, default):
@@ -1350,11 +1506,24 @@ def _torch_log_timing_code(time_ms, scale=50.0, max_time_ms=5000.0):
     return torch.log1p(value / scale_value) / denom
 
 
+def _torch_raw_log_timing_code(time_ms, scale=50.0, max_time_ms=5000.0):
+    value = time_ms.float().clamp(0.0, float(max_time_ms))
+    seconds = value / 1000.0
+    factor = value.new_tensor(1000.0 / max(float(scale), 1e-12))
+    return torch.log1p(factor * seconds)
+
+
 def _torch_log_timing_decode(time_norm, scale=50.0, max_time_ms=5000.0):
     clipped = time_norm.float().clamp(0.0, 1.0)
     scale_value = clipped.new_tensor(max(float(scale), 1e-12))
     denom = torch.log1p(clipped.new_tensor(float(max_time_ms)) / scale_value)
     return scale_value * torch.expm1(clipped * denom)
+
+
+def _torch_raw_log_timing_decode(log_value, scale=50.0, max_time_ms=5000.0):
+    factor = log_value.new_tensor(1000.0 / max(float(scale), 1e-12))
+    decoded = 1000.0 * torch.expm1(log_value.float()) / factor
+    return decoded.clamp(0.0, float(max_time_ms))
 
 
 def _torch_timing_control_code(time_ms, timing_control_mode="log_scaled", use_scale_bit=False, log_scale=50.0):
@@ -1384,6 +1553,14 @@ def _torch_timing_control_code(time_ms, timing_control_mode="log_scaled", use_sc
         )
     if mode == "log_scaled":
         return _torch_log_timing_code(value, scale=log_scale, max_time_ms=5000.0).unsqueeze(-1)
+    if mode == "raw_log":
+        return torch.stack(
+            [
+                value / 1000.0,
+                _torch_raw_log_timing_code(value, scale=log_scale, max_time_ms=5000.0),
+            ],
+            dim=-1,
+        )
     if mode == "dual_clip_linear":
         return torch.stack(
             [
@@ -1397,12 +1574,26 @@ def _torch_timing_control_code(time_ms, timing_control_mode="log_scaled", use_sc
 
 def _target7_to_raw7(score_shared_raw, target_predictions, config=None):
     score_shared_raw = score_shared_raw.float()
-    target_predictions = target_predictions.float().clamp(0.0, 1.0)
+    target_predictions = target_predictions.float()
     if target_predictions.shape[-1] < 7:
         raise ValueError(f"Expected target7 predictions, got shape {tuple(target_predictions.shape)}")
     if config is not None and not _uses_log_deviation_targets(config):
         raise ValueError("target7 -> raw7 reconstruction expects log_deviation timing targets")
     log_scale = float(_config_value(config, "timing_log_scale", 50.0)) if config is not None else 50.0
+    if _uses_raw_log_deviation_targets(config):
+        score_ioi_log = _torch_raw_log_timing_code(score_shared_raw[..., 0], scale=log_scale, max_time_ms=5000.0)
+        score_duration_log = _torch_raw_log_timing_code(score_shared_raw[..., 1], scale=log_scale, max_time_ms=5000.0)
+        perf_ioi_ms = _torch_raw_log_timing_decode(score_ioi_log + target_predictions[..., 0], scale=log_scale)
+        perf_duration_ms = _torch_raw_log_timing_decode(score_duration_log + target_predictions[..., 1], scale=log_scale)
+        if target_predictions.shape[-1] >= 9:
+            velocity = target_predictions[..., 4].clamp(0.0, 1.0) * 127.0
+            pedal = target_predictions[..., 5:9].clamp(0.0, 1.0) * 127.0
+        else:
+            velocity = target_predictions[..., 2].clamp(0.0, 1.0) * 127.0
+            pedal = target_predictions[..., 3:7].clamp(0.0, 1.0) * 127.0
+        return torch.cat([perf_ioi_ms.unsqueeze(-1), perf_duration_ms.unsqueeze(-1), velocity.unsqueeze(-1), pedal], dim=-1)
+
+    target_predictions = target_predictions.clamp(0.0, 1.0)
     score_ioi_norm = _torch_log_timing_code(score_shared_raw[..., 0], scale=log_scale, max_time_ms=5000.0)
     score_duration_norm = _torch_log_timing_code(score_shared_raw[..., 1], scale=log_scale, max_time_ms=5000.0)
     perf_ioi_norm = (score_ioi_norm + (target_predictions[..., 0] - 0.5)).clamp(0.0, 1.0)
@@ -1419,21 +1610,63 @@ def _decoder_rows_require_score_shared_raw(config):
 
 
 def _build_epr_decoder_perf_target_rows(config, target_predictions):
-    target_predictions = target_predictions.float().clamp(0.0, 1.0)
-    masks = target_predictions.new_ones(*target_predictions.shape[:-1], 3)
-    return torch.cat([target_predictions, masks], dim=-1)
+    target_features = target_predictions.float()
+    masks = target_features.new_ones(*target_features.shape[:-1], 3)
+    return torch.cat([target_features, masks], dim=-1)
 
 
-def _build_epr_decoder_rows(config, score_shared_raw, target_predictions):
+def _target_predictions_to_feedback7(config, target_predictions):
+    target_predictions = target_predictions.float()
+    if _uses_raw_log_deviation_targets(config) and target_predictions.shape[-1] >= 9:
+        return torch.cat(
+            [
+                target_predictions[..., 0:2],
+                target_predictions[..., 4:5].clamp(0.0, 1.0),
+                target_predictions[..., 5:9].clamp(0.0, 1.0),
+            ],
+            dim=-1,
+        )
+    if target_predictions.shape[-1] < 7:
+        raise ValueError(f"Expected at least 7 target values, got shape {tuple(target_predictions.shape)}")
+    if _uses_raw_log_deviation_targets(config):
+        return torch.cat(
+            [
+                target_predictions[..., 0:2],
+                target_predictions[..., 2:3].clamp(0.0, 1.0),
+                target_predictions[..., 3:7].clamp(0.0, 1.0),
+            ],
+            dim=-1,
+        )
+    return target_predictions[..., :7].clamp(0.0, 1.0)
+
+
+def _extract_integrated_score_musical(config, score_input_continuous):
+    if score_input_continuous is None:
+        return None
+    score_control_dim = int(getattr(config, "score_control_feature_dim", getattr(config, "control_feature_dim", 5)))
+    performance_control_dim = int(
+        getattr(config, "performance_control_feature_dim", getattr(config, "control_feature_dim", 5) + 4)
+    )
+    musical_dim = int(getattr(config, "musical_feature_dim", 12))
+    start = score_control_dim + performance_control_dim
+    end = start + musical_dim
+    if score_input_continuous.shape[-1] < end:
+        raise ValueError(
+            "score_input_continuous is too small to carry integrated musical features: "
+            f"got {score_input_continuous.shape[-1]}, need at least {end}"
+        )
+    return score_input_continuous[..., start:end]
+
+
+def _build_epr_decoder_rows(config, score_shared_raw, target_predictions, score_input_continuous=None):
     if decoder_note_input_schema(config) == "perf_target":
         return _build_epr_decoder_perf_target_rows(config, target_predictions)
     timing_control_mode = getattr(config, "timing_control_mode", None)
     use_timing_scale_bit = getattr(config, "use_timing_scale_bit", True)
     log_scale = getattr(config, "timing_log_scale", 50.0)
-    if resolve_timing_control_mode(timing_control_mode, use_timing_scale_bit) != "log_scaled":
-        raise ValueError("EPR decoder feedback requires timing_control_mode=log_scaled")
-    if target_predictions.shape[-1] < 7:
-        raise ValueError(f"EPR decoder feedback expects target7 predictions, got shape {tuple(target_predictions.shape)}")
+    if resolve_timing_control_mode(timing_control_mode, use_timing_scale_bit) not in {"log_scaled", "raw_log"}:
+        raise ValueError("EPR decoder feedback requires timing_control_mode=log_scaled or raw_log")
+    target7 = _target_predictions_to_feedback7(config, target_predictions)
     score_ioi = _torch_timing_control_code(
         score_shared_raw[..., 0],
         timing_control_mode=timing_control_mode,
@@ -1447,16 +1680,38 @@ def _build_epr_decoder_rows(config, score_shared_raw, target_predictions):
         log_scale=log_scale,
     )
     score_velocity = (score_shared_raw[..., 2:3].float().clamp(0.0, 127.0) / 127.0)
-    perf_ioi = (score_ioi[..., :1] + (target_predictions[..., 0:1].float().clamp(0.0, 1.0) - 0.5)).clamp(0.0, 1.0)
-    duration = (score_duration[..., :1] + (target_predictions[..., 1:2].float().clamp(0.0, 1.0) - 0.5)).clamp(0.0, 1.0)
-    velocity = target_predictions[..., 2:3].float().clamp(0.0, 1.0)
-    pedal = target_predictions[..., 3:7].float().clamp(0.0, 1.0)
+    if _uses_raw_log_deviation_targets(config):
+        score_ioi_log = _torch_raw_log_timing_code(score_shared_raw[..., 0], scale=log_scale, max_time_ms=5000.0).unsqueeze(-1)
+        score_duration_log = _torch_raw_log_timing_code(score_shared_raw[..., 1], scale=log_scale, max_time_ms=5000.0).unsqueeze(-1)
+        perf_ioi_ms = _torch_raw_log_timing_decode(score_ioi_log + target7[..., 0:1], scale=log_scale)
+        duration_ms = _torch_raw_log_timing_decode(score_duration_log + target7[..., 1:2], scale=log_scale)
+        perf_ioi = _torch_timing_control_code(
+            perf_ioi_ms.squeeze(-1),
+            timing_control_mode=timing_control_mode,
+            use_scale_bit=use_timing_scale_bit,
+            log_scale=log_scale,
+        )
+        duration = _torch_timing_control_code(
+            duration_ms.squeeze(-1),
+            timing_control_mode=timing_control_mode,
+            use_scale_bit=use_timing_scale_bit,
+            log_scale=log_scale,
+        )
+    else:
+        perf_ioi = (score_ioi[..., :1] + (target7[..., 0:1].float().clamp(0.0, 1.0) - 0.5)).clamp(0.0, 1.0)
+        duration = (score_duration[..., :1] + (target7[..., 1:2].float().clamp(0.0, 1.0) - 0.5)).clamp(0.0, 1.0)
+    velocity = target7[..., 2:3].float().clamp(0.0, 1.0)
+    pedal = target7[..., 3:7].float().clamp(0.0, 1.0)
     score_control = torch.cat([score_ioi, score_duration, score_velocity], dim=-1)
     expected_score_dim = int(getattr(config, "score_control_feature_dim", getattr(config, "control_feature_dim", 5)))
     if score_control.shape[-1] != expected_score_dim:
         raise ValueError(f"score control dim mismatch: got {score_control.shape[-1]}, expected {expected_score_dim}")
     performance_control = torch.cat([perf_ioi, duration, velocity, pedal], dim=-1)
-    musical = target_predictions.new_zeros(*target_predictions.shape[:-1], getattr(config, "musical_feature_dim", 12))
+    musical_source = _extract_integrated_score_musical(config, score_input_continuous)
+    if musical_source is None:
+        musical = target_predictions.new_zeros(*target_predictions.shape[:-1], getattr(config, "musical_feature_dim", 12))
+    else:
+        musical = musical_source.to(dtype=target_predictions.dtype, device=target_predictions.device)
     masks = target_predictions.new_tensor([0.0, 1.0, 0.0]).expand(*target_predictions.shape[:-1], 3)
     return torch.cat([score_control, performance_control, musical, masks], dim=-1)
 
@@ -1875,6 +2130,70 @@ def _mixture_beta_nll(logits, raw_alpha, raw_beta, target, mask, eps, alpha_min)
     return _masked_mean(values, mask)
 
 
+def _skew_normal_params(raw_loc, raw_log_scale, raw_alpha, sigma_min=1e-4, sigma_max=1e4):
+    log_min = torch.log(raw_log_scale.new_tensor(float(sigma_min)))
+    log_max = torch.log(raw_log_scale.new_tensor(float(sigma_max)))
+    scale = torch.exp(raw_log_scale.float().clamp(min=log_min.item(), max=log_max.item()))
+    return raw_loc.float(), scale, raw_alpha.float()
+
+
+def _skew_normal_log_prob(raw_loc, raw_log_scale, raw_alpha, target, sigma_min=1e-4, sigma_max=1e4):
+    loc, scale, alpha = _skew_normal_params(
+        raw_loc,
+        raw_log_scale,
+        raw_alpha,
+        sigma_min=sigma_min,
+        sigma_max=sigma_max,
+    )
+    z = (target.float() - loc) / scale.clamp_min(1e-12)
+    standard = torch.distributions.Normal(torch.zeros_like(z), torch.ones_like(z))
+    return (
+        math.log(2.0)
+        - torch.log(scale.clamp_min(1e-12))
+        + standard.log_prob(z)
+        + torch.log(standard.cdf(alpha * z).clamp_min(1e-12))
+    )
+
+
+def _skew_normal_nll(raw_loc, raw_log_scale, raw_alpha, target, mask, sigma_min=1e-4, sigma_max=1e4):
+    values = -_skew_normal_log_prob(
+        raw_loc,
+        raw_log_scale,
+        raw_alpha,
+        target,
+        sigma_min=sigma_min,
+        sigma_max=sigma_max,
+    )
+    return _masked_mean(values, mask)
+
+
+def _skew_normal_mean_or_sample(
+    raw_loc,
+    raw_log_scale,
+    raw_alpha,
+    sampling_strategy="mean",
+    sigma_min=1e-4,
+    sigma_max=1e4,
+):
+    loc, scale, alpha = _skew_normal_params(
+        raw_loc,
+        raw_log_scale,
+        raw_alpha,
+        sigma_min=sigma_min,
+        sigma_max=sigma_max,
+    )
+    delta = alpha / torch.sqrt(1.0 + alpha.square())
+    mode = str(sampling_strategy).lower()
+    if mode in {"mean", "deterministic", "mu", "expected", "expectation", "argmax", "greedy"}:
+        return loc + scale * delta * math.sqrt(2.0 / math.pi)
+    if mode in {"sample", "sampling", "stochastic"}:
+        u0 = torch.randn_like(loc)
+        u1 = torch.randn_like(loc)
+        z = delta * u0.abs() + torch.sqrt((1.0 - delta.square()).clamp_min(1e-12)) * u1
+        return loc + scale * z
+    raise ValueError(f"Unsupported sampling_strategy: {sampling_strategy}")
+
+
 def _mixture_logistic_normal_mean_or_sample(config, logits, raw_mu, raw_log_sigma, sampling_strategy="mean"):
     mode = str(sampling_strategy).lower()
     mu, sigma = _logistic_normal_params(
@@ -2151,6 +2470,51 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean", s
     strategy_name = str(sampling_strategy).lower()
     shared_strategy = "mean" if strategy_name in {"soft", "prob", "probs", "probability", "probabilities"} else sampling_strategy
     distribution = getattr(config, "epr_distribution", "point").lower()
+    if distribution in SN_DISTRIBUTIONS:
+        params = _split_epr_mixture_params(config, raw_outputs)
+        sigma_min = getattr(config, "skew_normal_sigma_min", getattr(config, "logistic_normal_sigma_min", 1e-4))
+        sigma_max = getattr(config, "skew_normal_sigma_max", getattr(config, "logistic_normal_sigma_max", 1e4))
+        logdev = _skew_normal_mean_or_sample(
+            params["timing_log_loc"],
+            params["timing_log_log_scale"],
+            params["timing_log_alpha"],
+            sampling_strategy=shared_strategy,
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
+        )
+        velocity = _skew_normal_mean_or_sample(
+            params["velocity_loc"],
+            params["velocity_log_scale"],
+            params["velocity_alpha"],
+            sampling_strategy=shared_strategy,
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
+        ).clamp(0.0, 1.0)
+        pedal = _materialize_binary4_logits(
+            params["pedal_binary_logits"],
+            sampling_strategy=sampling_strategy,
+        )
+        if _uses_raw_log_deviation_targets(config) and score_shared_raw is not None:
+            score_shared_raw = score_shared_raw.float()
+            log_scale = float(_config_value(config, "timing_log_scale", 50.0))
+            score_ioi_log = _torch_raw_log_timing_code(score_shared_raw[..., 0], scale=log_scale, max_time_ms=5000.0)
+            score_duration_log = _torch_raw_log_timing_code(
+                score_shared_raw[..., 1],
+                scale=log_scale,
+                max_time_ms=5000.0,
+            )
+            perf_ioi_ms = _torch_raw_log_timing_decode(score_ioi_log + logdev[..., 0], scale=log_scale)
+            perf_duration_ms = _torch_raw_log_timing_decode(score_duration_log + logdev[..., 1], scale=log_scale)
+            rawdev = torch.stack(
+                [
+                    (perf_ioi_ms - score_shared_raw[..., 0]) / 1000.0,
+                    (perf_duration_ms - score_shared_raw[..., 1]) / 1000.0,
+                ],
+                dim=-1,
+            )
+            return torch.cat([logdev, rawdev, velocity.unsqueeze(-1), pedal], dim=-1)
+        return torch.cat([logdev, velocity.unsqueeze(-1), pedal], dim=-1)
+
     if distribution == "beta_mu_kappa":
         params = _split_epr_distribution_params(raw_outputs)
         shared_mu, _, shared_alpha, shared_beta = _beta_params(
@@ -2218,6 +2582,8 @@ def _shift_feedback_mask_right(feedback_mask, attention_mask):
 
 def _target_feedback_mask_to_decoder_performance_mask(config, feedback_mask):
     if feedback_mask is None:
+        return None
+    if decoder_note_input_schema(config) == "perf_target":
         return None
     performance_dim = int(
         getattr(config, "performance_control_feature_dim", getattr(config, "control_feature_dim", 3) + 4)
@@ -2352,6 +2718,24 @@ def _apply_prior_note_dropout(config, decoder_input_continuous, special_note_ids
         raise ValueError(f"Unsupported prior_token_dropout_mode: {dropout_mode}")
 
 
+def _apply_tf_embedding_mask(note_encoder, embeddings, attention_mask, keep_prob=1.0, skip_first_token=False):
+    keep_prob = float(keep_prob)
+    if keep_prob >= 1.0:
+        return embeddings
+    valid_mask = attention_mask.bool()
+    if skip_first_token and valid_mask.shape[1] > 0:
+        valid_mask = valid_mask.clone()
+        valid_mask[:, 0] = False
+    if not valid_mask.any():
+        return embeddings
+    keep_mask = torch.rand(valid_mask.shape, device=embeddings.device) < keep_prob
+    drop_mask = valid_mask & (~keep_mask)
+    if not drop_mask.any():
+        return embeddings
+    pad_embed = note_encoder.pad_embedding().to(dtype=embeddings.dtype, device=embeddings.device)
+    return torch.where(drop_mask.unsqueeze(-1), pad_embed.view(1, 1, -1), embeddings)
+
+
 def _build_ar_special_note_ids(config, attention_mask):
     special_note_ids = attention_mask.new_full(attention_mask.shape, -1)
     if special_note_ids.shape[1] > 0:
@@ -2366,6 +2750,7 @@ def _build_prefilled_ar_note_inputs(
     output_dim,
     prefix_predictions=None,
     score_shared_raw=None,
+    score_input_continuous=None,
 ):
     batch_size, seq_len = attention_mask.shape
     if _uses_inr_epr_targets(config) or getattr(config, "task_type", "epr") == "csr":
@@ -2404,6 +2789,14 @@ def _build_prefilled_ar_note_inputs(
                         dtype=decoder_input_continuous.dtype,
                         device=decoder_input_continuous.device,
                     ),
+                    (
+                        score_input_continuous[:, :prefix_len].to(
+                            dtype=decoder_input_continuous.dtype,
+                            device=decoder_input_continuous.device,
+                        )
+                        if score_input_continuous is not None
+                        else None
+                    ),
                 )
             elif config.task_type == "csr":
                 decoder_input_continuous[:, 1 : prefix_len + 1] = _build_csr_decoder_rows(
@@ -2429,6 +2822,7 @@ def _build_ar_note_continuous(
     config,
     labels_continuous,
     score_shared_raw=None,
+    score_input_continuous=None,
     task_type="epr",
 ):
     if _uses_inr_epr_targets(config):
@@ -2436,7 +2830,12 @@ def _build_ar_note_continuous(
             raise ValueError("score_shared_raw is required for INR log_deviation AR note construction")
         if score_shared_raw is None:
             score_shared_raw = labels_continuous.new_zeros(*labels_continuous.shape[:-1], 3)
-        return _build_epr_decoder_rows(config, score_shared_raw, labels_continuous)
+        return _build_epr_decoder_rows(
+            config,
+            score_shared_raw,
+            labels_continuous,
+            score_input_continuous=score_input_continuous,
+        )
     if task_type == "csr":
         return _build_csr_decoder_rows(config, labels_continuous)
     batch_size, seq_len, _ = labels_continuous.shape
@@ -2695,7 +3094,72 @@ def _compute_integrated_loss_components(
 
     mask = attention_mask.bool()
     distribution = getattr(config, "epr_distribution", "point").lower()
-    if _is_scalar_distribution(distribution):
+    if distribution in SN_DISTRIBUTIONS:
+        params = _split_epr_mixture_params(config, continuous_pred)
+        sigma_min = getattr(config, "skew_normal_sigma_min", getattr(config, "logistic_normal_sigma_min", 1e-4))
+        sigma_max = getattr(config, "skew_normal_sigma_max", getattr(config, "logistic_normal_sigma_max", 1e4))
+        raw_lambda = float(getattr(config, "raw_timing_loss_lambda", 0.5))
+        loss_ioi_log = _skew_normal_nll(
+            params["timing_log_loc"][..., 0],
+            params["timing_log_log_scale"][..., 0],
+            params["timing_log_alpha"][..., 0],
+            labels_continuous[..., 0],
+            mask,
+            sigma_min,
+            sigma_max,
+        )
+        loss_duration_log = _skew_normal_nll(
+            params["timing_log_loc"][..., 1],
+            params["timing_log_log_scale"][..., 1],
+            params["timing_log_alpha"][..., 1],
+            labels_continuous[..., 1],
+            mask,
+            sigma_min,
+            sigma_max,
+        )
+        raw_offset = 2 if labels_continuous.shape[-1] >= 9 else None
+        if raw_offset is not None:
+            loss_ioi_raw = _skew_normal_nll(
+                params["timing_raw_loc"][..., 0],
+                params["timing_raw_log_scale"][..., 0],
+                params["timing_raw_alpha"][..., 0],
+                labels_continuous[..., 2],
+                mask,
+                sigma_min,
+                sigma_max,
+            )
+            loss_duration_raw = _skew_normal_nll(
+                params["timing_raw_loc"][..., 1],
+                params["timing_raw_log_scale"][..., 1],
+                params["timing_raw_alpha"][..., 1],
+                labels_continuous[..., 3],
+                mask,
+                sigma_min,
+                sigma_max,
+            )
+        else:
+            loss_ioi_raw = loss_ioi_log.new_zeros(())
+            loss_duration_raw = loss_duration_log.new_zeros(())
+            raw_lambda = 0.0
+        velocity_col = 4 if labels_continuous.shape[-1] >= 9 else 2
+        pedal_start = 5 if labels_continuous.shape[-1] >= 9 else 3
+        loss_ioi = loss_ioi_log + raw_lambda * loss_ioi_raw
+        loss_duration = loss_duration_log + raw_lambda * loss_duration_raw
+        loss_velocity = _skew_normal_nll(
+            params["velocity_loc"],
+            params["velocity_log_scale"],
+            params["velocity_alpha"],
+            labels_continuous[..., velocity_col],
+            mask,
+            sigma_min,
+            sigma_max,
+        )
+        loss_pedal = _bce_loss(
+            params["pedal_binary_logits"],
+            labels_continuous[..., pedal_start : pedal_start + 4],
+            mask.unsqueeze(-1).expand_as(labels_continuous[..., pedal_start : pedal_start + 4]),
+        )
+    elif _is_scalar_distribution(distribution):
         params = _split_epr_mixture_params(config, continuous_pred)
         eps = getattr(config, "epr_distribution_eps", getattr(config, "beta_eps", 1e-5))
         sigma_min = getattr(config, "logistic_normal_sigma_min", 1e-3)
@@ -2941,6 +3405,85 @@ def _compute_integrated_loss(
     )
 
 
+def _compute_stable_contract_loss(
+    config,
+    continuous_pred,
+    labels_continuous,
+    decoder_feedback_continuous,
+    stable_feedback_mask,
+    attention_mask,
+):
+    if continuous_pred is None or labels_continuous is None or decoder_feedback_continuous is None:
+        return None
+    if stable_feedback_mask is None or labels_continuous.shape[1] <= 1:
+        return None
+    if getattr(config, "task_type", "epr") != "epr" or not _uses_inr_epr_targets(config):
+        return None
+
+    pred_mean = _materialize_epr_prediction(
+        config,
+        continuous_pred,
+        sampling_strategy="mean",
+    )
+    mask = attention_mask[:, 1:].bool() & attention_mask[:, :-1].bool()
+    eps = float(getattr(config, "stable_contract_eps", 1e-6))
+    ioi_lambda = getattr(config, "stable_contract_ioi_lambda", None)
+    duration_lambda = getattr(config, "stable_contract_duration_lambda", None)
+    has_channel_weights = ioi_lambda is not None or duration_lambda is not None
+
+    if not has_channel_weights:
+        timing = slice(0, 2)
+        e_current = decoder_feedback_continuous[:, :-1, timing].float() - labels_continuous[:, :-1, timing].float()
+        r_next = pred_mean[:, 1:, timing].float() - labels_continuous[:, 1:, timing].float()
+        norm_current = torch.linalg.vector_norm(e_current, dim=-1)
+        norm_next = torch.linalg.vector_norm(r_next, dim=-1)
+        corrupted = stable_feedback_mask[:, :-1, timing].to(dtype=torch.bool).any(dim=-1)
+        valid = mask & corrupted & (norm_current > eps)
+        if not valid.any():
+            return norm_next.new_zeros(())
+        alpha = float(getattr(config, "stable_contract_alpha", 1.0))
+        values = F.relu(norm_next - alpha * norm_current)
+        return float(getattr(config, "stable_contract_lambda", 0.0)) * values.masked_select(valid).mean()
+
+    total = pred_mean.new_zeros(())
+    for column, name in ((0, "ioi"), (1, "duration")):
+        weight = getattr(config, f"stable_contract_{name}_lambda", None)
+        if weight is None:
+            weight = 0.0
+        weight = float(weight)
+        if weight <= 0.0:
+            continue
+        alpha = getattr(config, f"stable_contract_{name}_alpha", None)
+        alpha = float(getattr(config, "stable_contract_alpha", 1.0) if alpha is None else alpha)
+        current = (
+            decoder_feedback_continuous[:, :-1, column].float()
+            - labels_continuous[:, :-1, column].float()
+        ).abs()
+        next_residual = (
+            pred_mean[:, 1:, column].float()
+            - labels_continuous[:, 1:, column].float()
+        ).abs()
+        corrupted = stable_feedback_mask[:, :-1, column].to(dtype=torch.bool)
+        valid = mask & corrupted & (current > eps)
+        if not valid.any():
+            continue
+        values = F.relu(next_residual - alpha * current)
+        total = total + weight * values.masked_select(valid).mean()
+    return total
+
+
+def _stable_contract_enabled(config):
+    if not bool(getattr(config, "stable_contract_loss", False)):
+        return False
+    channel_lambdas = [
+        getattr(config, "stable_contract_ioi_lambda", None),
+        getattr(config, "stable_contract_duration_lambda", None),
+    ]
+    if any(value is not None and float(value) > 0.0 for value in channel_lambdas):
+        return True
+    return float(getattr(config, "stable_contract_lambda", 0.0)) > 0.0
+
+
 class IntegratedGQAAttention(nn.Module):
     def __init__(self, config, causal=False):
         super().__init__()
@@ -3106,6 +3649,7 @@ class IntegratedPianoTransformer(IntegratedStyleTokenMixin, nn.Module):
         labels_continuous: Optional[torch.FloatTensor] = None,
         decoder_feedback_continuous: Optional[torch.FloatTensor] = None,
         decoder_feedback_mask: Optional[torch.FloatTensor] = None,
+        stable_feedback_mask: Optional[torch.FloatTensor] = None,
         labels_epr_bins: Optional[torch.LongTensor] = None,
         label_mask: Optional[torch.LongTensor] = None,
         interpolated: Optional[torch.BoolTensor] = None,
@@ -3134,6 +3678,14 @@ class IntegratedPianoTransformer(IntegratedStyleTokenMixin, nn.Module):
         }
         score_note_embeds = self.note_encoder(pitch_ids, continuous)
         score_note_embeds = self._apply_style_to_note_embeds(score_note_embeds, **style_kwargs)
+        if self.training and bool(getattr(self.config, "tf_embedding_mask_score", False)):
+            score_note_embeds = _apply_tf_embedding_mask(
+                self.note_encoder,
+                score_note_embeds,
+                attention_mask,
+                keep_prob=getattr(self.config, "tf_embedding_mask_keep_prob", 1.0),
+                skip_first_token=False,
+            )
         score_context_embeds, context_attention_mask, _ = self._prepend_style_tokens(
             score_note_embeds,
             attention_mask,
@@ -3154,6 +3706,7 @@ class IntegratedPianoTransformer(IntegratedStyleTokenMixin, nn.Module):
                     self.config,
                     feedback_continuous,
                     score_shared_raw=score_shared_raw,
+                    score_input_continuous=continuous,
                     task_type=self.config.task_type,
                 )
                 decoder_input_continuous = _shift_continuous_right(decoder_target_continuous, attention_mask)
@@ -3228,6 +3781,17 @@ class IntegratedPianoTransformer(IntegratedStyleTokenMixin, nn.Module):
                 labels_epr_bins=labels_epr_bins,
                 score_shared_raw=score_shared_raw,
             )
+            if _stable_contract_enabled(self.config):
+                contract_loss = _compute_stable_contract_loss(
+                    self.config,
+                    continuous_pred,
+                    labels_continuous,
+                    decoder_feedback_continuous,
+                    stable_feedback_mask,
+                    loss_mask,
+                )
+                if contract_loss is not None:
+                    loss = loss + contract_loss
 
         return Seq2SeqLMOutput(loss=loss, logits=continuous_pred)
 
@@ -3316,6 +3880,7 @@ class IntegratedPianoTransformer(IntegratedStyleTokenMixin, nn.Module):
             self.config.output_continuous_dim,
             prefix_predictions=prefix_predictions,
             score_shared_raw=score_shared_raw,
+            score_input_continuous=continuous,
         )
         decoder_pitch_ids = _shift_pitch_right(self.config, pitch_ids, attention_mask)
         predictions = []
@@ -3357,6 +3922,7 @@ class IntegratedPianoTransformer(IntegratedStyleTokenMixin, nn.Module):
                         self.config,
                         score_shared_raw[:, step : step + 1],
                         step_pred,
+                        score_input_continuous=continuous[:, step : step + 1],
                     )[:, 0]
                 elif self.config.task_type == "epr":
                     decoder_input_continuous[:, step + 1, 1] = 1.0
@@ -3435,6 +4001,7 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
                 self.config,
                 feedback_continuous,
                 score_shared_raw=score_shared_raw,
+                score_input_continuous=continuous,
                 task_type=self.config.task_type,
             )
             decoder_input_continuous = _shift_continuous_right(decoder_target_continuous, attention_mask)
@@ -3470,6 +4037,7 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
         labels_continuous: Optional[torch.FloatTensor] = None,
         decoder_feedback_continuous: Optional[torch.FloatTensor] = None,
         decoder_feedback_mask: Optional[torch.FloatTensor] = None,
+        stable_feedback_mask: Optional[torch.FloatTensor] = None,
         labels_epr_bins: Optional[torch.LongTensor] = None,
         label_mask: Optional[torch.LongTensor] = None,
         interpolated: Optional[torch.BoolTensor] = None,
@@ -3536,6 +4104,14 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
                 decoder_inputs_embeds,
                 **style_kwargs,
             )
+            if self.training and bool(getattr(self.config, "tf_embedding_mask_decoder", False)):
+                decoder_inputs_embeds = _apply_tf_embedding_mask(
+                    self.decoder_note_encoder,
+                    decoder_inputs_embeds,
+                    decoder_input_mask,
+                    keep_prob=getattr(self.config, "tf_embedding_mask_keep_prob", 1.0),
+                    skip_first_token=True,
+                )
         if decoder_inputs_embeds is None:
             continuous_pred = self._autoregressive_rollout(
                 pitch_ids=pitch_ids,
@@ -3563,6 +4139,17 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
                     labels_epr_bins=labels_epr_bins,
                     score_shared_raw=score_shared_raw,
                 )
+                if _stable_contract_enabled(self.config):
+                    contract_loss = _compute_stable_contract_loss(
+                        self.config,
+                        continuous_pred,
+                        labels_continuous,
+                        decoder_feedback_continuous,
+                        stable_feedback_mask,
+                        loss_mask,
+                    )
+                    if contract_loss is not None:
+                        loss = loss + contract_loss
             return Seq2SeqLMOutput(loss=loss, logits=continuous_pred)
         if decoder_attention_mask is None:
             decoder_attention_mask = decoder_input_mask
@@ -3608,6 +4195,17 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
                 labels_epr_bins=labels_epr_bins,
                 score_shared_raw=score_shared_raw,
             )
+            if _stable_contract_enabled(self.config):
+                contract_loss = _compute_stable_contract_loss(
+                    self.config,
+                    continuous_pred,
+                    labels_continuous,
+                    decoder_feedback_continuous,
+                    stable_feedback_mask,
+                    loss_mask,
+                )
+                if contract_loss is not None:
+                    loss = loss + contract_loss
 
         return Seq2SeqLMOutput(
             loss=loss,
@@ -3718,6 +4316,7 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
             self.config.output_continuous_dim,
             prefix_predictions=prefix_predictions,
             score_shared_raw=score_shared_raw,
+            score_input_continuous=continuous,
         )
         decoder_pitch_ids = _shift_pitch_right(self.config, pitch_ids, attention_mask)
         if prefix_len >= seq_len:
@@ -3834,6 +4433,7 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
                         self.config,
                         score_shared_raw[:, step : step + 1],
                         step_pred,
+                        score_input_continuous=continuous[:, step : step + 1],
                     )[:, 0]
                 elif self.config.task_type == "epr":
                     decoder_input_continuous[:, step + 1, 1] = 1.0

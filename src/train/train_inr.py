@@ -208,6 +208,7 @@ def resolve_timing_control_mode(timing_control_mode="log_scaled", use_timing_sca
         "dual_log_linear",
         "dual_clip_linear",
         "log_scaled",
+        "raw_log",
     }
     if mode not in valid_modes:
         raise ValueError(f"Unsupported timing_control_mode={timing_control_mode}")
@@ -219,6 +220,8 @@ def timing_control_feature_dim(timing_control_mode="log_scaled", use_timing_scal
         timing_control_mode=timing_control_mode,
         use_timing_scale_bit=use_timing_scale_bit,
     )
+    if mode == "raw_log":
+        return 5
     return 3 if mode in {"piecewise_single", "log_scaled"} else 5
 
 
@@ -255,8 +258,9 @@ def decoder_note_input_schema(config_or_value=None):
 
 def dagger_target_columns(mode, output_dim=7):
     mode = str(mode or "full").lower()
+    output_dim = int(output_dim)
     if mode == "full":
-        return list(range(int(output_dim)))
+        return list(range(output_dim))
     if mode == "timing":
         return [0, 1]
     if mode == "ioi":
@@ -264,9 +268,9 @@ def dagger_target_columns(mode, output_dim=7):
     if mode == "duration":
         return [1]
     if mode == "velocity":
-        return [2]
+        return [4] if output_dim >= 9 else [2]
     if mode == "pedal":
-        return list(range(3, min(int(output_dim), 7)))
+        return list(range(5, min(output_dim, 9))) if output_dim >= 9 else list(range(3, min(output_dim, 7)))
     raise ValueError(f"Unsupported DAgger replacement mode: {mode}")
 
 
@@ -285,6 +289,65 @@ def normalize_dagger_replacement_weights(weights=None):
     if total <= 0.0:
         raise ValueError("DAgger replacement weights must contain at least one positive value")
     return {key: value / total for key, value in cleaned.items()}
+
+
+def normalize_stable_noise_modes(modes=None):
+    default = {
+        "zero_mean": {
+            "prob": 0.50,
+            "ioi_mu": 0.0,
+            "ioi_sigma": 0.010,
+            "duration_mu": 0.0,
+            "duration_sigma": 0.010,
+        },
+        "positive_bias": {
+            "prob": 0.25,
+            "ioi_mu": 0.003,
+            "ioi_sigma": 0.010,
+            "duration_mu": 0.003,
+            "duration_sigma": 0.010,
+        },
+        "variance_inflation": {
+            "prob": 0.25,
+            "ioi_mu": 0.0,
+            "ioi_sigma": 0.025,
+            "duration_mu": 0.0,
+            "duration_sigma": 0.020,
+        },
+    }
+    raw = default if modes is None else modes
+    cleaned = {}
+    for name, spec in dict(raw).items():
+        spec = dict(spec or {})
+        prob = float(spec.get("prob", 0.0))
+        if prob <= 0.0:
+            continue
+        cleaned[str(name)] = {
+            "prob": prob,
+            "ioi_mu": float(spec.get("ioi_mu", 0.0)),
+            "ioi_sigma": max(0.0, float(spec.get("ioi_sigma", 0.0))),
+            "duration_mu": float(spec.get("duration_mu", spec.get("dur_mu", 0.0))),
+            "duration_sigma": max(0.0, float(spec.get("duration_sigma", spec.get("dur_sigma", 0.0)))),
+        }
+    total = sum(item["prob"] for item in cleaned.values())
+    if total <= 0.0:
+        raise ValueError("stable_noise_modes must contain at least one positive-probability mode")
+    for item in cleaned.values():
+        item["prob"] = item["prob"] / total
+    return cleaned
+
+
+def stable_target_columns(channels=None):
+    if channels is None:
+        channels = ["ioi", "duration"]
+    mapping = {"ioi": 0, "duration": 1, "dur": 1}
+    cols = []
+    for channel in channels:
+        key = str(channel).lower()
+        if key not in mapping:
+            raise ValueError(f"Unsupported stable dynamics channel: {channel}")
+        cols.append(mapping[key])
+    return sorted(set(cols))
 
 
 def integrated_epr_input_dim(
@@ -312,8 +375,8 @@ def score_musical_input_dim(timing_control_mode="log_scaled", use_timing_scale_b
     return control_dim + musical_feature_dim(musical_feature_mode) + 1
 
 
-def decoder_perf_target_input_dim():
-    return 7 + 3
+def decoder_perf_target_input_dim(output_dim=7):
+    return int(output_dim) + 3
 
 
 def integrated_csr_output_dim():
@@ -434,6 +497,13 @@ def normalize_log_timing_value(time_ms, scale=1.0, max_time_ms=5000.0):
     return math.log1p(value / scale) / math.log1p(float(max_time_ms) / scale)
 
 
+def raw_log_timing_value(time_ms, scale=50.0, max_time_ms=5000.0):
+    value = min(max(float(time_ms), 0.0), float(max_time_ms))
+    seconds = value / 1000.0
+    factor = 1000.0 / max(float(scale), 1e-12)
+    return math.log1p(factor * seconds)
+
+
 def denormalize_log_timing_value(time_norm, scale=50.0, max_time_ms=5000.0):
     clipped = min(max(float(time_norm), 0.0), 1.0)
     scale = max(float(scale), 1e-12)
@@ -447,7 +517,11 @@ def normalize_log_timing_dev(score_time_ms, perf_time_ms, scale=50.0, max_time_m
 
 
 def _uses_log_deviation_target(epr_timing_target):
-    return str(epr_timing_target or "").lower() in {"log_deviation", "log_dev"}
+    return str(epr_timing_target or "").lower() in {"log_deviation", "log_dev", "raw_log_deviation", "raw_log_dev"}
+
+
+def _uses_raw_log_deviation_target(epr_timing_target):
+    return str(epr_timing_target or "").lower() in {"raw_log_deviation", "raw_log_dev"}
 
 
 def normalize_ioi_dev(
@@ -457,6 +531,11 @@ def normalize_ioi_dev(
     log_scale=50.0,
 ):
     if _uses_log_deviation_target(epr_timing_target):
+        if _uses_raw_log_deviation_target(epr_timing_target):
+            return raw_log_timing_value(perf_ioi_ms, scale=log_scale) - raw_log_timing_value(
+                score_ioi_ms,
+                scale=log_scale,
+            )
         score_norm = normalize_log_timing_value(score_ioi_ms, scale=log_scale, max_time_ms=5000.0)
         perf_norm = normalize_log_timing_value(perf_ioi_ms, scale=log_scale, max_time_ms=5000.0)
         delta = perf_norm - score_norm
@@ -470,6 +549,11 @@ def normalize_ioi_dev(
 
 def normalize_duration_dev(score_duration_ms, perf_duration_ms, epr_timing_target="deviation", log_scale=50.0):
     if _uses_log_deviation_target(epr_timing_target):
+        if _uses_raw_log_deviation_target(epr_timing_target):
+            return raw_log_timing_value(perf_duration_ms, scale=log_scale) - raw_log_timing_value(
+                score_duration_ms,
+                scale=log_scale,
+            )
         return normalize_log_timing_dev(score_duration_ms, perf_duration_ms, scale=log_scale, max_time_ms=5000.0)
     dev_ms = float(perf_duration_ms) - float(score_duration_ms)
     return min(max((dev_ms + 500.0) / 1000.0, 0.0), 1.0)
@@ -502,24 +586,33 @@ def performance_dev_velocity_pedal4_binary_rows(
     threshold = float(pedal_binary_threshold)
     rows = []
     for score_row, perf_row, pedal_row in zip(score_shared_raw, shared_rows, pedal_rows):
-        rows.append(
-            [
-                normalize_ioi_dev(
-                    score_row[0],
-                    perf_row[0],
-                    epr_timing_target=epr_timing_target,
-                    log_scale=log_scale,
-                ),
-                normalize_duration_dev(
-                    score_row[1],
-                    perf_row[1],
-                    epr_timing_target=epr_timing_target,
-                    log_scale=log_scale,
-                ),
-                min(max(float(perf_row[2]), 0.0), 127.0) / 127.0,
-                *[1.0 if float(value) >= threshold else 0.0 for value in pedal_row[:4]],
-            ]
+        log_ioi = normalize_ioi_dev(
+            score_row[0],
+            perf_row[0],
+            epr_timing_target=epr_timing_target,
+            log_scale=log_scale,
         )
+        log_duration = normalize_duration_dev(
+            score_row[1],
+            perf_row[1],
+            epr_timing_target=epr_timing_target,
+            log_scale=log_scale,
+        )
+        velocity = min(max(float(perf_row[2]), 0.0), 127.0) / 127.0
+        pedal = [1.0 if float(value) >= threshold else 0.0 for value in pedal_row[:4]]
+        if _uses_raw_log_deviation_target(epr_timing_target):
+            rows.append(
+                [
+                    log_ioi,
+                    log_duration,
+                    (float(perf_row[0]) - float(score_row[0])) / 1000.0,
+                    (float(perf_row[1]) - float(score_row[1])) / 1000.0,
+                    velocity,
+                    *pedal,
+                ]
+            )
+        else:
+            rows.append([log_ioi, log_duration, velocity, *pedal])
     return rows
 
 
@@ -554,6 +647,11 @@ def encode_timing_control_features(time_ms, timing_control_mode="log_scaled", us
         return [
             min(value / 500.0, 1.0),
             value / 5000.0,
+        ]
+    if mode == "raw_log":
+        return [
+            value / 1000.0,
+            raw_log_timing_value(value, scale=log_scale),
         ]
     raise ValueError(f"Unsupported timing_control_mode={mode}")
 
@@ -694,10 +792,10 @@ def build_score_musical_rows(score, musical_feature_mode="continuous"):
             score_ioi_ms = float(score_raw[idx][0]) if idx < len(score_raw) else 0.0
             score_ioi_is_zero = 1.0 if score_ioi_ms <= 0.0 else 0.0
             continuous = [
-                min(max(mo / 6.0, 0.0), 1.0),
+                mo,
                 score_ioi_is_zero,
-                min(max(md / 6.0, 0.0), 1.0),
-                min(max(raw_ml / 6.0, 0.0), 1.0),
+                md,
+                raw_ml,
                 tempo_norm,
                 first,
                 grace,
@@ -716,7 +814,7 @@ def build_score_musical_rows(score, musical_feature_mode="continuous"):
             l_bins = _one_hot_bucket(raw_ml, [0.0, 1.0, 1.5, 2.0, 4.0])
             phase = (mo / max(raw_ml, 1e-6)) % 1.0 if raw_ml > 0 else (mo / 4.0) % 1.0
             o_phase = min(15, int(math.floor(phase * 16.0)))
-            o_scalar = min(max(mo / 6.0, 0.0), 1.0)
+            o_scalar = mo
 
             rows.append(
                 [
@@ -740,9 +838,9 @@ def build_score_musical_rows(score, musical_feature_mode="continuous"):
         rows.append(
             [
                 *_one_hot_exact(md, MUSICAL_MD_CATEGORIES),
-                min(max(md / 6.0, 0.0), 1.0),
+                md,
                 *_one_hot_exact(ml_eff, MUSICAL_ML_CATEGORIES),
-                min(max(ml_eff / 6.0, 0.0), 1.0),
+                ml_eff,
                 ml_present,
                 *_one_hot_exact(mo_phase, MUSICAL_MO_PHASE_CATEGORIES),
                 min(max(mo_phase, 0.0), 1.0),
@@ -765,6 +863,7 @@ def build_epr_score_input_rows(
     log_scale=50.0,
     musical_feature_mode="categorical",
     score_note_schema="integrated",
+    disable_musical_features=False,
 ):
     score_raw = score["score_raw"]
     has_score_feature = score.get("has_score_feature", [0] * len(score["pitch"]))
@@ -782,7 +881,11 @@ def build_epr_score_input_rows(
             timing_control_mode=timing_control_mode,
             log_scale=log_scale,
         )
-        m_musical = 1.0 if bool(has_feature) else 0.0
+        if disable_musical_features:
+            m_musical = 0.0
+            musical = [0.0] * len(musical)
+        else:
+            m_musical = 1.0 if bool(has_feature) else 0.0
         masked_musical = [value * m_musical for value in musical]
         if schema == "score_musical":
             rows.append(score_control + masked_musical + [m_musical])
@@ -1119,6 +1222,7 @@ class PianoCoReNodeSFTDataset(Dataset):
         musical_feature_mode="categorical",
         score_note_schema="integrated",
         epr_timing_target="log_deviation",
+        disable_musical_features=False,
         use_timing_scale_bit=False,
         timing_control_mode="log_scaled",
         timing_log_scale=50.0,
@@ -1142,6 +1246,7 @@ class PianoCoReNodeSFTDataset(Dataset):
         self.musical_feature_mode = str(musical_feature_mode).lower()
         self.score_note_schema = score_note_input_schema(score_note_schema)
         self.epr_timing_target = str(epr_timing_target or "log_deviation").lower()
+        self.disable_musical_features = bool(disable_musical_features)
         self.use_timing_scale_bit = bool(use_timing_scale_bit)
         self.timing_control_mode = resolve_timing_control_mode(
             timing_control_mode=timing_control_mode,
@@ -1197,6 +1302,7 @@ class PianoCoReNodeSFTDataset(Dataset):
                 "input_feature_mode": self.input_feature_mode,
                 "musical_feature_mode": self.musical_feature_mode,
                 "score_note_input_schema": self.score_note_schema,
+                "disable_musical_features": self.disable_musical_features,
                 "timing_control_mode": self.timing_control_mode,
                 "timing_log_scale": self.timing_log_scale,
                 "use_timing_scale_bit": self.use_timing_scale_bit,
@@ -1469,6 +1575,7 @@ class PianoCoReNodeSFTDataset(Dataset):
                 log_scale=self.timing_log_scale,
                 musical_feature_mode=self.musical_feature_mode,
                 score_note_schema=self.score_note_schema,
+                disable_musical_features=self.disable_musical_features,
             )
         elif derive_features and task_type == "csr":
             prepared["score_musical"] = build_score_musical_rows(score, musical_feature_mode="continuous")
@@ -1531,6 +1638,8 @@ class PianoCoReNodeSFTDataset(Dataset):
         if self.task_type.lower() == "epr" and self.epr_timing_target in {
             "log_deviation",
             "log_dev",
+            "raw_log_deviation",
+            "raw_log_dev",
         }:
             labels = performance_dev_velocity_pedal4_binary_rows(
                 perf,
@@ -1609,6 +1718,7 @@ class PianoCoReNodeSFTDataset(Dataset):
                 log_scale=self.timing_log_scale,
                 musical_feature_mode=self.musical_feature_mode,
                 score_note_schema=self.score_note_schema,
+                disable_musical_features=self.disable_musical_features,
             )
         return cache[cache_key]
 
@@ -2094,9 +2204,18 @@ class NodeSFTTrainer(Trainer):
                     else:
                         pred = pred_tf
                 lengths = batch["attention_mask"].detach().sum(dim=1).cpu().tolist()
+                labels_cpu = batch["labels_continuous"].detach().float().cpu()
                 pred_cpu = pred.detach().float().cpu()
-                for item_index, length, values in zip(example_indices, lengths, pred_cpu):
-                    cache[int(item_index)] = values[: int(length)].contiguous()
+                for item_index, length, values, label_values in zip(example_indices, lengths, pred_cpu, labels_cpu):
+                    length = int(length)
+                    if label_values.shape[-1] >= 9 and values.shape[-1] == 7:
+                        expanded = label_values[:length].clone()
+                        expanded[:, 0:2] = values[:length, 0:2]
+                        expanded[:, 4:5] = values[:length, 2:3]
+                        expanded[:, 5:9] = values[:length, 3:7]
+                        cache[int(item_index)] = expanded.contiguous()
+                    else:
+                        cache[int(item_index)] = values[:length].contiguous()
         finally:
             if was_training:
                 self.model.train()
@@ -2534,6 +2653,11 @@ class NodeSFTDataCollator:
         dagger_apply_prob=1.0,
         dagger_replacement_weights=None,
         dagger_seed=42,
+        stable_dynamics_training=False,
+        stable_apply_prob=0.30,
+        stable_channels=None,
+        stable_noise_modes=None,
+        stable_seed=42,
     ):
         self.pitch_pad_id = pitch_pad_id
         self.task_type = task_type
@@ -2542,6 +2666,11 @@ class NodeSFTDataCollator:
         self.dagger_apply_prob = float(dagger_apply_prob)
         self.dagger_replacement_weights = normalize_dagger_replacement_weights(dagger_replacement_weights)
         self._dagger_rng = random.Random(int(dagger_seed))
+        self.stable_dynamics_training = bool(stable_dynamics_training)
+        self.stable_apply_prob = float(stable_apply_prob)
+        self.stable_columns = stable_target_columns(stable_channels)
+        self.stable_noise_modes = normalize_stable_noise_modes(stable_noise_modes)
+        self._stable_rng = random.Random(int(stable_seed))
 
     def _sample_dagger_mode(self):
         draw = self._dagger_rng.random()
@@ -2553,6 +2682,17 @@ class NodeSFTDataCollator:
             if draw <= running:
                 return key
         return last_key or "full"
+
+    def _sample_stable_noise_mode(self):
+        draw = self._stable_rng.random()
+        running = 0.0
+        last_spec = None
+        for spec in self.stable_noise_modes.values():
+            running += float(spec["prob"])
+            last_spec = spec
+            if draw <= running:
+                return spec
+        return last_spec
 
     def __call__(self, examples):
         pitch_tensors = [torch.tensor(example["pitch_ids"], dtype=torch.long) for example in examples]
@@ -2635,6 +2775,42 @@ class NodeSFTDataCollator:
                 batch["decoder_feedback_continuous"] = decoder_feedback_continuous
                 if decoder_feedback_mask.any():
                     batch["decoder_feedback_mask"] = decoder_feedback_mask
+        if self.stable_dynamics_training:
+            if self.task_type != "epr":
+                raise ValueError("stable_dynamics_training currently supports task_type=epr only")
+            decoder_feedback_continuous = batch.get("decoder_feedback_continuous")
+            if decoder_feedback_continuous is None:
+                decoder_feedback_continuous = labels_continuous.clone()
+            else:
+                decoder_feedback_continuous = decoder_feedback_continuous.clone()
+            stable_feedback_mask = torch.zeros_like(labels_continuous)
+            valid = attention_mask.bool()
+            apply_mask = torch.rand(valid.shape, dtype=torch.float32) < self.stable_apply_prob
+            apply_mask = apply_mask & valid
+            if apply_mask.any():
+                for row_idx in range(labels_continuous.shape[0]):
+                    row_mask = apply_mask[row_idx]
+                    if not row_mask.any():
+                        continue
+                    spec = self._sample_stable_noise_mode()
+                    for col in self.stable_columns:
+                        if col == 0:
+                            mu = float(spec["ioi_mu"])
+                            sigma = float(spec["ioi_sigma"])
+                        elif col == 1:
+                            mu = float(spec["duration_mu"])
+                            sigma = float(spec["duration_sigma"])
+                        else:
+                            continue
+                        noise = torch.randn_like(decoder_feedback_continuous[row_idx, :, col]) * sigma + mu
+                        updated = decoder_feedback_continuous[row_idx, row_mask, col] + noise[row_mask]
+                        if _uses_raw_log_deviation_target(self.epr_timing_target):
+                            decoder_feedback_continuous[row_idx, row_mask, col] = updated
+                        else:
+                            decoder_feedback_continuous[row_idx, row_mask, col] = updated.clamp(0.0, 1.0)
+                        stable_feedback_mask[row_idx, row_mask, col] = 1.0
+                batch["decoder_feedback_continuous"] = decoder_feedback_continuous
+                batch["stable_feedback_mask"] = stable_feedback_mask
         if self.use_style_tokens:
             batch["style_creator_ids"] = torch.tensor(
                 [int(example["style_creator_id"]) for example in examples],
@@ -2677,18 +2853,21 @@ def create_model(train_config):
         timing_control_mode=train_config.get("timing_control_mode"),
         use_timing_scale_bit=train_config.get("use_timing_scale_bit", False),
     )
-    if task_type in {"epr", "csr"} and timing_control_mode != "log_scaled":
-        raise ValueError("Integrated INR requires timing_control_mode=log_scaled")
-    if task_type == "epr" and epr_timing_target not in {"log_deviation", "log_dev"}:
-        raise ValueError("EPR requires epr_timing_target=log_deviation")
+    if task_type in {"epr", "csr"} and timing_control_mode not in {"log_scaled", "raw_log"}:
+        raise ValueError("Integrated INR requires timing_control_mode=log_scaled or raw_log")
+    if task_type == "epr" and epr_timing_target not in {"log_deviation", "log_dev", "raw_log_deviation", "raw_log_dev"}:
+        raise ValueError("EPR requires epr_timing_target=log_deviation or raw_log_deviation")
     use_timing_scale_bit = timing_control_mode == "piecewise_scale_bit"
     note_embedding_mode = str(train_config.get("note_embedding_mode", "sine")).lower()
     score_note_schema = score_note_input_schema(train_config)
     decoder_note_schema = decoder_note_input_schema(train_config)
     if input_feature_mode != "integrated":
         raise ValueError(f"INR0624 only supports input_feature_mode=integrated, got {input_feature_mode}")
-    if note_embedding_mode not in {"sine", "cine"}:
-        raise ValueError(f"INR0624 only supports note_embedding_mode in {{'sine', 'cine'}}, got {note_embedding_mode}")
+    if note_embedding_mode not in {"sine", "cine", "split_score_perf"}:
+        raise ValueError(
+            f"INR0624 only supports note_embedding_mode in {{'sine', 'cine', 'split_score_perf'}}, "
+            f"got {note_embedding_mode}"
+        )
     if task_type == "epr":
         if "epr_distribution" not in train_config:
             raise ValueError("EPR config must set epr_distribution explicitly")
@@ -2708,6 +2887,8 @@ def create_model(train_config):
             "logistic_normal",
             "mixture_logistic_normal",
             "mixture_beta",
+            "sn",
+            "skew_normal",
         }
         if distribution not in supported_distributions:
             raise ValueError(f"Unsupported epr_distribution={distribution}")
@@ -2719,6 +2900,8 @@ def create_model(train_config):
             "logistic_normal",
             "mixture_logistic_normal",
             "mixture_beta",
+            "sn",
+            "skew_normal",
         }
         pedal_distribution = str(train_config.get("pedal_distribution", distribution)).lower()
         if pedal_distribution not in supported_distributions:
@@ -2746,7 +2929,7 @@ def create_model(train_config):
             components = int(train_config["epr_mixture_components"])
             if components < 1:
                 raise ValueError(f"epr_mixture_components must be >= 1, got {components}")
-            if distribution in {"lan", "can", "ican", "iln", "logistic_normal"} and components != 1:
+            if distribution in {"sn", "skew_normal", "lan", "can", "ican", "iln", "logistic_normal"} and components != 1:
                 raise ValueError(f"epr_distribution={distribution} requires epr_mixture_components=1")
             if distribution in {"mixture_logistic_normal", "mixture_beta"} and components < 2:
                 raise ValueError(f"epr_distribution={distribution} requires epr_mixture_components >= 2")
@@ -2764,28 +2947,37 @@ def create_model(train_config):
             if pedal_representation != "binary_4":
                 raise ValueError("deviation EPR requires pedal_representation=binary_4")
             expected_output_dim = 7
-            if int(train_config.get("output_continuous_dim", train_config["continuous_dim"])) != expected_output_dim:
-                raise ValueError(
-                    f"deviation EPR with pedal_representation={pedal_representation} "
-                    f"requires output_continuous_dim={expected_output_dim}"
-                )
-            if distribution not in {
-                "point",
-                "huber",
-                "deterministic_huber",
-                "lan",
-                "can",
-                "ican",
-                "iln",
-                "logistic_normal",
-                "mixture_logistic_normal",
-                "beta_mu_kappa",
-                "mixture_beta",
-            }:
-                raise ValueError(
-                    "deviation EPR currently supports point/huber, lan/can/ican, LN/MLN, beta, and mixture_beta, "
-                    f"got epr_distribution={distribution}"
-                )
+        elif epr_timing_target in {"raw_log_deviation", "raw_log_dev"}:
+            pedal_representation = str(train_config.get("pedal_representation", "binary_4")).lower()
+            if pedal_representation != "binary_4":
+                raise ValueError("raw_log deviation EPR requires pedal_representation=binary_4")
+            expected_output_dim = 9
+        else:
+            expected_output_dim = None
+        if expected_output_dim is not None and int(train_config.get("output_continuous_dim", train_config["continuous_dim"])) != expected_output_dim:
+            raise ValueError(
+                f"EPR with pedal_representation={pedal_representation} "
+                f"requires output_continuous_dim={expected_output_dim}"
+            )
+        if expected_output_dim is not None and distribution not in {
+            "point",
+            "huber",
+            "deterministic_huber",
+            "lan",
+            "can",
+            "ican",
+            "iln",
+            "logistic_normal",
+            "mixture_logistic_normal",
+            "beta_mu_kappa",
+            "mixture_beta",
+            "sn",
+            "skew_normal",
+        }:
+            raise ValueError(
+                "deviation EPR currently supports point/huber, SN, lan/can/ican, LN/MLN, beta, and mixture_beta, "
+                f"got epr_distribution={distribution}"
+            )
     elif task_type == "csr":
         expected_output_dim = integrated_csr_output_dim()
         actual_output_dim = int(train_config.get("output_continuous_dim", train_config["continuous_dim"]))
@@ -2824,7 +3016,9 @@ def create_model(train_config):
     )
     score_input_continuous_dim = default_score_input_dim
     decoder_input_continuous_dim = (
-        decoder_perf_target_input_dim()
+        decoder_perf_target_input_dim(
+            train_config.get("output_continuous_dim", train_config.get("continuous_dim", 7))
+        )
         if task_type == "epr" and decoder_note_schema == "perf_target"
         else score_input_continuous_dim
     )
@@ -2852,7 +3046,9 @@ def create_model(train_config):
                 f"for score_note_schema={score_note_schema}, got {score_input_continuous_dim}"
             )
         if task_type == "epr" and decoder_note_schema == "perf_target":
-            expected_decoder_dim = decoder_perf_target_input_dim()
+            expected_decoder_dim = decoder_perf_target_input_dim(
+                train_config.get("output_continuous_dim", train_config.get("continuous_dim", 7))
+            )
             if int(decoder_input_continuous_dim) != expected_decoder_dim:
                 raise ValueError(
                     f"Integrated INR0624 EPR expects decoder_input_continuous_dim={expected_decoder_dim} "
@@ -2915,6 +3111,9 @@ def create_model(train_config):
         epr_distribution_eps=train_config.get("epr_distribution_eps"),
         logistic_normal_sigma_min=train_config.get("logistic_normal_sigma_min", 1e-3),
         logistic_normal_sigma_max=train_config.get("logistic_normal_sigma_max", 10.0),
+        skew_normal_sigma_min=train_config.get("skew_normal_sigma_min", train_config.get("logistic_normal_sigma_min", 1e-4)),
+        skew_normal_sigma_max=train_config.get("skew_normal_sigma_max", train_config.get("logistic_normal_sigma_max", 1e4)),
+        raw_timing_loss_lambda=train_config.get("raw_timing_loss_lambda", 0.5),
         beta_eps=train_config.get("beta_eps", 1e-5),
         beta_kappa_min=train_config.get("beta_kappa_min", 1e-3),
         beta_alpha_min=train_config.get("beta_alpha_min", 1e-4),
@@ -2932,6 +3131,17 @@ def create_model(train_config):
         prior_token_dropout_mode=train_config.get("prior_token_dropout_mode", "mask"),
         prior_attribute_keep_probs=train_config.get("prior_attribute_keep_probs"),
         prior_attribute_noise_std=train_config.get("prior_attribute_noise_std", 0.05),
+        tf_embedding_mask_keep_prob=train_config.get("tf_embedding_mask_keep_prob", 1.0),
+        tf_embedding_mask_score=train_config.get("tf_embedding_mask_score", False),
+        tf_embedding_mask_decoder=train_config.get("tf_embedding_mask_decoder", False),
+        stable_contract_loss=train_config.get("stable_contract_loss", False),
+        stable_contract_alpha=train_config.get("stable_contract_alpha", 1.0),
+        stable_contract_lambda=train_config.get("stable_contract_lambda", 0.0),
+        stable_contract_ioi_alpha=train_config.get("stable_contract_ioi_alpha"),
+        stable_contract_duration_alpha=train_config.get("stable_contract_duration_alpha"),
+        stable_contract_ioi_lambda=train_config.get("stable_contract_ioi_lambda"),
+        stable_contract_duration_lambda=train_config.get("stable_contract_duration_lambda"),
+        stable_contract_eps=train_config.get("stable_contract_eps", 1e-6),
         piano_pitch_min=train_config.get("piano_pitch_min", 21),
         pedal_representation=train_config.get("pedal_representation", "binary_4"),
         use_style_tokens=train_config.get("use_style_tokens", False),
@@ -3217,14 +3427,17 @@ def main():
         timing_control_mode=train_config.get("timing_control_mode"),
         use_timing_scale_bit=train_config.get("use_timing_scale_bit", False),
     )
-    if task_type in {"epr", "csr"} and timing_control_mode != "log_scaled":
-        raise ValueError("Integrated INR requires timing_control_mode=log_scaled")
-    if task_type == "epr" and str(train_config.get("epr_timing_target", "log_deviation")).lower() not in {"log_deviation", "log_dev"}:
-        raise ValueError("EPR requires epr_timing_target=log_deviation")
-    train_config["timing_control_mode"] = "log_scaled"
-    train_config["use_timing_scale_bit"] = False
-    if task_type == "epr":
-        train_config["epr_timing_target"] = "log_deviation"
+    if task_type in {"epr", "csr"} and timing_control_mode not in {"log_scaled", "raw_log"}:
+        raise ValueError("Integrated INR requires timing_control_mode=log_scaled or raw_log")
+    if task_type == "epr" and str(train_config.get("epr_timing_target", "log_deviation")).lower() not in {
+        "log_deviation",
+        "log_dev",
+        "raw_log_deviation",
+        "raw_log_dev",
+    }:
+        raise ValueError("EPR requires epr_timing_target=log_deviation or raw_log_deviation")
+    train_config["timing_control_mode"] = timing_control_mode
+    train_config["use_timing_scale_bit"] = timing_control_mode == "piecewise_scale_bit"
     musical_feature_mode = str(
         train_config.get(
             "musical_feature_mode",
@@ -3251,7 +3464,9 @@ def main():
         train_config["input_continuous_dim"] = inferred_input_dim
         train_config["score_input_continuous_dim"] = inferred_input_dim
         train_config["decoder_input_continuous_dim"] = (
-            decoder_perf_target_input_dim()
+            decoder_perf_target_input_dim(
+                train_config.get("output_continuous_dim", train_config.get("continuous_dim", 7))
+            )
             if task_type == "epr" and decoder_note_input_schema(train_config) == "perf_target"
             else inferred_input_dim
         )
@@ -3394,6 +3609,7 @@ def main():
         musical_feature_mode=musical_feature_mode,
         score_note_schema=train_config.get("score_note_input_schema", "integrated"),
         epr_timing_target=train_config.get("epr_timing_target", "log_deviation"),
+        disable_musical_features=train_config.get("disable_musical_features", False),
         use_timing_scale_bit=train_config.get("use_timing_scale_bit", False),
         timing_control_mode=train_config.get("timing_control_mode"),
         timing_log_scale=train_config.get("timing_log_scale", 50.0),
@@ -3423,6 +3639,7 @@ def main():
         musical_feature_mode=musical_feature_mode,
         score_note_schema=train_config.get("score_note_input_schema", "integrated"),
         epr_timing_target=train_config.get("epr_timing_target", "log_deviation"),
+        disable_musical_features=train_config.get("disable_musical_features", False),
         use_timing_scale_bit=train_config.get("use_timing_scale_bit", False),
         timing_control_mode=train_config.get("timing_control_mode"),
         timing_log_scale=train_config.get("timing_log_scale", 50.0),
@@ -3475,6 +3692,11 @@ def main():
             dagger_apply_prob=train_config.get("dagger_apply_prob", 1.0),
             dagger_replacement_weights=train_config.get("dagger_replacement_weights"),
             dagger_seed=train_config.get("dagger_seed", train_config.get("seed", 42)),
+            stable_dynamics_training=train_config.get("stable_dynamics_training", False),
+            stable_apply_prob=train_config.get("stable_apply_prob", 0.30),
+            stable_channels=train_config.get("stable_channels", ["ioi", "duration"]),
+            stable_noise_modes=train_config.get("stable_noise_modes"),
+            stable_seed=train_config.get("stable_seed", train_config.get("seed", 42)),
         ),
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,

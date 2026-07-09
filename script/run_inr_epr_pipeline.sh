@@ -16,11 +16,28 @@ MERGE_MODE="${MERGE_MODE:-continuation}"
 CONTINUATION_DROP_RATIO="${CONTINUATION_DROP_RATIO:-0.0}"
 BASE_NUM_TRAIN_EPOCHS="${BASE_NUM_TRAIN_EPOCHS:-8}"
 ADAPT_NUM_TRAIN_EPOCHS="${ADAPT_NUM_TRAIN_EPOCHS:-16}"
+BASE_ASAP_ONLY="${BASE_ASAP_ONLY:-0}"
 SKIP_BASE_TRAIN="${SKIP_BASE_TRAIN:-0}"
 BASE_CHECKPOINT_OVERRIDE="${BASE_CHECKPOINT_OVERRIDE:-}"
+RESUME_CHECKPOINT_OVERRIDE="${RESUME_CHECKPOINT_OVERRIDE:-}"
 RESUME_FROM_LATEST_CHECKPOINT="${RESUME_FROM_LATEST_CHECKPOINT:-1}"
 BATCH_SIZE_PER_DEVICE="${BATCH_SIZE_PER_DEVICE:-32}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-64}"
+PIPELINE_STAGE_START="${PIPELINE_STAGE_START:-train}"
+SKIP_EXISTING_PIPELINE_OUTPUTS="${SKIP_EXISTING_PIPELINE_OUTPUTS:-1}"
+
+PIPELINE_STAGE_START="$(printf '%s' "${PIPELINE_STAGE_START}" | tr '[:upper:]' '[:lower:]')"
+case "${PIPELINE_STAGE_START}" in
+  train|adapt|infer) ;;
+  *)
+    echo "Unsupported PIPELINE_STAGE_START=${PIPELINE_STAGE_START}; expected train, adapt, or infer" >&2
+    exit 1
+    ;;
+esac
+
+if [[ -n "${RESUME_CHECKPOINT_OVERRIDE}" && -z "${BASE_CHECKPOINT_OVERRIDE}" ]]; then
+  BASE_CHECKPOINT_OVERRIDE="${RESUME_CHECKPOINT_OVERRIDE}"
+fi
 
 IFS=',' read -ra GPU_LIST <<< "${CUDA_VISIBLE_DEVICES:-0}"
 GPU_COUNT="${#GPU_LIST[@]}"
@@ -67,6 +84,17 @@ best_checkpoint() {
   fi
 }
 
+train_dir_from_checkpoint() {
+  local checkpoint="$1"
+  local base_name
+  base_name="$(basename "${checkpoint}")"
+  if [[ "${base_name}" == checkpoint-* ]]; then
+    dirname "${checkpoint}"
+  else
+    echo "${checkpoint}"
+  fi
+}
+
 run_train() {
   local config="$1" stage="$2"
   if [[ "${GPU_COUNT}" -gt 1 ]]; then
@@ -97,7 +125,7 @@ if cfg.get("task_type", "epr").lower() != "epr":
     raise SystemExit("run_inr_epr_pipeline.sh requires task_type=epr")
 cfg["use_style_tokens"] = False
 cfg["pedal_representation"] = "binary_4"
-cfg["output_continuous_dim"] = 7
+cfg["output_continuous_dim"] = int(cfg.get("output_continuous_dim", cfg.get("continuous_dim", 7)))
 cfg["output_dir"] = output_root
 cfg["logging_dir"] = log_root
 cfg["num_train_epochs"] = float(epochs)
@@ -166,6 +194,16 @@ run_infer() {
     --output-dir "${out_dir}" 2>&1 | tee -a "${EVALUATE_LOG}"
 }
 
+maybe_run_infer() {
+  local config="$1" checkpoint="$2" protocol="$3" samples="$4" out_dir="$5" gpu="$6"
+  local manifest_path="${out_dir}/prediction_manifest.json"
+  if [[ "${SKIP_EXISTING_PIPELINE_OUTPUTS}" == "1" && -s "${manifest_path}" ]]; then
+    echo "[$(date '+%F %T')] infer ${protocol}: reuse existing ${manifest_path}" | tee -a "${EVALUATE_LOG}"
+    return 0
+  fi
+  run_infer "${config}" "${checkpoint}" "${protocol}" "${samples}" "${out_dir}" "${gpu}"
+}
+
 summarize_pair() {
   local config="$1" checkpoint="$2" train_output_dir="$3" det_dir="$4" sampling_dir="$5" summary_json="$6" plot_path="$7"
   PYTHONUNBUFFERED=1 python src/evaluate/summarize_inr_asap_pipeline.py \
@@ -186,56 +224,92 @@ BASE_RESUME=""
 if [[ "${RESUME_FROM_LATEST_CHECKPOINT}" == "1" ]]; then
   BASE_RESUME="$(latest_numeric_checkpoint "${TRAIN_ROOT}" || true)"
 fi
-write_train_config "${CONFIG}" "${BASE_CONFIG}" "${TRAIN_ROOT}" "${TF_LOG_ROOT}" "${BASE_NUM_TRAIN_EPOCHS}" "${BASE_RESUME}" "0"
+write_train_config "${CONFIG}" "${BASE_CONFIG}" "${TRAIN_ROOT}" "${TF_LOG_ROOT}" "${BASE_NUM_TRAIN_EPOCHS}" "${BASE_RESUME}" "${BASE_ASAP_ONLY}"
 
 echo "RUN_DIR ${RUN_DIR}" | tee -a "${EVALUATE_LOG}"
-BASE_MARKER="${TMP_DIR}/base.marker"
-touch "${BASE_MARKER}"
-if [[ "${SKIP_BASE_TRAIN}" == "1" ]]; then
-  [[ -n "${BASE_CHECKPOINT_OVERRIDE}" ]] || { echo "BASE_CHECKPOINT_OVERRIDE is required" >&2; exit 1; }
-  BASE_OUTPUT_DIR="$(dirname "${BASE_CHECKPOINT_OVERRIDE}")"
-  BASE_CHECKPOINT="${BASE_CHECKPOINT_OVERRIDE}"
+BASE_OUTPUT_DIR=""
+BASE_CHECKPOINT=""
+if [[ "${PIPELINE_STAGE_START}" == "train" ]]; then
+  BASE_MARKER="${TMP_DIR}/base.marker"
+  touch "${BASE_MARKER}"
+  if [[ "${SKIP_BASE_TRAIN}" == "1" ]]; then
+    [[ -n "${BASE_CHECKPOINT_OVERRIDE}" ]] || { echo "BASE_CHECKPOINT_OVERRIDE is required" >&2; exit 1; }
+    BASE_OUTPUT_DIR="$(train_dir_from_checkpoint "${BASE_CHECKPOINT_OVERRIDE}")"
+    BASE_CHECKPOINT="${BASE_CHECKPOINT_OVERRIDE}"
+  else
+    run_train "${BASE_CONFIG}" "base"
+    BASE_OUTPUT_DIR="$(latest_train_dir "${TRAIN_ROOT}" "${BASE_MARKER}")"
+    BASE_CHECKPOINT="$(best_checkpoint "${BASE_OUTPUT_DIR}")"
+  fi
 else
-  run_train "${BASE_CONFIG}" "base"
-  BASE_OUTPUT_DIR="$(latest_train_dir "${TRAIN_ROOT}" "${BASE_MARKER}")"
-  BASE_CHECKPOINT="$(best_checkpoint "${BASE_OUTPUT_DIR}")"
+  if [[ -n "${BASE_CHECKPOINT_OVERRIDE}" ]]; then
+    BASE_CHECKPOINT="${BASE_CHECKPOINT_OVERRIDE}"
+  elif [[ -n "${BASE_RESUME}" ]]; then
+    BASE_CHECKPOINT="${BASE_RESUME}"
+  else
+    BASE_CHECKPOINT="$(latest_numeric_checkpoint "${TRAIN_ROOT}" || true)"
+  fi
+  [[ -n "${BASE_CHECKPOINT}" ]] || { echo "Could not locate base checkpoint under ${TRAIN_ROOT}" >&2; exit 1; }
+  BASE_OUTPUT_DIR="$(train_dir_from_checkpoint "${BASE_CHECKPOINT}")"
 fi
 
-ADAPT_DIR="${RUN_DIR}/adapt_${ADAPT_NUM_TRAIN_EPOCHS}ep"
-ADAPT_CONFIG="${ADAPT_DIR}/config.json"
-ADAPT_TRAIN_ROOT="${ADAPT_DIR}/training"
-ADAPT_LOG_ROOT="${ADAPT_DIR}/tf-logs"
-mkdir -p "${ADAPT_TRAIN_ROOT}" "${ADAPT_LOG_ROOT}"
-write_train_config "${BASE_CONFIG}" "${ADAPT_CONFIG}" "${ADAPT_TRAIN_ROOT}" "${ADAPT_LOG_ROOT}" "${ADAPT_NUM_TRAIN_EPOCHS}" "${BASE_CHECKPOINT}" "1"
+FINAL_CONFIG="${BASE_CONFIG}"
+FINAL_OUTPUT_DIR="${BASE_OUTPUT_DIR}"
+FINAL_CHECKPOINT="${BASE_CHECKPOINT}"
+FINAL_DIR="${RUN_DIR}"
 
-ADAPT_MARKER="${TMP_DIR}/adapt.marker"
-touch "${ADAPT_MARKER}"
-run_train "${ADAPT_CONFIG}" "adapt"
-ADAPT_OUTPUT_DIR="$(latest_train_dir "${ADAPT_TRAIN_ROOT}" "${ADAPT_MARKER}")"
-ADAPT_CHECKPOINT="$(best_checkpoint "${ADAPT_OUTPUT_DIR}")"
+if (( ADAPT_NUM_TRAIN_EPOCHS > 0 )); then
+  ADAPT_DIR="${RUN_DIR}/adapt_${ADAPT_NUM_TRAIN_EPOCHS}ep"
+  ADAPT_CONFIG="${ADAPT_DIR}/config.json"
+  ADAPT_TRAIN_ROOT="${ADAPT_DIR}/training"
+  ADAPT_LOG_ROOT="${ADAPT_DIR}/tf-logs"
+  mkdir -p "${ADAPT_TRAIN_ROOT}" "${ADAPT_LOG_ROOT}"
+  write_train_config "${BASE_CONFIG}" "${ADAPT_CONFIG}" "${ADAPT_TRAIN_ROOT}" "${ADAPT_LOG_ROOT}" "${ADAPT_NUM_TRAIN_EPOCHS}" "${BASE_CHECKPOINT}" "1"
 
-DET_DIR="${ADAPT_DIR}/deterministic"
-SAMPLING_DIR="${ADAPT_DIR}/sampling"
+  if [[ "${PIPELINE_STAGE_START}" == "train" || "${PIPELINE_STAGE_START}" == "adapt" ]]; then
+    ADAPT_MARKER="${TMP_DIR}/adapt.marker"
+    touch "${ADAPT_MARKER}"
+    run_train "${ADAPT_CONFIG}" "adapt"
+    ADAPT_OUTPUT_DIR="$(latest_train_dir "${ADAPT_TRAIN_ROOT}" "${ADAPT_MARKER}")"
+    ADAPT_CHECKPOINT="$(best_checkpoint "${ADAPT_OUTPUT_DIR}")"
+  else
+    ADAPT_CHECKPOINT="$(latest_numeric_checkpoint "${ADAPT_TRAIN_ROOT}" || true)"
+    [[ -n "${ADAPT_CHECKPOINT}" ]] || { echo "Could not locate adapt checkpoint under ${ADAPT_TRAIN_ROOT}" >&2; exit 1; }
+    ADAPT_OUTPUT_DIR="$(train_dir_from_checkpoint "${ADAPT_CHECKPOINT}")"
+  fi
+
+  FINAL_CONFIG="${ADAPT_CONFIG}"
+  FINAL_OUTPUT_DIR="${ADAPT_OUTPUT_DIR}"
+  FINAL_CHECKPOINT="${ADAPT_CHECKPOINT}"
+  FINAL_DIR="${ADAPT_DIR}"
+fi
+
+DET_DIR="${FINAL_DIR}/deterministic"
+SAMPLING_DIR="${FINAL_DIR}/sampling"
 if [[ "${GPU_COUNT}" -gt 1 ]]; then
-  run_infer "${ADAPT_CONFIG}" "${ADAPT_CHECKPOINT}" deterministic "${DET_NUM_SAMPLES}" "${DET_DIR}" "${DET_GPU}" &
+  maybe_run_infer "${FINAL_CONFIG}" "${FINAL_CHECKPOINT}" deterministic "${DET_NUM_SAMPLES}" "${DET_DIR}" "${DET_GPU}" &
   DET_PID=$!
-  run_infer "${ADAPT_CONFIG}" "${ADAPT_CHECKPOINT}" sampling "${SAMPLING_NUM_SAMPLES}" "${SAMPLING_DIR}" "${SAMPLING_GPU}" &
+  maybe_run_infer "${FINAL_CONFIG}" "${FINAL_CHECKPOINT}" sampling "${SAMPLING_NUM_SAMPLES}" "${SAMPLING_DIR}" "${SAMPLING_GPU}" &
   SAMPLING_PID=$!
   wait "${DET_PID}"
   wait "${SAMPLING_PID}"
 else
-  run_infer "${ADAPT_CONFIG}" "${ADAPT_CHECKPOINT}" deterministic "${DET_NUM_SAMPLES}" "${DET_DIR}" "${DET_GPU}"
-  run_infer "${ADAPT_CONFIG}" "${ADAPT_CHECKPOINT}" sampling "${SAMPLING_NUM_SAMPLES}" "${SAMPLING_DIR}" "${SAMPLING_GPU}"
+  maybe_run_infer "${FINAL_CONFIG}" "${FINAL_CHECKPOINT}" deterministic "${DET_NUM_SAMPLES}" "${DET_DIR}" "${DET_GPU}"
+  maybe_run_infer "${FINAL_CONFIG}" "${FINAL_CHECKPOINT}" sampling "${SAMPLING_NUM_SAMPLES}" "${SAMPLING_DIR}" "${SAMPLING_GPU}"
 fi
 
-summarize_pair \
-  "${ADAPT_CONFIG}" \
-  "${ADAPT_CHECKPOINT}" \
-  "${ADAPT_OUTPUT_DIR}" \
-  "${DET_DIR}" \
-  "${SAMPLING_DIR}" \
-  "${ADAPT_DIR}/summary.json" \
-  "${ADAPT_DIR}/asap_label_distribution.png"
+if [[ "${SKIP_EXISTING_PIPELINE_OUTPUTS}" == "1" && -s "${FINAL_DIR}/summary.json" ]]; then
+  echo "[$(date '+%F %T')] summarize/statistics: reuse existing ${FINAL_DIR}/summary.json" | tee -a "${EVALUATE_LOG}"
+else
+  summarize_pair \
+    "${FINAL_CONFIG}" \
+    "${FINAL_CHECKPOINT}" \
+    "${FINAL_OUTPUT_DIR}" \
+    "${DET_DIR}" \
+    "${SAMPLING_DIR}" \
+    "${FINAL_DIR}/summary.json" \
+    "${FINAL_DIR}/asap_label_distribution.png"
+fi
 
 rm -rf "${TMP_DIR}"
 echo "END $(date '+%F %T')" | tee -a "${EVALUATE_LOG}"

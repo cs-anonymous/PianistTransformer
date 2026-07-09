@@ -39,8 +39,10 @@ FEATURES = [
 ]
 
 DEV_FEATURES = [
-    ("dev_ioi", "Normalized IOI Dev"),
-    ("dev_duration", "Normalized Duration Dev"),
+    ("log_dev_ioi", "Logscale IOI Dev"),
+    ("log_dev_duration", "Logscale Duration Dev"),
+    ("raw_dev_ioi_s", "Raw IOI Dev (s)"),
+    ("raw_dev_duration_s", "Raw Duration Dev (s)"),
 ]
 
 DEV_GROUPS = [
@@ -302,8 +304,10 @@ def plot_distributions(
 def empty_dev_groups():
     return {
         group: {
-            "dev_ioi": [],
-            "dev_duration": [],
+            "log_dev_ioi": [],
+            "log_dev_duration": [],
+            "raw_dev_ioi_s": [],
+            "raw_dev_duration_s": [],
         }
         for group, _ in DEV_GROUPS
     }
@@ -391,8 +395,10 @@ def extract_gt_dev_arrays(score_source_to_work_path, selected_gt_sources, config
                 continue
             for score_row, perf_row in zip(score_raw, shared_rows):
                 group = dev_group_name(score_row[0])
-                groups[group]["dev_ioi"].append(normalize_target_ioi_dev(score_row[0], perf_row[0], config))
-                groups[group]["dev_duration"].append(normalize_target_duration_dev(score_row[1], perf_row[1], config))
+                groups[group]["log_dev_ioi"].append(normalize_target_ioi_dev(score_row[0], perf_row[0], config))
+                groups[group]["log_dev_duration"].append(normalize_target_duration_dev(score_row[1], perf_row[1], config))
+                groups[group]["raw_dev_ioi_s"].append((float(perf_row[0]) - float(score_row[0])) / 1000.0)
+                groups[group]["raw_dev_duration_s"].append((float(perf_row[1]) - float(score_row[1])) / 1000.0)
     return dev_groups_to_arrays(groups)
 
 
@@ -408,13 +414,33 @@ def extract_pred_dev_arrays(raw_output_paths, score_source_to_work_path):
             score_raw_cache[score_source] = work["score"]["score_raw"]
         score_raw = score_raw_cache[score_source]
         target = payload.get("predicted_target7") or []
-        if len(target) != len(score_raw):
+        reconstructed_raw = payload.get("reconstructed_raw7") or []
+        if len(target) != len(score_raw) or len(reconstructed_raw) != len(score_raw):
             continue
-        for score_row, row in zip(score_raw, target):
+        for score_row, target_row, raw_row in zip(score_raw, target, reconstructed_raw):
             group = dev_group_name(score_row[0])
-            groups[group]["dev_ioi"].append(float(row[0]))
-            groups[group]["dev_duration"].append(float(row[1]))
+            groups[group]["log_dev_ioi"].append(float(target_row[0]))
+            groups[group]["log_dev_duration"].append(float(target_row[1]))
+            groups[group]["raw_dev_ioi_s"].append((float(raw_row[0]) - float(score_row[0])) / 1000.0)
+            groups[group]["raw_dev_duration_s"].append((float(raw_row[1]) - float(score_row[1])) / 1000.0)
     return dev_groups_to_arrays(groups)
+
+
+def dev_histogram_range(*arrays):
+    non_empty = [finite_values(array) for array in arrays if len(finite_values(array))]
+    if not non_empty:
+        return (0.0, 1.0)
+    merged = np.concatenate(non_empty)
+    low = float(np.percentile(merged, 0.5))
+    high = float(np.percentile(merged, 99.5))
+    if not math.isfinite(low) or not math.isfinite(high) or high <= low:
+        low = float(np.min(merged))
+        high = float(np.max(merged))
+    if high <= low:
+        pad = max(1e-3, abs(low) * 0.05)
+        low -= pad
+        high += pad
+    return low, high
 
 
 def analyze_dev_distribution(
@@ -439,7 +465,7 @@ def plot_dev_distributions(
     sampling_arrays = extract_pred_dev_arrays(unique_paths(sampling_manifest, "raw_output_paths"), score_source_to_work_path)
 
     output_plot.parent.mkdir(parents=True, exist_ok=True)
-    fig, axes = plt.subplots(2, 2, figsize=(11, 7), sharex=True)
+    fig, axes = plt.subplots(2, 4, figsize=(18, 7), sharex=False)
     colors = {
         "gt": "#222222",
         "det": "#2f6fed",
@@ -454,16 +480,19 @@ def plot_dev_distributions(
             det = finite_values(det_arrays[group][feature])
             sampling = finite_values(sampling_arrays[group][feature])
 
+            low, high = dev_histogram_range(gt, det, sampling)
+            bins = np.linspace(low, high, 80)
+
             for values, label, color, alpha in [
                 (gt, "ground truth", colors["gt"], 0.26),
                 (det, "deterministic", colors["det"], 0.32),
                 (sampling, "sampling", colors["sampling"], 0.32),
             ]:
-                values = values[(values >= 0.0) & (values <= 1.0)]
+                values = values[(values >= low) & (values <= high)]
                 if len(values):
                     axis.hist(values, bins=bins, density=True, alpha=alpha, label=label, color=color)
             axis.set_title(f"{group_title}: {title}")
-            axis.set_xlim(0.0, 1.0)
+            axis.set_xlim(low, high)
             axis.set_ylabel("density")
             axis.grid(alpha=0.2)
 
@@ -475,7 +504,7 @@ def plot_dev_distributions(
     plt.close(fig)
 
     def total_notes(arrays):
-        return int(sum(len(arrays[group]["dev_ioi"]) for group, _ in DEV_GROUPS))
+        return int(sum(len(arrays[group]["log_dev_ioi"]) for group, _ in DEV_GROUPS))
 
     return {
         "ground_truth_dev_notes": total_notes(gt_arrays),
@@ -483,9 +512,9 @@ def plot_dev_distributions(
         "sampling_dev_notes": total_notes(sampling_arrays),
         "dev_distribution_groups": {
             group: {
-                "ground_truth_notes": int(len(gt_arrays[group]["dev_ioi"])),
-                "deterministic_notes": int(len(det_arrays[group]["dev_ioi"])),
-                "sampling_notes": int(len(sampling_arrays[group]["dev_ioi"])),
+                "ground_truth_notes": int(len(gt_arrays[group]["log_dev_ioi"])),
+                "deterministic_notes": int(len(det_arrays[group]["log_dev_ioi"])),
+                "sampling_notes": int(len(sampling_arrays[group]["log_dev_ioi"])),
             }
             for group, _ in DEV_GROUPS
         },
