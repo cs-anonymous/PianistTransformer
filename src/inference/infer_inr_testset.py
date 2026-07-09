@@ -10,6 +10,7 @@ from pathlib import Path
 import pandas as pd
 import torch
 from torch.nn.utils.rnn import pad_sequence
+from miditoolkit import ControlChange, Instrument, MidiFile, Note, TempoChange
 from tqdm import tqdm
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -145,7 +146,21 @@ def load_config(path: Path, checkpoint: str | None):
 
 def score_midi_dir_from_processed(refined_dir: str) -> Path:
     refined_path = Path(refined_dir)
-    return refined_path.parent / "refined"
+    candidates = []
+    if refined_path.name in {"processed", "processed_raw"}:
+        candidates.append(refined_path.parent / "refined")
+    candidates.extend(
+        [
+            ROOT_DIR / "../PianoCoRe/refined",
+            ROOT_DIR.parent / "PianoCoRe/refined",
+            refined_path.parent / "refined",
+        ]
+    )
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved.exists():
+            return resolved
+    return (refined_path.parent / "refined").resolve()
 
 
 def list_gt_midis(
@@ -189,6 +204,8 @@ def load_score_from_node(
     score_note_schema="integrated",
     task_type="epr",
     performance_source=None,
+    disable_musical_features=False,
+    include_score_chord_offset=False,
 ):
     with open(path, "r", encoding="utf-8") as file:
         work = json.load(file)
@@ -220,9 +237,127 @@ def load_score_from_node(
             log_scale=timing_log_scale,
             musical_feature_mode=musical_feature_mode,
             score_note_schema=score_note_schema,
+            disable_musical_features=disable_musical_features,
+            include_score_chord_offset=include_score_chord_offset,
         )
     score_shared_raw = [row[:3] for row in score["score_raw"]]
     return pitch, continuous, score_shared_raw, work
+
+
+def pitch_ids_from_pitch(pitch, pitch_pad_id):
+    ids = []
+    for value in pitch:
+        if isinstance(value, (list, tuple)):
+            ids.append(max([int(item) for item in value], default=int(pitch_pad_id)))
+        else:
+            ids.append(int(value))
+    return ids
+
+
+def pitch_multihot_from_pitch(pitch, piano_pitch_min=21, pitch_multihot_dim=88):
+    rows = []
+    for value in pitch:
+        row = [0.0] * int(pitch_multihot_dim)
+        values = value if isinstance(value, (list, tuple)) else [value]
+        for pitch_value in values:
+            idx = int(pitch_value) - int(piano_pitch_min)
+            if 0 <= idx < int(pitch_multihot_dim):
+                row[idx] = 1.0
+        rows.append(row)
+    return rows
+
+
+def uses_pitch_multihot(config):
+    return str(config.get("pitch_representation", "")).lower() == "multihot"
+
+
+def deduplicate_controls(control_changes):
+    latest = {}
+    for cc in control_changes:
+        latest[(int(cc.number), int(cc.time))] = cc
+    return [latest[key] for key in sorted(latest)]
+
+
+def chord_features_to_midi(
+    pitch,
+    raw_rows,
+    target_rows,
+    target_ticks_per_beat=500,
+    target_tempo=120,
+):
+    notes = []
+    control_changes = []
+    high_onset_ms = 0.0
+    high_onsets = []
+    chord_values = []
+
+    for raw_row, target_row in zip(raw_rows, target_rows):
+        ioi_ms = max(float(raw_row[0]), 0.0)
+        duration_ms = max(float(raw_row[1]), 1.0)
+        velocity = min(max(float(raw_row[2]), 0.0), 127.0)
+        pedals = [int(round(min(max(float(value), 0.0), 127.0))) for value in raw_row[3:7]]
+        offsets = [0.0, 0.0, 0.0]
+        if len(target_row) >= 10:
+            offsets = [
+                float(target_row[-3]) * 1000.0,
+                float(target_row[-2]) * 1000.0,
+                float(target_row[-1]) * 127.0,
+            ]
+        high_onset_ms += ioi_ms
+        high_onsets.append(high_onset_ms)
+        chord_values.append((duration_ms, velocity, pedals, offsets))
+
+    for idx, pitch_values in enumerate(pitch):
+        values = sorted(int(item) for item in (pitch_values if isinstance(pitch_values, (list, tuple)) else [pitch_values]))
+        if not values:
+            continue
+        high_pitch = values[-1]
+        duration_ms, velocity, pedals, offsets = chord_values[idx]
+        onset_offset_ms, duration_offset_ms, velocity_offset = offsets
+        denom = max(len(values) - 1, 1)
+        for pitch_rank, pitch_value in enumerate(values):
+            if len(values) == 1:
+                ratio_from_high_to_low = 0.0
+            else:
+                ratio_from_high_to_low = (denom - pitch_rank) / denom
+            note_onset = high_onsets[idx] + onset_offset_ms * ratio_from_high_to_low
+            note_duration = max(1.0, duration_ms + duration_offset_ms * ratio_from_high_to_low)
+            note_velocity = int(round(min(max(velocity + velocity_offset * ratio_from_high_to_low, 1.0), 127.0)))
+            start_tick = max(0, int(round(note_onset)))
+            end_tick = max(start_tick + 1, int(round(note_onset + note_duration)))
+            notes.append(Note(note_velocity, int(pitch_value), start_tick, end_tick))
+
+        next_ioi = max(0.0, high_onsets[idx + 1] - high_onsets[idx]) if idx + 1 < len(high_onsets) else 4990.0
+        sample_times = [
+            high_onsets[idx],
+            high_onsets[idx] + next_ioi * 0.25,
+            high_onsets[idx] + next_ioi * 0.50,
+            high_onsets[idx] + next_ioi * 0.75,
+        ]
+        for value, sample_time in zip(pedals, sample_times):
+            control_changes.append(ControlChange(64, value, max(0, int(round(sample_time)))))
+
+    notes.sort(key=lambda item: (item.start, item.pitch, item.end, item.velocity))
+    control_changes = deduplicate_controls(control_changes)
+    max_tick = 0
+    if notes:
+        max_tick = max(max_tick, max(note.end for note in notes))
+    if control_changes:
+        max_tick = max(max_tick, max(cc.time for cc in control_changes))
+
+    output = MidiFile(ticks_per_beat=target_ticks_per_beat)
+    output.tempo_changes.append(TempoChange(target_tempo, 0))
+    output.instruments.append(
+        Instrument(
+            program=0,
+            is_drum=False,
+            name="Piano",
+            notes=notes,
+            control_changes=control_changes,
+        )
+    )
+    output.max_tick = max_tick + 1
+    return output
 
 
 def build_windows(total_notes: int, block_notes: int, overlap_ratio: float):
@@ -248,6 +383,8 @@ def build_windows(total_notes: int, block_notes: int, overlap_ratio: float):
 def batch_window_predictions(
     model,
     pitch,
+    pitch_ids,
+    pitch_multihot,
     continuous,
     score_shared_raw,
     score,
@@ -269,13 +406,16 @@ def batch_window_predictions(
         pitch_tensors = []
         continuous_tensors = []
         score_shared_raw_tensors = []
+        pitch_multihot_tensors = []
         style_score_rows = []
         lengths = []
 
         for start, end in batch_windows:
-            pitch_tensors.append(torch.tensor(pitch[start:end], dtype=torch.long))
+            pitch_tensors.append(torch.tensor(pitch_ids[start:end], dtype=torch.long))
             continuous_tensors.append(torch.tensor(continuous[start:end], dtype=torch.float32))
             score_shared_raw_tensors.append(torch.tensor(score_shared_raw[start:end], dtype=torch.float32))
+            if pitch_multihot is not None:
+                pitch_multihot_tensors.append(torch.tensor(pitch_multihot[start:end], dtype=torch.float32))
             if use_style_tokens:
                 style_score_rows.append(score_style_stats(score, start, end))
             lengths.append(end - start)
@@ -284,6 +424,9 @@ def batch_window_predictions(
         continuous_tensor = pad_sequence(continuous_tensors, batch_first=True, padding_value=0.0).to(device)
         score_shared_raw_tensor = pad_sequence(score_shared_raw_tensors, batch_first=True, padding_value=0.0).to(device)
         attention_mask = (pitch_ids != pitch_pad_id).long()
+        pitch_multihot_tensor = None
+        if pitch_multihot is not None:
+            pitch_multihot_tensor = pad_sequence(pitch_multihot_tensors, batch_first=True, padding_value=0.0).to(device)
         style_kwargs = {}
         if use_style_tokens:
             style_kwargs = {
@@ -311,6 +454,7 @@ def batch_window_predictions(
                 score_shared_raw=score_shared_raw_tensor,
                 attention_mask=attention_mask,
                 continuous_sampling_strategy=sampling_strategy,
+                pitch_multihot=pitch_multihot_tensor,
                 **style_kwargs,
             )
         logits = outputs.logits.detach().float().cpu()
@@ -330,6 +474,8 @@ def batch_window_predictions(
 def continuation_window_predictions(
     model,
     pitch,
+    pitch_ids,
+    pitch_multihot,
     continuous,
     score_shared_raw,
     score,
@@ -360,10 +506,13 @@ def continuation_window_predictions(
     )
 
     for window_idx, (start, end) in enumerate(windows):
-        pitch_ids = torch.tensor(pitch[start:end], dtype=torch.long, device=device).unsqueeze(0)
+        pitch_ids_tensor = torch.tensor(pitch_ids[start:end], dtype=torch.long, device=device).unsqueeze(0)
         continuous_tensor = torch.tensor(continuous[start:end], dtype=torch.float32, device=device).unsqueeze(0)
         score_shared_raw_tensor = torch.tensor(score_shared_raw[start:end], dtype=torch.float32, device=device).unsqueeze(0)
-        attention_mask = (pitch_ids != pitch_pad_id).long()
+        attention_mask = (pitch_ids_tensor != pitch_pad_id).long()
+        pitch_multihot_tensor = None
+        if pitch_multihot is not None:
+            pitch_multihot_tensor = torch.tensor(pitch_multihot[start:end], dtype=torch.float32, device=device).unsqueeze(0)
         style_kwargs = {}
         if use_style_tokens:
             if style_perf_stats_mode == "window" and oracle_style_targets is not None:
@@ -409,12 +558,13 @@ def continuation_window_predictions(
 
         with torch.no_grad():
             pred = model.predict_performance_continuous(
-                pitch_ids=pitch_ids,
+                pitch_ids=pitch_ids_tensor,
                 continuous=continuous_tensor,
                 score_shared_raw=score_shared_raw_tensor,
                 attention_mask=attention_mask,
                 prefix_predictions=prefix_predictions,
                 sampling_strategy=sampling_strategy,
+                pitch_multihot=pitch_multihot_tensor,
                 **style_kwargs,
             ).detach().float().cpu()
 
@@ -550,14 +700,28 @@ def predict_one_csr_work(model, device, config, work, args):
         score_note_schema=config.get("score_note_input_schema", "integrated"),
         task_type="csr",
         performance_source=performance_source,
+        disable_musical_features=bool(config.get("disable_musical_features", False)),
+        include_score_chord_offset=bool(config.get("include_score_chord_offset", False)),
     )
     score = loaded["score"]
+    pitch_ids = pitch_ids_from_pitch(pitch, config["pitch_pad_id"])
+    pitch_multihot = (
+        pitch_multihot_from_pitch(
+            pitch,
+            piano_pitch_min=int(config.get("piano_pitch_min", 21)),
+            pitch_multihot_dim=int(config.get("pitch_multihot_dim", 88)),
+        )
+        if uses_pitch_multihot(config)
+        else None
+    )
     windows = build_windows(len(pitch), config["block_notes"], config["overlap_ratio"])
     style_creator_id, style_source_id = style_ids_for_work(config, loaded, args.performance_dataset)
 
     pred_continuous = batch_window_predictions(
         model=model,
         pitch=pitch,
+        pitch_ids=pitch_ids,
+        pitch_multihot=pitch_multihot,
         continuous=continuous,
         score_shared_raw=score_shared_raw,
         score=score,
@@ -571,6 +735,8 @@ def predict_one_csr_work(model, device, config, work, args):
     ) if args.merge_mode == "average" else continuation_window_predictions(
         model=model,
         pitch=pitch,
+        pitch_ids=pitch_ids,
+        pitch_multihot=pitch_multihot,
         continuous=continuous,
         score_shared_raw=score_shared_raw,
         score=score,
@@ -630,8 +796,20 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
         musical_feature_mode=config.get("musical_feature_mode", "categorical"),
         score_note_schema=config.get("score_note_input_schema", "integrated"),
         task_type="epr",
+        disable_musical_features=bool(config.get("disable_musical_features", False)),
+        include_score_chord_offset=bool(config.get("include_score_chord_offset", False)),
     )
     score = loaded["score"]
+    pitch_ids = pitch_ids_from_pitch(pitch, config["pitch_pad_id"])
+    pitch_multihot = (
+        pitch_multihot_from_pitch(
+            pitch,
+            piano_pitch_min=int(config.get("piano_pitch_min", 21)),
+            pitch_multihot_dim=int(config.get("pitch_multihot_dim", 88)),
+        )
+        if uses_pitch_multihot(config)
+        else None
+    )
     windows = build_windows(len(pitch), config["block_notes"], config["overlap_ratio"])
     style_creator_id, style_source_id = style_ids_for_work(config, loaded, args.performance_dataset)
     gt_rel_paths = list_gt_midis(
@@ -704,6 +882,8 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
         pred_continuous = batch_window_predictions(
             model=model,
             pitch=pitch,
+            pitch_ids=pitch_ids,
+            pitch_multihot=pitch_multihot,
             continuous=continuous,
             score_shared_raw=score_shared_raw,
             score=score,
@@ -717,6 +897,8 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
         ) if args.merge_mode == "average" else continuation_window_predictions(
             model=model,
             pitch=pitch,
+            pitch_ids=pitch_ids,
+            pitch_multihot=pitch_multihot,
             continuous=continuous,
             score_shared_raw=score_shared_raw,
             score=score,
@@ -744,15 +926,33 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
             pred_continuous.float().cpu(),
             config=config,
         )
-        midi_obj = note_features_to_midi(
-            pitch=pitch,
-            continuous=raw_rows.tolist(),
-            target_ticks_per_beat=500,
-            target_tempo=120,
-            max_time_ms=config["max_time_ms"],
-            normalized=False,
-        )
+        raw_rows_list = raw_rows.tolist()
+        pred_continuous_list = pred_continuous.tolist()
+        if bool(config.get("chord_mode", False)):
+            midi_obj = chord_features_to_midi(
+                pitch=pitch,
+                raw_rows=raw_rows_list,
+                target_rows=pred_continuous_list,
+                target_ticks_per_beat=500,
+                target_tempo=120,
+            )
+        else:
+            midi_obj = note_features_to_midi(
+                pitch=pitch,
+                continuous=raw_rows_list,
+                target_ticks_per_beat=500,
+                target_tempo=120,
+                max_time_ms=config["max_time_ms"],
+                normalized=False,
+            )
         raw_path = raw_dir / f"{score_stem}__{plan['suffix']}.json"
+        target_key = "predicted_target12" if pred_continuous.shape[-1] == 12 else "predicted_target10" if pred_continuous.shape[-1] == 10 else "predicted_target7"
+        if pred_continuous.shape[-1] == 12:
+            timing_representation = "target12_raw_log_dev_velocity_binary4_offset3"
+        elif pred_continuous.shape[-1] == 10:
+            timing_representation = "target10_raw_dev_s_velocity_binary4_offset3"
+        else:
+            timing_representation = "target7_dev_velocity_binary4"
         raw_payload = {
             "score_source": score_source,
             "performance_source": plan.get("performance_source"),
@@ -762,10 +962,21 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
             "sample_idx": sample_idx,
             "seed": sample_seed,
             "oracle_gt_prefix_mode": args.oracle_gt_prefix_mode,
-            "timing_representation": "target7_dev_velocity_binary4",
-            "pitch": [int(value) for value in pitch],
-            "predicted_target7": pred_continuous.tolist(),
-            "reconstructed_raw7": raw_rows.tolist(),
+            "timing_representation": timing_representation,
+            "pitch": pitch if bool(config.get("chord_mode", False)) else [int(value) for value in pitch],
+            target_key: pred_continuous_list,
+            "predicted_target7": pred_continuous_list if pred_continuous.shape[-1] == 7 else None,
+            "reconstructed_raw7": raw_rows_list,
+            "chord_expansion": (
+                {
+                    "base_note": "highest_pitch",
+                    "offset_units": ["seconds", "seconds", "velocity_norm"],
+                    "offset_direction": "low_minus_high",
+                    "middle_notes": "linear_interpolation_by_pitch_rank",
+                }
+                if bool(config.get("chord_mode", False))
+                else None
+            ),
             "ground_truth_paths": gt_rel_paths,
         }
         raw_path.parent.mkdir(parents=True, exist_ok=True)

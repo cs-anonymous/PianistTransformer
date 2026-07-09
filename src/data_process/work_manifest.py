@@ -2,6 +2,7 @@ import random
 from pathlib import Path
 
 import pandas as pd
+import torch
 
 from src.data_process.fixed_window_split import load_windows_from_fixed_split
 
@@ -42,6 +43,39 @@ def make_windows(total_notes, block_notes, overlap_ratio, min_notes):
         deduped.append(window)
         seen.add(window)
     return deduped
+
+
+def work_token_count(path, metadata_note_count):
+    sidecar_path = Path(path).with_suffix(".pt")
+    if sidecar_path.exists():
+        try:
+            payload = torch.load(sidecar_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            payload = torch.load(sidecar_path, map_location="cpu")
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            score = payload.get("score")
+            if isinstance(score, dict):
+                for key in ("pitch", "score_raw"):
+                    value = score.get(key)
+                    if value is not None:
+                        return int(len(value))
+
+    try:
+        import json
+
+        with open(path, "r", encoding="utf-8") as file:
+            payload = json.load(file)
+        score = payload.get("score") if isinstance(payload, dict) else None
+        if isinstance(score, dict):
+            for key in ("pitch", "score_raw"):
+                value = score.get(key)
+                if value is not None:
+                    return int(len(value))
+    except Exception:
+        pass
+    return int(metadata_note_count)
 
 
 def build_work_manifest(
@@ -109,7 +143,7 @@ def build_work_manifest(
         if str(path) in skip_work_paths or score_rel_path in skip_work_paths:
             print(f"Skipping configured work JSON: {path}", flush=True)
             continue
-        note_count = int(group["refined_score_note_count"].iloc[0])
+        note_count = work_token_count(path, group["refined_score_note_count"].iloc[0])
         windows = make_windows(note_count, block_notes, overlap_ratio, min_notes)
         if window_split_scheme is not None and window_split_name is not None:
             windows = load_windows_from_fixed_split(

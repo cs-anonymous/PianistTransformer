@@ -182,10 +182,14 @@ def default_input_continuous_dim(
     score_feature_dim=8,
     continuous_dim=7,
     musical_feature_mode="categorical",
+    score_offset_dim=0,
 ):
     if input_feature_mode == "integrated":
         if task_type == "epr":
-            return integrated_epr_input_dim(musical_feature_mode=musical_feature_mode)
+            return integrated_epr_input_dim(
+                musical_feature_mode=musical_feature_mode,
+                score_offset_dim=score_offset_dim,
+            )
         if task_type == "csr":
             return integrated_epr_input_dim(musical_feature_mode="continuous")
     return continuous_dim
@@ -208,6 +212,8 @@ def resolve_timing_control_mode(timing_control_mode="log_scaled", use_timing_sca
         "dual_log_linear",
         "dual_clip_linear",
         "log_scaled",
+        "raw",
+        "raw_seconds",
         "raw_log",
     }
     if mode not in valid_modes:
@@ -222,11 +228,13 @@ def timing_control_feature_dim(timing_control_mode="log_scaled", use_timing_scal
     )
     if mode == "raw_log":
         return 5
-    return 3 if mode in {"piecewise_single", "log_scaled"} else 5
+    return 3 if mode in {"piecewise_single", "log_scaled", "raw", "raw_seconds"} else 5
 
 
 def musical_feature_dim(musical_feature_mode="categorical"):
     mode = str(musical_feature_mode).lower()
+    if mode in {"none", "off", "disabled", "no_musical", "nomus"}:
+        return 0
     if mode == "continuous":
         return 12
     if mode in {"categorical", "categorical51", "musical51"}:
@@ -355,6 +363,8 @@ def integrated_epr_input_dim(
     use_timing_scale_bit=False,
     musical_feature_mode="categorical",
     pedal_control_dim=4,
+    score_offset_dim=0,
+    performance_offset_dim=0,
 ):
     control_dim = timing_control_feature_dim(
         timing_control_mode=timing_control_mode,
@@ -363,8 +373,15 @@ def integrated_epr_input_dim(
     score_control_dim = control_dim
     performance_control_dim = control_dim + int(pedal_control_dim)
     musical_dim = musical_feature_dim(musical_feature_mode)
-    mask_dim = 3
-    return score_control_dim + performance_control_dim + musical_dim + mask_dim
+    mask_dim = 2 if musical_dim == 0 else 3
+    return (
+        score_control_dim
+        + int(score_offset_dim)
+        + performance_control_dim
+        + int(performance_offset_dim)
+        + musical_dim
+        + mask_dim
+    )
 
 
 def score_musical_input_dim(timing_control_mode="log_scaled", use_timing_scale_bit=False, musical_feature_mode="categorical"):
@@ -377,6 +394,10 @@ def score_musical_input_dim(timing_control_mode="log_scaled", use_timing_scale_b
 
 def decoder_perf_target_input_dim(output_dim=7):
     return int(output_dim) + 3
+
+
+def chord_offset_dim(chord_mode=False, include_score_chord_offset=False):
+    return 3 if bool(chord_mode) and bool(include_score_chord_offset) else 0
 
 
 def integrated_csr_output_dim():
@@ -524,12 +545,18 @@ def _uses_raw_log_deviation_target(epr_timing_target):
     return str(epr_timing_target or "").lower() in {"raw_log_deviation", "raw_log_dev"}
 
 
+def _uses_raw_deviation_target(epr_timing_target):
+    return str(epr_timing_target or "").lower() in {"raw_deviation", "raw_dev", "raw_seconds_deviation", "raw_seconds_dev"}
+
+
 def normalize_ioi_dev(
     score_ioi_ms,
     perf_ioi_ms,
     epr_timing_target="log_deviation",
     log_scale=50.0,
 ):
+    if _uses_raw_deviation_target(epr_timing_target):
+        return (float(perf_ioi_ms) - float(score_ioi_ms)) / 1000.0
     if _uses_log_deviation_target(epr_timing_target):
         if _uses_raw_log_deviation_target(epr_timing_target):
             return raw_log_timing_value(perf_ioi_ms, scale=log_scale) - raw_log_timing_value(
@@ -548,6 +575,8 @@ def normalize_ioi_dev(
 
 
 def normalize_duration_dev(score_duration_ms, perf_duration_ms, epr_timing_target="deviation", log_scale=50.0):
+    if _uses_raw_deviation_target(epr_timing_target):
+        return (float(perf_duration_ms) - float(score_duration_ms)) / 1000.0
     if _uses_log_deviation_target(epr_timing_target):
         if _uses_raw_log_deviation_target(epr_timing_target):
             return raw_log_timing_value(perf_duration_ms, scale=log_scale) - raw_log_timing_value(
@@ -565,6 +594,7 @@ def performance_dev_velocity_pedal4_binary_rows(
     epr_timing_target="log_deviation",
     log_scale=50.0,
     pedal_binary_threshold=64.0,
+    include_chord_offsets=False,
 ):
     shared_rows = perf.get("label_shared_raw")
     pedal_rows = _raw_value_rows(perf, "label_pedal4_raw", "pedal4_raw")
@@ -582,10 +612,26 @@ def performance_dev_velocity_pedal4_binary_rows(
         raise ValueError(
             f"label_shared_raw/label_pedal4_raw length mismatch: {len(shared_rows)} vs {len(pedal_rows)}"
         )
+    offset_rows = perf.get("label_offset_raw") if include_chord_offsets else None
+    if include_chord_offsets:
+        if offset_rows is None:
+            raise KeyError("include_chord_offsets=True requires label_offset_raw")
+        if len(offset_rows) != len(shared_rows):
+            raise ValueError(
+                f"label_offset_raw/label_shared_raw length mismatch: {len(offset_rows)} vs {len(shared_rows)}"
+            )
 
     threshold = float(pedal_binary_threshold)
     rows = []
-    for score_row, perf_row, pedal_row in zip(score_shared_raw, shared_rows, pedal_rows):
+    iterator = zip(score_shared_raw, shared_rows, pedal_rows)
+    if include_chord_offsets:
+        iterator = zip(score_shared_raw, shared_rows, pedal_rows, offset_rows)
+    for values in iterator:
+        if include_chord_offsets:
+            score_row, perf_row, pedal_row, offset_row = values
+        else:
+            score_row, perf_row, pedal_row = values
+            offset_row = None
         log_ioi = normalize_ioi_dev(
             score_row[0],
             perf_row[0],
@@ -600,6 +646,13 @@ def performance_dev_velocity_pedal4_binary_rows(
         )
         velocity = min(max(float(perf_row[2]), 0.0), 127.0) / 127.0
         pedal = [1.0 if float(value) >= threshold else 0.0 for value in pedal_row[:4]]
+        chord_offset = []
+        if include_chord_offsets:
+            chord_offset = [
+                float(offset_row[0]) / 1000.0,
+                float(offset_row[1]) / 1000.0,
+                float(offset_row[2]) / 127.0,
+            ]
         if _uses_raw_log_deviation_target(epr_timing_target):
             rows.append(
                 [
@@ -609,10 +662,21 @@ def performance_dev_velocity_pedal4_binary_rows(
                     (float(perf_row[1]) - float(score_row[1])) / 1000.0,
                     velocity,
                     *pedal,
+                    *chord_offset,
+                ]
+            )
+        elif _uses_raw_deviation_target(epr_timing_target):
+            rows.append(
+                [
+                    (float(perf_row[0]) - float(score_row[0])) / 1000.0,
+                    (float(perf_row[1]) - float(score_row[1])) / 1000.0,
+                    velocity,
+                    *pedal,
+                    *chord_offset,
                 ]
             )
         else:
-            rows.append([log_ioi, log_duration, velocity, *pedal])
+            rows.append([log_ioi, log_duration, velocity, *pedal, *chord_offset])
     return rows
 
 
@@ -643,6 +707,8 @@ def encode_timing_control_features(time_ms, timing_control_mode="log_scaled", us
         ]
     if mode == "log_scaled":
         return [normalize_log_timing_value(value, scale=log_scale, max_time_ms=5000.0)]
+    if mode in {"raw", "raw_seconds"}:
+        return [value / 1000.0]
     if mode == "dual_clip_linear":
         return [
             min(value / 500.0, 1.0),
@@ -736,6 +802,8 @@ def build_score_musical_rows(score, musical_feature_mode="continuous"):
     has_score_feature = score.get("has_score_feature", [0] * len(score.get("pitch", [])))
     score_raw = score.get("score_raw", [])
     mode = str(musical_feature_mode).lower()
+    if musical_feature_dim(mode) == 0:
+        return [[] for _ in range(len(score.get("pitch", [])))]
 
     rows = []
     measure_start = 0.0
@@ -864,23 +932,42 @@ def build_epr_score_input_rows(
     musical_feature_mode="categorical",
     score_note_schema="integrated",
     disable_musical_features=False,
+    include_score_chord_offset=False,
 ):
     score_raw = score["score_raw"]
     has_score_feature = score.get("has_score_feature", [0] * len(score["pitch"]))
     musical_rows = build_score_musical_rows(score, musical_feature_mode=musical_feature_mode)
+    musical_dim_value = musical_feature_dim(musical_feature_mode)
     control_dim = timing_control_feature_dim(
         timing_control_mode=timing_control_mode,
         use_timing_scale_bit=use_timing_scale_bit,
     )
     schema = score_note_input_schema(score_note_schema)
+    perf_offset_dim = 3 if include_score_chord_offset else 0
     rows = []
-    for raw_shared, musical, has_feature in zip(score_raw, musical_rows, has_score_feature):
+    score_offset_rows = score.get("score_offset_raw") if include_score_chord_offset else None
+    if include_score_chord_offset:
+        if score_offset_rows is None:
+            raise KeyError("include_score_chord_offset=True requires score.score_offset_raw")
+        if len(score_offset_rows) != len(score_raw):
+            raise ValueError(
+                f"score_offset_raw/score_raw length mismatch: {len(score_offset_rows)} vs {len(score_raw)}"
+            )
+    for idx, (raw_shared, musical, has_feature) in enumerate(zip(score_raw, musical_rows, has_score_feature)):
         score_control = encode_shared_control_row(
             raw_shared[:3],
             use_timing_scale_bit=use_timing_scale_bit,
             timing_control_mode=timing_control_mode,
             log_scale=log_scale,
         )
+        score_offset = []
+        if include_score_chord_offset:
+            offset = score_offset_rows[idx]
+            score_offset = [
+                float(offset[0]) / 1000.0,
+                float(offset[1]) / 1000.0,
+                float(offset[2]) / 127.0,
+            ]
         if disable_musical_features:
             m_musical = 0.0
             musical = [0.0] * len(musical)
@@ -888,13 +975,18 @@ def build_epr_score_input_rows(
             m_musical = 1.0 if bool(has_feature) else 0.0
         masked_musical = [value * m_musical for value in musical]
         if schema == "score_musical":
-            rows.append(score_control + masked_musical + [m_musical])
+            rows.append(score_control + score_offset + masked_musical + [m_musical])
             continue
         if schema != "integrated":
             raise ValueError(f"Unsupported score_note_schema={score_note_schema}")
         perf_control = [0.0] * (control_dim + 4)
+        perf_offset = [0.0] * perf_offset_dim
+        if musical_dim_value == 0:
+            masks = [1.0, 0.0]
+            rows.append(score_control + score_offset + perf_control + perf_offset + masked_musical + masks)
+            continue
         masks = [1.0, 0.0, m_musical]
-        rows.append(score_control + perf_control + masked_musical + masks)
+        rows.append(score_control + score_offset + perf_control + perf_offset + masked_musical + masks)
     return rows
 
 
@@ -1233,6 +1325,11 @@ class PianoCoReNodeSFTDataset(Dataset):
         composer_vocab=None,
         source_vocab=None,
         perf_style_stats_mode="prefix",
+        chord_mode=False,
+        include_chord_offsets=False,
+        include_score_chord_offset=None,
+        pitch_multihot_dim=88,
+        piano_pitch_min=21,
     ):
         super().__init__()
         self.split = split
@@ -1254,6 +1351,15 @@ class PianoCoReNodeSFTDataset(Dataset):
         )
         self.timing_log_scale = float(timing_log_scale)
         self.use_style_tokens = bool(use_style_tokens)
+        self.chord_mode = bool(chord_mode)
+        self.include_chord_offsets = bool(include_chord_offsets or chord_mode)
+        self.include_score_chord_offset = (
+            self.include_chord_offsets
+            if include_score_chord_offset is None
+            else bool(include_score_chord_offset)
+        )
+        self.pitch_multihot_dim = int(pitch_multihot_dim)
+        self.piano_pitch_min = int(piano_pitch_min)
         self.perf_style_stats_mode = str(perf_style_stats_mode or "prefix").lower()
         if self.perf_style_stats_mode not in {"prefix", "window"}:
             raise ValueError(f"Unsupported perf_style_stats_mode={perf_style_stats_mode}")
@@ -1306,6 +1412,7 @@ class PianoCoReNodeSFTDataset(Dataset):
                 "timing_control_mode": self.timing_control_mode,
                 "timing_log_scale": self.timing_log_scale,
                 "use_timing_scale_bit": self.use_timing_scale_bit,
+                "include_score_chord_offset": self.include_score_chord_offset,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -1355,6 +1462,8 @@ class PianoCoReNodeSFTDataset(Dataset):
             return False
         if "pitch" not in score or "score_raw" not in score:
             return False
+        if self.include_score_chord_offset and "score_offset_raw" not in score:
+            return False
         if self.task_type.lower() in {"epr", "csr"}:
             if "score_feature" not in score or "has_score_feature" not in score:
                 return False
@@ -1365,9 +1474,17 @@ class PianoCoReNodeSFTDataset(Dataset):
         for perf in performances:
             if not isinstance(perf, dict) or "interpolated" not in perf:
                 return False
+            if self.include_chord_offsets and "label_offset_raw" not in perf:
+                return False
             if self.task_type.lower() == "epr" and self.epr_timing_target in {
                 "log_deviation",
                 "log_dev",
+                "raw_log_deviation",
+                "raw_log_dev",
+                "raw_deviation",
+                "raw_dev",
+                "raw_seconds_deviation",
+                "raw_seconds_dev",
             }:
                 has_shared = "label_shared_raw" in perf or "label_raw" in perf
                 has_pedal = "label_pedal4_raw" in perf or "pedal4_raw" in perf or "label_raw" in perf
@@ -1445,9 +1562,11 @@ class PianoCoReNodeSFTDataset(Dataset):
                 continue
             prepared = self._torch_load_prepared(cache_path)
             signature = prepared.get("_cache_signature")
-            if prepared.get("_source_identity") != self._source_identity(path):
+            schema = prepared.get("schema")
+            is_chord_sidecar = schema == "pianocore_chord_work_compact_v1"
+            if not is_chord_sidecar and prepared.get("_source_identity") != self._source_identity(path):
                 continue
-            if self._is_raw_sidecar_signature(signature):
+            if is_chord_sidecar or self._is_raw_sidecar_signature(signature):
                 if self._has_raw_sidecar_payload(prepared):
                     return self._normalize_loaded_raw_sidecar(prepared)
                 continue
@@ -1576,6 +1695,7 @@ class PianoCoReNodeSFTDataset(Dataset):
                 musical_feature_mode=self.musical_feature_mode,
                 score_note_schema=self.score_note_schema,
                 disable_musical_features=self.disable_musical_features,
+                include_score_chord_offset=self.include_score_chord_offset,
             )
         elif derive_features and task_type == "csr":
             prepared["score_musical"] = build_score_musical_rows(score, musical_feature_mode="continuous")
@@ -1640,12 +1760,17 @@ class PianoCoReNodeSFTDataset(Dataset):
             "log_dev",
             "raw_log_deviation",
             "raw_log_dev",
+            "raw_deviation",
+            "raw_dev",
+            "raw_seconds_deviation",
+            "raw_seconds_dev",
         }:
             labels = performance_dev_velocity_pedal4_binary_rows(
                 perf,
                 prepared["score"]["score_raw"],
                 epr_timing_target=self.epr_timing_target,
                 log_scale=self.timing_log_scale,
+                include_chord_offsets=self.include_chord_offsets,
             )
             missing = "Missing score_raw/label_shared_raw/label_pedal4_raw for binary_4 deviation EPR targets"
             if labels is None:
@@ -1719,6 +1844,7 @@ class PianoCoReNodeSFTDataset(Dataset):
                 musical_feature_mode=self.musical_feature_mode,
                 score_note_schema=self.score_note_schema,
                 disable_musical_features=self.disable_musical_features,
+                include_score_chord_offset=self.include_score_chord_offset,
             )
         return cache[cache_key]
 
@@ -1734,6 +1860,56 @@ class PianoCoReNodeSFTDataset(Dataset):
         if "has_score_feature" in prepared:
             return prepared["has_score_feature"]
         return prepared["score"]["has_score_feature"]
+
+    def _pitch_ids_for_window(self, score, start, end):
+        values = score["pitch"][start:end]
+        if not self.chord_mode:
+            return values.tolist() if torch.is_tensor(values) else values
+        pitch_ids = []
+        for value in values:
+            if torch.is_tensor(value):
+                if value.numel() == 0:
+                    pitch_ids.append(128)
+                else:
+                    pitch_ids.append(int(value.max().item()))
+            elif isinstance(value, (list, tuple)):
+                pitch_ids.append(max(int(pitch) for pitch in value) if value else 128)
+            else:
+                pitch_ids.append(int(value))
+        return pitch_ids
+
+    def _pitch_multihot_for_window(self, score, start, end):
+        if "pitch_multihot" in score:
+            rows = self._rows_for_window(score["pitch_multihot"], start, end)
+            if rows and len(rows[0]) == self.pitch_multihot_dim:
+                return rows
+            if rows and len(rows[0]) == 128 and self.pitch_multihot_dim == 88:
+                return [row[self.piano_pitch_min : self.piano_pitch_min + self.pitch_multihot_dim] for row in rows]
+            raise ValueError(
+                f"Unsupported pitch_multihot dim {len(rows[0]) if rows else 0}; "
+                f"expected {self.pitch_multihot_dim}"
+            )
+        values = score["pitch"][start:end]
+        rows = []
+        for value in values:
+            row = [0.0] * self.pitch_multihot_dim
+            if torch.is_tensor(value):
+                pitches = value.detach().cpu().flatten().tolist()
+            elif isinstance(value, (list, tuple)):
+                pitches = value
+            else:
+                pitches = [value]
+            for pitch in pitches:
+                pitch = int(pitch)
+                idx = pitch - self.piano_pitch_min
+                if 0 <= idx < self.pitch_multihot_dim:
+                    row[idx] = 1.0
+            rows.append(row)
+        return rows
+
+    def _rows_for_window(self, rows, start, end):
+        values = rows[start:end]
+        return values.tolist() if torch.is_tensor(values) else values
 
     def _precompute_items(self):
         rank, _ = distributed_info()
@@ -1818,11 +1994,20 @@ class PianoCoReNodeSFTDataset(Dataset):
 
         sample = {
             "example_index": index,
-            "pitch_ids": score["pitch"][start:end],
+            "pitch_ids": self._pitch_ids_for_window(score, start, end),
+            "pitch_multihot": self._pitch_multihot_for_window(score, start, end),
             "continuous": continuous,
             "labels_continuous": labels_continuous,
-            "score_shared_raw": [row[:3] for row in score["score_raw"][start:end]],
-            "interpolated": interpolated[start:end],
+            "score_shared_raw": [row[:3] for row in self._rows_for_window(score["score_raw"], start, end)],
+            "offset_loss_mask": [
+                1 if int(value) > 1 else 0
+                for value in self._rows_for_window(
+                    score.get("chord_size", [len(p) if isinstance(p, list) else 1 for p in score["pitch"]]),
+                    start,
+                    end,
+                )
+            ],
+            "interpolated": self._rows_for_window(interpolated, start, end),
             "performance_dataset": perf.get("performance_dataset", "unknown"),
             "performance_id": perf.get("performance_id", "unknown"),
         }
@@ -2270,6 +2455,7 @@ class NodeSFTTrainer(Trainer):
                 loss_mask,
                 labels_epr_bins=inputs.get("labels_epr_bins"),
                 score_shared_raw=inputs.get("score_shared_raw"),
+                offset_loss_mask=inputs.get("offset_loss_mask"),
             )
             payload = {
                 "step": step,
@@ -2497,6 +2683,7 @@ class NodeSFTTrainer(Trainer):
                             decoder_feedback_continuous=feedback,
                             labels_epr_bins=batch.get("labels_epr_bins"),
                             label_mask=batch.get("label_mask"),
+                            offset_loss_mask=batch.get("offset_loss_mask"),
                             attention_mask=attention_mask,
                             continuous_sampling_strategy=str(getattr(self, "rollout_eval_materialize_strategy", "sample")),
                         )
@@ -2696,6 +2883,9 @@ class NodeSFTDataCollator:
 
     def __call__(self, examples):
         pitch_tensors = [torch.tensor(example["pitch_ids"], dtype=torch.long) for example in examples]
+        pitch_multihot_tensors = [
+            torch.tensor(example["pitch_multihot"], dtype=torch.float32) for example in examples
+        ]
         continuous_tensors = [
             torch.tensor(example["continuous"], dtype=torch.float32) for example in examples
         ]
@@ -2704,6 +2894,13 @@ class NodeSFTDataCollator:
         ]
         score_shared_raw_tensors = [
             torch.tensor(example["score_shared_raw"], dtype=torch.float32) for example in examples
+        ]
+        offset_loss_mask_tensors = [
+            torch.tensor(
+                example.get("offset_loss_mask", [1] * len(example["labels_continuous"])),
+                dtype=torch.long,
+            )
+            for example in examples
         ]
         interpolated_tensors = [
             torch.tensor(example["interpolated"], dtype=torch.bool) for example in examples
@@ -2727,9 +2924,11 @@ class NodeSFTDataCollator:
                     dagger_prefix_tensors.append(torch.empty(0, dtype=torch.float32))
 
         pitch_ids = pad_sequence(pitch_tensors, batch_first=True, padding_value=self.pitch_pad_id)
+        pitch_multihot = pad_sequence(pitch_multihot_tensors, batch_first=True, padding_value=0.0)
         continuous = pad_sequence(continuous_tensors, batch_first=True, padding_value=0.0)
         labels_continuous = pad_sequence(label_tensors, batch_first=True, padding_value=0.0)
         score_shared_raw = pad_sequence(score_shared_raw_tensors, batch_first=True, padding_value=0.0)
+        offset_loss_mask = pad_sequence(offset_loss_mask_tensors, batch_first=True, padding_value=0)
         interpolated = pad_sequence(interpolated_tensors, batch_first=True, padding_value=False)
         attention_mask = (pitch_ids != self.pitch_pad_id).long()
         label_mask = None
@@ -2742,9 +2941,11 @@ class NodeSFTDataCollator:
         batch = {
             "example_index": torch.tensor([int(example["example_index"]) for example in examples], dtype=torch.long),
             "pitch_ids": pitch_ids,
+            "pitch_multihot": pitch_multihot,
             "continuous": continuous,
             "labels_continuous": labels_continuous,
             "score_shared_raw": score_shared_raw,
+            "offset_loss_mask": offset_loss_mask,
             "attention_mask": attention_mask,
             "interpolated": interpolated,
         }
@@ -2804,7 +3005,7 @@ class NodeSFTDataCollator:
                             continue
                         noise = torch.randn_like(decoder_feedback_continuous[row_idx, :, col]) * sigma + mu
                         updated = decoder_feedback_continuous[row_idx, row_mask, col] + noise[row_mask]
-                        if _uses_raw_log_deviation_target(self.epr_timing_target):
+                        if _uses_raw_log_deviation_target(self.epr_timing_target) or _uses_raw_deviation_target(self.epr_timing_target):
                             decoder_feedback_continuous[row_idx, row_mask, col] = updated
                         else:
                             decoder_feedback_continuous[row_idx, row_mask, col] = updated.clamp(0.0, 1.0)
@@ -2849,14 +3050,28 @@ def create_model(train_config):
     task_type = train_config.get("task_type", "epr").lower()
     input_feature_mode = infer_input_feature_mode(train_config)
     epr_timing_target = str(train_config.get("epr_timing_target", "log_deviation")).lower()
+    chord_mode = bool(train_config.get("chord_mode", False))
+    include_score_chord_offset = bool(train_config.get("include_score_chord_offset", train_config.get("include_chord_offsets", chord_mode)))
+    score_offset_dim = chord_offset_dim(chord_mode, include_score_chord_offset)
+    performance_offset_dim = chord_offset_dim(chord_mode, include_score_chord_offset)
+    output_chord_offset_dim = 3 if chord_mode and bool(train_config.get("include_chord_offsets", True)) else 0
     timing_control_mode = resolve_timing_control_mode(
         timing_control_mode=train_config.get("timing_control_mode"),
         use_timing_scale_bit=train_config.get("use_timing_scale_bit", False),
     )
-    if task_type in {"epr", "csr"} and timing_control_mode not in {"log_scaled", "raw_log"}:
-        raise ValueError("Integrated INR requires timing_control_mode=log_scaled or raw_log")
-    if task_type == "epr" and epr_timing_target not in {"log_deviation", "log_dev", "raw_log_deviation", "raw_log_dev"}:
-        raise ValueError("EPR requires epr_timing_target=log_deviation or raw_log_deviation")
+    if task_type in {"epr", "csr"} and timing_control_mode not in {"log_scaled", "raw_log", "raw", "raw_seconds"}:
+        raise ValueError("Integrated INR requires timing_control_mode=log_scaled, raw_log, or raw")
+    if task_type == "epr" and epr_timing_target not in {
+        "log_deviation",
+        "log_dev",
+        "raw_log_deviation",
+        "raw_log_dev",
+        "raw_deviation",
+        "raw_dev",
+        "raw_seconds_deviation",
+        "raw_seconds_dev",
+    }:
+        raise ValueError("EPR requires epr_timing_target=log_deviation, raw_log_deviation, or raw_deviation")
     use_timing_scale_bit = timing_control_mode == "piecewise_scale_bit"
     note_embedding_mode = str(train_config.get("note_embedding_mode", "sine")).lower()
     score_note_schema = score_note_input_schema(train_config)
@@ -2892,6 +3107,8 @@ def create_model(train_config):
         }
         if distribution not in supported_distributions:
             raise ValueError(f"Unsupported epr_distribution={distribution}")
+        if output_chord_offset_dim > 0 and distribution not in {"sn", "skew_normal"}:
+            raise ValueError("chord offset prediction currently requires epr_distribution=skew_normal")
         scalar_distributions = {
             "lan",
             "can",
@@ -2946,12 +3163,17 @@ def create_model(train_config):
             pedal_representation = str(train_config.get("pedal_representation", "binary_4")).lower()
             if pedal_representation != "binary_4":
                 raise ValueError("deviation EPR requires pedal_representation=binary_4")
-            expected_output_dim = 7
+            expected_output_dim = 7 + output_chord_offset_dim
         elif epr_timing_target in {"raw_log_deviation", "raw_log_dev"}:
             pedal_representation = str(train_config.get("pedal_representation", "binary_4")).lower()
             if pedal_representation != "binary_4":
                 raise ValueError("raw_log deviation EPR requires pedal_representation=binary_4")
-            expected_output_dim = 9
+            expected_output_dim = 9 + output_chord_offset_dim
+        elif epr_timing_target in {"raw_deviation", "raw_dev", "raw_seconds_deviation", "raw_seconds_dev"}:
+            pedal_representation = str(train_config.get("pedal_representation", "binary_4")).lower()
+            if pedal_representation != "binary_4":
+                raise ValueError("raw deviation EPR requires pedal_representation=binary_4")
+            expected_output_dim = 7 + output_chord_offset_dim
         else:
             expected_output_dim = None
         if expected_output_dim is not None and int(train_config.get("output_continuous_dim", train_config["continuous_dim"])) != expected_output_dim:
@@ -3004,6 +3226,8 @@ def create_model(train_config):
             use_timing_scale_bit=use_timing_scale_bit,
             musical_feature_mode=musical_feature_mode,
             pedal_control_dim=4,
+            score_offset_dim=score_offset_dim,
+            performance_offset_dim=performance_offset_dim,
         )
         if task_type in {"epr", "csr"} and input_feature_mode == "integrated"
         else default_input_continuous_dim(
@@ -3012,6 +3236,8 @@ def create_model(train_config):
             score_feature_dim=score_feature_dim,
             continuous_dim=train_config.get("continuous_dim", 7),
             musical_feature_mode=musical_feature_mode,
+            score_offset_dim=score_offset_dim,
+            performance_offset_dim=performance_offset_dim,
         )
     )
     score_input_continuous_dim = default_score_input_dim
@@ -3039,6 +3265,8 @@ def create_model(train_config):
                 use_timing_scale_bit=use_timing_scale_bit,
                 musical_feature_mode=musical_feature_mode,
                 pedal_control_dim=4,
+                score_offset_dim=score_offset_dim,
+                performance_offset_dim=performance_offset_dim,
             )
         if int(score_input_continuous_dim) != expected_score_dim:
             raise ValueError(
@@ -3144,6 +3372,10 @@ def create_model(train_config):
         stable_contract_eps=train_config.get("stable_contract_eps", 1e-6),
         piano_pitch_min=train_config.get("piano_pitch_min", 21),
         pedal_representation=train_config.get("pedal_representation", "binary_4"),
+        chord_mode=chord_mode,
+        chord_offset_dim=output_chord_offset_dim,
+        pitch_representation=train_config.get("pitch_representation", "id"),
+        pitch_multihot_dim=train_config.get("pitch_multihot_dim", 88),
         use_style_tokens=train_config.get("use_style_tokens", False),
         style_creator_vocab_size=train_config.get("style_creator_vocab_size", 1),
         style_source_vocab_size=train_config.get("style_source_vocab_size", 1),
@@ -3402,6 +3634,9 @@ def main():
     parser.add_argument("--limit_works", type=int, default=None)
     parser.add_argument("--limit_performances_per_work", type=int, default=None)
     parser.add_argument("--limit_windows_per_work", type=int, default=None)
+    parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--logging_dir", type=str, default=None)
+    parser.add_argument("--run_name", type=str, default=None)
     args = parser.parse_args()
 
     local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
@@ -3419,23 +3654,35 @@ def main():
 
     with open(args.config, "r", encoding="utf-8") as file:
         train_config = json.load(file)
-    outname = str(train_config.get("run_name") or ("inr_" + current_datetime.strftime("%Y-%m-%d-%H-%M-%S")))
+    outname = str(args.run_name or train_config.get("run_name") or ("inr_" + current_datetime.strftime("%Y-%m-%d-%H-%M-%S")))
     task_type = train_config.get("task_type", "epr").lower()
     input_feature_mode = infer_input_feature_mode(train_config)
     train_config["input_feature_mode"] = input_feature_mode
+    chord_mode = bool(train_config.get("chord_mode", False))
+    include_chord_offsets = bool(train_config.get("include_chord_offsets", chord_mode))
+    include_score_chord_offset = bool(train_config.get("include_score_chord_offset", include_chord_offsets))
+    train_config["include_chord_offsets"] = include_chord_offsets
+    train_config["include_score_chord_offset"] = include_score_chord_offset
+    output_chord_offset_dim = 3 if chord_mode and include_chord_offsets else 0
+    score_offset_dim = chord_offset_dim(chord_mode, include_score_chord_offset)
+    performance_offset_dim = chord_offset_dim(chord_mode, include_score_chord_offset)
     timing_control_mode = resolve_timing_control_mode(
         timing_control_mode=train_config.get("timing_control_mode"),
         use_timing_scale_bit=train_config.get("use_timing_scale_bit", False),
     )
-    if task_type in {"epr", "csr"} and timing_control_mode not in {"log_scaled", "raw_log"}:
-        raise ValueError("Integrated INR requires timing_control_mode=log_scaled or raw_log")
+    if task_type in {"epr", "csr"} and timing_control_mode not in {"log_scaled", "raw_log", "raw", "raw_seconds"}:
+        raise ValueError("Integrated INR requires timing_control_mode=log_scaled, raw_log, or raw")
     if task_type == "epr" and str(train_config.get("epr_timing_target", "log_deviation")).lower() not in {
         "log_deviation",
         "log_dev",
         "raw_log_deviation",
         "raw_log_dev",
+        "raw_deviation",
+        "raw_dev",
+        "raw_seconds_deviation",
+        "raw_seconds_dev",
     }:
-        raise ValueError("EPR requires epr_timing_target=log_deviation or raw_log_deviation")
+        raise ValueError("EPR requires epr_timing_target=log_deviation, raw_log_deviation, or raw_deviation")
     train_config["timing_control_mode"] = timing_control_mode
     train_config["use_timing_scale_bit"] = timing_control_mode == "piecewise_scale_bit"
     musical_feature_mode = str(
@@ -3445,6 +3692,11 @@ def main():
         )
     ).lower()
     train_config["musical_feature_mode"] = musical_feature_mode
+    if task_type == "epr":
+        epr_timing_target = str(train_config.get("epr_timing_target", "log_deviation")).lower()
+        base_output_dim = 9 if epr_timing_target in {"raw_log_deviation", "raw_log_dev"} else 7
+        train_config["continuous_dim"] = base_output_dim + output_chord_offset_dim
+        train_config["output_continuous_dim"] = base_output_dim + output_chord_offset_dim
     if train_config.get("use_style_tokens", False):
         raise ValueError("use_style_tokens is disabled for the simplified EPR/CSR pipelines")
     if task_type in {"epr", "csr"} and input_feature_mode == "integrated":
@@ -3455,12 +3707,14 @@ def main():
                 musical_feature_mode=musical_feature_mode,
             )
         else:
-            inferred_input_dim = integrated_epr_input_dim(
-                timing_control_mode=timing_control_mode,
-                use_timing_scale_bit=train_config.get("use_timing_scale_bit", False),
-                musical_feature_mode=musical_feature_mode,
-                pedal_control_dim=4,
-            )
+                inferred_input_dim = integrated_epr_input_dim(
+                    timing_control_mode=timing_control_mode,
+                    use_timing_scale_bit=train_config.get("use_timing_scale_bit", False),
+                    musical_feature_mode=musical_feature_mode,
+                    pedal_control_dim=4,
+                    score_offset_dim=score_offset_dim,
+                    performance_offset_dim=performance_offset_dim,
+                )
         train_config["input_continuous_dim"] = inferred_input_dim
         train_config["score_input_continuous_dim"] = inferred_input_dim
         train_config["decoder_input_continuous_dim"] = (
@@ -3479,6 +3733,8 @@ def main():
                 score_feature_dim=train_config.get("score_feature_dim", 8),
                 continuous_dim=train_config.get("continuous_dim", 7),
                 musical_feature_mode=musical_feature_mode,
+                score_offset_dim=score_offset_dim,
+                performance_offset_dim=performance_offset_dim,
             ),
         )
     if task_type == "csr":
@@ -3493,6 +3749,10 @@ def main():
         train_config["max_performances_per_work"] = args.limit_performances_per_work
     if args.limit_windows_per_work is not None:
         train_config["max_windows_per_work"] = args.limit_windows_per_work
+    if args.output_dir is not None:
+        train_config["output_dir"] = args.output_dir
+    if args.logging_dir is not None:
+        train_config["logging_dir"] = args.logging_dir
 
     enable_eval_best_checkpointing(train_config)
 
@@ -3620,6 +3880,11 @@ def main():
         composer_vocab=train_config.get("style_composer_vocab"),
         source_vocab=train_config.get("style_source_vocab"),
         perf_style_stats_mode=train_config.get("perf_style_stats_mode", "prefix"),
+        chord_mode=train_config.get("chord_mode", False),
+        include_chord_offsets=train_config.get("include_chord_offsets", False),
+        include_score_chord_offset=train_config.get("include_score_chord_offset"),
+        pitch_multihot_dim=train_config.get("pitch_multihot_dim", 88),
+        piano_pitch_min=train_config.get("piano_pitch_min", 21),
     )
     eval_dataset = PianoCoReNodeSFTDataset(
         eval_manifest,
@@ -3650,6 +3915,11 @@ def main():
         composer_vocab=train_config.get("style_composer_vocab"),
         source_vocab=train_config.get("style_source_vocab"),
         perf_style_stats_mode=train_config.get("perf_style_stats_mode", "prefix"),
+        chord_mode=train_config.get("chord_mode", False),
+        include_chord_offsets=train_config.get("include_chord_offsets", False),
+        include_score_chord_offset=train_config.get("include_score_chord_offset"),
+        pitch_multihot_dim=train_config.get("pitch_multihot_dim", 88),
+        piano_pitch_min=train_config.get("piano_pitch_min", 21),
     )
 
     model = create_model(train_config)

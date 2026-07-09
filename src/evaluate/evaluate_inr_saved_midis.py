@@ -50,17 +50,25 @@ def cached_raw_output_pedal_arrays(path: str):
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     rows = payload.get("predicted_target")
     if rows is None:
+        rows = payload.get("predicted_target12")
+    if rows is None:
+        rows = payload.get("predicted_target10")
+    if rows is None:
         rows = payload.get("predicted_target7")
     if rows is None:
-        raise KeyError(f"No predicted_target or predicted_target7 in {path}")
+        raise KeyError(f"No predicted_target, predicted_target12, predicted_target10, or predicted_target7 in {path}")
     rows = np.asarray(rows, dtype=np.float64)
     if rows.ndim != 2 or rows.shape[1] < 7:
         raise ValueError(f"Unexpected predicted target shape for {path}: {rows.shape}")
+    if rows.shape[1] >= 12 or str(payload.get("timing_representation", "")).startswith("target12"):
+        pedal_start = 5
+    else:
+        pedal_start = 3
     return {
-        "pedal_0": rows[:, 3],
-        "pedal_25": rows[:, 4],
-        "pedal_50": rows[:, 5],
-        "pedal_75": rows[:, 6],
+        "pedal_0": rows[:, pedal_start],
+        "pedal_25": rows[:, pedal_start + 1],
+        "pedal_50": rows[:, pedal_start + 2],
+        "pedal_75": rows[:, pedal_start + 3],
     }
 
 

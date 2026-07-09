@@ -26,6 +26,7 @@ from src.model.integrated_pianoformer import (
     _logistic_normal_params,
     _materialize_epr_prediction,
     _shift_pitch_right,
+    _shift_pitch_multihot_right,
     _shared_scalar_params,
     _split_epr_mixture_params,
     _target7_to_raw7,
@@ -57,6 +58,9 @@ RAW_DISTRIBUTION_KEYS = [
     ("pedal_25", "Pedal 25%"),
     ("pedal_50", "Pedal 50%"),
     ("pedal_75", "Pedal 75%"),
+    ("onset_offset_ms", "Onset offset"),
+    ("duration_offset_ms", "Duration offset"),
+    ("velocity_offset", "Velocity offset"),
 ]
 
 TARGET_DISTRIBUTION_KEYS = [
@@ -67,6 +71,9 @@ TARGET_DISTRIBUTION_KEYS = [
     ("pedal_25", "Pedal 25%"),
     ("pedal_50", "Pedal 50%"),
     ("pedal_75", "Pedal 75%"),
+    ("onset_offset_s", "Onset offset s"),
+    ("duration_offset_s", "Duration offset s"),
+    ("velocity_offset_norm", "Velocity offset norm"),
 ]
 
 TIMING_HEAD_FEATURES = [("ioi", 0), ("duration", 1)]
@@ -80,6 +87,31 @@ POSITION_FEATURES = [
     ("pedal_50", 5),
     ("pedal_75", 6),
 ]
+
+
+def has_raw_log_layout(config):
+    return str(config.get("epr_timing_target", "log_deviation")).lower() in {
+        "raw_log_deviation",
+        "raw_log_dev",
+    }
+
+
+def offset_dim(config):
+    return 3 if bool(config.get("chord_mode", False)) and bool(config.get("include_chord_offsets", True)) else 0
+
+
+def target_layout(config, target_rows):
+    target_rows = np.asarray(target_rows)
+    raw_log = has_raw_log_layout(config)
+    if raw_log:
+        velocity_col = 4
+        pedal_start = 5
+    else:
+        velocity_col = 2
+        pedal_start = 3
+    off_dim = offset_dim(config)
+    offset_start = pedal_start + 4 if off_dim > 0 and target_rows.shape[-1] >= pedal_start + 4 + off_dim else None
+    return velocity_col, pedal_start, offset_start, off_dim
 
 
 def _temperature_mixture_value(config, logits, raw_mu, raw_log_sigma, sampling_strategy="mean", temperature=1.0):
@@ -477,8 +509,12 @@ def load_config(config_path, checkpoint):
         "log_dev",
         "raw_log_deviation",
         "raw_log_dev",
+        "raw_deviation",
+        "raw_dev",
+        "raw_seconds_deviation",
+        "raw_seconds_dev",
     }:
-        raise ValueError("This script only supports log_deviation/raw_log_deviation timing targets")
+        raise ValueError("This script only supports log_deviation/raw_log_deviation/raw_deviation timing targets")
     return config
 
 
@@ -518,10 +554,62 @@ def labels_for_perf(config, perf, score_shared_raw):
         epr_timing_target=config.get("epr_timing_target", "log_deviation"),
         log_scale=float(config.get("timing_log_scale", 50.0)),
         pedal_binary_threshold=float(config.get("pedal_binary_threshold", 64.0)),
+        include_chord_offsets=bool(config.get("chord_mode", False))
+        and bool(config.get("include_chord_offsets", True)),
     )
     if labels is None:
         raise ValueError(f"Could not build target labels for {perf.get('performance_source')}")
     return labels
+
+
+def pitch_ids_from_pitch_values(pitches, pitch_pad_id):
+    pitch_ids = []
+    for value in pitches:
+        if isinstance(value, (list, tuple)):
+            pitch_ids.append(max(int(pitch) for pitch in value) if value else int(pitch_pad_id))
+        else:
+            pitch_ids.append(int(value))
+    return pitch_ids
+
+
+def pitch_multihot_rows(config, score, start, end):
+    dim = int(config.get("pitch_multihot_dim", 88))
+    piano_min = int(config.get("piano_pitch_min", 21))
+    if "pitch_multihot" in score:
+        rows = score["pitch_multihot"][start:end]
+        if rows and len(rows[0]) == dim:
+            return rows
+        if rows and len(rows[0]) == 128 and dim == 88:
+            return [row[piano_min : piano_min + dim] for row in rows]
+        raise ValueError(f"Unsupported pitch_multihot dim {len(rows[0]) if rows else 0}; expected {dim}")
+    rows = []
+    for value in score["pitch"][start:end]:
+        row = [0.0] * dim
+        pitches = value if isinstance(value, (list, tuple)) else [value]
+        for pitch in pitches:
+            idx = int(pitch) - piano_min
+            if 0 <= idx < dim:
+                row[idx] = 1.0
+        rows.append(row)
+    return rows
+
+
+def chord_mask_from_pitch_values(pitches):
+    return np.asarray(
+        [
+            len(value) > 1 if isinstance(value, (list, tuple)) else False
+            for value in pitches
+        ],
+        dtype=bool,
+    )
+
+
+def target_offsets3(config, target_rows):
+    target_rows = torch.as_tensor(target_rows).float()
+    off_dim = offset_dim(config)
+    if off_dim <= 0 or target_rows.shape[-1] < off_dim:
+        return target_rows.new_empty(*target_rows.shape[:-1], 0)
+    return target_rows[..., -off_dim:]
 
 
 def raw_arrays_from_rows(rows):
@@ -540,40 +628,50 @@ def raw_arrays_from_rows(rows):
 def metric_arrays(raw_rows, target_rows):
     arrays = raw_arrays_from_rows(raw_rows)
     target_rows = np.asarray(target_rows, dtype=np.float64)
-    if target_rows.shape[-1] >= 9:
-        arrays["pedal_0"] = target_rows[:, 5]
-        arrays["pedal_25"] = target_rows[:, 6]
-        arrays["pedal_50"] = target_rows[:, 7]
-        arrays["pedal_75"] = target_rows[:, 8]
-    else:
-        arrays["pedal_0"] = target_rows[:, 3]
-        arrays["pedal_25"] = target_rows[:, 4]
-        arrays["pedal_50"] = target_rows[:, 5]
-        arrays["pedal_75"] = target_rows[:, 6]
+    arrays["pedal_0"] = target_rows[:, 3]
+    arrays["pedal_25"] = target_rows[:, 4]
+    arrays["pedal_50"] = target_rows[:, 5]
+    arrays["pedal_75"] = target_rows[:, 6]
     return arrays
 
 
-def distribution_arrays(raw_rows, target_rows):
+def distribution_arrays(config, raw_rows, target_rows, chord_mask=None):
     raw_rows = np.asarray(raw_rows, dtype=np.float64)
     target_rows = np.asarray(target_rows, dtype=np.float64)
+    velocity_col, pedal_start, offset_start, off_dim = target_layout(config, target_rows)
     raw = {
         "ioi_ms": raw_rows[:, 0],
         "duration_ms": raw_rows[:, 1],
         "velocity": raw_rows[:, 2],
-        "pedal_0": target_rows[:, 3],
-        "pedal_25": target_rows[:, 4],
-        "pedal_50": target_rows[:, 5],
-        "pedal_75": target_rows[:, 6],
+        "pedal_0": target_rows[:, pedal_start],
+        "pedal_25": target_rows[:, pedal_start + 1],
+        "pedal_50": target_rows[:, pedal_start + 2],
+        "pedal_75": target_rows[:, pedal_start + 3],
     }
     target = {
         "ioi_log_dev": target_rows[:, 0],
         "duration_log_dev": target_rows[:, 1],
-        "velocity_norm": target_rows[:, 4] if target_rows.shape[-1] >= 9 else target_rows[:, 2],
-        "pedal_0": target_rows[:, 5] if target_rows.shape[-1] >= 9 else target_rows[:, 3],
-        "pedal_25": target_rows[:, 6] if target_rows.shape[-1] >= 9 else target_rows[:, 4],
-        "pedal_50": target_rows[:, 7] if target_rows.shape[-1] >= 9 else target_rows[:, 5],
-        "pedal_75": target_rows[:, 8] if target_rows.shape[-1] >= 9 else target_rows[:, 6],
+        "velocity_norm": target_rows[:, velocity_col],
+        "pedal_0": target_rows[:, pedal_start],
+        "pedal_25": target_rows[:, pedal_start + 1],
+        "pedal_50": target_rows[:, pedal_start + 2],
+        "pedal_75": target_rows[:, pedal_start + 3],
     }
+    if offset_start is not None and off_dim >= 3:
+        mask = np.ones(target_rows.shape[0], dtype=bool) if chord_mask is None else np.asarray(chord_mask, dtype=bool)
+        raw["onset_offset_ms"] = target_rows[mask, offset_start] * 1000.0
+        raw["duration_offset_ms"] = target_rows[mask, offset_start + 1] * 1000.0
+        raw["velocity_offset"] = target_rows[mask, offset_start + 2] * 127.0
+        target["onset_offset_s"] = target_rows[mask, offset_start]
+        target["duration_offset_s"] = target_rows[mask, offset_start + 1]
+        target["velocity_offset_norm"] = target_rows[mask, offset_start + 2]
+    else:
+        raw["onset_offset_ms"] = np.asarray([], dtype=np.float64)
+        raw["duration_offset_ms"] = np.asarray([], dtype=np.float64)
+        raw["velocity_offset"] = np.asarray([], dtype=np.float64)
+        target["onset_offset_s"] = np.asarray([], dtype=np.float64)
+        target["duration_offset_s"] = np.asarray([], dtype=np.float64)
+        target["velocity_offset_norm"] = np.asarray([], dtype=np.float64)
     return {"raw": raw, "target": target}
 
 
@@ -590,9 +688,9 @@ def empty_distributions():
     }
 
 
-def extend_distributions(store, pred_raw, gt_raw, pred_target, gt_target):
-    pred = distribution_arrays(pred_raw, pred_target)
-    gt = distribution_arrays(gt_raw, gt_target)
+def extend_distributions(store, config, pred_raw, gt_raw, pred_target, gt_target, chord_mask=None):
+    pred = distribution_arrays(config, pred_raw, pred_target, chord_mask=chord_mask)
+    gt = distribution_arrays(config, gt_raw, gt_target, chord_mask=chord_mask)
     for domain in ("raw", "target"):
         for key, values in pred[domain].items():
             store[domain]["pred"][key].extend(np.asarray(values, dtype=np.float64).tolist())
@@ -692,6 +790,9 @@ def aggregate_pairwise(rows):
         "duration_wass",
         "velocity_wass",
         "pedal_wass",
+        "onset_offset_wass",
+        "duration_offset_wass",
+        "velocity_offset_wass",
         "ioi_ms_mean_shift",
         "duration_ms_mean_shift",
         "ioi_ms_std_ratio",
@@ -708,6 +809,12 @@ def aggregate_pairwise(rows):
         "duration_logdev_pred_std",
         "ioi_logdev_gt_std",
         "duration_logdev_gt_std",
+        "onset_offset_ms_mean_shift",
+        "duration_offset_ms_mean_shift",
+        "velocity_offset_mean_shift",
+        "onset_offset_ms_std_ratio",
+        "duration_offset_ms_std_ratio",
+        "velocity_offset_std_ratio",
     ]
     total_weight = float(sum(max(0, int(row.get("num_rows", 0))) for row in rows))
     output = {"num_rows": int(total_weight)}
@@ -742,6 +849,12 @@ def pairwise_summary(rows):
         "duration_logdev_pred_std",
         "ioi_logdev_gt_std",
         "duration_logdev_gt_std",
+        "onset_offset_ms_mean_shift",
+        "duration_offset_ms_mean_shift",
+        "velocity_offset_mean_shift",
+        "onset_offset_ms_std_ratio",
+        "duration_offset_ms_std_ratio",
+        "velocity_offset_std_ratio",
     ]
     return {
         "num_rows": int(len(rows)),
@@ -750,6 +863,9 @@ def pairwise_summary(rows):
         "duration_wass": finite_mean([row.get("duration_wass", float("nan")) for row in rows]),
         "velocity_wass": finite_mean([row.get("velocity_wass", float("nan")) for row in rows]),
         "pedal_wass": finite_mean([row.get("pedal_wass", float("nan")) for row in rows]),
+        "onset_offset_wass": finite_mean([row.get("onset_offset_wass", float("nan")) for row in rows]),
+        "duration_offset_wass": finite_mean([row.get("duration_offset_wass", float("nan")) for row in rows]),
+        "velocity_offset_wass": finite_mean([row.get("velocity_offset_wass", float("nan")) for row in rows]),
         **{key: finite_mean([row.get(key, float("nan")) for row in rows]) for key in timing_keys},
     }
 
@@ -757,6 +873,7 @@ def pairwise_summary(rows):
 def predict_tf_batch(
     model,
     pitch_ids,
+    pitch_multihot,
     continuous,
     score_shared_raw,
     labels_continuous,
@@ -768,6 +885,7 @@ def predict_tf_batch(
     with torch.no_grad():
         outputs = model(
             pitch_ids=pitch_ids,
+            pitch_multihot=pitch_multihot,
             continuous=continuous,
             score_shared_raw=score_shared_raw,
             labels_continuous=labels_continuous,
@@ -786,10 +904,11 @@ def predict_tf_batch(
     return pred.detach().float().cpu(), loss_value
 
 
-def predict_full_ar_batch(model, pitch_ids, continuous, score_shared_raw, attention_mask, sampling_strategy):
+def predict_full_ar_batch(model, pitch_ids, pitch_multihot, continuous, score_shared_raw, attention_mask, sampling_strategy):
     with torch.no_grad():
         pred = model.predict_performance_continuous(
             pitch_ids=pitch_ids,
+            pitch_multihot=pitch_multihot,
             continuous=continuous,
             score_shared_raw=score_shared_raw,
             attention_mask=attention_mask,
@@ -801,6 +920,7 @@ def predict_full_ar_batch(model, pitch_ids, continuous, score_shared_raw, attent
 def predict_partial_t5_batch(
     model,
     pitch_ids,
+    pitch_multihot,
     continuous,
     score_shared_raw,
     labels_continuous,
@@ -816,10 +936,11 @@ def predict_partial_t5_batch(
     config = model.config
     batch_size, seq_len = pitch_ids.shape
     output_dim = labels_continuous.shape[-1]
-    score_note_embeds = model.note_encoder(pitch_ids, continuous)
+    score_note_embeds = model.note_encoder(pitch_ids, continuous, pitch_multihot=pitch_multihot)
     score_context_embeds, context_attention_mask, _ = model._prepend_style_tokens(score_note_embeds, attention_mask)
     encoder_outputs = model.model.encoder(attention_mask=context_attention_mask, inputs_embeds=score_context_embeds)
     decoder_pitch_ids = _shift_pitch_right(config, pitch_ids, attention_mask)
+    decoder_pitch_multihot = _shift_pitch_multihot_right(pitch_multihot, attention_mask)
     special_note_ids = _build_ar_special_note_ids(config, attention_mask)
     predictions = labels_continuous.new_zeros((batch_size, seq_len, output_dim))
     feedback_predictions = labels_continuous.new_zeros((batch_size, seq_len, output_dim))
@@ -855,6 +976,11 @@ def predict_partial_t5_batch(
             decoder_pitch_ids[:, : step + 1],
             decoder_input_continuous,
             special_note_ids=special_note_ids[:, : step + 1],
+            pitch_multihot=(
+                decoder_pitch_multihot[:, : step + 1]
+                if decoder_pitch_multihot is not None
+                else None
+            ),
         )
         decoder_outputs = model.model(
             attention_mask=context_attention_mask,
@@ -898,6 +1024,7 @@ def predict_partial_t5_batch(
 def predict_batch(
     model,
     pitch_ids,
+    pitch_multihot,
     continuous,
     score_shared_raw,
     labels_continuous,
@@ -914,6 +1041,7 @@ def predict_batch(
         return predict_tf_batch(
             model,
             pitch_ids,
+            pitch_multihot,
             continuous,
             score_shared_raw,
             labels_continuous,
@@ -930,13 +1058,22 @@ def predict_batch(
         and str(feedback_targets).lower() == "all"
         and str(feedback_strategy).lower() == str(sampling_strategy).lower()
     ):
-        return predict_full_ar_batch(model, pitch_ids, continuous, score_shared_raw, attention_mask, sampling_strategy)
+        return predict_full_ar_batch(
+            model,
+            pitch_ids,
+            pitch_multihot,
+            continuous,
+            score_shared_raw,
+            attention_mask,
+            sampling_strategy,
+        )
     if not hasattr(model, "model"):
         raise ValueError("Partial rollout currently supports T5/T5Gemma only")
     with torch.no_grad():
         return predict_partial_t5_batch(
             model,
             pitch_ids,
+            pitch_multihot,
             continuous,
             score_shared_raw,
             labels_continuous,
@@ -954,6 +1091,7 @@ def predict_batch(
 def predict_tf_feedback_batch(
     model,
     pitch_ids,
+    pitch_multihot,
     continuous,
     score_shared_raw,
     labels_continuous,
@@ -965,6 +1103,7 @@ def predict_tf_feedback_batch(
     with torch.no_grad():
         outputs = model(
             pitch_ids=pitch_ids,
+            pitch_multihot=pitch_multihot,
             continuous=continuous,
             score_shared_raw=score_shared_raw,
             labels_continuous=labels_continuous,
@@ -972,7 +1111,7 @@ def predict_tf_feedback_batch(
             attention_mask=attention_mask,
             continuous_sampling_strategy=sampling_strategy,
         )
-        pred = _materialize_epr_prediction(
+        pred = materialize_epr_prediction_eval(
             model.config,
             outputs.logits,
             sampling_strategy=sampling_strategy,
@@ -982,7 +1121,7 @@ def predict_tf_feedback_batch(
         if feedback_strategy_name == str(sampling_strategy).lower():
             feedback_pred = pred
         else:
-            feedback_pred = _materialize_epr_prediction(
+            feedback_pred = materialize_epr_prediction_eval(
                 model.config,
                 outputs.logits,
                 sampling_strategy=feedback_strategy,
@@ -995,6 +1134,7 @@ def predict_tf_feedback_batch(
 def predict_kpass_batches(
     model,
     pitch_ids,
+    pitch_multihot,
     continuous,
     score_shared_raw,
     labels_continuous,
@@ -1011,6 +1151,7 @@ def predict_kpass_batches(
     pred, loss_value = predict_tf_batch(
         model,
         pitch_ids,
+        pitch_multihot,
         continuous,
         score_shared_raw,
         labels_continuous,
@@ -1024,6 +1165,7 @@ def predict_kpass_batches(
         pred, feedback_pred, loss_value = predict_tf_feedback_batch(
             model,
             pitch_ids,
+            pitch_multihot,
             continuous,
             score_shared_raw,
             labels_continuous,
@@ -1042,6 +1184,7 @@ def predict_score_for_k(
     model,
     device,
     config,
+    score,
     pitch,
     score_inputs,
     score_shared_raw,
@@ -1065,17 +1208,20 @@ def predict_score_for_k(
     for batch_start in range(0, len(windows), batch_size):
         batch_windows = windows[batch_start : batch_start + batch_size]
         pitch_tensors = []
+        pitch_multihot_tensors = []
         score_tensors = []
         raw_tensors = []
         label_tensors = []
         lengths = []
         for start, end in batch_windows:
-            pitch_tensors.append(torch.tensor(pitch[start:end], dtype=torch.long))
+            pitch_tensors.append(torch.tensor(pitch_ids_from_pitch_values(pitch[start:end], config["pitch_pad_id"]), dtype=torch.long))
+            pitch_multihot_tensors.append(torch.tensor(pitch_multihot_rows(config, score, start, end), dtype=torch.float32))
             score_tensors.append(torch.tensor(score_inputs[start:end], dtype=torch.float32))
             raw_tensors.append(torch.tensor(score_shared_raw[start:end], dtype=torch.float32))
             label_tensors.append(torch.tensor(labels[start:end], dtype=torch.float32))
             lengths.append(end - start)
         pitch_ids = pad_sequence(pitch_tensors, batch_first=True, padding_value=config["pitch_pad_id"]).to(device)
+        pitch_multihot = pad_sequence(pitch_multihot_tensors, batch_first=True, padding_value=0.0).to(device)
         continuous = pad_sequence(score_tensors, batch_first=True, padding_value=0.0).to(device)
         score_raw = pad_sequence(raw_tensors, batch_first=True, padding_value=0.0).to(device)
         label_batch = pad_sequence(label_tensors, batch_first=True, padding_value=0.0).to(device)
@@ -1083,6 +1229,7 @@ def predict_score_for_k(
         pred, loss_value = predict_batch(
             model,
             pitch_ids,
+            pitch_multihot,
             continuous,
             score_raw,
             label_batch,
@@ -1114,6 +1261,7 @@ def predict_scores_for_kpass(
     model,
     device,
     config,
+    score,
     pitch,
     score_inputs,
     score_shared_raw,
@@ -1134,17 +1282,20 @@ def predict_scores_for_kpass(
     for batch_start in range(0, len(windows), batch_size):
         batch_windows = windows[batch_start : batch_start + batch_size]
         pitch_tensors = []
+        pitch_multihot_tensors = []
         score_tensors = []
         raw_tensors = []
         label_tensors = []
         lengths = []
         for start, end in batch_windows:
-            pitch_tensors.append(torch.tensor(pitch[start:end], dtype=torch.long))
+            pitch_tensors.append(torch.tensor(pitch_ids_from_pitch_values(pitch[start:end], config["pitch_pad_id"]), dtype=torch.long))
+            pitch_multihot_tensors.append(torch.tensor(pitch_multihot_rows(config, score, start, end), dtype=torch.float32))
             score_tensors.append(torch.tensor(score_inputs[start:end], dtype=torch.float32))
             raw_tensors.append(torch.tensor(score_shared_raw[start:end], dtype=torch.float32))
             label_tensors.append(torch.tensor(labels[start:end], dtype=torch.float32))
             lengths.append(end - start)
         pitch_ids = pad_sequence(pitch_tensors, batch_first=True, padding_value=config["pitch_pad_id"]).to(device)
+        pitch_multihot = pad_sequence(pitch_multihot_tensors, batch_first=True, padding_value=0.0).to(device)
         continuous = pad_sequence(score_tensors, batch_first=True, padding_value=0.0).to(device)
         score_raw = pad_sequence(raw_tensors, batch_first=True, padding_value=0.0).to(device)
         label_batch = pad_sequence(label_tensors, batch_first=True, padding_value=0.0).to(device)
@@ -1152,6 +1303,7 @@ def predict_scores_for_kpass(
         batch_preds = predict_kpass_batches(
             model,
             pitch_ids,
+            pitch_multihot,
             continuous,
             score_raw,
             label_batch,
@@ -1192,6 +1344,8 @@ def predict_work(model, device, config, item, args, rollout_ks):
         log_scale=float(config.get("timing_log_scale", 50.0)),
         musical_feature_mode=config.get("musical_feature_mode", "categorical"),
         score_note_schema=config.get("score_note_input_schema", "integrated"),
+        disable_musical_features=bool(config.get("disable_musical_features", False)),
+        include_score_chord_offset=bool(config.get("include_score_chord_offset", False)),
     )
     windows = build_windows(len(pitch), int(config["block_notes"]), float(config["overlap_ratio"]))
     perfs = selected_perfs(work, item)
@@ -1214,6 +1368,7 @@ def predict_work(model, device, config, item, args, rollout_ks):
                 model,
                 device,
                 config,
+                score,
                 pitch,
                 score_inputs,
                 score_shared_raw,
@@ -1247,6 +1402,7 @@ def predict_work(model, device, config, item, args, rollout_ks):
                     model,
                     device,
                     config,
+                    score,
                     pitch,
                     score_inputs,
                     score_shared_raw,
@@ -1267,15 +1423,30 @@ def predict_work(model, device, config, item, args, rollout_ks):
             pred_feedback = _target_predictions_to_feedback7(config, pred_target.float())
             target_feedback = _target_predictions_to_feedback7(config, target_tensor)
             pred_raw = _target7_to_raw7(score_raw_tensor, pred_feedback.float(), config=config).cpu().numpy()
-            target_raw = _target7_to_raw7(score_raw_tensor, target_tensor, config=config).cpu().numpy()
-            pred_target_np = pred_feedback.float().cpu().numpy()
-            gt_target_np = target_feedback.float().cpu().numpy()
-            pred_note_arrays = metric_arrays(pred_raw, pred_target_np)
-            gt_note_arrays = metric_arrays(target_raw, gt_target_np)
+            target_raw = _target7_to_raw7(score_raw_tensor, target_feedback.float(), config=config).cpu().numpy()
+            pred_feedback_np = pred_feedback.float().cpu().numpy()
+            gt_feedback_np = target_feedback.float().cpu().numpy()
+            pred_target_np = pred_target.float().cpu().numpy()
+            gt_target_np = target_tensor.float().cpu().numpy()
+            pred_note_arrays = metric_arrays(pred_raw, pred_feedback_np)
+            gt_note_arrays = metric_arrays(target_raw, gt_feedback_np)
             pred_arrays.append(pred_note_arrays)
             gt_arrays.append(gt_note_arrays)
+            chord_mask = chord_mask_from_pitch_values(pitch)
+            pred_offsets = target_offsets3(config, pred_target.float()).cpu().numpy()
+            gt_offsets = target_offsets3(config, target_tensor).cpu().numpy()
+            pred_offsets_chord = pred_offsets[chord_mask] if pred_offsets.shape[-1] >= 3 else np.zeros((0, 3))
+            gt_offsets_chord = gt_offsets[chord_mask] if gt_offsets.shape[-1] >= 3 else np.zeros((0, 3))
             if distributions is not None:
-                extend_distributions(distributions, pred_raw, target_raw, pred_target_np, gt_target_np)
+                extend_distributions(
+                    distributions,
+                    config,
+                    pred_raw,
+                    target_raw,
+                    pred_target_np,
+                    gt_target_np,
+                    chord_mask=chord_mask,
+                )
             if position_values is not None:
                 merge_position_values(window_position, position_values)
             pair_rows.append(
@@ -1290,6 +1461,21 @@ def predict_work(model, device, config, item, args, rollout_ks):
                             feature_wasserstein(pred_note_arrays[key], gt_note_arrays[key])
                             for key in ("pedal_0", "pedal_25", "pedal_50", "pedal_75")
                         ]
+                    ),
+                    "onset_offset_wass": (
+                        feature_wasserstein(pred_offsets_chord[:, 0] * 1000.0, gt_offsets_chord[:, 0] * 1000.0)
+                        if len(pred_offsets_chord) and len(gt_offsets_chord)
+                        else float("nan")
+                    ),
+                    "duration_offset_wass": (
+                        feature_wasserstein(pred_offsets_chord[:, 1] * 1000.0, gt_offsets_chord[:, 1] * 1000.0)
+                        if len(pred_offsets_chord) and len(gt_offsets_chord)
+                        else float("nan")
+                    ),
+                    "velocity_offset_wass": (
+                        feature_wasserstein(pred_offsets_chord[:, 2] * 127.0, gt_offsets_chord[:, 2] * 127.0)
+                        if len(pred_offsets_chord) and len(gt_offsets_chord)
+                        else float("nan")
                     ),
                     "ioi_ms_mean_shift": finite_mean_shift(pred_raw[:, 0], target_raw[:, 0]),
                     "duration_ms_mean_shift": finite_mean_shift(pred_raw[:, 1], target_raw[:, 1]),
@@ -1307,6 +1493,36 @@ def predict_work(model, device, config, item, args, rollout_ks):
                     "duration_logdev_pred_std": finite_std(pred_feedback[:, 1]),
                     "ioi_logdev_gt_std": finite_std(target_feedback[:, 0]),
                     "duration_logdev_gt_std": finite_std(target_feedback[:, 1]),
+                    "onset_offset_ms_mean_shift": (
+                        finite_mean_shift(pred_offsets_chord[:, 0] * 1000.0, gt_offsets_chord[:, 0] * 1000.0)
+                        if len(pred_offsets_chord) and len(gt_offsets_chord)
+                        else float("nan")
+                    ),
+                    "duration_offset_ms_mean_shift": (
+                        finite_mean_shift(pred_offsets_chord[:, 1] * 1000.0, gt_offsets_chord[:, 1] * 1000.0)
+                        if len(pred_offsets_chord) and len(gt_offsets_chord)
+                        else float("nan")
+                    ),
+                    "velocity_offset_mean_shift": (
+                        finite_mean_shift(pred_offsets_chord[:, 2] * 127.0, gt_offsets_chord[:, 2] * 127.0)
+                        if len(pred_offsets_chord) and len(gt_offsets_chord)
+                        else float("nan")
+                    ),
+                    "onset_offset_ms_std_ratio": (
+                        finite_std_ratio(pred_offsets_chord[:, 0] * 1000.0, gt_offsets_chord[:, 0] * 1000.0)
+                        if len(pred_offsets_chord) and len(gt_offsets_chord)
+                        else float("nan")
+                    ),
+                    "duration_offset_ms_std_ratio": (
+                        finite_std_ratio(pred_offsets_chord[:, 1] * 1000.0, gt_offsets_chord[:, 1] * 1000.0)
+                        if len(pred_offsets_chord) and len(gt_offsets_chord)
+                        else float("nan")
+                    ),
+                    "velocity_offset_std_ratio": (
+                        finite_std_ratio(pred_offsets_chord[:, 2] * 127.0, gt_offsets_chord[:, 2] * 127.0)
+                        if len(pred_offsets_chord) and len(gt_offsets_chord)
+                        else float("nan")
+                    ),
                 }
             )
         by_k[label] = {
@@ -1352,10 +1568,19 @@ def write_curve_csv(path, aggregate_by_k, rollout_ks):
                 "pairwise_duration_wass": agg["pairwise"].get("duration_wass"),
                 "pairwise_velocity_wass": agg["pairwise"].get("velocity_wass"),
                 "pairwise_pedal_wass": agg["pairwise"].get("pedal_wass"),
+                "pairwise_onset_offset_wass": agg["pairwise"].get("onset_offset_wass"),
+                "pairwise_duration_offset_wass": agg["pairwise"].get("duration_offset_wass"),
+                "pairwise_velocity_offset_wass": agg["pairwise"].get("velocity_offset_wass"),
                 "pairwise_ioi_ms_mean_shift": agg["pairwise"].get("ioi_ms_mean_shift"),
                 "pairwise_duration_ms_mean_shift": agg["pairwise"].get("duration_ms_mean_shift"),
                 "pairwise_ioi_ms_std_ratio": agg["pairwise"].get("ioi_ms_std_ratio"),
                 "pairwise_duration_ms_std_ratio": agg["pairwise"].get("duration_ms_std_ratio"),
+                "pairwise_onset_offset_ms_mean_shift": agg["pairwise"].get("onset_offset_ms_mean_shift"),
+                "pairwise_duration_offset_ms_mean_shift": agg["pairwise"].get("duration_offset_ms_mean_shift"),
+                "pairwise_velocity_offset_mean_shift": agg["pairwise"].get("velocity_offset_mean_shift"),
+                "pairwise_onset_offset_ms_std_ratio": agg["pairwise"].get("onset_offset_ms_std_ratio"),
+                "pairwise_duration_offset_ms_std_ratio": agg["pairwise"].get("duration_offset_ms_std_ratio"),
+                "pairwise_velocity_offset_std_ratio": agg["pairwise"].get("velocity_offset_std_ratio"),
                 "pairwise_ioi_logdev_mean_shift": agg["pairwise"].get("ioi_logdev_mean_shift"),
                 "pairwise_duration_logdev_mean_shift": agg["pairwise"].get("duration_logdev_mean_shift"),
                 "pairwise_ioi_logdev_std_ratio": agg["pairwise"].get("ioi_logdev_std_ratio"),

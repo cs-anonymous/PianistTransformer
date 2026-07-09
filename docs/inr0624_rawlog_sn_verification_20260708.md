@@ -1,269 +1,284 @@
-# INR0624 Raw-Log + Skew-Normal 修改核对记录
+# INR0624 最终 Raw-Log SN Chord 表示
 
-日期：2026-07-08
+本文档记录当前最终版相对原 INR note 表示的改动。当前目标配置是 ASAP-only、chord token、raw+log timing、skew-normal head、88 维 pitch multi-hot、无 musical channel。
 
-本文档用于核对以下 5 项修改是否已经在当前仓库中落地，并记录当前实现状态与代码证据。
+## 表示改动
 
-## 结论摘要
+原 INR 是逐 note token；当前改为逐 chord token。chord 由 score MIDI 构建：
 
-| 项目 | 状态 | 结论 |
+- continuation note 需要 `score IOI == 0` 且与前一个 note 的 `score duration` 相同。
+- 如果候选 chord size `>= 3`，且所有 note 都有有效 staff feature，则不合并跨 staff chord。
+- size 2 或 staff 缺失时不强制 staff 一致。
+- chord base note 使用最高音。
+- JSON 中 `pitch` 保存为升序 MIDI pitch list；模型输入使用 88 维 piano multi-hot。
+
+构建脚本：[scripts/build_chord_asap_dataset.py](/home/sy/EPR/PianistTransformer/scripts/build_chord_asap_dataset.py:1)
+
+sidecar schema：
+
+```text
+pianocore_chord_work_compact_v1
+```
+
+每个 work 仍是一份全曲 JSON/PT，window 只保存在 `windows` 字段中，不拆成多个文件。
+
+## 字段
+
+score 字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `score.pitch` | `list[list[int]]`，每个 chord 的 MIDI pitch，升序 |
+| `score.pitch_multihot` | `(num_chords, 88)`，A0-C8，A0 index 0，对应 MIDI 21 |
+| `score.chord_size` | chord 内 note 数 |
+| `score.score_raw` | `[ioi_ms_high, duration_ms_high, velocity_high]` |
+| `score.score_offset_raw` | `[onset_ms_low_minus_high, duration_ms_low_minus_high, velocity_low_minus_high]` |
+| `score.score_feature` | 最高音的原 score feature，仅兼容保留；本次训练不用 musical channel |
+
+performance 字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `label_shared_raw` | `[perf_ioi_ms_high, perf_duration_ms_high, velocity_high]` |
+| `label_pedal4_raw` | chord span 内 0%, 25%, 50%, 75% pedal sample |
+| `label_offset_raw` | `[onset_ms_low_minus_high, duration_ms_low_minus_high, velocity_low_minus_high]` |
+| `interpolated` | chord 内是否包含插值 alignment note |
+
+offset 方向固定为 `low - high`，可以为负。输入和 target 中：
+
+- onset/duration offset 用秒：`ms / 1000`
+- velocity offset 归一化：`velocity_delta / 127`
+
+## 输入和 Target
+
+当前不使用 musical 信息：
+
+```json
+"musical_feature_mode": "none",
+"disable_musical_features": true
+```
+
+continuous input 维度是 22：
+
+| block | dim | 内容 |
+| --- | ---: | --- |
+| score control | 5 | score IOI raw+log, score duration raw+log, score velocity |
+| score offset | 3 | score onset/duration/velocity offset |
+| performance control | 9 | perf IOI raw+log, perf duration raw+log, perf velocity, pedal4 |
+| performance offset | 3 | perf onset/duration/velocity offset |
+| masks | 2 | score/performance mask |
+
+target 维度是 12：
+
+| block | dim | 内容 |
+| --- | ---: | --- |
+| base target | 9 | `[log_ioi_dev, log_duration_dev, raw_ioi_dev_s, raw_duration_dev_s, velocity_norm, pedal4]` |
+| chord offset target | 3 | `[onset_offset_s, duration_offset_s, velocity_offset_norm]` |
+
+pitch 不再是单个 pitch id：
+
+```json
+"pitch_representation": "multihot",
+"pitch_multihot_dim": 88
+```
+
+之前出现过的 128 维来自 MIDI pitch 全域 `0..127`。当前 sidecar 已改成 88 维；训练代码仍兼容旧 128 维 sidecar，会切 `[21:109]`。
+
+## Raw-Log Timing
+
+timing control 使用双表示：
+
+```text
+[raw_seconds, log1p(20 * seconds)]
+```
+
+因为当前 `timing_log_scale = 50 ms`，所以：
+
+```text
+logscale = log1p(time_ms / 50) = log1p(20 * seconds)
+```
+
+target dev 使用：
+
+```text
+log_ioi_dev      = logscale(perf_ioi_ms) - logscale(score_ioi_ms)
+log_duration_dev = logscale(perf_duration_ms) - logscale(score_duration_ms)
+raw_ioi_dev_s      = (perf_ioi_ms - score_ioi_ms) / 1000
+raw_duration_dev_s = (perf_duration_ms - score_duration_ms) / 1000
+```
+
+旧的 `+0.5` 和 clamp 不用于当前 `raw_log_deviation` 路径。
+
+## SN Head 和 Loss
+
+当前使用：
+
+```json
+"epr_distribution": "skew_normal",
+"raw_timing_loss_lambda": 0.5
+```
+
+IOI loss：
+
+```text
+loss_ioi = SN_NLL(log_ioi_dev) + 0.5 * SN_NLL(raw_ioi_dev_s)
+```
+
+Duration loss：
+
+```text
+loss_duration = SN_NLL(log_duration_dev) + 0.5 * SN_NLL(raw_duration_dev_s)
+```
+
+Velocity loss：
+
+```text
+loss_velocity = SN_NLL(velocity / 127)
+```
+
+Pedal loss：
+
+```text
+loss_pedal = BCEWithLogits(pedal4)
+```
+
+Offset loss：
+
+```text
+loss_offset = mean SN_NLL([onset_offset_s, duration_offset_s, velocity_offset_norm])
+```
+
+总 loss：
+
+```text
+loss =
+  1.0 * loss_ioi
++ 1.0 * loss_duration
++ 1.0 * loss_velocity
++ 0.5 * loss_pedal
++ 1.0 * loss_offset
+```
+
+连续分布的 NLL 可以为负。这里是 `-log density`，不是离散概率的 `-log probability`；当 skew-normal 的 scale 较小且 target 落在高密度区域时，density 可以大于 1，因此 `NLL < 0` 是正常现象。
+
+offset 没有独立大 head，而是挂在相关 head 的额外通道上：
+
+| head | 输出 |
+| --- | --- |
+| IOI | log timing SN + raw timing SN + onset offset SN |
+| duration | log timing SN + raw timing SN + duration offset SN |
+| velocity | velocity SN + velocity offset SN |
+| pedal | pedal4 logits |
+
+因此 chord raw-log SN 输出宽度为：
+
+```text
+ioi 9 + duration 9 + velocity 6 + pedal 4 = 28
+```
+
+虽然 offset 的参数来自这些 head 的额外通道，但 logging 中仍单独汇总为 `train_loss_offset`。
+
+## 数据统计
+
+当前 ASAP chord sidecar：
+
+| 项目 | 数值 |
+| --- | ---: |
+| works | 207 |
+| performances | 969 |
+| 原 note 数 | 570,623 |
+| chord token 数 | 368,472 |
+| notes/chord | 1.549 |
+| work-level windows | 900 |
+| window-performance examples | 4,944 |
+| sidecar size | 约 282 MB |
+
+chord size 分布：
+
+| size | count | pct |
+| ---: | ---: | ---: |
+| 1 | 249,169 | 67.62% |
+| 2 | 74,508 | 20.22% |
+| 3 | 22,974 | 6.23% |
+| 4 | 12,874 | 3.49% |
+| 5 | 4,336 | 1.18% |
+| 6 | 2,810 | 0.76% |
+| 7 | 1,031 | 0.28% |
+| 8 | 687 | 0.19% |
+| 9 | 63 | 0.02% |
+| 10 | 20 | 0.01% |
+
+window：
+
+```text
+window_size = 512 chords
+overlap = 64 chords
+stride = 448 chords
+overlap_ratio = 0.125
+```
+
+训练必须限制 ASAP-only，否则 `PianoCoRe/metadata.csv` 会混入 Aria-MIDI、ATEPP、PERiScoPe 等 performance，把 train examples 错误放大到 209,156。
+
+正确 manifest：
+
+| split | works | windows | performance refs | examples |
+| --- | ---: | ---: | ---: | ---: |
+| train | 188 | 795 | 896 | 4,510 |
+| test | 19 | 105 | 82 | 551 |
+
+当前 global batch：
+
+```text
+per_device_train_batch_size = 16
+world_size = 2
+gradient_accumulation_steps = 2
+global_batch = 64
+steps_per_epoch = ceil(4510 / 64) = 71
+```
+
+## 训练配置
+
+最终配置：
+
+| 项目 | 值 |
+| --- | --- |
+| epochs | 20 |
+| eval/save | 每 71 steps，即每 1 epoch |
+| train/eval dataset | ASAP only |
+| input dim | 22 |
+| target dim | 12 |
+| pitch dim | 88 multi-hot |
+| musical channel | disabled |
+| timing target | raw-log deviation |
+| distribution | skew-normal |
+| raw timing loss weight | 0.5 |
+
+配置文件：
+
+- [configs/inr0624_chord_asap_sn_rawlog_multihot_nomus_sine.json](/home/sy/EPR/PianistTransformer/configs/inr0624_chord_asap_sn_rawlog_multihot_nomus_sine.json:1)
+- [configs/inr0624_chord_asap_sn_rawlog_multihot_nomus_cine.json](/home/sy/EPR/PianistTransformer/configs/inr0624_chord_asap_sn_rawlog_multihot_nomus_cine.json:1)
+
+启动脚本：
+
+- [scripts/run_chord_multihot_nomus_train.sh](/home/sy/EPR/PianistTransformer/scripts/run_chord_multihot_nomus_train.sh:1)
+
+两个任务并行：
+
+| task | GPUs | note embedding |
 | --- | --- | --- |
-| 1. timing 改为双输入 `[raw_s, logscale]` | 已完成 | 当前 `raw_log` 模式已经把 timing control 编码为 `[s, log1p(20 * s)]`，不再除以 `g(5000)` |
-| 2. timing head 改为双 head，raw dev + logscale dev，loss 相加 | 部分完成 | 双 head 和双 target 已完成，但当前 loss 是 `log_loss + 0.5 * raw_loss`，还不是“直接相加” |
-| 3. musical 中 `mo/md/ml` 不除 6，只有 `vel` 除 127 | 已完成 | `build_score_musical_rows` 已改为直接保留原始 `mo/md/ml` 标量 |
-| 4. head 不再用 MLN / logistic，改用 SN 或 MSN | 部分完成 | 新配置已切到 `skew_normal`，但仓库默认启动脚本/README 仍主要指向旧的 `mln3` 配置 |
-| 5. infer 时只用 logscale 采样，raw timing 只用于训练 | 已完成 | 当前 SN 推理只读取 `timing_log_*` 参数，修改 `timing_raw_*` 不影响 infer 输出 |
+| sine | `0,1` | `sine` |
+| cine | `2,3` | `cine` |
 
-## 逐项核对
+## 经验统计
 
-### 1. Timing 双输入 `[s, log1p(20 * s)]`
+用于支持 compact chord 表示的统计：
 
-已完成。
+- score IOI=0 continuation 占所有 score note 的 47.57%。
+- 在这些 continuation 中，74.50% 与前一个 note 有相同 score duration。
+- score chord velocity 约 97.92% all-equal。
+- performance chord onset 顺序不稳定：high-to-low 33.76%，low-to-high 23.46%，mixed 32.95%，全同时 9.83%。
+- performance start stagger 中位数约 9.37 ms，p75 约 18.75 ms。
+- performance duration 差异更大，中位数约 27.08 ms，p75 约 77.08 ms。
+- same-duration continuation 中跨 staff 只占 0.85% unique，performance-weighted 后约 0.40%；其中 size 2 占 94% 以上。
 
-- `src/train/train_inr.py` 中 `timing_control_feature_dim(..., mode='raw_log')` 返回 5，表示 score control 两个 timing 字段各占 2 维，再加 velocity 1 维。
-- `src/train/train_inr.py` 中 `encode_timing_control_features()` 在 `raw_log` 模式下返回：
-
-```python
-[
-    value / 1000.0,
-    raw_log_timing_value(value, scale=log_scale),
-]
-```
-
-- `src/model/integrated_pianoformer.py` 中 `_torch_timing_control_code()` 的 `raw_log` 分支也一致：
-
-```python
-[
-    value / 1000.0,
-    log1p((1000 / scale) * seconds),
-]
-```
-
-当 `scale = 50` ms 时，第二维正好是 `log1p(20 * s)`。
-
-本地 smoke check：
-
-- `100 ms -> [0.1, 1.0986122886681096]`
-- 其中 `1.0986122886681096 = log(3) = log1p(20 * 0.1)`
-
-### 2. Timing 双 head 与双 loss
-
-双 head 已完成，但 loss 权重还没有完全改到“直接相加”。
-
-已完成部分：
-
-- `src/train/train_inr.py` 中 `performance_dev_velocity_pedal4_binary_rows()` 在 `raw_log_deviation` 模式下输出 9 维 label：
-
-```python
-[
-    log_ioi_dev,
-    log_duration_dev,
-    raw_ioi_dev_s,
-    raw_duration_dev_s,
-    velocity / 127,
-    pedal4_binary...
-]
-```
-
-- `src/model/integrated_pianoformer.py` 中 `_split_epr_mixture_params()` 对 `skew_normal` 拆出了两套 timing 参数：
-  - `timing_log_loc / timing_log_log_scale / timing_log_alpha`
-  - `timing_raw_loc / timing_raw_log_scale / timing_raw_alpha`
-
-- `IntegratedContinuousDecoder` 对 SN timing head 的输出宽度也已经翻倍：
-  - IOI: `per_feature_dim * 2`
-  - Duration: `per_feature_dim * 2`
-
-未完全符合的地方：
-
-- `src/model/integrated_pianoformer.py` 中 loss 目前是：
-
-```python
-loss_ioi = loss_ioi_log + raw_lambda * loss_ioi_raw
-loss_duration = loss_duration_log + raw_lambda * loss_duration_raw
-```
-
-- 当前新配置 [configs/inr0624_epr_sn_rawlog_sine.json](/home/sy/EPR/PianistTransformer/configs/inr0624_epr_sn_rawlog_sine.json:32) 里：
-
-```json
-"raw_timing_loss_lambda": 0.5
-```
-
-这表示现在实际是：
-
-- `loss_ioi = log_loss + 0.5 * raw_loss`
-- `loss_duration = log_loss + 0.5 * raw_loss`
-
-因此“两个 loss 直接相加”这一点还没有完全完成。如果要严格符合原要求，`raw_timing_loss_lambda` 需要改为 `1.0`，或者直接去掉这个缩放系数。
-
-### 3. `mo / md / ml` 不除 6，只保留原始值
-
-已完成。
-
-`src/train/train_inr.py` 中 `build_score_musical_rows()` 已经把原先的 `/ 6` 标量改成了原始值：
-
-- continuous 分支：
-  - `mo`
-  - `md`
-  - `raw_ml`
-
-- musical51 分支：
-  - `md`
-  - `ml_eff`
-
-- categorical62 / musical62 分支：
-  - `o_scalar = mo`
-
-速度归一化仍然保留为 `/ 127`，这和要求一致。
-
-本地 smoke check 也确认了标量未再除 6：
-
-- 第一条样例的 `md scalar = 2.0`
-- 第一条样例的 `ml scalar = 4.0`
-
-如果仍使用旧设计，这两个位置应该会分别看到约 `0.333` 和 `0.667`，但当前不是。
-
-### 4. Head 改为 SN / MSN，不再用 MLN / logistic
-
-代码主路径已支持并已提供 SN 配置，但仓库默认实验入口还没有整体切换完。
-
-已完成部分：
-
-- `src/model/integrated_pianoformer.py` 已新增：
-  - `SN_DISTRIBUTIONS = {"sn", "skew_normal"}`
-  - `_skew_normal_params()`
-  - `_skew_normal_log_prob()`
-  - `_skew_normal_nll()`
-  - `_skew_normal_mean_or_sample()`
-
-- `src/train/train_inr.py` 中 `create_model()` 已允许：
-  - `"sn"`
-  - `"skew_normal"`
-
-- 新配置 [configs/inr0624_epr_sn_rawlog_sine.json](/home/sy/EPR/PianistTransformer/configs/inr0624_epr_sn_rawlog_sine.json:29) 已切到：
-
-```json
-"epr_distribution": "skew_normal"
-```
-
-当前仍未完全切换的地方：
-
-- `script/launch_inr0624_epr_logscale_4gpu.sh` 仍默认使用：
-  - `configs/inr0624_epr_mln3_cine_mslog.json`
-  - `configs/inr0624_epr_mln3_sine_mslog.json`
-
-- `script/README.md` 也仍主要引用 `mln3_*_mslog` 配置。
-
-因此结论是：
-
-- “SN 方案已实现并有新配置”是成立的。
-- “仓库默认 EPR 启动入口已经完全从 MLN/MLN3 切换掉”目前还不成立。
-
-### 5. Infer 只用 logscale 采样；raw dev 不做 infer 采样
-
-已完成。
-
-`src/model/integrated_pianoformer.py` 中 `_materialize_epr_prediction()` 在 `distribution in SN_DISTRIBUTIONS` 时，只使用：
-
-- `params["timing_log_loc"]`
-- `params["timing_log_log_scale"]`
-- `params["timing_log_alpha"]`
-
-它不会读取：
-
-- `params["timing_raw_loc"]`
-- `params["timing_raw_log_scale"]`
-- `params["timing_raw_alpha"]`
-
-也就是说，raw timing head 目前只参与训练 loss，不参与 infer materialization。
-
-本地 smoke check：
-
-- 构造固定的 SN raw decoder 输出后，只改 `timing_raw_*` 对应参数
-- infer 前后输出完全一致：`torch.allclose(pred1, pred2) == True`
-
-这与“训练时双 timing 表示，但 infer 时只用 logscale sample”的要求一致。
-
-## 关于 dev 目标的核对
-
-这部分已经符合要求。
-
-当前 `raw_log_deviation` 路径中：
-
-- log dev 采用：
-
-```python
-raw_log_timing_value(perf_ms) - raw_log_timing_value(score_ms)
-```
-
-- raw dev 采用：
-
-```python
-(perf_ms - score_ms) / 1000.0
-```
-
-这里已经没有旧版的：
-
-- `+ 0.5`
-- `clamp(0, 1)`
-
-它们只还保留在旧的 `log_deviation` 兼容路径中，不在新 `raw_log_deviation` 路径里。
-
-## 当前和旧文档的差异
-
-当前主设计文档 [docs/INR0624.md](/home/sy/EPR/PianistTransformer/docs/INR0624.md:64) 仍主要描述旧的单 log-scale / `+0.5` / clamp / ALN-MLN 系表述，尚未反映本次 raw-log + SN 改动。
-
-因此，这次新增本文档是必要的；它记录的是当前代码已经实现到哪一步，而不是旧设计文档中的历史状态。
-
-## 最终判断
-
-当前仓库对这 5 项修改的落地状态可以总结为：
-
-1. timing 双输入：已完成
-2. timing 双 head：已完成
-3. timing 双 loss 直接相加：未完全完成，当前仍是 `raw_loss * 0.5`
-4. `mo/md/ml` 去标准化：已完成
-5. SN 头替代 MLN/logistic：代码与新配置已完成，但默认启动入口未完全切换
-6. infer 只用 logscale sample：已完成
-
-如果后续要把这组修改视为“完全完成”，最直接还差的两点是：
-
-1. 把 `raw_timing_loss_lambda` 从 `0.5` 改成 `1.0` 或移除缩放
-2. 把默认启动脚本和 README 从 `mln3_*_mslog` 切到新的 `skew_normal + raw_log` 配置
-
-## 2026-07-08 晚间补充
-
-晚间重新核对后，实验配置保持为：
-
-```json
-"raw_timing_loss_lambda": 0.5
-```
-
-这是按用户后续确认执行的最终口径，因此当晚正式启动的三组实验实际使用的是：
-
-- `loss_ioi = log_loss + 0.5 * raw_loss`
-- `loss_duration = log_loss + 0.5 * raw_loss`
-
-也就是说：
-
-- 仓库“全局默认值”仍未完全切换
-- 这次正式实验也继续沿用 `0.5` 权重
-
-## 2026-07-08 最终实验启动口径
-
-当晚最终实际启动的三组实验，训练口径统一为：
-
-- 只使用 `ASAP` 训练/验证，不再先跑全量数据再 adapt
-- `num_train_epochs = 16`
-- `per_device_train_batch_size = 32`
-- `gradient_accumulation_steps = 2`
-- 单实验单卡运行
-
-对应启动批次为：
-
-- `results/inr_epr_pipeline/launch_rawlog_3exp_20260708_235220`
-
-三组实验分别是：
-
-- `exp1_sine_tfmask50`
-- `exp2_sine_nomus_tfmask50`
-- `exp3_splitperf_tfmask50`
+因此最终只保留最高音 base 属性，并增加 3 个 `low - high` offset；不为 chord 内每个 note 重复一套完整 INR 字段。
