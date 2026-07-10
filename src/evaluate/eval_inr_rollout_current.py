@@ -518,6 +518,7 @@ def labels_for_perf(config, perf, score_shared_raw):
         epr_timing_target=config.get("epr_timing_target", "log_deviation"),
         log_scale=float(config.get("timing_log_scale", 50.0)),
         pedal_binary_threshold=float(config.get("pedal_binary_threshold", 64.0)),
+        legacy_dual_timing_head=bool(config.get("legacy_dual_timing_head", False)),
     )
     if labels is None:
         raise ValueError(f"Could not build target labels for {perf.get('performance_source')}")

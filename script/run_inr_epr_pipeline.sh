@@ -12,6 +12,7 @@ DET_NUM_SAMPLES="${DET_NUM_SAMPLES:-1}"
 SAMPLING_NUM_SAMPLES="${SAMPLING_NUM_SAMPLES:-1}"
 DET_STRATEGY="${DET_STRATEGY:-greedy}"
 INFER_BATCH_SIZE_WINDOWS="${INFER_BATCH_SIZE_WINDOWS:-8}"
+INFER_SCORE_SOURCE_LIST="${INFER_SCORE_SOURCE_LIST:-}"
 MERGE_MODE="${MERGE_MODE:-continuation}"
 CONTINUATION_DROP_RATIO="${CONTINUATION_DROP_RATIO:-0.0}"
 BASE_NUM_TRAIN_EPOCHS="${BASE_NUM_TRAIN_EPOCHS:-8}"
@@ -150,6 +151,17 @@ cfg["early_stopping_threshold"] = float(cfg.get("early_stopping_threshold", 0.00
 cfg.setdefault("eval_dataloader_persistent_workers", False)
 cfg.setdefault("eval_dataloader_num_workers", cfg.get("dataloader_num_workers", 0))
 cfg.setdefault("eval_dataloader_prefetch_factor", cfg.get("dataloader_prefetch_factor", 2))
+for key in (
+    "eval_every_steps",
+    "eval_every_epochs",
+    "save_every_steps",
+    "eval_steps",
+    "save_steps",
+    "evaluation_strategy",
+    "eval_strategy",
+    "save_strategy",
+):
+    cfg.pop(key, None)
 if resume_path:
     cfg["resume_path"] = resume_path
     cfg["resume_trainer_state"] = False
@@ -161,14 +173,10 @@ if asap_only == "1":
     cfg["eval_performance_dataset"] = "ASAP"
     cfg["eval_split"] = "valid"
     cfg["prepared_sidecar_tag"] = cfg.get("prepared_sidecar_tag") or "ASAP"
-    cfg["eval_every_epochs"] = 0.5
-    cfg.pop("eval_every_steps", None)
 else:
     cfg.pop("train_performance_dataset", None)
     cfg.pop("eval_performance_dataset", None)
     cfg.pop("prepared_sidecar_tag", None)
-    cfg["eval_every_steps"] = int(cfg.get("eval_every_steps", 1000))
-    cfg["save_every_steps"] = int(cfg.get("save_every_steps", 1000))
 Path(dst).parent.mkdir(parents=True, exist_ok=True)
 Path(dst).write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 PY
@@ -178,6 +186,10 @@ run_infer() {
   local config="$1" checkpoint="$2" protocol="$3" samples="$4" out_dir="$5" gpu="$6"
   mkdir -p "${out_dir}"
   echo "[$(date '+%F %T')] infer ${protocol}: ${checkpoint}" | tee -a "${EVALUATE_LOG}"
+  local score_source_args=()
+  if [[ -n "${INFER_SCORE_SOURCE_LIST}" ]]; then
+    score_source_args=(--score-source-list "${INFER_SCORE_SOURCE_LIST}")
+  fi
   CUDA_VISIBLE_DEVICES="${gpu}" PYTHONUNBUFFERED=1 python src/inference/infer_inr_testset.py \
     --config "${config}" \
     --checkpoint "${checkpoint}" \
@@ -190,6 +202,7 @@ run_infer() {
     --device cuda \
     --protocol "${protocol}" \
     --num-samples "${samples}" \
+    "${score_source_args[@]}" \
     --deterministic-strategy "${DET_STRATEGY}" \
     --output-dir "${out_dir}" 2>&1 | tee -a "${EVALUATE_LOG}"
 }

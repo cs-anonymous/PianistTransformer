@@ -140,6 +140,11 @@ def load_config(path: Path, checkpoint: str | None):
         config["style_source_vocab_size"] = len(config["style_source_vocab"])
     if checkpoint:
         config["resume_path"] = checkpoint
+    target = str(config.get("epr_timing_target", "")).lower()
+    config["legacy_dual_timing_head"] = (
+        target in {"raw_log_deviation", "raw_log_dev", "raw_log_absolute", "absolute_raw_log"}
+        and int(config.get("output_continuous_dim", config.get("continuous_dim", 0)) or 0) == 9
+    )
     return config
 
 
@@ -189,6 +194,7 @@ def load_score_from_node(
     score_note_schema="integrated",
     task_type="epr",
     performance_source=None,
+    disable_musical_features=False,
 ):
     with open(path, "r", encoding="utf-8") as file:
         work = json.load(file)
@@ -220,6 +226,7 @@ def load_score_from_node(
             log_scale=timing_log_scale,
             musical_feature_mode=musical_feature_mode,
             score_note_schema=score_note_schema,
+            disable_musical_features=disable_musical_features,
         )
     score_shared_raw = [row[:3] for row in score["score_raw"]]
     return pitch, continuous, score_shared_raw, work
@@ -524,6 +531,7 @@ def labels_for_perf(config, perf, score_shared_raw):
         epr_timing_target=config.get("epr_timing_target", "log_deviation"),
         log_scale=float(config.get("timing_log_scale", 50.0)),
         pedal_binary_threshold=float(config.get("pedal_binary_threshold", 64.0)),
+        legacy_dual_timing_head=bool(config.get("legacy_dual_timing_head", False)),
     )
     if labels is None:
         raise ValueError(f"Could not build labels for {perf.get('performance_source')}")
@@ -630,6 +638,7 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
         musical_feature_mode=config.get("musical_feature_mode", "categorical"),
         score_note_schema=config.get("score_note_input_schema", "integrated"),
         task_type="epr",
+        disable_musical_features=config.get("disable_musical_features", False),
     )
     score = loaded["score"]
     windows = build_windows(len(pitch), config["block_notes"], config["overlap_ratio"])
@@ -753,6 +762,14 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
             normalized=False,
         )
         raw_path = raw_dir / f"{score_stem}__{plan['suffix']}.json"
+        if pred_continuous.shape[-1] == 9:
+            target_key = "predicted_target9"
+        else:
+            target_key = "predicted_target7"
+        if pred_continuous.shape[-1] == 9:
+            timing_representation = "target9_raw_log_dev_raw_dev_velocity_binary4"
+        else:
+            timing_representation = "target7_dev_velocity_binary4"
         raw_payload = {
             "score_source": score_source,
             "performance_source": plan.get("performance_source"),
@@ -762,10 +779,12 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
             "sample_idx": sample_idx,
             "seed": sample_seed,
             "oracle_gt_prefix_mode": args.oracle_gt_prefix_mode,
-            "timing_representation": "target7_dev_velocity_binary4",
+            "timing_representation": timing_representation,
             "pitch": [int(value) for value in pitch],
-            "predicted_target7": pred_continuous.tolist(),
-            "reconstructed_raw7": raw_rows.tolist(),
+            target_key: pred_continuous_list,
+            "predicted_target7": pred_continuous_list if pred_continuous.shape[-1] == 7 else None,
+            "predicted_target9": pred_continuous_list if pred_continuous.shape[-1] == 9 else None,
+            "reconstructed_raw7": raw_rows_list,
             "ground_truth_paths": gt_rel_paths,
         }
         raw_path.parent.mkdir(parents=True, exist_ok=True)
@@ -993,6 +1012,7 @@ def main():
         min_notes=config["min_notes"],
         max_works=None if (args.performance_dataset is not None or args.exclude_performance_dataset is not None) else args.max_works,
         skip_work_paths=config.get("skip_work_paths"),
+        prepared_sidecar_tag=config.get("prepared_sidecar_tag"),
     )
     manifest = filter_manifest_by_performance_dataset(
         manifest,

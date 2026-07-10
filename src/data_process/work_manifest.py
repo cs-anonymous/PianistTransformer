@@ -44,6 +44,56 @@ def make_windows(total_notes, block_notes, overlap_ratio, min_notes):
     return deduped
 
 
+def work_token_count(path, metadata_note_count, prepared_sidecar_tag=None):
+    try:
+        metadata_note_count = int(float(metadata_note_count))
+    except (TypeError, ValueError, OverflowError):
+        metadata_note_count = 0
+    if metadata_note_count > 0:
+        return metadata_note_count
+
+    source = Path(path)
+    sidecar_paths = []
+    if prepared_sidecar_tag:
+        sidecar_paths.append(source.with_suffix(f".{prepared_sidecar_tag}.pt"))
+    sidecar_paths.append(source.with_suffix(".pt"))
+
+    seen = set()
+    for sidecar_path in sidecar_paths:
+        sidecar_path = Path(sidecar_path)
+        if str(sidecar_path) in seen or not sidecar_path.exists():
+            continue
+        seen.add(str(sidecar_path))
+        try:
+            payload = torch.load(sidecar_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            payload = torch.load(sidecar_path, map_location="cpu")
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            score = payload.get("score")
+            if isinstance(score, dict):
+                for key in ("pitch", "score_raw"):
+                    value = score.get(key)
+                    if value is not None:
+                        return int(len(value))
+
+    try:
+        import json
+
+        with open(path, "r", encoding="utf-8") as file:
+            payload = json.load(file)
+        score = payload.get("score") if isinstance(payload, dict) else None
+        if isinstance(score, dict):
+            for key in ("pitch", "score_raw"):
+                value = score.get(key)
+                if value is not None:
+                    return int(len(value))
+    except Exception:
+        pass
+    return int(metadata_note_count)
+
+
 def build_work_manifest(
     metadata_path,
     refined_dir,
@@ -61,6 +111,7 @@ def build_work_manifest(
     window_split_scheme=None,
     window_split_name=None,
     window_split_summary_path=None,
+    prepared_sidecar_tag=None,
 ):
     columns = [
         "tier_a",
@@ -109,7 +160,11 @@ def build_work_manifest(
         if str(path) in skip_work_paths or score_rel_path in skip_work_paths:
             print(f"Skipping configured work JSON: {path}", flush=True)
             continue
-        note_count = int(group["refined_score_note_count"].iloc[0])
+        note_count = work_token_count(
+            path,
+            group["refined_score_note_count"].iloc[0],
+            prepared_sidecar_tag=prepared_sidecar_tag,
+        )
         windows = make_windows(note_count, block_notes, overlap_ratio, min_notes)
         if window_split_scheme is not None and window_split_name is not None:
             windows = load_windows_from_fixed_split(

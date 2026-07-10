@@ -106,6 +106,41 @@ def load_evaluate_list(path: Path):
     return json.loads(path.read_text())
 
 
+def _scale_feature_column(values):
+    array = np.asarray(values, dtype=np.float64)
+    if array.size == 0:
+        return array
+    if np.nanmax(array) <= 1.0:
+        return np.clip(array, 0.0, 1.0) * 127.0
+    return np.clip(array, 0.0, 127.0)
+
+
+def _extract_raw_output_arrays(raw_output_path: Path):
+    payload = json.loads(raw_output_path.read_text(encoding="utf-8"))
+    rows = payload.get("reconstructed_raw7")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError(f"raw output {raw_output_path} does not contain non-empty reconstructed_raw7")
+    cont = np.asarray(rows, dtype=np.float64)
+    if cont.ndim != 2 or cont.shape[1] != 7:
+        raise ValueError(f"Unexpected reconstructed_raw7 shape for {raw_output_path}: {cont.shape}")
+    return {
+        "ioi": np.clip(cont[:, 0], 0.0, None),
+        "duration": np.clip(cont[:, 1], 0.0, None),
+        "velocity": _scale_feature_column(cont[:, 2]),
+        "pedal_0": _scale_feature_column(cont[:, 3]),
+        "pedal_25": _scale_feature_column(cont[:, 4]),
+        "pedal_50": _scale_feature_column(cont[:, 5]),
+        "pedal_75": _scale_feature_column(cont[:, 6]),
+    }
+
+
+def _fallback_raw_output_path(midi_path: Path):
+    if midi_path.parent.name != "midis":
+        return None
+    candidate = midi_path.parent.parent / "raw_outputs" / f"{midi_path.stem}.json"
+    return candidate if candidate.exists() else None
+
+
 def extract_note_arrays(midi_path: Path):
     midi_obj = MidiFile(str(midi_path))
     payload = midi_to_note_features(
@@ -116,6 +151,9 @@ def extract_note_arrays(midi_path: Path):
     )
     cont = np.asarray(payload["continuous"], dtype=np.float64)
     if cont.ndim != 2 or cont.shape[1] != 7:
+        fallback = _fallback_raw_output_path(midi_path)
+        if fallback is not None:
+            return _extract_raw_output_arrays(fallback)
         raise ValueError(f"Unexpected feature shape for {midi_path}: {cont.shape}")
     return {
         "ioi": cont[:, 0],

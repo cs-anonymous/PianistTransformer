@@ -1,7 +1,12 @@
 import json
+from pathlib import Path
 
 
 _FIXED_WINDOW_SPLIT_INDEX_CACHE = {}
+
+
+def _normalized_work_path(path):
+    return str(Path(path).expanduser().resolve())
 
 
 def _load_fixed_window_split_index(summary_path, scheme_name):
@@ -23,11 +28,13 @@ def _load_fixed_window_split_index(summary_path, scheme_name):
         valid_window = row.get("valid_window")
         train_window_count = int(row.get("train_window_count", 0) or 0)
         valid_window_count = int(row.get("valid_window_count", 0) or 0)
-        index[str(work_path)] = {
+        entry = {
             "valid_window": valid_window,
             "train_window_count": train_window_count,
             "valid_window_count": valid_window_count,
         }
+        index[str(work_path)] = entry
+        index[_normalized_work_path(work_path)] = entry
     _FIXED_WINDOW_SPLIT_INDEX_CACHE[cache_key] = index
     return index
 
@@ -35,7 +42,7 @@ def _load_fixed_window_split_index(summary_path, scheme_name):
 def load_windows_from_fixed_split(path, scheme_name, split_name, canonical_windows=None, summary_path=None):
     if summary_path:
         index = _load_fixed_window_split_index(summary_path, scheme_name)
-        entry = index.get(str(path))
+        entry = index.get(str(path)) or index.get(_normalized_work_path(path))
         if entry is None:
             raise KeyError(f"Missing work entry for fixed split scheme={scheme_name} in summary {summary_path}: {path}")
         if canonical_windows is None:

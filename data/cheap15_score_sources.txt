@@ -1,0 +1,15 @@
+Chopin,_Frédéric/Ballade_No.2_in_F_major,_Op.38/score_ASAP_refined.mid
+Beethoven,_Ludwig_van/Piano_Sonata_No.27_in_E_minor,_Op.90/1._Mit_Lebhaftigkeit_und_durchaus_mit_Empfindung_und_Ausdruck/score_ASAP_refined.mid
+Beethoven,_Ludwig_van/Piano_Sonata_No.12_in_A_flat_major,_Op.26_("Funeral_March")/1._Andante_con_variazioni_(A_flat_major)/score_MS_refined.mid
+Haydn,_Joseph/Piano_Sonata_No.46,_Keyboard_Sonata_in_E_major,_Hob.XVI:31/1._Moderato_(E_major)/score_ASAP_refined.mid
+Beethoven,_Ludwig_van/Piano_Sonata_No.28_in_A_major,_Op.101/1._Etwas_lebhaft_und_mit_der_innigsten_Empfindung/score_ASAP_refined.mid
+Haydn,_Joseph/Piano_Sonata_No.47,_Keyboard_Sonata_in_B_minor,_Hob.XVI:32/1._Allegro_moderato_(B_minor)/score_ASAP_refined.mid
+Glinka,_Mikhail/A_Farewell_to_Saint_Petersburg/10._The_Lark/score_MS_refined.mid
+Haydn,_Joseph/Piano_Sonata_No.52,_Keyboard_Sonata_in_G_major,_Hob.XVI:39/1._Allegro_con_brio_(G_major)/score_ASAP_refined.mid
+Beethoven,_Ludwig_van/Piano_Sonata_No.27_in_E_minor,_Op.90/2._Nicht_zu_geschwind_und_sehr_singbar_vorgetragen/score_ASAP_refined.mid
+Mozart,_Wolfgang_Amadeus/Fantasia_in_C_minor,_K.475/score_ASAP_refined.mid
+Beethoven,_Ludwig_van/Piano_Sonata_No.28_in_A_major,_Op.101/2._Lebhaft._Marschmassig/score_ASAP_refined.mid
+Debussy,_Claude/Pour_le_Piano/1._Prélude/score_ASAP_refined.mid
+Haydn,_Joseph/Piano_Sonata_No.52,_Keyboard_Sonata_in_G_major,_Hob.XVI:39/3._Prestissimo_(G_major)/score_ASAP_refined.mid
+Haydn,_Joseph/Piano_Sonata_No.52,_Keyboard_Sonata_in_G_major,_Hob.XVI:39/2._Adagio_(C_major)/score_ASAP_refined.mid
+Beethoven,_Ludwig_van/Piano_Sonata_No.24_in_F_sharp_major,_Op.78_("A_Thérèse")/2._Allegro_vivace/score_ASAP_refined.mid

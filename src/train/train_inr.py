@@ -227,6 +227,8 @@ def timing_control_feature_dim(timing_control_mode="log_scaled", use_timing_scal
 
 def musical_feature_dim(musical_feature_mode="categorical"):
     mode = str(musical_feature_mode).lower()
+    if mode in {"none", "off", "disabled", "no_musical", "nomus"}:
+        return 0
     if mode == "continuous":
         return 12
     if mode in {"categorical", "categorical51", "musical51"}:
@@ -524,6 +526,24 @@ def _uses_raw_log_deviation_target(epr_timing_target):
     return str(epr_timing_target or "").lower() in {"raw_log_deviation", "raw_log_dev"}
 
 
+def _uses_raw_deviation_target(epr_timing_target):
+    return str(epr_timing_target or "").lower() in {"raw_deviation", "raw_dev", "raw_seconds_deviation", "raw_seconds_dev"}
+
+
+def _uses_absolute_target(epr_timing_target):
+    return str(epr_timing_target or "").lower() in {
+        "absolute",
+        "absolute_log",
+        "log_absolute",
+        "raw_log_absolute",
+        "absolute_raw_log",
+    }
+
+
+def _uses_raw_log_absolute_target(epr_timing_target):
+    return str(epr_timing_target or "").lower() in {"raw_log_absolute", "absolute_raw_log"}
+
+
 def normalize_ioi_dev(
     score_ioi_ms,
     perf_ioi_ms,
@@ -565,6 +585,7 @@ def performance_dev_velocity_pedal4_binary_rows(
     epr_timing_target="log_deviation",
     log_scale=50.0,
     pedal_binary_threshold=64.0,
+    legacy_dual_timing_head=False,
 ):
     shared_rows = perf.get("label_shared_raw")
     pedal_rows = _raw_value_rows(perf, "label_pedal4_raw", "pedal4_raw")
@@ -600,17 +621,36 @@ def performance_dev_velocity_pedal4_binary_rows(
         )
         velocity = min(max(float(perf_row[2]), 0.0), 127.0) / 127.0
         pedal = [1.0 if float(value) >= threshold else 0.0 for value in pedal_row[:4]]
-        if _uses_raw_log_deviation_target(epr_timing_target):
+        if _uses_raw_log_absolute_target(epr_timing_target):
             rows.append(
                 [
-                    log_ioi,
-                    log_duration,
-                    (float(perf_row[0]) - float(score_row[0])) / 1000.0,
-                    (float(perf_row[1]) - float(score_row[1])) / 1000.0,
+                    raw_log_timing_value(perf_row[0], scale=log_scale),
+                    raw_log_timing_value(perf_row[1], scale=log_scale),
+                    float(perf_row[0]) / 1000.0,
+                    float(perf_row[1]) / 1000.0,
                     velocity,
                     *pedal,
                 ]
             )
+        elif _uses_absolute_target(epr_timing_target):
+            rows.append(
+                [
+                    raw_log_timing_value(perf_row[0], scale=log_scale),
+                    raw_log_timing_value(perf_row[1], scale=log_scale),
+                    velocity,
+                    *pedal,
+                ]
+            )
+        elif _uses_raw_log_deviation_target(epr_timing_target):
+            row = [log_ioi, log_duration]
+            if legacy_dual_timing_head:
+                row.extend(
+                    [
+                        (float(perf_row[0]) - float(score_row[0])) / 1000.0,
+                        (float(perf_row[1]) - float(score_row[1])) / 1000.0,
+                    ]
+                )
+            rows.append([*row, velocity, *pedal])
         else:
             rows.append([log_ioi, log_duration, velocity, *pedal])
     return rows
@@ -867,7 +907,12 @@ def build_epr_score_input_rows(
 ):
     score_raw = score["score_raw"]
     has_score_feature = score.get("has_score_feature", [0] * len(score["pitch"]))
-    musical_rows = build_score_musical_rows(score, musical_feature_mode=musical_feature_mode)
+    musical_dim = musical_feature_dim(musical_feature_mode)
+    musical_rows = (
+        build_score_musical_rows(score, musical_feature_mode=musical_feature_mode)
+        if musical_dim > 0
+        else [[] for _ in score["pitch"]]
+    )
     control_dim = timing_control_feature_dim(
         timing_control_mode=timing_control_mode,
         use_timing_scale_bit=use_timing_scale_bit,
@@ -881,7 +926,9 @@ def build_epr_score_input_rows(
             timing_control_mode=timing_control_mode,
             log_scale=log_scale,
         )
-        if disable_musical_features:
+        if musical_dim == 0:
+            m_musical = 0.0
+        elif disable_musical_features:
             m_musical = 0.0
             musical = [0.0] * len(musical)
         else:
@@ -893,7 +940,7 @@ def build_epr_score_input_rows(
         if schema != "integrated":
             raise ValueError(f"Unsupported score_note_schema={score_note_schema}")
         perf_control = [0.0] * (control_dim + 4)
-        masks = [1.0, 0.0, m_musical]
+        masks = [1.0, 0.0] if musical_dim == 0 else [1.0, 0.0, m_musical]
         rows.append(score_control + perf_control + masked_musical + masks)
     return rows
 
@@ -1155,31 +1202,21 @@ def distributed_info():
 
 
 def configure_eval_schedule(train_config, train_examples):
-    eval_every_steps = train_config.get("eval_every_steps")
-    eval_every_epochs = train_config.get("eval_every_epochs")
-    save_every_steps = train_config.get("save_every_steps")
-
-    if eval_every_steps is not None:
-        eval_steps = max(1, int(eval_every_steps))
-    elif eval_every_epochs is not None:
+    asap_only = str(train_config.get("train_performance_dataset", "")).strip().upper() == "ASAP"
+    if asap_only:
         world_size = int(os.environ.get("WORLD_SIZE", "1") or 1)
         per_device = int(train_config.get("per_device_train_batch_size", 1) or 1)
         grad_accum = int(train_config.get("gradient_accumulation_steps", 1) or 1)
-        global_batch_size = int(
-            train_config.get("global_batch_size") or (per_device * grad_accum * world_size)
-        )
+        global_batch_size = per_device * grad_accum * world_size
         steps_per_epoch = max(1, math.ceil(int(train_examples) / max(global_batch_size, 1)))
-        eval_steps = max(1, int(round(float(eval_every_epochs) * steps_per_epoch)))
+        eval_steps = steps_per_epoch
     else:
-        eval_steps = train_config.get("eval_steps")
+        eval_steps = 1000
 
-    if eval_steps is not None:
-        eval_steps = max(1, int(eval_steps))
-        train_config["eval_strategy"] = "steps"
-        train_config["save_strategy"] = "steps"
-        train_config["eval_steps"] = eval_steps
-        train_config["save_steps"] = max(1, int(save_every_steps or eval_steps))
-
+    train_config["eval_strategy"] = "steps"
+    train_config["save_strategy"] = "steps"
+    train_config["eval_steps"] = eval_steps
+    train_config["save_steps"] = eval_steps
     train_config.setdefault("load_best_model_at_end", True)
     train_config.setdefault("metric_for_best_model", "eval_loss")
     train_config.setdefault("greater_is_better", False)
@@ -1233,6 +1270,7 @@ class PianoCoReNodeSFTDataset(Dataset):
         composer_vocab=None,
         source_vocab=None,
         perf_style_stats_mode="prefix",
+        legacy_dual_timing_head=False,
     ):
         super().__init__()
         self.split = split
@@ -1253,6 +1291,7 @@ class PianoCoReNodeSFTDataset(Dataset):
             use_timing_scale_bit=use_timing_scale_bit,
         )
         self.timing_log_scale = float(timing_log_scale)
+        self.legacy_dual_timing_head = bool(legacy_dual_timing_head)
         self.use_style_tokens = bool(use_style_tokens)
         self.perf_style_stats_mode = str(perf_style_stats_mode or "prefix").lower()
         if self.perf_style_stats_mode not in {"prefix", "window"}:
@@ -1368,6 +1407,17 @@ class PianoCoReNodeSFTDataset(Dataset):
             if self.task_type.lower() == "epr" and self.epr_timing_target in {
                 "log_deviation",
                 "log_dev",
+                "raw_log_deviation",
+                "raw_log_dev",
+                "raw_deviation",
+                "raw_dev",
+                "raw_seconds_deviation",
+                "raw_seconds_dev",
+                "absolute",
+                "absolute_log",
+                "log_absolute",
+                "raw_log_absolute",
+                "absolute_raw_log",
             }:
                 has_shared = "label_shared_raw" in perf or "label_raw" in perf
                 has_pedal = "label_pedal4_raw" in perf or "pedal4_raw" in perf or "label_raw" in perf
@@ -1640,12 +1690,22 @@ class PianoCoReNodeSFTDataset(Dataset):
             "log_dev",
             "raw_log_deviation",
             "raw_log_dev",
+            "raw_deviation",
+            "raw_dev",
+            "raw_seconds_deviation",
+            "raw_seconds_dev",
+            "absolute",
+            "absolute_log",
+            "log_absolute",
+            "raw_log_absolute",
+            "absolute_raw_log",
         }:
             labels = performance_dev_velocity_pedal4_binary_rows(
                 perf,
                 prepared["score"]["score_raw"],
                 epr_timing_target=self.epr_timing_target,
                 log_scale=self.timing_log_scale,
+                legacy_dual_timing_head=self.legacy_dual_timing_head,
             )
             missing = "Missing score_raw/label_shared_raw/label_pedal4_raw for binary_4 deviation EPR targets"
             if labels is None:
@@ -2247,16 +2307,9 @@ class NodeSFTTrainer(Trainer):
             }
         )
 
-    def _maybe_log_train_loss_components(self, inputs, outputs):
-        interval = int(getattr(self, "loss_component_logging_steps", 0) or 0)
-        if interval <= 0 or not self.is_world_process_zero():
+    def _accumulate_train_loss_components(self, inputs, outputs):
+        if not self.model.training or not self.is_world_process_zero():
             return
-        step = int(getattr(self.state, "global_step", 0) or 0)
-        if step <= 0 or step % interval != 0:
-            return
-        if int(getattr(self, "_last_loss_component_log_step", -1)) == step:
-            return
-        self._last_loss_component_log_step = step
         labels = inputs.get("labels_continuous")
         attention_mask = inputs.get("attention_mask")
         if labels is None or attention_mask is None or getattr(outputs, "logits", None) is None:
@@ -2271,18 +2324,36 @@ class NodeSFTTrainer(Trainer):
                 labels_epr_bins=inputs.get("labels_epr_bins"),
                 score_shared_raw=inputs.get("score_shared_raw"),
             )
-            payload = {
-                "step": step,
-                "event": "train_loss_components",
-            }
+            values = {}
             for name, value in components.items():
                 if torch.is_tensor(value):
-                    payload[f"train_loss_{name}"] = float(value.detach().float().cpu().item())
-            print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
+                    values[name] = float(value.detach().float().cpu().item())
+            weights = getattr(self._model_config(self.model), "loss_weights", {}) or {}
+            weighted_total = 0.0
+            for name in ("ioi", "duration", "velocity", "pedal"):
+                if name not in values:
+                    continue
+                contribution = float(weights.get(name, 1.0)) * values[name]
+                values[f"weighted_{name}"] = contribution
+                weighted_total += contribution
+            values["components_total"] = weighted_total
+            accumulator = getattr(self, "_train_loss_component_sums", None)
+            if accumulator is None:
+                accumulator = {}
+                self._train_loss_component_sums = accumulator
+            for name, value in values.items():
+                accumulator[name] = accumulator.get(name, 0.0) + value
+            self._train_loss_component_count = int(
+                getattr(self, "_train_loss_component_count", 0)
+            ) + 1
         except Exception as exc:  # noqa: BLE001
             print(
                 json.dumps(
-                    {"step": step, "event": "train_loss_components_failed", "reason": str(exc)},
+                    {
+                        "step": int(getattr(self.state, "global_step", 0) or 0),
+                        "event": "train_loss_components_failed",
+                        "reason": str(exc),
+                    },
                     ensure_ascii=False,
                     sort_keys=True,
                 ),
@@ -2292,10 +2363,18 @@ class NodeSFTTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         outputs = model(**inputs)
         loss = outputs.loss
-        self._maybe_log_train_loss_components(inputs, outputs)
+        self._accumulate_train_loss_components(inputs, outputs)
         return (loss, outputs) if return_outputs else loss
 
     def log(self, logs, *args, **kwargs):
+        if "loss" in logs:
+            count = int(getattr(self, "_train_loss_component_count", 0) or 0)
+            sums = getattr(self, "_train_loss_component_sums", {}) or {}
+            if count > 0:
+                for name, value in sums.items():
+                    logs[f"train_loss_{name}"] = round(float(value) / count, 6)
+                self._train_loss_component_sums = {}
+                self._train_loss_component_count = 0
         if self.is_world_process_zero():
             printable_logs = {"step": self.state.global_step}
             printable_logs.update(logs)
@@ -2853,22 +2932,47 @@ def create_model(train_config):
         timing_control_mode=train_config.get("timing_control_mode"),
         use_timing_scale_bit=train_config.get("use_timing_scale_bit", False),
     )
-    if task_type in {"epr", "csr"} and timing_control_mode not in {"log_scaled", "raw_log"}:
-        raise ValueError("Integrated INR requires timing_control_mode=log_scaled or raw_log")
-    if task_type == "epr" and epr_timing_target not in {"log_deviation", "log_dev", "raw_log_deviation", "raw_log_dev"}:
-        raise ValueError("EPR requires epr_timing_target=log_deviation or raw_log_deviation")
+    if task_type in {"epr", "csr"} and timing_control_mode not in {"log_scaled", "raw_log", "raw", "raw_seconds"}:
+        raise ValueError("Integrated INR requires timing_control_mode=log_scaled, raw_log, or raw")
+    if task_type == "epr" and epr_timing_target not in {
+        "log_deviation",
+        "log_dev",
+        "raw_log_deviation",
+        "raw_log_dev",
+        "raw_deviation",
+        "raw_dev",
+        "raw_seconds_deviation",
+        "raw_seconds_dev",
+        "absolute",
+        "absolute_log",
+        "log_absolute",
+        "raw_log_absolute",
+        "absolute_raw_log",
+    }:
+        raise ValueError("EPR requires a supported deviation or absolute timing target")
     use_timing_scale_bit = timing_control_mode == "piecewise_scale_bit"
     note_embedding_mode = str(train_config.get("note_embedding_mode", "sine")).lower()
     score_note_schema = score_note_input_schema(train_config)
     decoder_note_schema = decoder_note_input_schema(train_config)
     if input_feature_mode != "integrated":
         raise ValueError(f"INR0624 only supports input_feature_mode=integrated, got {input_feature_mode}")
-    if note_embedding_mode not in {"sine", "cine", "split_score_perf"}:
+    if note_embedding_mode not in {"sine", "cine", "slot_attribute"}:
         raise ValueError(
-            f"INR0624 only supports note_embedding_mode in {{'sine', 'cine', 'split_score_perf'}}, "
+            f"INR0624 only supports note_embedding_mode in {{'sine', 'cine', 'slot_attribute'}}, "
             f"got {note_embedding_mode}"
         )
     if task_type == "epr":
+        configured_output_dim = int(
+            train_config.get("output_continuous_dim", train_config.get("continuous_dim", 7))
+        )
+        legacy_dual_timing_head = bool(
+            train_config.get(
+                "legacy_dual_timing_head",
+                epr_timing_target in {"raw_log_deviation", "raw_log_dev"}
+                and configured_output_dim >= 9,
+            )
+        )
+        train_config["legacy_dual_timing_head"] = legacy_dual_timing_head
         if "epr_distribution" not in train_config:
             raise ValueError("EPR config must set epr_distribution explicitly")
         distribution = str(train_config["epr_distribution"]).lower()
@@ -2950,8 +3054,23 @@ def create_model(train_config):
         elif epr_timing_target in {"raw_log_deviation", "raw_log_dev"}:
             pedal_representation = str(train_config.get("pedal_representation", "binary_4")).lower()
             if pedal_representation != "binary_4":
-                raise ValueError("raw_log deviation EPR requires pedal_representation=binary_4")
+                raise ValueError("raw_log EPR requires pedal_representation=binary_4")
+            expected_output_dim = 9 if legacy_dual_timing_head else 7
+        elif epr_timing_target in {"raw_log_absolute", "absolute_raw_log"}:
+            pedal_representation = str(train_config.get("pedal_representation", "binary_4")).lower()
+            if pedal_representation != "binary_4":
+                raise ValueError("raw_log EPR requires pedal_representation=binary_4")
             expected_output_dim = 9
+        elif epr_timing_target in {"absolute", "absolute_log", "log_absolute"}:
+            pedal_representation = str(train_config.get("pedal_representation", "binary_4")).lower()
+            if pedal_representation != "binary_4":
+                raise ValueError("absolute EPR requires pedal_representation=binary_4")
+            expected_output_dim = 7
+        elif epr_timing_target in {"raw_deviation", "raw_dev", "raw_seconds_deviation", "raw_seconds_dev"}:
+            pedal_representation = str(train_config.get("pedal_representation", "binary_4")).lower()
+            if pedal_representation != "binary_4":
+                raise ValueError("raw deviation EPR requires pedal_representation=binary_4")
+            expected_output_dim = 7
         else:
             expected_output_dim = None
         if expected_output_dim is not None and int(train_config.get("output_continuous_dim", train_config["continuous_dim"])) != expected_output_dim:
@@ -3102,6 +3221,10 @@ def create_model(train_config):
         head_depth=train_config.get("head_depth", 2),
         head_width_multiplier=train_config.get("head_width_multiplier", 1.0),
         head_activation=train_config.get("head_activation", "gelu"),
+        slot_version=train_config.get("slot_version"),
+        slot_dim=train_config.get("slot_dim"),
+        slot_fusion=train_config.get("slot_fusion", "mlp"),
+        slot_gates=train_config.get("slot_gates", False),
         decoder_head_layout=train_config.get("decoder_head_layout", "pyramid4"),
         decoder_head_expand_ratio=train_config.get("decoder_head_expand_ratio", 2.0),
         decoder_head_shrink_ratio=train_config.get("decoder_head_shrink_ratio", 0.5),
@@ -3114,6 +3237,7 @@ def create_model(train_config):
         skew_normal_sigma_min=train_config.get("skew_normal_sigma_min", train_config.get("logistic_normal_sigma_min", 1e-4)),
         skew_normal_sigma_max=train_config.get("skew_normal_sigma_max", train_config.get("logistic_normal_sigma_max", 1e4)),
         raw_timing_loss_lambda=train_config.get("raw_timing_loss_lambda", 0.5),
+        legacy_dual_timing_head=train_config.get("legacy_dual_timing_head", False),
         beta_eps=train_config.get("beta_eps", 1e-5),
         beta_kappa_min=train_config.get("beta_kappa_min", 1e-3),
         beta_alpha_min=train_config.get("beta_alpha_min", 1e-4),
@@ -3127,10 +3251,12 @@ def create_model(train_config):
         soft_ce_tau=train_config.get("soft_ce_tau"),
         timing_input_normalization=train_config.get("timing_input_normalization", "scaled_log_5000_s10"),
         musical_feature_mode=musical_feature_mode,
+        musical_gate_init=train_config.get("musical_gate_init", 1.0),
         prior_token_keep_prob=train_config.get("prior_token_keep_prob", 1.0),
         prior_token_dropout_mode=train_config.get("prior_token_dropout_mode", "mask"),
         prior_attribute_keep_probs=train_config.get("prior_attribute_keep_probs"),
         prior_attribute_noise_std=train_config.get("prior_attribute_noise_std", 0.05),
+        prior_property_dropout_prob=train_config.get("prior_property_dropout_prob"),
         tf_embedding_mask_keep_prob=train_config.get("tf_embedding_mask_keep_prob", 1.0),
         tf_embedding_mask_score=train_config.get("tf_embedding_mask_score", False),
         tf_embedding_mask_decoder=train_config.get("tf_embedding_mask_decoder", False),
@@ -3434,8 +3560,17 @@ def main():
         "log_dev",
         "raw_log_deviation",
         "raw_log_dev",
+        "raw_deviation",
+        "raw_dev",
+        "raw_seconds_deviation",
+        "raw_seconds_dev",
+        "absolute",
+        "absolute_log",
+        "log_absolute",
+        "raw_log_absolute",
+        "absolute_raw_log",
     }:
-        raise ValueError("EPR requires epr_timing_target=log_deviation or raw_log_deviation")
+        raise ValueError("EPR requires a supported deviation or absolute timing target")
     train_config["timing_control_mode"] = timing_control_mode
     train_config["use_timing_scale_bit"] = timing_control_mode == "piecewise_scale_bit"
     musical_feature_mode = str(
@@ -3445,6 +3580,27 @@ def main():
         )
     ).lower()
     train_config["musical_feature_mode"] = musical_feature_mode
+    if task_type == "epr":
+        epr_timing_target = str(train_config.get("epr_timing_target", "log_deviation")).lower()
+        configured_output_dim = int(
+            train_config.get("output_continuous_dim", train_config.get("continuous_dim", 7))
+        )
+        legacy_dual_timing_head = bool(
+            train_config.get(
+                "legacy_dual_timing_head",
+                epr_timing_target in {"raw_log_deviation", "raw_log_dev"}
+                and configured_output_dim >= 9,
+            )
+        )
+        if epr_timing_target in {"raw_log_absolute", "absolute_raw_log"}:
+            base_output_dim = 9
+        elif epr_timing_target in {"raw_log_deviation", "raw_log_dev"} and legacy_dual_timing_head:
+            base_output_dim = 9
+        else:
+            base_output_dim = 7
+        train_config["legacy_dual_timing_head"] = legacy_dual_timing_head
+        train_config["continuous_dim"] = base_output_dim
+        train_config["output_continuous_dim"] = base_output_dim
     if train_config.get("use_style_tokens", False):
         raise ValueError("use_style_tokens is disabled for the simplified EPR/CSR pipelines")
     if task_type in {"epr", "csr"} and input_feature_mode == "integrated":
@@ -3528,6 +3684,7 @@ def main():
             window_split_scheme=fixed_window_split_scheme,
             window_split_name=train_config.get("fixed_window_train_split_name", "train"),
             window_split_summary_path=fixed_window_split_summary_path,
+            prepared_sidecar_tag=train_config.get("prepared_sidecar_tag"),
         )
     else:
         train_manifest = build_work_manifest(
@@ -3541,6 +3698,7 @@ def main():
             skip_work_paths=train_config.get("skip_work_paths"),
             performance_dataset=train_config.get("train_performance_dataset"),
             exclude_performance_dataset=train_config.get("train_exclude_performance_dataset"),
+            prepared_sidecar_tag=train_config.get("prepared_sidecar_tag"),
         )
     if fixed_window_split_scheme:
         eval_manifest = build_work_manifest(
@@ -3560,6 +3718,7 @@ def main():
             window_split_scheme=fixed_window_split_scheme,
             window_split_name=train_config.get("fixed_window_eval_split_name", "valid"),
             window_split_summary_path=fixed_window_split_summary_path,
+            prepared_sidecar_tag=train_config.get("prepared_sidecar_tag"),
         )
         train_config["eval_split"] = train_config.get("fixed_window_eval_split_name", "valid")
     else:
@@ -3577,6 +3736,7 @@ def main():
             skip_work_paths=train_config.get("skip_work_paths"),
             performance_dataset=train_config.get("eval_performance_dataset"),
             exclude_performance_dataset=train_config.get("eval_exclude_performance_dataset"),
+            prepared_sidecar_tag=train_config.get("prepared_sidecar_tag"),
         )
 
     max_train_epochs = float(train_config.get("max_train_epochs", 8.0))
@@ -3620,6 +3780,7 @@ def main():
         composer_vocab=train_config.get("style_composer_vocab"),
         source_vocab=train_config.get("style_source_vocab"),
         perf_style_stats_mode=train_config.get("perf_style_stats_mode", "prefix"),
+        legacy_dual_timing_head=train_config.get("legacy_dual_timing_head", False),
     )
     eval_dataset = PianoCoReNodeSFTDataset(
         eval_manifest,
@@ -3650,6 +3811,7 @@ def main():
         composer_vocab=train_config.get("style_composer_vocab"),
         source_vocab=train_config.get("style_source_vocab"),
         perf_style_stats_mode=train_config.get("perf_style_stats_mode", "prefix"),
+        legacy_dual_timing_head=train_config.get("legacy_dual_timing_head", False),
     )
 
     model = create_model(train_config)
@@ -3658,6 +3820,8 @@ def main():
     print_model_parameters(model)
 
     training_args_dict = filter_valid_args(train_config, TrainingArguments)
+    if str(train_config.get("note_embedding_mode", "")).lower() == "slot_attribute":
+        training_args_dict["save_safetensors"] = False
     if args.deepspeed:
         training_args_dict["deepspeed"] = args.deepspeed
     if "accelerator_config" in train_config:
