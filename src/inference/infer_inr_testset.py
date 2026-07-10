@@ -141,6 +141,11 @@ def load_config(path: Path, checkpoint: str | None):
         config["style_source_vocab_size"] = len(config["style_source_vocab"])
     if checkpoint:
         config["resume_path"] = checkpoint
+    target = str(config.get("epr_timing_target", "")).lower()
+    config["legacy_dual_timing_head"] = (
+        target in {"raw_log_deviation", "raw_log_dev", "raw_log_absolute", "absolute_raw_log"}
+        and int(config.get("output_continuous_dim", config.get("continuous_dim", 0)) or 0) == 9
+    )
     return config
 
 
@@ -946,7 +951,14 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
                 normalized=False,
             )
         raw_path = raw_dir / f"{score_stem}__{plan['suffix']}.json"
-        target_key = "predicted_target12" if pred_continuous.shape[-1] == 12 else "predicted_target10" if pred_continuous.shape[-1] == 10 else "predicted_target7"
+        if pred_continuous.shape[-1] == 12:
+            target_key = "predicted_target12"
+        elif pred_continuous.shape[-1] == 10:
+            target_key = "predicted_target10"
+        elif pred_continuous.shape[-1] == 9:
+            target_key = "predicted_target9"
+        else:
+            target_key = "predicted_target7"
         if pred_continuous.shape[-1] == 12:
             timing_representation = "target12_raw_log_dev_velocity_binary4_offset3"
         elif pred_continuous.shape[-1] == 10:
@@ -966,6 +978,7 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
             "pitch": pitch if bool(config.get("chord_mode", False)) else [int(value) for value in pitch],
             target_key: pred_continuous_list,
             "predicted_target7": pred_continuous_list if pred_continuous.shape[-1] == 7 else None,
+            "predicted_target9": pred_continuous_list if pred_continuous.shape[-1] == 9 else None,
             "reconstructed_raw7": raw_rows_list,
             "chord_expansion": (
                 {

@@ -114,11 +114,24 @@ def normalize_slot_version(slot_version=None):
     if slot_version is None:
         return "slot8"
     value = str(slot_version).lower()
-    if value in {"slot8", "8slot", "8slot_rawlog_nomus_0709"}:
+    if value in {"slot5", "5slot", "pt5", "a5", "a5_pt_absolute_nomus"}:
+        return "slot5"
+    if value in {"slot8", "8slot", "8slot_rawlog_nomus_0709", "inr8", "b8", "b8_inr_logdev_nomus"}:
         return "slot8"
-    if value in {"slot12", "12slot", "12slot_rawlog_musical_0709"}:
+    if value in {"slot9", "9slot", "pt9", "a9", "a9_pt_absolute_musical"}:
+        return "slot9"
+    if value in {"slot12", "12slot", "12slot_rawlog_musical_0709", "inr12", "b12", "b12_inr_logdev_musical"}:
         return "slot12"
     raise ValueError(f"Unsupported slot_version={slot_version}")
+
+
+def slot_version_num_slots(slot_version):
+    value = normalize_slot_version(slot_version)
+    return {"slot5": 5, "slot8": 8, "slot9": 9, "slot12": 12}[value]
+
+
+def slot_version_is_pt(slot_version):
+    return normalize_slot_version(slot_version) in {"slot5", "slot9"}
 
 
 def score_note_input_schema(config_or_value=None):
@@ -208,6 +221,7 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         skew_normal_sigma_min=1e-4,
         skew_normal_sigma_max=1e4,
         raw_timing_loss_lambda=0.5,
+        legacy_dual_timing_head=False,
         epr_inflated_features=None,
         epr_timing_bins=5000,
         epr_value_bins=128,
@@ -227,6 +241,7 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         prior_token_dropout_mode="mask",
         prior_attribute_keep_probs=None,
         prior_attribute_noise_std=0.05,
+        prior_property_dropout_prob=None,
         tf_embedding_mask_keep_prob=1.0,
         tf_embedding_mask_score=False,
         tf_embedding_mask_decoder=False,
@@ -338,6 +353,7 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.skew_normal_sigma_min = skew_normal_sigma_min
         self.skew_normal_sigma_max = skew_normal_sigma_max
         self.raw_timing_loss_lambda = raw_timing_loss_lambda
+        self.legacy_dual_timing_head = bool(legacy_dual_timing_head)
         self.epr_inflated_features = epr_inflated_features or {
             "ioi": "zero",
             "pedal": "zero_one",
@@ -378,6 +394,7 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.prior_token_dropout_mode = prior_token_dropout_mode
         self.prior_attribute_keep_probs = prior_attribute_keep_probs
         self.prior_attribute_noise_std = prior_attribute_noise_std
+        self.prior_property_dropout_prob = prior_property_dropout_prob
         self.tf_embedding_mask_keep_prob = float(tf_embedding_mask_keep_prob)
         self.tf_embedding_mask_score = bool(tf_embedding_mask_score)
         self.tf_embedding_mask_decoder = bool(tf_embedding_mask_decoder)
@@ -527,12 +544,14 @@ class IntegratedNoteEncoder(nn.Module):
         self.embedding_depth = getattr(config, "embedding_depth", 2)
         self.activation = getattr(config, "head_activation", "gelu")
         self.pitch_factor_dim = 20
+        self.slot_pitch_embedding = None
         self.slot_version = normalize_slot_version(getattr(config, "slot_version", None)) if self.mode == "slot_attribute" else None
-        self.slot_num = 8 if self.slot_version == "slot8" else 12 if self.slot_version == "slot12" else 0
+        self.slot_num = slot_version_num_slots(self.slot_version) if self.slot_version is not None else 0
+        self.slot_is_pt = slot_version_is_pt(self.slot_version) if self.slot_version is not None else False
         self.slot_dim = (
             int(getattr(config, "slot_dim", 0))
             if getattr(config, "slot_dim", None) is not None
-            else (config.hidden_size // self.slot_num if self.slot_num > 0 else 0)
+            else (128 if self.slot_num > 0 else 0)
         )
         self.score_control_dim = int(
             getattr(config, "score_control_feature_dim", getattr(config, "control_feature_dim", 5))
@@ -582,19 +601,21 @@ class IntegratedNoteEncoder(nn.Module):
                     f"slot_attribute requires a valid slot_version/slot_dim, got slot_version={self.slot_version}, "
                     f"slot_dim={self.slot_dim}"
                 )
-            if self.slot_num * self.slot_dim != int(config.hidden_size):
-                raise ValueError(
-                    f"slot_attribute expects slot_num * slot_dim == hidden_size, got "
-                    f"{self.slot_num} * {self.slot_dim} != {config.hidden_size}"
-                )
+            if self.slot_dim != 128:
+                raise ValueError(f"slot_attribute uses fixed 128-dim slots, got slot_dim={self.slot_dim}")
         pitch_output_dim = self.slot_dim if self.mode == "slot_attribute" else config.hidden_size
-        self.pitch_projection = _make_mlp(
-            self.pitch_input_dim,
-            pitch_output_dim,
-            pitch_output_dim,
-            self.embedding_depth,
-            self.activation,
-        )
+        if self.mode == "slot_attribute" and getattr(config, "pitch_representation", "id") == "id":
+            pitch_table_size = max(int(config.pitch_vocab_size), int(config.pitch_pad_id) + 1) + 1
+            self.slot_pitch_embedding = nn.Embedding(pitch_table_size, self.slot_dim)
+            self.pitch_projection = None
+        else:
+            self.pitch_projection = _make_mlp(
+                self.pitch_input_dim,
+                pitch_output_dim,
+                pitch_output_dim,
+                self.embedding_depth,
+                self.activation,
+            )
 
         self.score_control_projection = None
         self.score_offset_projection = None
@@ -614,7 +635,15 @@ class IntegratedNoteEncoder(nn.Module):
         self.slot_musical_duration_projection = None
         self.slot_musical_length_projection = None
         self.slot_musical_binary_projection = None
+        self.slot_null_embeddings = None
         self.slot_mask_embeddings = None
+        self.slot_pad_embeddings = None
+        self.slot_musical_onset_embedding = None
+        self.slot_musical_duration_embedding = None
+        self.slot_musical_length_embedding = None
+        self.slot_musical_onset_scalar_projection = None
+        self.slot_musical_duration_scalar_projection = None
+        self.slot_musical_length_scalar_projection = None
         self.slot_fusion = None
         self.slot_gate_logits = None
         self.slot_timing_dim = max(1, (self.score_control_dim - 1) // 2) if self.mode == "slot_attribute" else 0
@@ -698,9 +727,9 @@ class IntegratedNoteEncoder(nn.Module):
                 raise ValueError(
                     f"slot_attribute expects performance_control_dim={expected_perf_dim}, got {self.performance_control_dim}"
                 )
-            if self.slot_version == "slot12" and self.musical_dim not in {0, 51}:
+            if self.slot_version in {"slot9", "slot12"} and self.musical_dim not in {0, 51}:
                 raise ValueError(
-                    f"slot12 expects musical_feature_dim in {{0, 51}}, got {self.musical_dim}. "
+                    f"{self.slot_version} expects musical_feature_dim in {{0, 51}}, got {self.musical_dim}. "
                     "Use musical_feature_mode='musical51' or disable musical features."
                 )
             self.slot_score_ioi_projection = _make_mlp(
@@ -752,27 +781,18 @@ class IntegratedNoteEncoder(nn.Module):
                 self.embedding_depth,
                 self.activation,
             )
-            if self.slot_version == "slot12":
-                self.slot_musical_onset_projection = _make_mlp(
-                    17,
-                    self.slot_dim,
-                    self.slot_dim,
-                    self.embedding_depth,
-                    self.activation,
+            if self.slot_version in {"slot9", "slot12"}:
+                self.slot_musical_onset_embedding = nn.Embedding(18, self.slot_dim)
+                self.slot_musical_duration_embedding = nn.Embedding(18, self.slot_dim)
+                self.slot_musical_length_embedding = nn.Embedding(10, self.slot_dim)
+                self.slot_musical_onset_scalar_projection = _make_mlp(
+                    1, self.slot_dim, self.slot_dim, self.embedding_depth, self.activation
                 )
-                self.slot_musical_duration_projection = _make_mlp(
-                    17,
-                    self.slot_dim,
-                    self.slot_dim,
-                    self.embedding_depth,
-                    self.activation,
+                self.slot_musical_duration_scalar_projection = _make_mlp(
+                    1, self.slot_dim, self.slot_dim, self.embedding_depth, self.activation
                 )
-                self.slot_musical_length_projection = _make_mlp(
-                    10,
-                    self.slot_dim,
-                    self.slot_dim,
-                    self.embedding_depth,
-                    self.activation,
+                self.slot_musical_length_scalar_projection = _make_mlp(
+                    2, self.slot_dim, self.slot_dim, self.embedding_depth, self.activation
                 )
                 self.slot_musical_binary_projection = _make_mlp(
                     6,
@@ -781,12 +801,16 @@ class IntegratedNoteEncoder(nn.Module):
                     self.embedding_depth,
                     self.activation,
                 )
+            self.slot_null_embeddings = nn.Parameter(torch.zeros(self.slot_num, self.slot_dim))
             self.slot_mask_embeddings = nn.Parameter(torch.zeros(self.slot_num, self.slot_dim))
+            self.slot_pad_embeddings = nn.Parameter(torch.zeros(self.slot_num, self.slot_dim))
+            nn.init.normal_(self.slot_null_embeddings, mean=0.0, std=0.02)
             nn.init.normal_(self.slot_mask_embeddings, mean=0.0, std=0.02)
+            nn.init.normal_(self.slot_pad_embeddings, mean=0.0, std=0.02)
             self.slot_fusion = _make_mlp(
                 self.slot_num * self.slot_dim,
                 config.hidden_size,
-                config.hidden_size,
+                max(config.hidden_size * 2, self.slot_dim * 12),
                 max(2, self.embedding_depth),
                 self.activation,
             )
@@ -866,12 +890,29 @@ class IntegratedNoteEncoder(nn.Module):
         value = self.slot_mask_embeddings[slot_index].to(dtype=reference.dtype, device=reference.device)
         return value.view(*([1] * (reference.ndim - 1)), self.slot_dim)
 
+    def _slot_null_embedding(self, slot_index, reference):
+        value = self.slot_null_embeddings[slot_index].to(dtype=reference.dtype, device=reference.device)
+        return value.view(*([1] * (reference.ndim - 1)), self.slot_dim)
+
+    def _slot_pad_embedding(self, slot_index, reference):
+        value = self.slot_pad_embeddings[slot_index].to(dtype=reference.dtype, device=reference.device)
+        return value.view(*([1] * (reference.ndim - 1)), self.slot_dim)
+
     def _slot_encode(self, projection, features, mask, slot_index):
         encoded = projection(features)
         if mask is None:
             return encoded
         mask = mask.to(dtype=encoded.dtype, device=encoded.device)
         return encoded * mask + self._slot_missing_embedding(slot_index, encoded) * (1.0 - mask)
+
+    def _slot_encode_with_missing(self, projection, features, mask, slot_index, missing_mask=None):
+        encoded = self._slot_encode(projection, features, mask, slot_index)
+        if missing_mask is None:
+            return encoded
+        missing = missing_mask.to(dtype=encoded.dtype, device=encoded.device).clamp(0.0, 1.0)
+        if missing.shape[-1] != 1:
+            missing = missing.amax(dim=-1, keepdim=True)
+        return encoded * (1.0 - missing) + self._slot_pad_embedding(slot_index, encoded) * missing
 
     def _slot_apply_gate(self, slot_index, embedding):
         if self.slot_gate_logits is None:
@@ -903,6 +944,34 @@ class IntegratedNoteEncoder(nn.Module):
         musical_binary = musical[..., 45:51]
         return musical_onset, musical_duration, musical_length, musical_binary
 
+    def _categorical_slot_embedding(self, table, one_hot, scalar_features, scalar_projection, slot_index, mask):
+        category = one_hot.float().argmax(dim=-1).clamp(0, table.num_embeddings - 3)
+        no_value_id = table.num_embeddings - 2
+        pad_id = table.num_embeddings - 1
+        if mask is None:
+            ids = category
+            active = torch.ones_like(category, dtype=torch.bool)
+        else:
+            active = mask.squeeze(-1).to(device=category.device) > 0.5
+            ids = torch.where(active, category, category.new_full(category.shape, pad_id))
+        emb = table(ids).to(dtype=scalar_features.dtype)
+        if scalar_projection is not None and scalar_features.shape[-1] > 0:
+            emb = emb + scalar_projection(scalar_features) * active.unsqueeze(-1).to(dtype=emb.dtype)
+        return emb
+
+    def _musical_length_slot_embedding(self, one_hot, scalar, present, slot_index, mask):
+        category = one_hot.float().argmax(dim=-1).clamp(0, self.slot_musical_length_embedding.num_embeddings - 3)
+        no_value_id = self.slot_musical_length_embedding.num_embeddings - 2
+        pad_id = self.slot_musical_length_embedding.num_embeddings - 1
+        active = mask.squeeze(-1).to(device=category.device) > 0.5 if mask is not None else torch.ones_like(category, dtype=torch.bool)
+        has_length = present.squeeze(-1).to(device=category.device) > 0.5
+        ids = torch.where(has_length, category, category.new_full(category.shape, no_value_id))
+        ids = torch.where(active, ids, category.new_full(category.shape, pad_id))
+        residual_mask = (active & has_length).unsqueeze(-1).to(dtype=scalar.dtype)
+        return self.slot_musical_length_embedding(ids).to(dtype=scalar.dtype) + self.slot_musical_length_scalar_projection(
+            torch.cat([scalar, present], dim=-1)
+        ) * residual_mask
+
     def _forward_slot_attribute(
         self,
         pitch_embeds,
@@ -910,6 +979,7 @@ class IntegratedNoteEncoder(nn.Module):
         performance_control,
         musical,
         masks,
+        performance_missing_mask=None,
     ):
         m_score = masks[..., 0:1] if self.mask_dim >= 1 else None
         m_perf = masks[..., 1:2] if self.mask_dim >= 2 else None
@@ -917,18 +987,66 @@ class IntegratedNoteEncoder(nn.Module):
 
         score_ioi, score_duration, score_velocity = self._split_slot_score(score_control)
         perf_ioi, perf_duration, perf_velocity, perf_pedal = self._split_slot_performance(performance_control)
+        missing_score = None
+        missing_perf = None
+        if performance_missing_mask is not None:
+            missing_perf = self._split_slot_performance(performance_missing_mask)
 
-        slot_embeddings = [
-            self._slot_apply_gate(0, pitch_embeds),
-            self._slot_apply_gate(1, self._slot_encode(self.slot_score_ioi_projection, score_ioi, m_score, 1)),
-            self._slot_apply_gate(2, self._slot_encode(self.slot_score_duration_projection, score_duration, m_score, 2)),
-            self._slot_apply_gate(3, self._slot_encode(self.slot_score_velocity_projection, score_velocity, m_score, 3)),
-            self._slot_apply_gate(4, self._slot_encode(self.slot_perf_ioi_projection, perf_ioi, m_perf, 4)),
-            self._slot_apply_gate(5, self._slot_encode(self.slot_perf_duration_projection, perf_duration, m_perf, 5)),
-            self._slot_apply_gate(6, self._slot_encode(self.slot_perf_velocity_projection, perf_velocity, m_perf, 6)),
-            self._slot_apply_gate(7, self._slot_encode(self.slot_perf_pedal_projection, perf_pedal, m_perf, 7)),
-        ]
-        if self.slot_version == "slot12":
+        if self.slot_is_pt:
+            value_mask = m_score if self.role != "decoder" else m_perf
+            ioi_projection = self.slot_score_ioi_projection if self.role != "decoder" else self.slot_perf_ioi_projection
+            duration_projection = (
+                self.slot_score_duration_projection if self.role != "decoder" else self.slot_perf_duration_projection
+            )
+            velocity_projection = (
+                self.slot_score_velocity_projection if self.role != "decoder" else self.slot_perf_velocity_projection
+            )
+            ioi_features = score_ioi if self.role != "decoder" else perf_ioi
+            duration_features = score_duration if self.role != "decoder" else perf_duration
+            velocity_features = score_velocity if self.role != "decoder" else perf_velocity
+            pedal_mask = m_perf if self.role == "decoder" else None
+            pedal_embedding = (
+                self._slot_encode_with_missing(
+                    self.slot_perf_pedal_projection,
+                    perf_pedal,
+                    pedal_mask,
+                    4,
+                    missing_perf[3] if self.role == "decoder" and missing_perf is not None else None,
+                )
+                if self.role == "decoder"
+                else self._slot_null_embedding(4, pitch_embeds).expand_as(pitch_embeds)
+            )
+            slot_embeddings = [
+                self._slot_apply_gate(0, pitch_embeds),
+                self._slot_apply_gate(1, self._slot_encode_with_missing(ioi_projection, ioi_features, value_mask, 1, missing_perf[0] if self.role == "decoder" and missing_perf is not None else None)),
+                self._slot_apply_gate(2, self._slot_encode_with_missing(duration_projection, duration_features, value_mask, 2, missing_perf[1] if self.role == "decoder" and missing_perf is not None else None)),
+                self._slot_apply_gate(3, self._slot_encode_with_missing(velocity_projection, velocity_features, value_mask, 3, missing_perf[2] if self.role == "decoder" and missing_perf is not None else None)),
+                self._slot_apply_gate(4, pedal_embedding),
+            ]
+        else:
+            if self.role != "decoder":
+                perf_slots = [
+                    self._slot_null_embedding(slot_index, pitch_embeds).expand_as(pitch_embeds)
+                    for slot_index in range(4, 8)
+                ]
+            else:
+                perf_slots = [
+                    self._slot_encode_with_missing(self.slot_perf_ioi_projection, perf_ioi, m_perf, 4, missing_perf[0] if missing_perf is not None else None),
+                    self._slot_encode_with_missing(self.slot_perf_duration_projection, perf_duration, m_perf, 5, missing_perf[1] if missing_perf is not None else None),
+                    self._slot_encode_with_missing(self.slot_perf_velocity_projection, perf_velocity, m_perf, 6, missing_perf[2] if missing_perf is not None else None),
+                    self._slot_encode_with_missing(self.slot_perf_pedal_projection, perf_pedal, m_perf, 7, missing_perf[3] if missing_perf is not None else None),
+                ]
+            slot_embeddings = [
+                self._slot_apply_gate(0, pitch_embeds),
+                self._slot_apply_gate(1, self._slot_encode(self.slot_score_ioi_projection, score_ioi, m_score, 1)),
+                self._slot_apply_gate(2, self._slot_encode(self.slot_score_duration_projection, score_duration, m_score, 2)),
+                self._slot_apply_gate(3, self._slot_encode(self.slot_score_velocity_projection, score_velocity, m_score, 3)),
+                self._slot_apply_gate(4, perf_slots[0]),
+                self._slot_apply_gate(5, perf_slots[1]),
+                self._slot_apply_gate(6, perf_slots[2]),
+                self._slot_apply_gate(7, perf_slots[3]),
+            ]
+        if self.slot_version in {"slot9", "slot12"}:
             if self.musical_dim <= 0:
                 batch_shape = score_control.shape[:-1]
                 musical_onset = score_control.new_zeros(*batch_shape, 17)
@@ -937,23 +1055,49 @@ class IntegratedNoteEncoder(nn.Module):
                 musical_binary = score_control.new_zeros(*batch_shape, 6)
             else:
                 musical_onset, musical_duration, musical_length, musical_binary = self._split_slot_musical51(musical)
+            musical_base = len(slot_embeddings)
             slot_embeddings.extend(
                 [
                     self._slot_apply_gate(
-                        8,
-                        self._slot_encode(self.slot_musical_onset_projection, musical_onset, m_musical, 8),
+                        musical_base,
+                        self._categorical_slot_embedding(
+                            self.slot_musical_onset_embedding,
+                            musical_onset[..., :16],
+                            musical_onset[..., 16:17],
+                            self.slot_musical_onset_scalar_projection,
+                            musical_base,
+                            m_musical,
+                        ),
                     ),
                     self._slot_apply_gate(
-                        9,
-                        self._slot_encode(self.slot_musical_duration_projection, musical_duration, m_musical, 9),
+                        musical_base + 1,
+                        self._categorical_slot_embedding(
+                            self.slot_musical_duration_embedding,
+                            musical_duration[..., :16],
+                            musical_duration[..., 16:17],
+                            self.slot_musical_duration_scalar_projection,
+                            musical_base + 1,
+                            m_musical,
+                        ),
                     ),
                     self._slot_apply_gate(
-                        10,
-                        self._slot_encode(self.slot_musical_length_projection, musical_length, m_musical, 10),
+                        musical_base + 2,
+                        self._musical_length_slot_embedding(
+                            musical_length[..., :8],
+                            musical_length[..., 8:9],
+                            musical_length[..., 9:10],
+                            musical_base + 2,
+                            m_musical,
+                        ),
                     ),
                     self._slot_apply_gate(
-                        11,
-                        self._slot_encode(self.slot_musical_binary_projection, musical_binary, m_musical, 11),
+                        musical_base + 3,
+                        self._slot_encode(
+                            self.slot_musical_binary_projection,
+                            musical_binary,
+                            m_musical,
+                            musical_base + 3,
+                        ),
                     ),
                 ]
             )
@@ -967,7 +1111,12 @@ class IntegratedNoteEncoder(nn.Module):
             projection_dtype = continuous.dtype
         continuous = continuous.to(dtype=projection_dtype)
         pitch_factors = self._pitch_factors(pitch_ids, pitch_multihot=pitch_multihot).to(dtype=projection_dtype)
-        pitch_embeds = self.pitch_projection(pitch_factors)
+        if self.slot_pitch_embedding is not None:
+            pitch_embeds = self.slot_pitch_embedding(
+                pitch_ids.long().clamp(0, self.slot_pitch_embedding.num_embeddings - 1)
+            ).to(dtype=projection_dtype)
+        else:
+            pitch_embeds = self.pitch_projection(pitch_factors)
 
         if self.role == "decoder" and self.schema == "perf_target":
             target_features, masks = self._split_perf_target(continuous)
@@ -1010,6 +1159,7 @@ class IntegratedNoteEncoder(nn.Module):
                 performance_control,
                 musical,
                 masks,
+                performance_missing_mask=performance_missing_mask,
             )
         else:
             m_score_control = masks[..., 0:1]
@@ -1038,7 +1188,7 @@ class IntegratedNoteEncoder(nn.Module):
                 + musical_embeds
                 + mask_embeds
             )
-        if performance_missing_mask is not None:
+        if performance_missing_mask is not None and self.mode != "slot_attribute":
             missing_embeds = torch.matmul(
                 performance_missing_mask,
                 self.performance_missing_embeddings.to(dtype=projection_dtype),
@@ -1446,7 +1596,7 @@ class IntegratedContinuousDecoder(nn.Module):
         return torch.cat(parts, dim=-1)
 
     def forward(self, hidden_states):
-        if _uses_inr_epr_targets(self.config):
+        if _uses_epr_targets(self.config):
             shared = self._shared_outputs(hidden_states)
             pedal = self.pedal_head(hidden_states[..., self.perf_slice])
             if self.epr_distribution in {
@@ -1881,7 +2031,7 @@ def _uses_raw_deviation_targets(config):
 
 
 def _timing_distribution_count(config):
-    return 2 if _uses_raw_log_deviation_targets(config) else 1
+    return 2 if bool(_config_value(config, "legacy_dual_timing_head", False)) else 1
 
 
 def _config_value(config, name, default):
@@ -1970,6 +2120,19 @@ def _target7_to_raw7(score_shared_raw, target_predictions, config=None):
     target_predictions = target_predictions.float()
     if target_predictions.shape[-1] < 7:
         raise ValueError(f"Expected target7 predictions, got shape {tuple(target_predictions.shape)}")
+    if config is not None and _uses_absolute_epr_targets(config):
+        log_scale = float(_config_value(config, "timing_log_scale", 50.0))
+        if _uses_raw_log_absolute_targets(config) and target_predictions.shape[-1] >= 9:
+            perf_ioi_ms = target_predictions[..., 2].clamp_min(0.0) * 1000.0
+            perf_duration_ms = target_predictions[..., 3].clamp_min(0.0) * 1000.0
+            velocity = target_predictions[..., 4].clamp(0.0, 1.0) * 127.0
+            pedal = target_predictions[..., 5:9].clamp(0.0, 1.0) * 127.0
+        else:
+            perf_ioi_ms = _torch_raw_log_timing_decode(target_predictions[..., 0], scale=log_scale)
+            perf_duration_ms = _torch_raw_log_timing_decode(target_predictions[..., 1], scale=log_scale)
+            velocity = target_predictions[..., 2].clamp(0.0, 1.0) * 127.0
+            pedal = target_predictions[..., 3:7].clamp(0.0, 1.0) * 127.0
+        return torch.cat([perf_ioi_ms.unsqueeze(-1), perf_duration_ms.unsqueeze(-1), velocity.unsqueeze(-1), pedal], dim=-1)
     if config is not None and not _uses_log_deviation_targets(config):
         if not _uses_raw_deviation_targets(config):
             raise ValueError("target7 -> raw7 reconstruction expects deviation timing targets")
@@ -2005,8 +2168,35 @@ def _target7_to_raw7(score_shared_raw, target_predictions, config=None):
     return torch.cat([perf_ioi_ms.unsqueeze(-1), perf_duration_ms.unsqueeze(-1), velocity.unsqueeze(-1), pedal], dim=-1)
 
 
+def _uses_absolute_epr_targets(config):
+    return (
+        _config_value(config, "task_type", "epr") == "epr"
+        and str(_config_value(config, "epr_timing_target", "absolute")).lower()
+        in {
+            "absolute",
+            "absolute_log",
+            "log_absolute",
+            "raw_log_absolute",
+            "absolute_raw_log",
+        }
+    )
+
+
+def _uses_raw_log_absolute_targets(config):
+    return str(_config_value(config, "epr_timing_target", "absolute")).lower() in {
+        "raw_log_absolute",
+        "absolute_raw_log",
+    }
+
+
+def _uses_epr_targets(config):
+    return _uses_inr_epr_targets(config) or _uses_absolute_epr_targets(config)
+
+
 def _decoder_rows_require_score_shared_raw(config):
-    return decoder_note_input_schema(config) == "integrated"
+    return decoder_note_input_schema(config) == "integrated" and not slot_version_is_pt(
+        getattr(config, "slot_version", None)
+    )
 
 
 def _build_epr_decoder_perf_target_rows(config, target_predictions):
@@ -2017,6 +2207,28 @@ def _build_epr_decoder_perf_target_rows(config, target_predictions):
 
 def _target_predictions_to_feedback7(config, target_predictions):
     target_predictions = target_predictions.float()
+    if _uses_absolute_epr_targets(config):
+        if _uses_raw_log_absolute_targets(config) and target_predictions.shape[-1] >= 9:
+            return torch.cat(
+                [
+                    target_predictions[..., 2:4].clamp_min(0.0) * 1000.0,
+                    target_predictions[..., 4:5].clamp(0.0, 1.0),
+                    target_predictions[..., 5:9].clamp(0.0, 1.0),
+                ],
+                dim=-1,
+            )
+        log_scale = float(_config_value(config, "timing_log_scale", 50.0))
+        perf_ioi_ms = _torch_raw_log_timing_decode(target_predictions[..., 0:1], scale=log_scale)
+        perf_duration_ms = _torch_raw_log_timing_decode(target_predictions[..., 1:2], scale=log_scale)
+        return torch.cat(
+            [
+                perf_ioi_ms,
+                perf_duration_ms,
+                target_predictions[..., 2:3].clamp(0.0, 1.0),
+                target_predictions[..., 3:7].clamp(0.0, 1.0),
+            ],
+            dim=-1,
+        )
     if _uses_raw_log_deviation_targets(config) and target_predictions.shape[-1] >= 9:
         return torch.cat(
             [
@@ -2099,7 +2311,20 @@ def _build_epr_decoder_rows(config, score_shared_raw, target_predictions, score_
         log_scale=log_scale,
     )
     score_velocity = (score_shared_raw[..., 2:3].float().clamp(0.0, 127.0) / 127.0)
-    if _uses_raw_deviation_targets(config):
+    if _uses_absolute_epr_targets(config):
+        perf_ioi = _torch_timing_control_code(
+            target7[..., 0],
+            timing_control_mode=timing_control_mode,
+            use_scale_bit=use_timing_scale_bit,
+            log_scale=log_scale,
+        )
+        duration = _torch_timing_control_code(
+            target7[..., 1],
+            timing_control_mode=timing_control_mode,
+            use_scale_bit=use_timing_scale_bit,
+            log_scale=log_scale,
+        )
+    elif _uses_raw_deviation_targets(config):
         perf_ioi_ms = (score_shared_raw[..., 0:1].float() + target7[..., 0:1].float() * 1000.0).clamp_min(0.0)
         duration_ms = (score_shared_raw[..., 1:2].float() + target7[..., 1:2].float() * 1000.0).clamp_min(0.0)
         perf_ioi = _torch_timing_control_code(
@@ -2149,10 +2374,32 @@ def _build_epr_decoder_rows(config, score_shared_raw, target_predictions, score_
         musical = target_predictions.new_zeros(*target_predictions.shape[:-1], getattr(config, "musical_feature_dim", 12))
     else:
         musical = musical_source.to(dtype=target_predictions.dtype, device=target_predictions.device)
+    score_visible = 0.0 if slot_version_is_pt(getattr(config, "slot_version", None)) else 1.0
     if int(getattr(config, "mask_feature_dim", 3)) == 2:
-        masks = target_predictions.new_tensor([0.0, 1.0]).expand(*target_predictions.shape[:-1], 2)
+        masks = target_predictions.new_tensor([score_visible, 1.0]).expand(*target_predictions.shape[:-1], 2)
     else:
-        masks = target_predictions.new_tensor([0.0, 1.0, 0.0]).expand(*target_predictions.shape[:-1], 3)
+        musical_visible = 0.0
+        if score_input_continuous is not None:
+            musical_dim = int(getattr(config, "musical_feature_dim", 12))
+            score_control_dim = int(getattr(config, "score_control_feature_dim", getattr(config, "control_feature_dim", 5)))
+            score_offset_dim = int(getattr(config, "score_offset_feature_dim", 0))
+            performance_control_dim = int(
+                getattr(config, "performance_control_feature_dim", getattr(config, "control_feature_dim", 5) + 4)
+            )
+            performance_offset_dim = int(getattr(config, "performance_offset_feature_dim", 0))
+            mask_start = score_control_dim + score_offset_dim + performance_control_dim + performance_offset_dim + musical_dim
+            if score_input_continuous.shape[-1] > mask_start + 2:
+                musical_visible = score_input_continuous[..., mask_start + 2 : mask_start + 3]
+        masks = torch.cat(
+            [
+                target_predictions.new_full((*target_predictions.shape[:-1], 1), score_visible),
+                target_predictions.new_ones(*target_predictions.shape[:-1], 1),
+                musical_visible
+                if torch.is_tensor(musical_visible)
+                else target_predictions.new_full((*target_predictions.shape[:-1], 1), float(musical_visible)),
+            ],
+            dim=-1,
+        )
     return torch.cat([score_control, score_offset, performance_control, performance_offset, musical, masks], dim=-1)
 
 
@@ -2904,8 +3151,8 @@ def _materialize_binary4_logits(logits, sampling_strategy="mean"):
 
 
 def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean", score_shared_raw=None):
-    if not _uses_inr_epr_targets(config):
-        raise ValueError("EPR materialization only supports INR log_deviation targets")
+    if not _uses_epr_targets(config):
+        raise ValueError("EPR materialization only supports configured EPR timing targets")
 
     strategy_name = str(sampling_strategy).lower()
     shared_strategy = "mean" if strategy_name in {"soft", "prob", "probs", "probability", "probabilities"} else sampling_strategy
@@ -2949,10 +3196,23 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean", s
         )
         if _uses_raw_deviation_targets(config):
             return torch.cat([timing, velocity.unsqueeze(-1), pedal, offset], dim=-1)
-        if _uses_raw_log_deviation_targets(config) and score_shared_raw is not None:
+        if _uses_raw_log_absolute_targets(config):
+            perf_ioi_ms = _torch_raw_log_timing_decode(timing[..., 0], scale=float(_config_value(config, "timing_log_scale", 50.0)))
+            perf_duration_ms = _torch_raw_log_timing_decode(timing[..., 1], scale=float(_config_value(config, "timing_log_scale", 50.0)))
+            raw_seconds = torch.stack([perf_ioi_ms / 1000.0, perf_duration_ms / 1000.0], dim=-1)
+            return torch.cat([timing, raw_seconds, velocity.unsqueeze(-1), pedal, offset], dim=-1)
+        if (
+            _uses_raw_log_deviation_targets(config)
+            and bool(_config_value(config, "legacy_dual_timing_head", False))
+            and score_shared_raw is not None
+        ):
             score_shared_raw = score_shared_raw.float()
             log_scale = float(_config_value(config, "timing_log_scale", 50.0))
-            score_ioi_log = _torch_raw_log_timing_code(score_shared_raw[..., 0], scale=log_scale, max_time_ms=5000.0)
+            score_ioi_log = _torch_raw_log_timing_code(
+                score_shared_raw[..., 0],
+                scale=log_scale,
+                max_time_ms=5000.0,
+            )
             score_duration_log = _torch_raw_log_timing_code(
                 score_shared_raw[..., 1],
                 scale=log_scale,
@@ -3096,13 +3356,54 @@ def _shift_pitch_multihot_right(pitch_multihot, attention_mask):
 
 
 def _apply_prior_note_dropout(config, decoder_input_continuous, special_note_ids, attention_mask):
+    property_missing_mask = None
+    property_dropout_prob = getattr(config, "prior_property_dropout_prob", None)
+    if property_dropout_prob is not None and decoder_input_continuous.shape[1] > 1:
+        dropout_prob = float(property_dropout_prob)
+        if dropout_prob > 0.0:
+            valid = attention_mask[:, 1:].bool()
+            score_control_dim = int(getattr(config, "score_control_feature_dim", getattr(config, "control_feature_dim", 3)))
+            performance_dim = int(
+                getattr(config, "performance_control_feature_dim", getattr(config, "control_feature_dim", 3) + 4)
+            )
+            if performance_dim > 0:
+                slot_count = 4
+                timing_dim = max(1, (score_control_dim - 1) // 2)
+                slot_slices = [
+                    slice(0, timing_dim),
+                    slice(timing_dim, timing_dim * 2),
+                    slice(timing_dim * 2, timing_dim * 2 + 1),
+                    slice(timing_dim * 2 + 1, min(timing_dim * 2 + 5, performance_dim)),
+                ]
+                slot_drop = torch.rand(
+                    decoder_input_continuous.shape[0],
+                    decoder_input_continuous.shape[1] - 1,
+                    slot_count,
+                    device=decoder_input_continuous.device,
+                ) < dropout_prob
+                slot_drop = slot_drop & valid.unsqueeze(-1)
+                property_missing_mask = decoder_input_continuous.new_zeros(
+                    decoder_input_continuous.shape[0],
+                    decoder_input_continuous.shape[1],
+                    performance_dim,
+                )
+                for slot_idx, column_slice in enumerate(slot_slices):
+                    if column_slice.start >= performance_dim:
+                        continue
+                    slot_mask = slot_drop[..., slot_idx].unsqueeze(-1)
+                    property_missing_mask[:, 1:, column_slice] = torch.where(
+                        slot_mask,
+                        torch.ones_like(property_missing_mask[:, 1:, column_slice]),
+                        property_missing_mask[:, 1:, column_slice],
+                    )
+
     keep_prob = float(getattr(config, "prior_token_keep_prob", 1.0))
     if keep_prob >= 1.0 or decoder_input_continuous.shape[1] <= 1:
-        return decoder_input_continuous, special_note_ids
+        return decoder_input_continuous, special_note_ids, property_missing_mask
 
     valid_mask = attention_mask[:, 1:].bool()
     if not valid_mask.any():
-        return decoder_input_continuous, special_note_ids
+        return decoder_input_continuous, special_note_ids, property_missing_mask
 
     keep_mask = torch.rand(
         decoder_input_continuous.shape[0],
@@ -3120,7 +3421,7 @@ def _apply_prior_note_dropout(config, decoder_input_continuous, special_note_ids
             masked_special_note_ids[:, 1:].new_full(masked_special_note_ids[:, 1:].shape, mask_id),
             masked_special_note_ids[:, 1:],
         )
-        return decoder_input_continuous, masked_special_note_ids
+        return decoder_input_continuous, masked_special_note_ids, property_missing_mask
     if dropout_mode in {"zero", "feature_zero"}:
         dropped = decoder_input_continuous.clone()
         keep_mask = keep_mask & valid_mask
@@ -3128,10 +3429,10 @@ def _apply_prior_note_dropout(config, decoder_input_continuous, special_note_ids
             dropped[:, 1:, 2:] = dropped[:, 1:, 2:] * keep_mask.unsqueeze(-1).to(dtype=dropped.dtype)
         else:
             dropped[:, 1:] = dropped[:, 1:] * keep_mask.unsqueeze(-1).to(dtype=dropped.dtype)
-        return dropped, special_note_ids
+        return dropped, special_note_ids, property_missing_mask
     if dropout_mode in {"attribute_zero", "attribute_noise", "attribute_uniform"}:
         dropped = decoder_input_continuous.clone()
-        if _uses_inr_epr_targets(config):
+        if _uses_epr_targets(config):
             attr_start = int(getattr(config, "score_control_feature_dim", getattr(config, "control_feature_dim", 3)))
             attr_dim = int(
                 getattr(
@@ -3151,7 +3452,7 @@ def _apply_prior_note_dropout(config, decoder_input_continuous, special_note_ids
             )
         attr_end = min(attr_start + attr_dim, dropped.shape[-1])
         if attr_start >= attr_end:
-            return dropped, special_note_ids
+            return dropped, special_note_ids, property_missing_mask
 
         attr_values = dropped[:, 1:, attr_start:attr_end]
         attr_dim = attr_values.shape[-1]
@@ -3188,9 +3489,9 @@ def _apply_prior_note_dropout(config, decoder_input_continuous, special_note_ids
             noise_std = noise_std[:attr_dim].clamp_min(0.0)
             replacement = (attr_values + torch.randn_like(attr_values) * noise_std.view(1, 1, -1)).clamp(0.0, 1.0)
         dropped[:, 1:, attr_start:attr_end] = torch.where(attr_drop_mask, replacement, attr_values)
-        return dropped, special_note_ids
+        return dropped, special_note_ids, property_missing_mask
     if dropout_mode in {"none", "off"}:
-        return decoder_input_continuous, special_note_ids
+        return decoder_input_continuous, special_note_ids, property_missing_mask
     else:
         raise ValueError(f"Unsupported prior_token_dropout_mode: {dropout_mode}")
 
@@ -3230,7 +3531,7 @@ def _build_prefilled_ar_note_inputs(
     score_input_continuous=None,
 ):
     batch_size, seq_len = attention_mask.shape
-    if _uses_inr_epr_targets(config) or getattr(config, "task_type", "epr") == "csr":
+    if _uses_epr_targets(config) or getattr(config, "task_type", "epr") == "csr":
         decoder_dim = int(getattr(config, "decoder_input_continuous_dim", getattr(config, "input_continuous_dim")))
     else:
         decoder_dim = output_dim + 2
@@ -3243,7 +3544,7 @@ def _build_prefilled_ar_note_inputs(
     if prefix_predictions is not None:
         prefix_len = int(prefix_predictions.shape[1])
         if prefix_len > 0:
-            if _uses_inr_epr_targets(config):
+            if _uses_epr_targets(config):
                 if _decoder_rows_require_score_shared_raw(config) and score_shared_raw is None:
                     raise ValueError("score_shared_raw is required for INR log_deviation AR prefix inputs")
                 decoder_input_continuous[:, 1 : prefix_len + 1] = _build_epr_decoder_rows(
@@ -3302,7 +3603,7 @@ def _build_ar_note_continuous(
     score_input_continuous=None,
     task_type="epr",
 ):
-    if _uses_inr_epr_targets(config):
+    if _uses_epr_targets(config):
         if _decoder_rows_require_score_shared_raw(config) and score_shared_raw is None:
             raise ValueError("score_shared_raw is required for INR log_deviation AR note construction")
         if score_shared_raw is None:
@@ -3564,20 +3865,25 @@ def _compute_integrated_loss_components(
     score_shared_raw=None,
     offset_loss_mask=None,
 ):
-    del labels_epr_bins, score_shared_raw
+    del labels_epr_bins
     if getattr(config, "task_type", "epr") == "csr":
         return _compute_csr_loss_components(config, continuous_pred, labels_continuous, attention_mask)
-    if not _uses_inr_epr_targets(config):
+    if not _uses_epr_targets(config):
         raise ValueError("EPR loss only supports INR log_deviation targets")
 
     mask = attention_mask.bool()
     offset_mask = mask if offset_loss_mask is None else (mask & offset_loss_mask.to(device=mask.device).bool())
     distribution = getattr(config, "epr_distribution", "point").lower()
+    detail_components = {}
     if distribution in SN_DISTRIBUTIONS:
         params = _split_epr_mixture_params(config, continuous_pred)
         sigma_min = getattr(config, "skew_normal_sigma_min", getattr(config, "logistic_normal_sigma_min", 1e-4))
         sigma_max = getattr(config, "skew_normal_sigma_max", getattr(config, "logistic_normal_sigma_max", 1e4))
-        raw_lambda = float(getattr(config, "raw_timing_loss_lambda", 0.5))
+        raw_lambda = (
+            float(getattr(config, "raw_timing_loss_lambda", 0.25))
+            if _uses_raw_log_deviation_targets(config)
+            else 0.0
+        )
         timing_params_prefix = "timing_raw" if _uses_raw_deviation_targets(config) else "timing_log"
         loss_ioi_log = _skew_normal_nll(
             params[f"{timing_params_prefix}_loc"][..., 0],
@@ -3597,35 +3903,93 @@ def _compute_integrated_loss_components(
             sigma_min,
             sigma_max,
         )
-        has_raw_log_layout = _uses_raw_log_deviation_targets(config) and labels_continuous.shape[-1] >= 9
-        raw_offset = 2 if has_raw_log_layout else None
-        if raw_offset is not None:
-            loss_ioi_raw = _skew_normal_nll(
-                params["timing_raw_loc"][..., 0],
-                params["timing_raw_log_scale"][..., 0],
-                params["timing_raw_alpha"][..., 0],
-                labels_continuous[..., 2],
-                mask,
-                sigma_min,
-                sigma_max,
+        has_raw_log_layout = (
+            (_uses_raw_log_deviation_targets(config) or _uses_raw_log_absolute_targets(config))
+            and labels_continuous.shape[-1] >= 9
+        )
+        if _uses_raw_log_deviation_targets(config):
+            if score_shared_raw is None:
+                raise ValueError("raw-log deviation auxiliary loss requires score_shared_raw")
+            timing_center = _skew_normal_mean_or_sample(
+                params["timing_log_loc"],
+                params["timing_log_log_scale"],
+                params["timing_log_alpha"],
+                sampling_strategy="mean",
+                sigma_min=sigma_min,
+                sigma_max=sigma_max,
             )
-            loss_duration_raw = _skew_normal_nll(
-                params["timing_raw_loc"][..., 1],
-                params["timing_raw_log_scale"][..., 1],
-                params["timing_raw_alpha"][..., 1],
-                labels_continuous[..., 3],
+            score_shared_raw = score_shared_raw.float()
+            log_scale = float(_config_value(config, "timing_log_scale", 50.0))
+            score_ioi_log = _torch_raw_log_timing_code(
+                score_shared_raw[..., 0],
+                scale=log_scale,
+                max_time_ms=5000.0,
+            )
+            score_duration_log = _torch_raw_log_timing_code(
+                score_shared_raw[..., 1],
+                scale=log_scale,
+                max_time_ms=5000.0,
+            )
+            pred_ioi_ms = _torch_raw_log_timing_decode(
+                score_ioi_log + timing_center[..., 0],
+                scale=log_scale,
+            )
+            pred_duration_ms = _torch_raw_log_timing_decode(
+                score_duration_log + timing_center[..., 1],
+                scale=log_scale,
+            )
+            pred_ioi_raw_dev = (pred_ioi_ms - score_shared_raw[..., 0]) / 1000.0
+            pred_duration_raw_dev = (pred_duration_ms - score_shared_raw[..., 1]) / 1000.0
+            if has_raw_log_layout:
+                target_ioi_raw_dev = labels_continuous[..., 2]
+                target_duration_raw_dev = labels_continuous[..., 3]
+            else:
+                target_ioi_ms = _torch_raw_log_timing_decode(
+                    score_ioi_log + labels_continuous[..., 0],
+                    scale=log_scale,
+                )
+                target_duration_ms = _torch_raw_log_timing_decode(
+                    score_duration_log + labels_continuous[..., 1],
+                    scale=log_scale,
+                )
+                target_ioi_raw_dev = (target_ioi_ms - score_shared_raw[..., 0]) / 1000.0
+                target_duration_raw_dev = (target_duration_ms - score_shared_raw[..., 1]) / 1000.0
+            loss_ioi_raw = _regression_loss(
+                pred_ioi_raw_dev,
+                target_ioi_raw_dev,
                 mask,
-                sigma_min,
-                sigma_max,
+                "huber",
+                config.huber_delta,
+            )
+            loss_duration_raw = _regression_loss(
+                pred_duration_raw_dev,
+                target_duration_raw_dev,
+                mask,
+                "huber",
+                config.huber_delta,
             )
         else:
             loss_ioi_raw = loss_ioi_log.new_zeros(())
             loss_duration_raw = loss_duration_log.new_zeros(())
-            raw_lambda = 0.0
         velocity_col = 4 if has_raw_log_layout else 2
         pedal_start = 5 if has_raw_log_layout else 3
         loss_ioi = loss_ioi_log + raw_lambda * loss_ioi_raw
         loss_duration = loss_duration_log + raw_lambda * loss_duration_raw
+        detail_components.update(
+            {
+                "ioi_log_nll": loss_ioi_log,
+                "duration_log_nll": loss_duration_log,
+            }
+        )
+        if raw_lambda > 0.0:
+            detail_components.update(
+                {
+                    "ioi_raw_aux_huber": loss_ioi_raw,
+                    "duration_raw_aux_huber": loss_duration_raw,
+                    "ioi_raw_aux_weighted": raw_lambda * loss_ioi_raw,
+                    "duration_raw_aux_weighted": raw_lambda * loss_duration_raw,
+                }
+            )
         loss_velocity = _skew_normal_nll(
             params["velocity_loc"],
             params["velocity_log_scale"],
@@ -3640,6 +4004,8 @@ def _compute_integrated_loss_components(
             labels_continuous[..., pedal_start : pedal_start + 4],
             mask.unsqueeze(-1).expand_as(labels_continuous[..., pedal_start : pedal_start + 4]),
         )
+        pedal_logits_for_detail = params["pedal_binary_logits"]
+        pedal_target_for_detail = labels_continuous[..., pedal_start : pedal_start + 4]
         offset_start = pedal_start + 4
         offset_dim = params["offset_loc"].shape[-1]
         loss_offset = (
@@ -3688,6 +4054,8 @@ def _compute_integrated_loss_components(
             labels_continuous[..., 3:7],
             mask.unsqueeze(-1).expand_as(labels_continuous[..., 3:7]),
         )
+        pedal_logits_for_detail = params["pedal_binary_logits"]
+        pedal_target_for_detail = labels_continuous[..., 3:7]
         loss_offset = loss_pedal.new_zeros(())
     elif distribution == "beta_mu_kappa":
         params = _split_epr_distribution_params(continuous_pred)
@@ -3724,6 +4092,8 @@ def _compute_integrated_loss_components(
             labels_continuous[..., 3:7],
             mask.unsqueeze(-1).expand_as(labels_continuous[..., 3:7]),
         )
+        pedal_logits_for_detail = continuous_pred[..., pedal_pred_start : pedal_pred_start + 4]
+        pedal_target_for_detail = labels_continuous[..., 3:7]
         loss_offset = (
             _regression_loss(
                 continuous_pred[..., -offset_dim:],
@@ -3737,7 +4107,10 @@ def _compute_integrated_loss_components(
         )
     else:
         pred = continuous_pred
-        has_raw_log = _uses_raw_log_deviation_targets(config) and labels_continuous.shape[-1] >= 9
+        has_raw_log = (
+            (_uses_raw_log_deviation_targets(config) or _uses_raw_log_absolute_targets(config))
+            and labels_continuous.shape[-1] >= 9
+        )
         velocity_col = 4 if has_raw_log else 2
         pedal_start = 5 if has_raw_log else 3
         offset_dim = int(getattr(config, "chord_offset_dim", 0)) if bool(getattr(config, "chord_mode", False)) else 0
@@ -3768,6 +4141,8 @@ def _compute_integrated_loss_components(
             labels_continuous[..., pedal_start : pedal_start + 4],
             mask.unsqueeze(-1).expand_as(labels_continuous[..., pedal_start : pedal_start + 4]),
         )
+        pedal_logits_for_detail = pred[..., pedal_pred_start : pedal_pred_start + 4]
+        pedal_target_for_detail = labels_continuous[..., pedal_start : pedal_start + 4]
         offset_start = pedal_start + 4
         loss_offset = (
             _regression_loss(
@@ -3780,13 +4155,23 @@ def _compute_integrated_loss_components(
             if offset_dim > 0 and labels_continuous.shape[-1] >= offset_start + offset_dim
             else loss_pedal.new_zeros(())
         )
-    return {
+    pedal_names = ("pedal_0", "pedal_25", "pedal_50", "pedal_75")
+    for index, name in enumerate(pedal_names):
+        detail_components[name] = _bce_loss(
+            pedal_logits_for_detail[..., index],
+            pedal_target_for_detail[..., index],
+            mask,
+        )
+    components = {
         "ioi": loss_ioi,
         "duration": loss_duration,
         "velocity": loss_velocity,
         "pedal": loss_pedal,
-        "offset": loss_offset,
+        **detail_components,
     }
+    if loss_offset.numel() > 0 and int(getattr(config, "chord_offset_dim", 0)) > 0:
+        components["offset"] = loss_offset
+    return components
 
 
 def _bce_loss(logits, target, mask):
@@ -3927,13 +4312,15 @@ def _compute_integrated_loss(
         return total
 
     weights = config.loss_weights
-    return (
+    total = (
         weights.get("ioi", 1.0) * components["ioi"]
         + weights.get("duration", 1.0) * components["duration"]
         + weights.get("velocity", 1.0) * components["velocity"]
         + weights.get("pedal", 1.0) * components["pedal"]
-        + weights.get("offset", 1.0) * components.get("offset", components["pedal"].new_zeros(()))
     )
+    if "offset" in components:
+        total = total + weights.get("offset", 1.0) * components["offset"]
+    return total
 
 
 def _compute_stable_contract_loss(
@@ -4155,6 +4542,8 @@ class IntegratedPianoTransformer(IntegratedStyleTokenMixin, nn.Module):
             continuous_dim=getattr(config, "decoder_input_continuous_dim", config.input_continuous_dim),
             role="decoder",
         )
+        if str(getattr(config, "note_embedding_mode", "")).lower() == "slot_attribute":
+            self._decoder_note_encoder.slot_fusion = self.note_encoder.slot_fusion
         self.style_token_encoder = IntegratedStyleTokenEncoder(config) if config.use_style_tokens else None
         self.continuous_decoder = IntegratedContinuousDecoder(config)
         backbone_type = config.backbone_type.lower()
@@ -4197,7 +4586,7 @@ class IntegratedPianoTransformer(IntegratedStyleTokenMixin, nn.Module):
         del interpolated, example_index, kwargs
         if pitch_ids is None or continuous is None:
             raise ValueError("pitch_ids and continuous are required")
-        if _uses_inr_epr_targets(self.config) and score_shared_raw is None:
+        if _uses_epr_targets(self.config) and score_shared_raw is None:
             raise ValueError("score_shared_raw is required for deviation EPR")
         if attention_mask is None:
             attention_mask = (pitch_ids != self.config.pitch_pad_id).long()
@@ -4249,12 +4638,18 @@ class IntegratedPianoTransformer(IntegratedStyleTokenMixin, nn.Module):
                 )
                 special_note_ids = _build_ar_special_note_ids(self.config, attention_mask)
                 if self.training:
-                    decoder_input_continuous, special_note_ids = _apply_prior_note_dropout(
+                    decoder_input_continuous, special_note_ids, property_missing_mask = _apply_prior_note_dropout(
                         self.config,
                         decoder_input_continuous,
                         special_note_ids,
                         attention_mask,
                     )
+                    if property_missing_mask is not None:
+                        decoder_missing_mask = (
+                            property_missing_mask
+                            if decoder_missing_mask is None
+                            else torch.maximum(decoder_missing_mask, property_missing_mask)
+                        )
                 decoder_pitch_ids = _shift_pitch_right(self.config, pitch_ids, attention_mask)
                 performance_embeds = self.decoder_note_encoder(
                     decoder_pitch_ids,
@@ -4463,7 +4858,7 @@ class IntegratedPianoTransformer(IntegratedStyleTokenMixin, nn.Module):
                 )
             predictions.append(step_pred)
             if step + 1 < seq_len:
-                if _uses_inr_epr_targets(self.config):
+                if _uses_epr_targets(self.config):
                     decoder_input_continuous[:, step + 1] = _build_epr_decoder_rows(
                         self.config,
                         score_shared_raw[:, step : step + 1],
@@ -4477,7 +4872,7 @@ class IntegratedPianoTransformer(IntegratedStyleTokenMixin, nn.Module):
                         self.config,
                         step_pred,
                     )[:, 0]
-                if not _uses_inr_epr_targets(self.config) and self.config.task_type != "csr":
+                if not _uses_epr_targets(self.config) and self.config.task_type != "csr":
                     decoder_input_continuous[:, step + 1, 2:] = step_pred[:, 0, :]
 
         output = torch.cat(predictions, dim=1) if predictions else continuous.new_zeros((batch_size, 0, self.config.output_continuous_dim))
@@ -4505,6 +4900,8 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
             continuous_dim=getattr(config, "decoder_input_continuous_dim", config.input_continuous_dim),
             role="decoder",
         )
+        if str(getattr(config, "note_embedding_mode", "")).lower() == "slot_attribute":
+            self._decoder_note_encoder.slot_fusion = self.note_encoder.slot_fusion
         self.style_token_encoder = IntegratedStyleTokenEncoder(config) if config.use_style_tokens else None
         self.model = IntegratedPianoT5GemmaModel(config)
         self.continuous_decoder = IntegratedContinuousDecoder(config)
@@ -4558,12 +4955,18 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
             )
             special_note_ids = _build_ar_special_note_ids(self.config, attention_mask)
             if self.training:
-                decoder_input_continuous, special_note_ids = _apply_prior_note_dropout(
+                decoder_input_continuous, special_note_ids, property_missing_mask = _apply_prior_note_dropout(
                     self.config,
                     decoder_input_continuous,
                     special_note_ids,
                     attention_mask,
-            )
+                )
+                if property_missing_mask is not None:
+                    decoder_missing_mask = (
+                        property_missing_mask
+                        if decoder_missing_mask is None
+                        else torch.maximum(decoder_missing_mask, property_missing_mask)
+                    )
             decoder_pitch_ids = _shift_pitch_right(self.config, pitch_ids, attention_mask)
             decoder_pitch_multihot = _shift_pitch_multihot_right(pitch_multihot, attention_mask)
             decoder_inputs_embeds = self.decoder_note_encoder(
@@ -4620,7 +5023,7 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
 
         if pitch_ids is None or continuous is None:
             raise ValueError("pitch_ids and continuous are required")
-        if _uses_inr_epr_targets(self.config) and score_shared_raw is None:
+        if _uses_epr_targets(self.config) and score_shared_raw is None:
             raise ValueError("score_shared_raw is required for INR log_deviation EPR")
 
         if attention_mask is None:
@@ -4999,7 +5402,7 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
             predictions.append(step_pred)
 
             if step + 1 < seq_len:
-                if _uses_inr_epr_targets(self.config):
+                if _uses_epr_targets(self.config):
                     decoder_input_continuous[:, step + 1] = _build_epr_decoder_rows(
                         self.config,
                         score_shared_raw[:, step : step + 1],
@@ -5013,7 +5416,7 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
                         self.config,
                         step_pred,
                     )[:, 0]
-                if not _uses_inr_epr_targets(self.config) and self.config.task_type != "csr":
+                if not _uses_epr_targets(self.config) and self.config.task_type != "csr":
                     decoder_input_continuous[:, step + 1, 2:] = step_pred[:, 0, :]
 
         output = torch.cat(predictions, dim=1) if predictions else continuous.new_zeros((batch_size, 0, self.config.output_continuous_dim))

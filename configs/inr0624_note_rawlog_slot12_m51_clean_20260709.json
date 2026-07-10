@@ -40,7 +40,7 @@
   "beta_kappa_min": 0.001,
   "note_embedding_mode": "slot_attribute",
   "slot_version": "slot12",
-  "slot_dim": 64,
+  "slot_dim": 128,
   "slot_fusion": "mlp",
   "slot_gates": false,
   "musical_gate_init": 1.0,

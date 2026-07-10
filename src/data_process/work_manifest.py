@@ -46,6 +46,13 @@ def make_windows(total_notes, block_notes, overlap_ratio, min_notes):
 
 
 def work_token_count(path, metadata_note_count, prepared_sidecar_tag=None):
+    try:
+        metadata_note_count = int(float(metadata_note_count))
+    except (TypeError, ValueError, OverflowError):
+        metadata_note_count = 0
+    if metadata_note_count > 0:
+        return metadata_note_count
+
     source = Path(path)
     sidecar_paths = []
     if prepared_sidecar_tag:

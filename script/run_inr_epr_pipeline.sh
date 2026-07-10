@@ -150,6 +150,17 @@ cfg["early_stopping_threshold"] = float(cfg.get("early_stopping_threshold", 0.00
 cfg.setdefault("eval_dataloader_persistent_workers", False)
 cfg.setdefault("eval_dataloader_num_workers", cfg.get("dataloader_num_workers", 0))
 cfg.setdefault("eval_dataloader_prefetch_factor", cfg.get("dataloader_prefetch_factor", 2))
+for key in (
+    "eval_every_steps",
+    "eval_every_epochs",
+    "save_every_steps",
+    "eval_steps",
+    "save_steps",
+    "evaluation_strategy",
+    "eval_strategy",
+    "save_strategy",
+):
+    cfg.pop(key, None)
 if resume_path:
     cfg["resume_path"] = resume_path
     cfg["resume_trainer_state"] = False
@@ -161,14 +172,10 @@ if asap_only == "1":
     cfg["eval_performance_dataset"] = "ASAP"
     cfg["eval_split"] = "valid"
     cfg["prepared_sidecar_tag"] = cfg.get("prepared_sidecar_tag") or "ASAP"
-    cfg["eval_every_epochs"] = 0.5
-    cfg.pop("eval_every_steps", None)
 else:
     cfg.pop("train_performance_dataset", None)
     cfg.pop("eval_performance_dataset", None)
     cfg.pop("prepared_sidecar_tag", None)
-    cfg["eval_every_steps"] = int(cfg.get("eval_every_steps", 1000))
-    cfg["save_every_steps"] = int(cfg.get("save_every_steps", 1000))
 Path(dst).parent.mkdir(parents=True, exist_ok=True)
 Path(dst).write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 PY
