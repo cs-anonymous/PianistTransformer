@@ -954,9 +954,17 @@ predicted absolute performance timing
 
 ---
 
-## 5.5 Raw-space auxiliary regression loss
+## 5.5 Raw-space regression loss
 
-raw deviation 不再使用独立的概率分布 head，而是从主 logscale prediction 确定性重建。
+INR8-Dev 保留 timing 的双表示，并使用两个独立输出分支：
+
+```text
+logscale deviation:
+  skew-normal distribution head
+
+raw deviation:
+  direct regression head
+```
 
 真实 raw deviation 为：
 
@@ -966,17 +974,10 @@ d^{raw,*}_t
 \frac{y_t-x_t}{1000}
 \]
 
-预测 raw deviation 为：
+预测 raw deviation \(\hat d^{raw}_t\) 直接来自 raw regression head，
+不由 logscale prediction 确定性重建。
 
-\[
-\hat d^{raw}_t
-=
-\frac{\hat y_t-x_t}{1000}
-\]
-
-其中时间单位由毫秒转换为秒。
-
-辅助损失使用：
+raw regression loss 使用：
 
 \[
 L_{raw}
@@ -1033,18 +1034,28 @@ logscale distribution NLL:
   model the compressed long-tail distribution
 
 raw-space SmoothL1:
-  constrain reconstructed absolute millisecond error
+  constrain raw timing deviation error
 ```
 
-由于 raw prediction 直接由 logscale prediction 重建，因此两者天然一致。
-
-第一版不需要额外 consistency loss。
+当前 INR8-Dev 不加入额外 consistency loss；两个 timing 表示由各自的
+监督目标共同训练。
 
 ---
 
-## 5.6 Which distribution estimate is used for raw auxiliary loss
+## 5.6 Raw regression estimate
 
-如果 timing head 输出一个概率分布，raw auxiliary loss 不应默认基于随机 sample 计算，否则会增加训练梯度方差。
+raw branch 是确定性的 point regression，因此训练和推理都直接使用该
+head 的输出，不从 skew-normal 分布随机采样。
+
+INR8-Dev 的 9 维 materialized prediction 为：
+
+```text
+[log_ioi_dev, log_duration_dev,
+ raw_ioi_dev, raw_duration_dev,
+ velocity, pedal_0, pedal_25, pedal_50, pedal_75]
+```
+
+如果 raw branch 改为概率分布，raw loss 不应默认基于随机 sample 计算，否则会增加训练梯度方差。
 
 推荐使用分布的确定性中心估计。
 
@@ -1086,7 +1097,7 @@ raw-space SmoothL1:
 \omega\delta\sqrt{\frac{2}{\pi}}
 \]
 
-推荐 raw auxiliary loss 基于 distribution mean 计算：
+这种可选设计中，推荐 raw loss 基于 distribution mean 计算：
 
 \[
 \hat d^{log}
@@ -1104,9 +1115,9 @@ sampling remains independent during inference
 
 ---
 
-## 5.7 Optional raw auxiliary head
+## 5.7 Optional consistency loss
 
-如果后续希望增加一个额外的非概率 raw auxiliary head：
+INR8-Dev 已使用独立的非概率 raw regression head：
 
 \[
 \hat d^{raw,aux}_t
@@ -1126,7 +1137,7 @@ d^{raw,*}_t
 \right)
 \]
 
-此时需要额外 consistency loss，使 raw auxiliary head 与 log branch reconstruction 一致：
+如果后续希望约束 raw head 与 log branch reconstruction 一致，可加入：
 
 \[
 L_{cons}
@@ -1156,16 +1167,7 @@ L_{log}
 \lambda_{cons}L_{cons}
 \]
 
-但该方案只作为后续可选实验。
-
-第一版推荐：
-
-```text
-one logscale distribution head
-+ deterministic raw-space reconstruction loss
-```
-
-而不是增加第二个 raw prediction head。
+该 consistency loss 只作为后续可选实验，当前 INR8-Dev 不启用。
 
 ---
 
@@ -2467,11 +2469,10 @@ autoregressive exposure bias
 - [ ] Implement factorized duration trunk.
 - [ ] Implement velocity trunk.
 - [ ] Implement pedal trunk.
-- [ ] Use logscale timing as the only primary timing distribution.
+- [ ] Use skew-normal heads for logscale timing deviation.
+- [ ] Use independent regression heads for raw timing deviation.
 - [ ] Reconstruct absolute timing from INR logscale deviation.
-- [ ] Compute raw-space SmoothL1 auxiliary loss.
-- [ ] Use deterministic distribution center for raw auxiliary loss.
-- [ ] Keep raw auxiliary head disabled by default.
+- [ ] Compute raw-space SmoothL1 loss with weight 0.25.
 - [ ] Implement optional consistency loss behind a config flag.
 
 ---
@@ -2554,11 +2555,11 @@ autoregressive exposure bias
   "fusion_output_dim": 768,
   "share_fusion_between_encoder_and_decoder": true,
   "share_score_perf_attribute_encoders": false,
-  "target_type": "logscale_deviation",
+  "target_type": "raw_log_deviation",
   "timing_log_scale_ms": 50,
-  "raw_timing_aux_loss": "smooth_l1",
-  "raw_timing_aux_lambda": 0.25,
-  "raw_auxiliary_head": false,
+  "raw_timing_head": "regression",
+  "raw_timing_loss": "smooth_l1",
+  "raw_timing_loss_lambda": 0.25,
   "consistency_loss": false,
   "velocity_target": "absolute_performance",
   "pedal_target": "absolute_performance",
@@ -2680,36 +2681,33 @@ autoregressive exposure bias
 
 8. INR uses separate score and performance slots.
 
-9. INR predicts logscale timing deviation as its only
-   primary timing distribution.
+9. INR8-Dev predicts logscale timing deviation with
+   skew-normal distribution heads.
 
-10. Reconstruct absolute performance timing from:
+10. INR8-Dev also predicts raw timing deviation with
+    independent regression heads.
+
+11. Reconstruct absolute performance timing from:
     current score timing + predicted logscale deviation.
 
-11. Derive raw deviation from the reconstructed timing.
+12. Use raw-space SmoothL1 with weight 0.25 for the raw heads.
 
-12. Use raw-space SmoothL1 as an auxiliary regression loss.
+13. Do not use a second raw timing distribution head.
 
-13. Do not use a second independent raw timing distribution
-    head in the first version.
-
-14. Add consistency loss only if an optional raw auxiliary
-    head is introduced later.
-
-15. Keep velocity and pedal as absolute performance targets
+14. Keep velocity and pedal as absolute performance targets
     in the first INR version.
 
-16. Distinguish structural NULL, feature MASK, BOS and PAD.
+15. Distinguish structural NULL, feature MASK, BOS and PAD.
 
-17. Add feedback source embeddings for performance slots.
+16. Add feedback source embeddings for performance slots.
 
-18. Add musical slots only after the no-musical PT/INR
+17. Add musical slots only after the no-musical PT/INR
     comparison is complete.
 
-19. Use bridge experiments to separate paired-history effects
+18. Use bridge experiments to separate paired-history effects
     from relative-target effects.
 
-20. Separate representation experiments from rollout-level
+19. Separate representation experiments from rollout-level
     stability training.
 ```
 

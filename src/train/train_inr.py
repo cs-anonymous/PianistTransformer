@@ -3238,6 +3238,7 @@ def create_model(train_config):
         skew_normal_sigma_max=train_config.get("skew_normal_sigma_max", train_config.get("logistic_normal_sigma_max", 1e4)),
         raw_timing_loss_lambda=train_config.get("raw_timing_loss_lambda", 0.5),
         legacy_dual_timing_head=train_config.get("legacy_dual_timing_head", False),
+        raw_timing_head_type=train_config.get("raw_timing_head_type"),
         beta_eps=train_config.get("beta_eps", 1e-5),
         beta_kappa_min=train_config.get("beta_kappa_min", 1e-3),
         beta_alpha_min=train_config.get("beta_alpha_min", 1e-4),

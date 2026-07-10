@@ -35,7 +35,8 @@ Date: 2026-07-10
   components.
 - Restored pure-note target layouts:
   - Legacy raw-log deviation: 9 dimensions.
-  - New raw-log deviation: 7 dimensions.
+- New INR raw-log deviation: 9 dimensions with log-deviation and raw-deviation
+  timing targets.
   - Raw-log absolute: 9 dimensions.
   - Other absolute/deviation layouts: 7 dimensions.
 - Legacy raw-log mode is inferred from an existing 9-dimensional output
@@ -65,6 +66,9 @@ No zero-filled 51-dimensional musical block is retained.
 Real ASAP prepared sidecars were used for forward smoke tests:
 
 - Legacy raw-log: input 16, label 9, raw decoder output 19, finite loss.
-- INR8-Dev: input 16, label 7, raw decoder output 13, finite loss.
+- INR8-Dev uses skew-normal distribution loss for log-deviation timing and
+  direct Huber regression loss for raw-deviation timing with weight 0.25.
+- INR8-Dev: input 16, label 9, raw decoder output 15, materialized output 9,
+  finite loss.
 - INR8-Dev property dropout produced performance-property missing masks and
   routed them to an 8 by 128 slot PAD embedding table.

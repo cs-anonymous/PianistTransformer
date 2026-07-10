@@ -220,6 +220,7 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         skew_normal_sigma_max=1e4,
         raw_timing_loss_lambda=0.5,
         legacy_dual_timing_head=False,
+        raw_timing_head_type=None,
         epr_inflated_features=None,
         epr_timing_bins=5000,
         epr_value_bins=128,
@@ -346,6 +347,15 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.skew_normal_sigma_max = skew_normal_sigma_max
         self.raw_timing_loss_lambda = raw_timing_loss_lambda
         self.legacy_dual_timing_head = bool(legacy_dual_timing_head)
+        self.raw_timing_head_type = str(
+            raw_timing_head_type
+            or ("distribution" if self.legacy_dual_timing_head else "none")
+        ).lower()
+        if self.raw_timing_head_type not in {"none", "distribution", "regression"}:
+            raise ValueError(
+                "raw_timing_head_type must be none, distribution, or regression; "
+                f"got {self.raw_timing_head_type}"
+            )
         self.epr_inflated_features = epr_inflated_features or {
             "ioi": "zero",
             "pedal": "zero_one",
@@ -1410,6 +1420,7 @@ class IntegratedContinuousDecoder(nn.Module):
             if self.epr_distribution in SN_DISTRIBUTIONS:
                 ioi_output_dim = duration_output_dim = (
                     per_feature_dim * _timing_distribution_count(config)
+                    + (1 if _uses_raw_timing_regression_head(config) else 0)
                 )
                 velocity_output_dim = per_feature_dim
             else:
@@ -1638,12 +1649,16 @@ def _split_epr_mixture_params(config, raw_outputs):
     if distribution in SN_DISTRIBUTIONS:
         feature_dim = 3
         timing_count = _timing_distribution_count(config)
-        timing_feature_dim = feature_dim * timing_count
-        ioi_base = raw_outputs[..., :timing_feature_dim].reshape(
+        timing_feature_dim = feature_dim * timing_count + (
+            1 if _uses_raw_timing_regression_head(config) else 0
+        )
+        ioi_raw = raw_outputs[..., :timing_feature_dim]
+        ioi_base = ioi_raw[..., : feature_dim * timing_count].reshape(
             *raw_outputs.shape[:-1], timing_count, feature_dim
         )
         cursor = timing_feature_dim
-        duration_base = raw_outputs[..., cursor : cursor + timing_feature_dim].reshape(
+        duration_raw = raw_outputs[..., cursor : cursor + timing_feature_dim]
+        duration_base = duration_raw[..., : feature_dim * timing_count].reshape(
             *raw_outputs.shape[:-1],
             timing_count,
             feature_dim,
@@ -1673,6 +1688,11 @@ def _split_epr_mixture_params(config, raw_outputs):
                         [ioi_base[..., 1, 2], duration_base[..., 1, 2]], dim=-1
                     ),
                 }
+            )
+        elif _uses_raw_timing_regression_head(config):
+            params["timing_raw_regression"] = torch.stack(
+                [ioi_raw[..., -1], duration_raw[..., -1]],
+                dim=-1,
             )
         return params
     if distribution in {*ACN_DISTRIBUTIONS, *IACN_DISTRIBUTIONS}:
@@ -1934,7 +1954,11 @@ def _uses_raw_deviation_targets(config):
 
 
 def _timing_distribution_count(config):
-    return 2 if bool(_config_value(config, "legacy_dual_timing_head", False)) else 1
+    return 2 if str(_config_value(config, "raw_timing_head_type", "none")).lower() == "distribution" else 1
+
+
+def _uses_raw_timing_regression_head(config):
+    return str(_config_value(config, "raw_timing_head_type", "none")).lower() == "regression"
 
 
 def _config_value(config, name, default):
@@ -3061,8 +3085,19 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean", s
         if (
             _uses_raw_log_deviation_targets(config)
             and bool(_config_value(config, "legacy_dual_timing_head", False))
-            and score_shared_raw is not None
         ):
+            if _uses_raw_timing_regression_head(config):
+                return torch.cat(
+                    [
+                        logdev,
+                        params["timing_raw_regression"],
+                        velocity.unsqueeze(-1),
+                        pedal,
+                    ],
+                    dim=-1,
+                )
+            if score_shared_raw is None:
+                return torch.cat([logdev, velocity.unsqueeze(-1), pedal], dim=-1)
             score_shared_raw = score_shared_raw.float()
             log_scale = float(_config_value(config, "timing_log_scale", 50.0))
             score_ioi_log = _torch_raw_log_timing_code(
@@ -3715,7 +3750,7 @@ def _compute_integrated_loss_components(
         raw_lambda = float(getattr(config, "raw_timing_loss_lambda", 0.25))
         legacy_dual_layout = (
             _uses_raw_log_deviation_targets(config)
-            and _timing_distribution_count(config) > 1
+            and bool(getattr(config, "legacy_dual_timing_head", False))
             and labels_continuous.shape[-1] >= 9
         )
         loss_ioi_log = _skew_normal_nll(
@@ -3736,7 +3771,30 @@ def _compute_integrated_loss_components(
             sigma_min,
             sigma_max,
         )
-        if legacy_dual_layout:
+        if legacy_dual_layout and _uses_raw_timing_regression_head(config):
+            loss_ioi_raw = _regression_loss(
+                params["timing_raw_regression"][..., 0],
+                labels_continuous[..., 2],
+                mask,
+                "huber",
+                config.huber_delta,
+            )
+            loss_duration_raw = _regression_loss(
+                params["timing_raw_regression"][..., 1],
+                labels_continuous[..., 3],
+                mask,
+                "huber",
+                config.huber_delta,
+            )
+            detail_components.update(
+                {
+                    "ioi_raw_huber": loss_ioi_raw,
+                    "duration_raw_huber": loss_duration_raw,
+                    "ioi_raw_weighted": raw_lambda * loss_ioi_raw,
+                    "duration_raw_weighted": raw_lambda * loss_duration_raw,
+                }
+            )
+        elif legacy_dual_layout:
             loss_ioi_raw = _skew_normal_nll(
                 params["timing_raw_loc"][..., 0],
                 params["timing_raw_log_scale"][..., 0],

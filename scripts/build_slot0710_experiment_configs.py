@@ -40,6 +40,9 @@ EXPERIMENTS = {
         "base": BASE_NOMUS,
         "slot_version": "slot8",
         "target": "raw_log_deviation",
+        "target_dim": 9,
+        "input_dim": 16,
+        "raw_timing_head_type": "regression",
         "musical_feature_mode": "none",
         "disable_musical_features": True,
         "run_name": "INR8-Dev",
@@ -76,7 +79,7 @@ def build_config(spec):
         "save_strategy",
     ):
         config.pop(key, None)
-    target_dim = 7
+    target_dim = int(spec.get("target_dim", 7))
     config.update(
         {
             "metadata_path": str(METADATA),
@@ -107,9 +110,14 @@ def build_config(spec):
             "overwrite_output_dir": True,
         }
     )
+    if spec.get("input_dim") is not None:
+        config["input_continuous_dim"] = int(spec["input_dim"])
     config.pop("raw_timing_loss_lambda", None)
+    config.pop("raw_timing_head_type", None)
     if spec["target"] == "raw_log_deviation":
         config["raw_timing_loss_lambda"] = 0.25
+    if spec.get("raw_timing_head_type"):
+        config["raw_timing_head_type"] = spec["raw_timing_head_type"]
     return config
 
 
