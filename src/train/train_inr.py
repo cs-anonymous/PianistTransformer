@@ -365,7 +365,7 @@ def integrated_epr_input_dim(
     score_control_dim = control_dim
     performance_control_dim = control_dim + int(pedal_control_dim)
     musical_dim = musical_feature_dim(musical_feature_mode)
-    mask_dim = 3
+    mask_dim = 2 if musical_dim == 0 else 3
     return score_control_dim + performance_control_dim + musical_dim + mask_dim
 
 
@@ -2737,6 +2737,8 @@ class NodeSFTDataCollator:
         stable_channels=None,
         stable_noise_modes=None,
         stable_seed=42,
+        stable_zero_ioi_nonnegative_feedback=False,
+        epr_timing_target="log_deviation",
     ):
         self.pitch_pad_id = pitch_pad_id
         self.task_type = task_type
@@ -2750,6 +2752,8 @@ class NodeSFTDataCollator:
         self.stable_columns = stable_target_columns(stable_channels)
         self.stable_noise_modes = normalize_stable_noise_modes(stable_noise_modes)
         self._stable_rng = random.Random(int(stable_seed))
+        self.stable_zero_ioi_nonnegative_feedback = bool(stable_zero_ioi_nonnegative_feedback)
+        self.epr_timing_target = str(epr_timing_target).lower()
 
     def _sample_dagger_mode(self):
         draw = self._dagger_rng.random()
@@ -2884,6 +2888,15 @@ class NodeSFTDataCollator:
                         noise = torch.randn_like(decoder_feedback_continuous[row_idx, :, col]) * sigma + mu
                         updated = decoder_feedback_continuous[row_idx, row_mask, col] + noise[row_mask]
                         if _uses_raw_log_deviation_target(self.epr_timing_target):
+                            if (
+                                col == 0
+                                and self.stable_zero_ioi_nonnegative_feedback
+                                and score_shared_raw is not None
+                            ):
+                                score_zero_mask = score_shared_raw[row_idx, row_mask, 0] <= 1e-8
+                                if score_zero_mask.any():
+                                    updated = updated.clone()
+                                    updated[score_zero_mask] = updated[score_zero_mask].clamp_min(0.0)
                             decoder_feedback_continuous[row_idx, row_mask, col] = updated
                         else:
                             decoder_feedback_continuous[row_idx, row_mask, col] = updated.clamp(0.0, 1.0)
@@ -2952,6 +2965,20 @@ def create_model(train_config):
         raise ValueError("EPR requires a supported deviation or absolute timing target")
     use_timing_scale_bit = timing_control_mode == "piecewise_scale_bit"
     note_embedding_mode = str(train_config.get("note_embedding_mode", "sine")).lower()
+    slot_share_role_encoders = train_config.get("slot_share_role_encoders")
+    resume_path = train_config.get("resume_path")
+    if slot_share_role_encoders is None:
+        checkpoint_config = None
+        if resume_path and Path(resume_path).is_dir():
+            checkpoint_config_path = Path(resume_path) / "config.json"
+            if checkpoint_config_path.exists():
+                checkpoint_config = json.loads(checkpoint_config_path.read_text(encoding="utf-8"))
+        slot_share_role_encoders = (
+            bool(checkpoint_config.get("slot_share_role_encoders", False))
+            if checkpoint_config is not None
+            else True
+        )
+        train_config["slot_share_role_encoders"] = slot_share_role_encoders
     score_note_schema = score_note_input_schema(train_config)
     decoder_note_schema = decoder_note_input_schema(train_config)
     if input_feature_mode != "integrated":
@@ -3225,6 +3252,7 @@ def create_model(train_config):
         slot_dim=train_config.get("slot_dim"),
         slot_fusion=train_config.get("slot_fusion", "mlp"),
         slot_gates=train_config.get("slot_gates", False),
+        slot_share_role_encoders=slot_share_role_encoders,
         decoder_head_layout=train_config.get("decoder_head_layout", "pyramid4"),
         decoder_head_expand_ratio=train_config.get("decoder_head_expand_ratio", 2.0),
         decoder_head_shrink_ratio=train_config.get("decoder_head_shrink_ratio", 0.5),
@@ -3258,9 +3286,15 @@ def create_model(train_config):
         prior_attribute_keep_probs=train_config.get("prior_attribute_keep_probs"),
         prior_attribute_noise_std=train_config.get("prior_attribute_noise_std", 0.05),
         prior_property_dropout_prob=train_config.get("prior_property_dropout_prob"),
+        prior_property_dropout_pattern=train_config.get("prior_property_dropout_pattern", "independent"),
+        prior_property_dropout_replacement=train_config.get("prior_property_dropout_replacement", "pad"),
+        prior_property_visible_prob=train_config.get("prior_property_visible_prob", 0.50),
+        prior_property_all_dropout_prob=train_config.get("prior_property_all_dropout_prob", 0.25),
+        stable_force_all_properties_visible=train_config.get("stable_force_all_properties_visible", False),
         tf_embedding_mask_keep_prob=train_config.get("tf_embedding_mask_keep_prob", 1.0),
         tf_embedding_mask_score=train_config.get("tf_embedding_mask_score", False),
         tf_embedding_mask_decoder=train_config.get("tf_embedding_mask_decoder", False),
+        slot_decoder_mask_mode=train_config.get("slot_decoder_mask_mode", "property"),
         stable_contract_loss=train_config.get("stable_contract_loss", False),
         stable_contract_alpha=train_config.get("stable_contract_alpha", 1.0),
         stable_contract_lambda=train_config.get("stable_contract_lambda", 0.0),
@@ -3269,6 +3303,15 @@ def create_model(train_config):
         stable_contract_ioi_lambda=train_config.get("stable_contract_ioi_lambda"),
         stable_contract_duration_lambda=train_config.get("stable_contract_duration_lambda"),
         stable_contract_eps=train_config.get("stable_contract_eps", 1e-6),
+        zero_ioi_transform=train_config.get("zero_ioi_transform"),
+        zero_ioi_positive_support=train_config.get("zero_ioi_positive_support", False),
+        zero_ioi_support_eps=train_config.get("zero_ioi_support_eps", 1e-6),
+        zero_ioi_residual=train_config.get("zero_ioi_residual", False),
+        zero_ioi_residual_targets=train_config.get("zero_ioi_residual_targets"),
+        zero_score_ioi_embedding=train_config.get("zero_score_ioi_embedding", False),
+        zero_timing_head_condition=train_config.get("zero_timing_head_condition", False),
+        zero_ioi_dual_distribution_mode=train_config.get("zero_ioi_dual_distribution_mode", "none"),
+        zero_ioi_dual_duration=train_config.get("zero_ioi_dual_duration", True),
         piano_pitch_min=train_config.get("piano_pitch_min", 21),
         pedal_representation=train_config.get("pedal_representation", "binary_4"),
         use_style_tokens=train_config.get("use_style_tokens", False),
@@ -3280,7 +3323,6 @@ def create_model(train_config):
         torch_dtype=dtype,
     )
 
-    resume_path = train_config.get("resume_path")
     if resume_path:
         model = IntegratedPianoT5Gemma(model_config) if backbone_type in {"t5", "t5gemma"} else IntegratedPianoTransformer(model_config)
         state_dict = load_torch_state_dict(resume_path)
@@ -3546,6 +3588,12 @@ def main():
 
     with open(args.config, "r", encoding="utf-8") as file:
         train_config = json.load(file)
+    seed = int(train_config.get("seed", 42))
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     outname = str(train_config.get("run_name") or ("inr_" + current_datetime.strftime("%Y-%m-%d-%H-%M-%S")))
     task_type = train_config.get("task_type", "epr").lower()
     input_feature_mode = infer_input_feature_mode(train_config)
@@ -3862,6 +3910,11 @@ def main():
             stable_channels=train_config.get("stable_channels", ["ioi", "duration"]),
             stable_noise_modes=train_config.get("stable_noise_modes"),
             stable_seed=train_config.get("stable_seed", train_config.get("seed", 42)),
+            stable_zero_ioi_nonnegative_feedback=train_config.get(
+                "stable_zero_ioi_nonnegative_feedback",
+                False,
+            ),
+            epr_timing_target=train_config.get("epr_timing_target", "log_deviation"),
         ),
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,

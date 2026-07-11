@@ -219,16 +219,21 @@ def map_midi(score_midi_obj, performance_midi_obj, max_tempo=300):
         )
     )
         
+    cc_list = norm_performance.instruments[0].control_changes
+    tail_performance_time = max(
+        [score_tempo_change_points[-1][1] + 5000]
+        + [cc.time + 1 for cc in cc_list]
+    )
+    tail_delta = max(5000, tail_performance_time - score_tempo_change_points[-1][1])
     score_tempo_change_points.append(
         (
-            score_tempo_change_points[-1][0] + 5000,
-            score_tempo_change_points[-1][1] + 5000,
+            score_tempo_change_points[-1][0] + tail_delta,
+            score_tempo_change_points[-1][1] + tail_delta,
             len(score_tempo_change_points)
         )
     )
 
     new_cc_list = []
-    cc_list = norm_performance.instruments[0].control_changes
     cnt = 0
     for i in range(len(cc_list)):
         while not (score_tempo_change_points[cnt][1] <= cc_list[i].time < score_tempo_change_points[cnt+1][1]):

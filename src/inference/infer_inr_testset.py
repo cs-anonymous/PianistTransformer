@@ -24,11 +24,17 @@ from src.train.train_inr import (
     build_score_musical_rows,
     build_style_vocabs,
     create_model,
+    decoder_note_input_schema,
+    decoder_perf_target_input_dim,
+    integrated_epr_input_dim,
     infer_input_feature_mode,
+    musical_feature_dim,
     performance_dev_velocity_pedal4_binary_rows,
     perf_style_stats_range_from_cache,
     perf_style_stats_from_cache,
     score_style_stats,
+    score_musical_input_dim,
+    score_note_input_schema,
 )
 from src.model.integrated_pianoformer import _target7_to_raw7
 from src.utils.inr_midi import note_features_to_midi
@@ -145,6 +151,36 @@ def load_config(path: Path, checkpoint: str | None):
         target in {"raw_log_deviation", "raw_log_dev", "raw_log_absolute", "absolute_raw_log"}
         and int(config.get("output_continuous_dim", config.get("continuous_dim", 0)) or 0) == 9
     )
+    musical_mode = str(config.get("musical_feature_mode", "categorical")).lower()
+    config["musical_feature_dim"] = musical_feature_dim(musical_mode)
+    config["mask_feature_dim"] = 2 if int(config["musical_feature_dim"]) == 0 else 3
+    config["score_control_feature_dim"] = int(config.get("score_control_feature_dim", config.get("control_feature_dim", 5)))
+    config["performance_control_feature_dim"] = int(
+        config.get("performance_control_feature_dim", config.get("control_feature_dim", 5) + 4)
+    )
+    if config.get("task_type", "epr").lower() in {"epr", "csr"} and config["input_feature_mode"] == "integrated":
+        score_schema = score_note_input_schema(config)
+        decoder_schema = decoder_note_input_schema(config)
+        if config.get("task_type", "epr").lower() == "epr" and score_schema == "score_musical":
+            score_dim = score_musical_input_dim(
+                timing_control_mode=config.get("timing_control_mode"),
+                use_timing_scale_bit=config.get("use_timing_scale_bit", False),
+                musical_feature_mode=musical_mode,
+            )
+        else:
+            score_dim = integrated_epr_input_dim(
+                timing_control_mode=config.get("timing_control_mode"),
+                use_timing_scale_bit=config.get("use_timing_scale_bit", False),
+                musical_feature_mode=musical_mode,
+                pedal_control_dim=4,
+            )
+        config["input_continuous_dim"] = score_dim
+        config["score_input_continuous_dim"] = score_dim
+        config["decoder_input_continuous_dim"] = (
+            decoder_perf_target_input_dim(config.get("output_continuous_dim", config.get("continuous_dim", 7)))
+            if config.get("task_type", "epr").lower() == "epr" and decoder_schema == "perf_target"
+            else score_dim
+        )
     return config
 
 
@@ -753,9 +789,11 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
             pred_continuous.float().cpu(),
             config=config,
         )
+        pred_continuous_list = pred_continuous.float().cpu().tolist()
+        raw_rows_list = raw_rows.tolist()
         midi_obj = note_features_to_midi(
             pitch=pitch,
-            continuous=raw_rows.tolist(),
+            continuous=raw_rows_list,
             target_ticks_per_beat=500,
             target_tempo=120,
             max_time_ms=config["max_time_ms"],

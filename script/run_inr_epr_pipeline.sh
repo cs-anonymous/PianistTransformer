@@ -26,12 +26,21 @@ BATCH_SIZE_PER_DEVICE="${BATCH_SIZE_PER_DEVICE:-32}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-64}"
 PIPELINE_STAGE_START="${PIPELINE_STAGE_START:-train}"
 SKIP_EXISTING_PIPELINE_OUTPUTS="${SKIP_EXISTING_PIPELINE_OUTPUTS:-1}"
+EVAL_CHECKPOINT_MODE="${EVAL_CHECKPOINT_MODE:-best}"
 
 PIPELINE_STAGE_START="$(printf '%s' "${PIPELINE_STAGE_START}" | tr '[:upper:]' '[:lower:]')"
 case "${PIPELINE_STAGE_START}" in
   train|adapt|infer) ;;
   *)
     echo "Unsupported PIPELINE_STAGE_START=${PIPELINE_STAGE_START}; expected train, adapt, or infer" >&2
+    exit 1
+    ;;
+esac
+
+case "${EVAL_CHECKPOINT_MODE}" in
+  best|latest) ;;
+  *)
+    echo "Unsupported EVAL_CHECKPOINT_MODE=${EVAL_CHECKPOINT_MODE}; expected best or latest" >&2
     exit 1
     ;;
 esac
@@ -65,8 +74,8 @@ SAMPLING_GPU="${GPU_LIST[$(( GPU_COUNT > 1 ? 1 : 0 ))]}"
 
 latest_train_dir() {
   local root="$1" marker="$2"
-  find "${root}" -maxdepth 1 -mindepth 1 -type d -name 'inr_*' -newer "${marker}" \
-    -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-
+  find "${root}" -maxdepth 2 -mindepth 2 -type f -name 'train_config.json' -newer "${marker}" \
+    -printf '%T@ %h\n' | sort -nr | head -n 1 | cut -d' ' -f2-
 }
 
 latest_numeric_checkpoint() {
@@ -82,6 +91,15 @@ best_checkpoint() {
     echo "${train_dir}/checkpoint-best"
   else
     echo "${train_dir}"
+  fi
+}
+
+evaluation_checkpoint() {
+  local train_dir="$1"
+  if [[ "${EVAL_CHECKPOINT_MODE}" == "latest" ]]; then
+    latest_numeric_checkpoint "${train_dir}"
+  else
+    best_checkpoint "${train_dir}"
   fi
 }
 
@@ -252,7 +270,7 @@ if [[ "${PIPELINE_STAGE_START}" == "train" ]]; then
   else
     run_train "${BASE_CONFIG}" "base"
     BASE_OUTPUT_DIR="$(latest_train_dir "${TRAIN_ROOT}" "${BASE_MARKER}")"
-    BASE_CHECKPOINT="$(best_checkpoint "${BASE_OUTPUT_DIR}")"
+    BASE_CHECKPOINT="$(evaluation_checkpoint "${BASE_OUTPUT_DIR}")"
   fi
 else
   if [[ -n "${BASE_CHECKPOINT_OVERRIDE}" ]]; then
@@ -284,7 +302,7 @@ if (( ADAPT_NUM_TRAIN_EPOCHS > 0 )); then
     touch "${ADAPT_MARKER}"
     run_train "${ADAPT_CONFIG}" "adapt"
     ADAPT_OUTPUT_DIR="$(latest_train_dir "${ADAPT_TRAIN_ROOT}" "${ADAPT_MARKER}")"
-    ADAPT_CHECKPOINT="$(best_checkpoint "${ADAPT_OUTPUT_DIR}")"
+    ADAPT_CHECKPOINT="$(evaluation_checkpoint "${ADAPT_OUTPUT_DIR}")"
   else
     ADAPT_CHECKPOINT="$(latest_numeric_checkpoint "${ADAPT_TRAIN_ROOT}" || true)"
     [[ -n "${ADAPT_CHECKPOINT}" ]] || { echo "Could not locate adapt checkpoint under ${ADAPT_TRAIN_ROOT}" >&2; exit 1; }

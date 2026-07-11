@@ -402,7 +402,7 @@ def extract_gt_dev_arrays(score_source_to_work_path, selected_gt_sources, config
     return dev_groups_to_arrays(groups)
 
 
-def extract_pred_dev_arrays(raw_output_paths, score_source_to_work_path):
+def extract_pred_dev_arrays(raw_output_paths, score_source_to_work_path, config):
     score_raw_cache = {}
     groups = empty_dev_groups()
     for path in raw_output_paths:
@@ -413,14 +413,24 @@ def extract_pred_dev_arrays(raw_output_paths, score_source_to_work_path):
                 work = json.load(file)
             score_raw_cache[score_source] = work["score"]["score_raw"]
         score_raw = score_raw_cache[score_source]
-        target = payload.get("predicted_target7") or []
+        target = payload.get("predicted_target7") or payload.get("predicted_target9") or []
         reconstructed_raw = payload.get("reconstructed_raw7") or []
-        if len(target) != len(score_raw) or len(reconstructed_raw) != len(score_raw):
-            continue
-        for score_row, target_row, raw_row in zip(score_raw, target, reconstructed_raw):
+        if len(reconstructed_raw) != len(score_raw):
+            raise ValueError(
+                f"Prediction/score length mismatch for {path}: "
+                f"reconstructed_raw7={len(reconstructed_raw)}, score_raw={len(score_raw)}"
+            )
+        has_target = len(target) == len(score_raw) and all(len(row) >= 2 for row in target)
+        for row_idx, (score_row, raw_row) in enumerate(zip(score_raw, reconstructed_raw)):
             group = dev_group_name(score_row[0])
-            groups[group]["log_dev_ioi"].append(float(target_row[0]))
-            groups[group]["log_dev_duration"].append(float(target_row[1]))
+            if has_target:
+                log_dev_ioi = float(target[row_idx][0])
+                log_dev_duration = float(target[row_idx][1])
+            else:
+                log_dev_ioi = normalize_target_ioi_dev(score_row[0], raw_row[0], config)
+                log_dev_duration = normalize_target_duration_dev(score_row[1], raw_row[1], config)
+            groups[group]["log_dev_ioi"].append(log_dev_ioi)
+            groups[group]["log_dev_duration"].append(log_dev_duration)
             groups[group]["raw_dev_ioi_s"].append((float(raw_row[0]) - float(score_row[0])) / 1000.0)
             groups[group]["raw_dev_duration_s"].append((float(raw_row[1]) - float(score_row[1])) / 1000.0)
     return dev_groups_to_arrays(groups)
@@ -461,8 +471,16 @@ def plot_dev_distributions(
     score_source_to_work_path = score_source_to_work_path_from_manifest(det_manifest, config)
     selected_gt_sources = selected_gt_sources_from_manifest(det_manifest, config)
     gt_arrays = extract_gt_dev_arrays(score_source_to_work_path, selected_gt_sources, config)
-    det_arrays = extract_pred_dev_arrays(unique_paths(det_manifest, "raw_output_paths"), score_source_to_work_path)
-    sampling_arrays = extract_pred_dev_arrays(unique_paths(sampling_manifest, "raw_output_paths"), score_source_to_work_path)
+    det_arrays = extract_pred_dev_arrays(
+        unique_paths(det_manifest, "raw_output_paths"),
+        score_source_to_work_path,
+        config,
+    )
+    sampling_arrays = extract_pred_dev_arrays(
+        unique_paths(sampling_manifest, "raw_output_paths"),
+        score_source_to_work_path,
+        config,
+    )
 
     output_plot.parent.mkdir(parents=True, exist_ok=True)
     fig, axes = plt.subplots(2, 4, figsize=(18, 7), sharex=False)

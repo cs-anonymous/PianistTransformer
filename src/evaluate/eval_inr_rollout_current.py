@@ -25,6 +25,7 @@ from src.model.integrated_pianoformer import (
     _decode_mixture_value,
     _logistic_normal_params,
     _materialize_epr_prediction,
+    _skew_normal_params,
     _shift_pitch_right,
     _shared_scalar_params,
     _split_epr_mixture_params,
@@ -170,6 +171,23 @@ def materialize_epr_prediction_eval(
 
 def empty_head_stats(config):
     components = int(config.get("epr_mixture_components", 1)) if isinstance(config, dict) else int(getattr(config, "epr_mixture_components", 1))
+    distribution = str(
+        config.get("epr_distribution", "point")
+        if isinstance(config, dict)
+        else getattr(config, "epr_distribution", "point")
+    ).lower()
+    if distribution in {"sn", "skew_normal"}:
+        return {
+            feature: {
+                "n": 0.0,
+                "pred_mean": 0.0,
+                "pred_std": 0.0,
+                "loc": 0.0,
+                "scale": 0.0,
+                "alpha": 0.0,
+            }
+            for feature, _ in TIMING_HEAD_FEATURES
+        }
     base_keys = [
         "pred_mean_norm",
         "pred_mode_norm",
@@ -195,14 +213,39 @@ def update_head_stats(store, config, raw_outputs, attention_mask):
     if store is None:
         return
     distribution = str(getattr(config, "epr_distribution", "point")).lower()
-    if distribution != "mixture_logistic_normal":
-        return
-
     params = _split_epr_mixture_params(config, raw_outputs)
     mask = attention_mask.detach().bool()
     if mask.ndim == 3:
         mask = mask.squeeze(-1)
     if not mask.any():
+        return
+
+    if distribution in {"sn", "skew_normal"}:
+        loc, scale, alpha = _skew_normal_params(
+            params["timing_log_loc"],
+            params["timing_log_log_scale"],
+            params["timing_log_alpha"],
+            sigma_min=getattr(config, "skew_normal_sigma_min", 1e-4),
+            sigma_max=getattr(config, "skew_normal_sigma_max", 1e4),
+        )
+        delta = alpha / torch.sqrt(1.0 + alpha.square())
+        pred_mean = loc + scale * delta * np.sqrt(2.0 / np.pi)
+        pred_std = scale * torch.sqrt((1.0 - 2.0 * delta.square() / np.pi).clamp_min(0.0))
+        masked_count = float(mask.sum().detach().cpu().item())
+        for feature, index in TIMING_HEAD_FEATURES:
+            stats = store[feature]
+            stats["n"] += masked_count
+            for key, values in (
+                ("pred_mean", pred_mean[..., index]),
+                ("pred_std", pred_std[..., index]),
+                ("loc", loc[..., index]),
+                ("scale", scale[..., index]),
+                ("alpha", alpha[..., index]),
+            ):
+                stats[key] += float(values.detach()[mask].float().sum().cpu().item())
+        return
+
+    if distribution != "mixture_logistic_normal":
         return
 
     for feature, index in TIMING_HEAD_FEATURES:
@@ -1197,10 +1240,16 @@ def predict_work(model, device, config, item, args, rollout_ks):
     windows = build_windows(len(pitch), int(config["block_notes"]), float(config["overlap_ratio"]))
     perfs = selected_perfs(work, item)
     by_k = {}
+    use_fast_kpass = (
+        bool(getattr(args, "fast_kpass", False))
+        and not bool(getattr(args, "head_stats", False))
+        and str(getattr(args, "feedback_mode", "pollute")).lower() == "pollute"
+        and str(getattr(args, "feedback_targets", "all")).lower() == "all"
+    )
     kpass_values = [
         int(rollout_k)
         for rollout_k in rollout_ks
-        if rollout_k is not None and bool(getattr(args, "fast_kpass", False))
+        if rollout_k is not None and use_fast_kpass
     ]
     kpass_results = {}
     if kpass_values:
