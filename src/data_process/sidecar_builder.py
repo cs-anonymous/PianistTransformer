@@ -92,6 +92,7 @@ def build_sidecar_for_work(
         for key in (
             "label_shared_raw",
             "label_pedal4_raw",
+            "label_pedal_start_valley_raw",
             "label_raw",
             "pedal4_raw",
         ):

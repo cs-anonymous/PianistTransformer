@@ -82,7 +82,7 @@ def build_dataset(config, manifest, split):
         max_time_ms=config.get("max_time_ms", 10000.0),
         epr_timing_bins=config.get("epr_timing_bins", 5000),
         epr_value_bins=config.get("epr_value_bins", 128),
-        pedal_representation=config.get("pedal_representation", "binary_4"),
+        pedal_representation=config.get("pedal_representation", "start_valley"),
         musical_feature_mode=config.get(
             "musical_feature_mode",
             "continuous" if str(config.get("task_type", "epr")).lower() == "csr" else "categorical",
@@ -129,7 +129,8 @@ def main():
     parser.add_argument("--input-feature-mode", default="integrated")
     parser.add_argument("--timing-input-normalization", default="log1p_t_over_50_5000")
     parser.add_argument("--max-time-ms", type=float, default=10000.0)
-    parser.add_argument("--pedal-representation", default="binary_4")
+    parser.add_argument("--pedal-representation", default="start_valley")
+    parser.add_argument("--pedal-valley-pos-weight", type=float, default=None)
     parser.add_argument("--musical-feature-mode", default="musical51")
     parser.add_argument("--epr-timing-target", default="log_deviation")
     parser.add_argument("--use-timing-scale-bit", type=int, default=0)
@@ -172,6 +173,7 @@ def main():
         "timing_input_normalization": args.timing_input_normalization,
         "max_time_ms": args.max_time_ms,
         "pedal_representation": args.pedal_representation,
+        "pedal_valley_pos_weight": args.pedal_valley_pos_weight,
         "musical_feature_mode": args.musical_feature_mode,
         "epr_timing_target": args.epr_timing_target,
         "use_timing_scale_bit": bool(args.use_timing_scale_bit),

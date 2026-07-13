@@ -22,11 +22,13 @@ base = json.loads(base_path.read_text(encoding="utf-8"))
 common = dict(base)
 common.update(
     {
-        "continuous_dim": 7,
-        "input_continuous_dim": 12,
-        "score_input_continuous_dim": 12,
-        "decoder_input_continuous_dim": 12,
-        "output_continuous_dim": 7,
+        "continuous_dim": 5,
+        "input_continuous_dim": 10,
+        "score_input_continuous_dim": 10,
+        "decoder_input_continuous_dim": 10,
+        "output_continuous_dim": 5,
+        "pedal_representation": "start_valley",
+        "pedal_valley_pos_weight": 28.0,
         "epr_timing_target": "floor_log_deviation",
         "timing_control_mode": "floor_log",
         "eval_gt_time_normalization": "score_onset_span",

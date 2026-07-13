@@ -137,6 +137,10 @@ def pp_wass_metrics(prediction_paths, gt_paths, raw_output_paths=None, pedal_bin
 
     pedal_keys = [f"{name}_wass" for name in ("pedal_0", "pedal_25", "pedal_50", "pedal_75")]
     output["pedal_wass"] = finite_mean([output[key] for key in pedal_keys])
+    output["pedal_start_wass"] = feature_wasserstein(
+        np.concatenate([item["pedal_0"] for item in pred_arrays]) if pred_arrays else np.asarray([], dtype=np.float64),
+        np.concatenate([item["pedal_0"] for item in gt_arrays]) if gt_arrays else np.asarray([], dtype=np.float64),
+    )
     return output
 
 
@@ -188,6 +192,16 @@ def pn_wass_metrics(prediction_paths, gt_paths, raw_output_paths=None, pedal_bin
 
     pedal_keys = [f"{name}_wass" for name in ("pedal_0", "pedal_25", "pedal_50", "pedal_75")]
     output["pedal_wass"] = finite_mean([output[key] for key in pedal_keys])
+    usable = min((len(item["pedal_0"]) for item in all_arrays), default=0)
+    output["pedal_start_wass"] = finite_mean(
+        [
+            feature_wasserstein(
+                [item["pedal_0"][note_idx] for item in pred_arrays],
+                [item["pedal_0"][note_idx] for item in gt_arrays],
+            )
+            for note_idx in range(usable)
+        ]
+    )
     return output
 
 

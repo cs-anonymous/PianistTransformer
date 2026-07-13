@@ -274,7 +274,7 @@ def build_eval_dataset(train_config: dict) -> PianoCoReNodeSFTDataset:
         max_time_ms=cfg.get("max_time_ms", 10000.0),
         epr_timing_bins=cfg.get("epr_timing_bins", 5000),
         epr_value_bins=cfg.get("epr_value_bins", 128),
-        pedal_representation=cfg.get("pedal_representation", "binary_4"),
+        pedal_representation=cfg.get("pedal_representation", "start_valley"),
         musical_feature_mode=musical_feature_mode,
         epr_timing_target=cfg.get("epr_timing_target", "log_deviation"),
         use_timing_scale_bit=cfg.get("use_timing_scale_bit", False),

@@ -24,11 +24,13 @@ from src.train.train_inr import (
     build_score_musical_rows,
     build_style_vocabs,
     create_model,
+    default_epr_output_dim,
     decoder_note_input_schema,
     decoder_perf_target_input_dim,
     integrated_epr_input_dim,
     infer_input_feature_mode,
     musical_feature_dim,
+    pedal_representation_dim,
     performance_dev_velocity_pedal4_binary_rows,
     perf_style_stats_range_from_cache,
     perf_style_stats_from_cache,
@@ -146,17 +148,25 @@ def load_config(path: Path, checkpoint: str | None):
         config["style_source_vocab_size"] = len(config["style_source_vocab"])
     if checkpoint:
         config["resume_path"] = checkpoint
+    config.setdefault("pedal_representation", "start_valley")
     target = str(config.get("epr_timing_target", "")).lower()
     config["legacy_dual_timing_head"] = (
         target in {"raw_log_deviation", "raw_log_dev", "raw_log_absolute", "absolute_raw_log"}
         and int(config.get("output_continuous_dim", config.get("continuous_dim", 0)) or 0) == 9
     )
+    if config.get("task_type", "epr").lower() == "epr" and "output_continuous_dim" not in config:
+        config["output_continuous_dim"] = default_epr_output_dim(
+            target,
+            config.get("pedal_representation", "start_valley"),
+            legacy_dual_timing_head=config.get("legacy_dual_timing_head", False),
+        )
     musical_mode = str(config.get("musical_feature_mode", "categorical")).lower()
     config["musical_feature_dim"] = musical_feature_dim(musical_mode)
     config["mask_feature_dim"] = 2 if int(config["musical_feature_dim"]) == 0 else 3
     config["score_control_feature_dim"] = int(config.get("score_control_feature_dim", config.get("control_feature_dim", 5)))
+    pedal_dim = pedal_representation_dim(config.get("pedal_representation", "start_valley"))
     config["performance_control_feature_dim"] = int(
-        config.get("performance_control_feature_dim", config.get("control_feature_dim", 5) + 4)
+        config.get("performance_control_feature_dim", config.get("control_feature_dim", 5) + pedal_dim)
     )
     if config.get("task_type", "epr").lower() in {"epr", "csr"} and config["input_feature_mode"] == "integrated":
         score_schema = score_note_input_schema(config)
@@ -172,7 +182,7 @@ def load_config(path: Path, checkpoint: str | None):
                 timing_control_mode=config.get("timing_control_mode"),
                 use_timing_scale_bit=config.get("use_timing_scale_bit", False),
                 musical_feature_mode=musical_mode,
-                pedal_control_dim=4,
+                pedal_control_dim=pedal_dim,
             )
         config["input_continuous_dim"] = score_dim
         config["score_input_continuous_dim"] = score_dim
@@ -231,6 +241,7 @@ def load_score_from_node(
     task_type="epr",
     performance_source=None,
     disable_musical_features=False,
+    pedal_control_dim=4,
 ):
     with open(path, "r", encoding="utf-8") as file:
         work = json.load(file)
@@ -263,6 +274,7 @@ def load_score_from_node(
             musical_feature_mode=musical_feature_mode,
             score_note_schema=score_note_schema,
             disable_musical_features=disable_musical_features,
+            pedal_control_dim=pedal_control_dim,
         )
     score_shared_raw = [row[:3] for row in score["score_raw"]]
     return pitch, continuous, score_shared_raw, work
@@ -559,8 +571,6 @@ def csr_metric_summary(pred_rows, target_rows, mask):
 
 
 def labels_for_perf(config, perf, score_shared_raw):
-    if str(config.get("pedal_representation", "")).lower() != "binary_4":
-        raise ValueError("EPR inference expects pedal_representation=binary_4")
     labels = performance_dev_velocity_pedal4_binary_rows(
         perf,
         score_shared_raw,
@@ -568,6 +578,7 @@ def labels_for_perf(config, perf, score_shared_raw):
         log_scale=float(config.get("timing_log_scale", 50.0)),
         pedal_binary_threshold=float(config.get("pedal_binary_threshold", 64.0)),
         legacy_dual_timing_head=bool(config.get("legacy_dual_timing_head", False)),
+        pedal_representation=config.get("pedal_representation", "start_valley"),
     )
     if labels is None:
         raise ValueError(f"Could not build labels for {perf.get('performance_source')}")
@@ -773,6 +784,7 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
         score_note_schema=config.get("score_note_input_schema", "integrated"),
         task_type="epr",
         disable_musical_features=config.get("disable_musical_features", False),
+        pedal_control_dim=pedal_representation_dim(config.get("pedal_representation", "start_valley")),
     )
     score = loaded["score"]
     windows = build_windows(len(pitch), config["block_notes"], config["overlap_ratio"])
@@ -912,6 +924,13 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
         )
         pred_continuous_list = pred_continuous.float().cpu().tolist()
         raw_rows_list = raw_rows.tolist()
+        pedal_dim = pedal_representation_dim(config.get("pedal_representation", "start_valley"))
+        pedal_start = pred_continuous.shape[-1] - pedal_dim
+        pedal_start_valley_rows = (
+            pred_continuous.float().cpu()[:, pedal_start : pedal_start + pedal_dim].tolist()
+            if pedal_dim == 2
+            else None
+        )
         midi_obj = note_features_to_midi(
             pitch=pitch,
             continuous=raw_rows_list,
@@ -919,6 +938,9 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
             target_tempo=120,
             max_time_ms=config["max_time_ms"],
             normalized=False,
+            pedal_start_valley=pedal_start_valley_rows,
+            valley_phase=float(config.get("pedal_valley_phase", 0.5)),
+            valley_restore_phase=float(config.get("pedal_valley_restore_phase", 0.9)),
         )
         raw_path = raw_dir / f"{score_stem}__{plan['suffix']}.json"
         if pred_continuous.shape[-1] == 9:

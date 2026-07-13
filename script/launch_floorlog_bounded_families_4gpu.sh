@@ -23,6 +23,13 @@ for key in ("resume_path", "resume_from_checkpoint", "pretrained_model"):
 base.update({
     "pretrained_model": None,
     "load_pianoformer_backbone": False,
+    "continuous_dim": 5,
+    "input_continuous_dim": 10,
+    "score_input_continuous_dim": 10,
+    "decoder_input_continuous_dim": 10,
+    "output_continuous_dim": 5,
+    "pedal_representation": "start_valley",
+    "pedal_valley_pos_weight": 28.0,
     "bounded_floorlog_support": True,
     "velocity_distribution": None,
     "timing_sample_shrink_mode": "none",
