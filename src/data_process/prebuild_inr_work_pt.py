@@ -97,7 +97,7 @@ def build_dataset(config, manifest, split):
 
 
 def worker(args):
-    config, split, work_path, selected_sources = args
+    config, split, work_path, selected_sources, performance_time_normalization = args
     manifest = [
         {
             "path": work_path,
@@ -106,7 +106,12 @@ def worker(args):
         }
     ]
     dataset = build_dataset(config, manifest, split)
-    sidecar = build_sidecar_for_work(dataset, work_path, selected_sources=selected_sources)
+    sidecar = build_sidecar_for_work(
+        dataset,
+        work_path,
+        selected_sources=selected_sources,
+        performance_time_normalization=performance_time_normalization,
+    )
     if sidecar is None or not Path(sidecar).exists():
         raise RuntimeError(f"Failed to write sidecar for {work_path}: {sidecar}")
     return str(work_path), str(sidecar)
@@ -148,6 +153,12 @@ def main():
     parser.add_argument("--workers", type=int, default=36)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--sidecar-tag", default=None)
+    parser.add_argument(
+        "--performance-time-normalization",
+        choices=["none", "score_onset_span"],
+        default="none",
+        help="Optional global time scaling applied to raw performance timing labels.",
+    )
     args = parser.parse_args()
 
     config = {
@@ -212,14 +223,17 @@ def main():
     done = 0
     if args.workers <= 1:
         for path in paths:
-            worker((config, args.split, path, selected_by_path.get(path)))
+            worker((config, args.split, path, selected_by_path.get(path), args.performance_time_normalization))
             done += 1
             if done % 10 == 0 or done == len(paths):
                 print(json.dumps({"event": "inr_sidecar_prebuild_progress", "done": done, "works": len(paths)}), flush=True)
     else:
         with ProcessPoolExecutor(max_workers=args.workers) as pool:
             futures = [
-                pool.submit(worker, (config, args.split, path, selected_by_path.get(path)))
+                pool.submit(
+                    worker,
+                    (config, args.split, path, selected_by_path.get(path), args.performance_time_normalization),
+                )
                 for path in paths
             ]
             for future in as_completed(futures):

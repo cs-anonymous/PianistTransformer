@@ -35,6 +35,9 @@ ACN_DISTRIBUTIONS = {"can"}
 IACN_DISTRIBUTIONS = {"ican"}
 ILN_DISTRIBUTIONS = {"iln"}
 SN_DISTRIBUTIONS = {"sn", "skew_normal"}
+DLM_DISTRIBUTIONS = {"dlm", "discretized_logistic_mixture"}
+TANH_T_DISTRIBUTIONS = {"tanh_student_t", "bounded_tanh_student_t"}
+BOUNDED_SN_DISTRIBUTIONS = {"bounded_skew_normal", "bounded_sn"}
 
 
 def _is_scalar_distribution(distribution):
@@ -42,6 +45,8 @@ def _is_scalar_distribution(distribution):
         "logistic_normal",
         "mixture_logistic_normal",
         "mixture_beta",
+        *TANH_T_DISTRIBUTIONS,
+        *BOUNDED_SN_DISTRIBUTIONS,
         *SN_DISTRIBUTIONS,
         *ALN_DISTRIBUTIONS,
         *ACN_DISTRIBUTIONS,
@@ -51,7 +56,7 @@ def _is_scalar_distribution(distribution):
 
 
 def _scalar_distribution_dim(distribution):
-    if distribution in {*ACN_DISTRIBUTIONS, "logistic_normal", "mixture_logistic_normal", "mixture_beta", *SN_DISTRIBUTIONS}:
+    if distribution in {*ACN_DISTRIBUTIONS, "logistic_normal", "mixture_logistic_normal", "mixture_beta", *SN_DISTRIBUTIONS, *TANH_T_DISTRIBUTIONS, *BOUNDED_SN_DISTRIBUTIONS}:
         return 3
     if distribution in IACN_DISTRIBUTIONS:
         return 5
@@ -63,7 +68,7 @@ def _scalar_distribution_dim(distribution):
 
 
 def _scalar_distribution_components(config, distribution):
-    if distribution in {*SN_DISTRIBUTIONS, *ALN_DISTRIBUTIONS, *ACN_DISTRIBUTIONS, *IACN_DISTRIBUTIONS, *ILN_DISTRIBUTIONS, "logistic_normal"}:
+    if distribution in {*SN_DISTRIBUTIONS, *TANH_T_DISTRIBUTIONS, *BOUNDED_SN_DISTRIBUTIONS, *ALN_DISTRIBUTIONS, *ACN_DISTRIBUTIONS, *IACN_DISTRIBUTIONS, *ILN_DISTRIBUTIONS, "logistic_normal"}:
         return 1
     return int(getattr(config, "epr_mixture_components", 1))
 
@@ -78,6 +83,7 @@ def resolve_timing_control_mode(timing_control_mode="log_scaled", use_timing_sca
         "dual_log_linear",
         "dual_clip_linear",
         "log_scaled",
+        "floor_log",
         "raw_log",
     }
     if mode not in valid_modes:
@@ -92,7 +98,7 @@ def timing_control_feature_dim(timing_control_mode="log_scaled", use_timing_scal
     )
     if mode == "raw_log":
         return 5
-    return 3 if mode in {"piecewise_single", "log_scaled"} else 5
+    return 3 if mode in {"piecewise_single", "log_scaled", "floor_log"} else 5
 
 
 def musical_feature_dim(musical_feature_mode="categorical"):
@@ -218,8 +224,46 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         beta_eps=1e-5,
         beta_kappa_min=1e-3,
         beta_alpha_min=1e-4,
+        mixture_beta_parameterization="alpha_beta",
+        mixture_beta_kappa_min=1e-3,
+        predictive_variance_lambda=0.0,
+        predictive_timing_radius=0.05,
+        predictive_velocity_radius=0.05,
         skew_normal_sigma_min=1e-4,
         skew_normal_sigma_max=1e4,
+        bounded_floorlog_support=False,
+        velocity_distribution=None,
+        dlm_components=None,
+        dlm_timing_bins=256,
+        dlm_velocity_bins=128,
+        dlm_ioi_zero_min=0.0,
+        dlm_ioi_zero_max=5.0,
+        dlm_ioi_nonzero_min=-2.5,
+        dlm_ioi_nonzero_max=1.5,
+        dlm_duration_min=-3.0,
+        dlm_duration_max=2.0,
+        dlm_velocity_min=-0.5,
+        dlm_velocity_max=127.5,
+        dlm_scale_min=1e-3,
+        dlm_scale_max=10.0,
+        dlm_timing_scale_min=None,
+        dlm_timing_scale_max=None,
+        dlm_timing_scale_parameterization="legacy_clamp",
+        dlm_tail_loss_lambda=0.0,
+        dlm_tail_radius=0.05,
+        dlm_timing_weighted_nll_alpha=0.0,
+        dlm_timing_weight_min=0.5,
+        dlm_timing_weight_max=4.0,
+        dlm_raw_ms_crps_lambda=0.0,
+        dlm_raw_ms_crps_scale_ms=1000.0,
+        dlm_sampling_temperature=1.0,
+        dlm_timing_sample_truncate_radius=0.0,
+        dlm_timing_sample_truncate_center="mean",
+        timing_sample_truncate_radius=None,
+        timing_sample_truncate_center=None,
+        timing_sample_shrink_mode="none",
+        timing_sample_shrink_factor=1.0,
+        timing_sample_shrink_radius=0.0,
         raw_timing_loss_lambda=0.5,
         legacy_dual_timing_head=False,
         raw_timing_head_type=None,
@@ -361,8 +405,70 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.beta_eps = beta_eps
         self.beta_kappa_min = beta_kappa_min
         self.beta_alpha_min = beta_alpha_min
+        self.mixture_beta_parameterization = str(mixture_beta_parameterization).lower()
+        self.mixture_beta_kappa_min = float(mixture_beta_kappa_min)
+        self.predictive_variance_lambda = float(predictive_variance_lambda)
+        self.predictive_timing_radius = float(predictive_timing_radius)
+        self.predictive_velocity_radius = float(predictive_velocity_radius)
         self.skew_normal_sigma_min = skew_normal_sigma_min
         self.skew_normal_sigma_max = skew_normal_sigma_max
+        self.bounded_floorlog_support = bool(bounded_floorlog_support)
+        default_velocity_distribution = (
+            "skew_normal"
+            if str(epr_distribution).lower() in DLM_DISTRIBUTIONS
+            else epr_distribution
+        )
+        self.velocity_distribution = str(velocity_distribution or default_velocity_distribution).lower()
+        self.dlm_components = int(dlm_components if dlm_components is not None else epr_mixture_components)
+        self.dlm_timing_bins = int(dlm_timing_bins)
+        self.dlm_velocity_bins = int(dlm_velocity_bins)
+        self.dlm_ioi_zero_min = float(dlm_ioi_zero_min)
+        self.dlm_ioi_zero_max = float(dlm_ioi_zero_max)
+        self.dlm_ioi_nonzero_min = float(dlm_ioi_nonzero_min)
+        self.dlm_ioi_nonzero_max = float(dlm_ioi_nonzero_max)
+        self.dlm_duration_min = float(dlm_duration_min)
+        self.dlm_duration_max = float(dlm_duration_max)
+        self.dlm_velocity_min = float(dlm_velocity_min)
+        self.dlm_velocity_max = float(dlm_velocity_max)
+        self.dlm_scale_min = float(dlm_scale_min)
+        self.dlm_scale_max = float(dlm_scale_max)
+        self.dlm_timing_scale_min = float(
+            dlm_scale_min if dlm_timing_scale_min is None else dlm_timing_scale_min
+        )
+        self.dlm_timing_scale_max = float(
+            dlm_scale_max if dlm_timing_scale_max is None else dlm_timing_scale_max
+        )
+        self.dlm_timing_scale_parameterization = str(dlm_timing_scale_parameterization).lower()
+        self.dlm_tail_loss_lambda = float(dlm_tail_loss_lambda)
+        self.dlm_tail_radius = float(dlm_tail_radius)
+        self.dlm_timing_weighted_nll_alpha = float(dlm_timing_weighted_nll_alpha)
+        self.dlm_timing_weight_min = float(dlm_timing_weight_min)
+        self.dlm_timing_weight_max = float(dlm_timing_weight_max)
+        self.dlm_raw_ms_crps_lambda = float(dlm_raw_ms_crps_lambda)
+        self.dlm_raw_ms_crps_scale_ms = float(dlm_raw_ms_crps_scale_ms)
+        if self.dlm_timing_weighted_nll_alpha < 0.0:
+            raise ValueError("dlm_timing_weighted_nll_alpha must be >= 0")
+        if self.dlm_timing_weight_min <= 0.0 or self.dlm_timing_weight_max < self.dlm_timing_weight_min:
+            raise ValueError("DLM timing weight bounds require 0 < min <= max")
+        if self.dlm_raw_ms_crps_lambda < 0.0 or self.dlm_raw_ms_crps_scale_ms <= 0.0:
+            raise ValueError("DLM raw-ms CRPS requires lambda >= 0 and scale_ms > 0")
+        self.dlm_sampling_temperature = float(dlm_sampling_temperature)
+        if not math.isfinite(self.dlm_sampling_temperature) or self.dlm_sampling_temperature <= 0.0:
+            raise ValueError(
+                "dlm_sampling_temperature must be finite and > 0, got "
+                f"{self.dlm_sampling_temperature}"
+            )
+        if timing_sample_truncate_radius is None:
+            timing_sample_truncate_radius = dlm_timing_sample_truncate_radius
+        if timing_sample_truncate_center is None:
+            timing_sample_truncate_center = dlm_timing_sample_truncate_center
+        self.timing_sample_truncate_radius = float(timing_sample_truncate_radius or 0.0)
+        self.timing_sample_truncate_center = str(timing_sample_truncate_center or "mean").lower()
+        self.dlm_timing_sample_truncate_radius = self.timing_sample_truncate_radius
+        self.dlm_timing_sample_truncate_center = self.timing_sample_truncate_center
+        self.timing_sample_shrink_mode = str(timing_sample_shrink_mode or "none").lower()
+        self.timing_sample_shrink_factor = float(timing_sample_shrink_factor)
+        self.timing_sample_shrink_radius = float(timing_sample_shrink_radius or 0.0)
         self.raw_timing_loss_lambda = raw_timing_loss_lambda
         self.legacy_dual_timing_head = bool(legacy_dual_timing_head)
         self.raw_timing_head_type = str(
@@ -1637,6 +1743,18 @@ class IntegratedContinuousDecoder(nn.Module):
             pedal_output_dim = pedal_components * _scalar_distribution_dim(self.pedal_distribution) * 4
             if self.pedal_representation == "binary_4":
                 pedal_output_dim = 4
+        elif (
+            getattr(config, "task_type", "epr") == "epr"
+            and self.epr_distribution in DLM_DISTRIBUTIONS
+        ):
+            components = int(getattr(config, "dlm_components", getattr(config, "epr_mixture_components", 8)))
+            if components < 1:
+                raise ValueError(f"dlm_components must be >= 1, got {components}")
+            per_feature_dim = components * 3
+            ioi_output_dim = duration_output_dim = per_feature_dim
+            velocity_distribution = str(getattr(config, "velocity_distribution", "skew_normal")).lower()
+            velocity_output_dim = per_feature_dim if velocity_distribution in DLM_DISTRIBUTIONS else 3
+            pedal_output_dim = 4
         else:
             ioi_output_dim = duration_output_dim = velocity_output_dim = 1
             pedal_output_dim = 4
@@ -1788,6 +1906,7 @@ class IntegratedContinuousDecoder(nn.Module):
                 "logistic_normal",
                 "mixture_logistic_normal",
                 "mixture_beta",
+                *DLM_DISTRIBUTIONS,
             }:
                 return torch.cat([shared, pedal], dim=-1)
             shared = torch.sigmoid(shared)
@@ -1818,6 +1937,7 @@ class IntegratedContinuousDecoder(nn.Module):
             "logistic_normal",
             "mixture_logistic_normal",
             "mixture_beta",
+            *DLM_DISTRIBUTIONS,
         }:
             return torch.cat([shared, pedal], dim=-1)
 
@@ -1880,6 +2000,58 @@ def _mask_count(mask):
 def _split_epr_mixture_params(config, raw_outputs):
     components = _epr_mixture_components(config)
     distribution = getattr(config, "epr_distribution", "point").lower()
+    if distribution in DLM_DISTRIBUTIONS:
+        components = int(getattr(config, "dlm_components", components))
+        per_feature_dim = components * 3
+        cursor = 0
+        ioi_base = raw_outputs[..., cursor : cursor + per_feature_dim].reshape(
+            *raw_outputs.shape[:-1],
+            3,
+            components,
+        )
+        cursor += per_feature_dim
+        duration_base = raw_outputs[..., cursor : cursor + per_feature_dim].reshape(
+            *raw_outputs.shape[:-1],
+            3,
+            components,
+        )
+        cursor += per_feature_dim
+        velocity_distribution = str(getattr(config, "velocity_distribution", "skew_normal")).lower()
+        if velocity_distribution in DLM_DISTRIBUTIONS:
+            velocity_base = raw_outputs[..., cursor : cursor + per_feature_dim].reshape(
+                *raw_outputs.shape[:-1],
+                3,
+                components,
+            )
+            cursor += per_feature_dim
+            params = {
+                "ioi_logits": ioi_base[..., 0, :],
+                "ioi_loc": ioi_base[..., 1, :],
+                "ioi_log_scale": ioi_base[..., 2, :],
+                "duration_logits": duration_base[..., 0, :],
+                "duration_loc": duration_base[..., 1, :],
+                "duration_log_scale": duration_base[..., 2, :],
+                "velocity_logits": velocity_base[..., 0, :],
+                "velocity_loc": velocity_base[..., 1, :],
+                "velocity_log_scale": velocity_base[..., 2, :],
+                "pedal_binary_logits": raw_outputs[..., cursor : cursor + 4],
+            }
+        else:
+            velocity_base = raw_outputs[..., cursor : cursor + 3]
+            cursor += 3
+            params = {
+                "ioi_logits": ioi_base[..., 0, :],
+                "ioi_loc": ioi_base[..., 1, :],
+                "ioi_log_scale": ioi_base[..., 2, :],
+                "duration_logits": duration_base[..., 0, :],
+                "duration_loc": duration_base[..., 1, :],
+                "duration_log_scale": duration_base[..., 2, :],
+                "velocity_loc": velocity_base[..., 0],
+                "velocity_log_scale": velocity_base[..., 1],
+                "velocity_alpha": velocity_base[..., 2],
+                "pedal_binary_logits": raw_outputs[..., cursor : cursor + 4],
+            }
+        return params
     if distribution in SN_DISTRIBUTIONS:
         feature_dim = 3
         base_timing_count = _timing_distribution_count(config)
@@ -2189,7 +2361,16 @@ def _uses_inr_epr_targets(config):
     return (
         _config_value(config, "task_type", "epr") == "epr"
         and str(_config_value(config, "epr_timing_target", "absolute")).lower()
-        in {"log_deviation", "log_dev", "raw_log_deviation", "raw_log_dev"}
+        in {
+            "log_deviation",
+            "log_dev",
+            "raw_log_deviation",
+            "raw_log_dev",
+            "floor_log_deviation",
+            "floor_log_dev",
+            "pure_log_deviation",
+            "pure_log_dev",
+        }
     )
 
 
@@ -2199,6 +2380,10 @@ def _uses_log_deviation_targets(config):
         "log_dev",
         "raw_log_deviation",
         "raw_log_dev",
+        "floor_log_deviation",
+        "floor_log_dev",
+        "pure_log_deviation",
+        "pure_log_dev",
     }
 
 
@@ -2206,6 +2391,15 @@ def _uses_raw_log_deviation_targets(config):
     return str(_config_value(config, "epr_timing_target", "absolute")).lower() in {
         "raw_log_deviation",
         "raw_log_dev",
+    }
+
+
+def _uses_floor_log_deviation_targets(config):
+    return str(_config_value(config, "epr_timing_target", "absolute")).lower() in {
+        "floor_log_deviation",
+        "floor_log_dev",
+        "pure_log_deviation",
+        "pure_log_dev",
     }
 
 
@@ -2259,6 +2453,11 @@ def _torch_raw_log_timing_decode(log_value, scale=50.0, max_time_ms=5000.0):
     return decoded.clamp(0.0, float(max_time_ms))
 
 
+def _torch_floor_log_reconstruct(score_time_ms, dev):
+    base = score_time_ms.float().clamp_min(1.0)
+    return (base * torch.exp(dev.float())).clamp_min(0.0)
+
+
 def _torch_timing_control_code(time_ms, timing_control_mode="log_scaled", use_scale_bit=False, log_scale=50.0):
     value = time_ms.float().clamp(0.0, 5000.0)
     mode = resolve_timing_control_mode(
@@ -2286,6 +2485,8 @@ def _torch_timing_control_code(time_ms, timing_control_mode="log_scaled", use_sc
         )
     if mode == "log_scaled":
         return _torch_log_timing_code(value, scale=log_scale, max_time_ms=5000.0).unsqueeze(-1)
+    if mode == "floor_log":
+        return torch.log(value.clamp_min(1.0)).unsqueeze(-1)
     if mode == "raw_log":
         return torch.stack(
             [
@@ -2337,6 +2538,12 @@ def _target7_to_raw7(score_shared_raw, target_predictions, config=None):
         else:
             velocity = target_predictions[..., 2].clamp(0.0, 1.0) * 127.0
             pedal = target_predictions[..., 3:7].clamp(0.0, 1.0) * 127.0
+        return torch.cat([perf_ioi_ms.unsqueeze(-1), perf_duration_ms.unsqueeze(-1), velocity.unsqueeze(-1), pedal], dim=-1)
+    if _uses_floor_log_deviation_targets(config):
+        perf_ioi_ms = _torch_floor_log_reconstruct(score_shared_raw[..., 0], target_predictions[..., 0])
+        perf_duration_ms = _torch_floor_log_reconstruct(score_shared_raw[..., 1], target_predictions[..., 1])
+        velocity = target_predictions[..., 2].clamp(0.0, 1.0) * 127.0
+        pedal = target_predictions[..., 3:7].clamp(0.0, 1.0) * 127.0
         return torch.cat([perf_ioi_ms.unsqueeze(-1), perf_duration_ms.unsqueeze(-1), velocity.unsqueeze(-1), pedal], dim=-1)
 
     target_predictions = target_predictions.clamp(0.0, 1.0)
@@ -2432,6 +2639,15 @@ def _target_predictions_to_feedback7(config, target_predictions):
             ],
             dim=-1,
         )
+    if _uses_floor_log_deviation_targets(config):
+        return torch.cat(
+            [
+                target_predictions[..., 0:2],
+                target_predictions[..., 2:3].clamp(0.0, 1.0),
+                target_predictions[..., 3:7].clamp(0.0, 1.0),
+            ],
+            dim=-1,
+        )
     return target_predictions[..., :7].clamp(0.0, 1.0)
 
 
@@ -2459,8 +2675,8 @@ def _build_epr_decoder_rows(config, score_shared_raw, target_predictions, score_
     timing_control_mode = getattr(config, "timing_control_mode", None)
     use_timing_scale_bit = getattr(config, "use_timing_scale_bit", True)
     log_scale = getattr(config, "timing_log_scale", 50.0)
-    if resolve_timing_control_mode(timing_control_mode, use_timing_scale_bit) not in {"log_scaled", "raw_log"}:
-        raise ValueError("EPR decoder feedback requires timing_control_mode=log_scaled or raw_log")
+    if resolve_timing_control_mode(timing_control_mode, use_timing_scale_bit) not in {"log_scaled", "floor_log", "raw_log"}:
+        raise ValueError("EPR decoder feedback requires timing_control_mode=log_scaled, floor_log, or raw_log")
     target7 = _target_predictions_to_feedback7(config, target_predictions)
     score_ioi = _torch_timing_control_code(
         score_shared_raw[..., 0],
@@ -2508,6 +2724,21 @@ def _build_epr_decoder_rows(config, score_shared_raw, target_predictions, score_
         score_duration_log = _torch_raw_log_timing_code(score_shared_raw[..., 1], scale=log_scale, max_time_ms=5000.0).unsqueeze(-1)
         perf_ioi_ms = _torch_raw_log_timing_decode(score_ioi_log + target7[..., 0:1], scale=log_scale)
         duration_ms = _torch_raw_log_timing_decode(score_duration_log + target7[..., 1:2], scale=log_scale)
+        perf_ioi = _torch_timing_control_code(
+            perf_ioi_ms.squeeze(-1),
+            timing_control_mode=timing_control_mode,
+            use_scale_bit=use_timing_scale_bit,
+            log_scale=log_scale,
+        )
+        duration = _torch_timing_control_code(
+            duration_ms.squeeze(-1),
+            timing_control_mode=timing_control_mode,
+            use_scale_bit=use_timing_scale_bit,
+            log_scale=log_scale,
+        )
+    elif _uses_floor_log_deviation_targets(config):
+        perf_ioi_ms = _torch_floor_log_reconstruct(score_shared_raw[..., 0:1], target7[..., 0:1])
+        duration_ms = _torch_floor_log_reconstruct(score_shared_raw[..., 1:2], target7[..., 1:2])
         perf_ioi = _torch_timing_control_code(
             perf_ioi_ms.squeeze(-1),
             timing_control_mode=timing_control_mode,
@@ -2665,6 +2896,72 @@ def _mixture_logistic_normal_nll(logits, raw_mu, raw_log_sigma, target, mask, ep
         sigma_max,
     )
     return _masked_mean(values, mask)
+
+
+def _bounded_student_t_log_prob(raw_loc, raw_log_scale, raw_df, target, eps, sigma_min, sigma_max):
+    if raw_loc.shape != target.shape:
+        raw_loc = raw_loc[..., : target.shape[-1]]
+        raw_log_scale = raw_log_scale[..., : target.shape[-1]]
+        raw_df = raw_df[..., : target.shape[-1]]
+    target = target.float().clamp(float(eps), 1.0 - float(eps))
+    z = torch.atanh((2.0 * target - 1.0).clamp(-1.0 + float(eps), 1.0 - float(eps)))
+    loc, scale = _logistic_normal_params(raw_loc, raw_log_scale, sigma_min, sigma_max)
+    df = 2.0 + F.softplus(raw_df.float())
+    log_base = torch.distributions.StudentT(df=df, loc=loc, scale=scale).log_prob(z)
+    log_jacobian = -math.log(2.0) - torch.log(target) - torch.log1p(-target)
+    return log_base + log_jacobian
+
+
+def _bounded_student_t_nll(raw_loc, raw_log_scale, raw_df, target, mask, eps, sigma_min, sigma_max):
+    return _masked_mean(
+        -_bounded_student_t_log_prob(raw_loc, raw_log_scale, raw_df, target, eps, sigma_min, sigma_max),
+        mask,
+    )
+
+
+def _bounded_student_t_mean_or_sample(config, raw_loc, raw_log_scale, raw_df, sampling_strategy="mean"):
+    sigma_min = getattr(config, "logistic_normal_sigma_min", 1e-3)
+    sigma_max = getattr(config, "logistic_normal_sigma_max", 10.0)
+    loc, scale = _logistic_normal_params(raw_loc, raw_log_scale, sigma_min, sigma_max)
+    mode = str(sampling_strategy).lower()
+    if mode in {"mean", "deterministic", "mu", "greedy"}:
+        z = loc
+    elif mode in {"sample", "sampling", "stochastic"}:
+        df = 2.0 + F.softplus(raw_df.float())
+        z = torch.distributions.StudentT(df=df, loc=loc, scale=scale).sample()
+    else:
+        raise ValueError(f"Unsupported sampling_strategy: {sampling_strategy}")
+    return 0.5 * (torch.tanh(z) + 1.0)
+
+
+def _bounded_skew_normal_log_prob(raw_loc, raw_log_scale, raw_alpha, target, eps, sigma_min, sigma_max):
+    if raw_loc.shape != target.shape:
+        raw_loc = raw_loc[..., : target.shape[-1]]
+        raw_log_scale = raw_log_scale[..., : target.shape[-1]]
+        raw_alpha = raw_alpha[..., : target.shape[-1]]
+    target = target.float().clamp(float(eps), 1.0 - float(eps))
+    z = torch.logit(target, eps=float(eps))
+    return _skew_normal_log_prob(raw_loc, raw_log_scale, raw_alpha, z, sigma_min, sigma_max) \
+        - torch.log(target) - torch.log1p(-target)
+
+
+def _bounded_skew_normal_nll(raw_loc, raw_log_scale, raw_alpha, target, mask, eps, sigma_min, sigma_max):
+    return _masked_mean(
+        -_bounded_skew_normal_log_prob(raw_loc, raw_log_scale, raw_alpha, target, eps, sigma_min, sigma_max),
+        mask,
+    )
+
+
+def _bounded_skew_normal_mean_or_sample(config, raw_loc, raw_log_scale, raw_alpha, sampling_strategy="mean"):
+    value = _skew_normal_mean_or_sample(
+        raw_loc,
+        raw_log_scale,
+        raw_alpha,
+        sampling_strategy=sampling_strategy,
+        sigma_min=getattr(config, "skew_normal_sigma_min", 1e-4),
+        sigma_max=getattr(config, "skew_normal_sigma_max", 1e4),
+    )
+    return torch.sigmoid(value)
 
 
 def _logistic_asymmetric_normal_log_prob(
@@ -2956,24 +3253,92 @@ def _inflated_logistic_normal_mean_or_sample(
     )
 
 
-def _mixture_beta_params(raw_alpha, raw_beta, alpha_min=1e-4):
+def _mixture_beta_params(
+    raw_alpha,
+    raw_beta,
+    alpha_min=1e-4,
+    parameterization="alpha_beta",
+    kappa_min=1e-3,
+):
+    if str(parameterization).lower() in {"mu_kappa", "mean_concentration"}:
+        mean = torch.sigmoid(raw_alpha.float())
+        kappa = F.softplus(raw_beta.float()) + float(kappa_min)
+        alpha = mean * kappa + float(alpha_min)
+        beta = (1.0 - mean) * kappa + float(alpha_min)
+        return alpha, beta, mean
     alpha = F.softplus(raw_alpha.float()) + float(alpha_min)
     beta = F.softplus(raw_beta.float()) + float(alpha_min)
     mean = alpha / (alpha + beta).clamp_min(1e-12)
     return alpha, beta, mean
 
 
-def _mixture_beta_log_prob(logits, raw_alpha, raw_beta, target, eps, alpha_min):
+def _mixture_beta_log_prob(
+    logits, raw_alpha, raw_beta, target, eps, alpha_min,
+    parameterization="alpha_beta", kappa_min=1e-3,
+):
     target = target.float().clamp(float(eps), 1.0 - float(eps)).unsqueeze(-1)
-    alpha, beta, _ = _mixture_beta_params(raw_alpha, raw_beta, alpha_min=alpha_min)
+    alpha, beta, _ = _mixture_beta_params(
+        raw_alpha, raw_beta, alpha_min=alpha_min,
+        parameterization=parameterization, kappa_min=kappa_min,
+    )
     log_pi = F.log_softmax(logits.float(), dim=-1)
     log_beta = torch.distributions.Beta(alpha, beta).log_prob(target)
     return torch.logsumexp(log_pi + log_beta, dim=-1)
 
 
-def _mixture_beta_nll(logits, raw_alpha, raw_beta, target, mask, eps, alpha_min):
-    values = -_mixture_beta_log_prob(logits, raw_alpha, raw_beta, target, eps, alpha_min)
+def _mixture_beta_nll(
+    logits, raw_alpha, raw_beta, target, mask, eps, alpha_min,
+    parameterization="alpha_beta", kappa_min=1e-3,
+):
+    values = -_mixture_beta_log_prob(
+        logits, raw_alpha, raw_beta, target, eps, alpha_min,
+        parameterization=parameterization, kappa_min=kappa_min,
+    )
     return _masked_mean(values, mask)
+
+
+def _mixture_unit_variance(config, distribution, logits, raw_a, raw_b):
+    probs = torch.softmax(logits.float(), dim=-1)
+    distribution = str(distribution).lower()
+    if distribution == "mixture_beta":
+        alpha, beta, component_mean = _mixture_beta_params(
+            raw_a,
+            raw_b,
+            alpha_min=getattr(config, "beta_alpha_min", 1e-4),
+            parameterization=getattr(config, "mixture_beta_parameterization", "alpha_beta"),
+            kappa_min=getattr(config, "mixture_beta_kappa_min", 1e-3),
+        )
+        concentration = (alpha + beta).clamp_min(1e-12)
+        component_var = alpha * beta / (
+            concentration.square() * (concentration + 1.0)
+        ).clamp_min(1e-12)
+    elif distribution in {"logistic_normal", "mixture_logistic_normal"}:
+        loc, sigma = _logistic_normal_params(
+            raw_a,
+            raw_b,
+            getattr(config, "logistic_normal_sigma_min", 1e-3),
+            getattr(config, "logistic_normal_sigma_max", 10.0),
+        )
+        component_mean = torch.sigmoid(
+            loc / torch.sqrt(1.0 + (math.pi / 8.0) * sigma.square())
+        )
+        slope = component_mean * (1.0 - component_mean)
+        component_var = slope.square() * sigma.square()
+    else:
+        raise ValueError(f"Predictive variance is not implemented for {distribution}")
+    mixture_mean = torch.sum(probs * component_mean, dim=-1)
+    second_moment = torch.sum(
+        probs * (component_var + component_mean.square()), dim=-1
+    )
+    return (second_moment - mixture_mean.square()).clamp_min(0.0)
+
+
+def _predictive_variance_penalty(config, variance, mask, radius_unit):
+    radius = torch.as_tensor(radius_unit, device=variance.device, dtype=variance.dtype)
+    excess = F.relu(torch.sqrt(variance + 1e-12) - radius)
+    return float(getattr(config, "predictive_variance_lambda", 0.0)) * _masked_mean(
+        excess.square(), mask
+    )
 
 
 def _skew_normal_params(raw_loc, raw_log_scale, raw_alpha, sigma_min=1e-4, sigma_max=1e4):
@@ -3269,6 +3634,95 @@ def _skew_normal_mean_or_sample(
     raise ValueError(f"Unsupported sampling_strategy: {sampling_strategy}")
 
 
+def _timing_truncate_radius(config):
+    radius = getattr(config, "timing_sample_truncate_radius", None)
+    if radius is None:
+        radius = getattr(config, "dlm_timing_sample_truncate_radius", 0.0)
+    return float(radius or 0.0)
+
+
+def _timing_truncate_center_mode(config):
+    center = getattr(config, "timing_sample_truncate_center", None)
+    if center is None:
+        center = getattr(config, "dlm_timing_sample_truncate_center", "mean")
+    return str(center or "mean").lower()
+
+
+def _apply_timing_sample_shrink(config, sample, center):
+    mode = str(getattr(config, "timing_sample_shrink_mode", "none") or "none").lower()
+    if mode in {"none", "off", "false", "0"}:
+        return sample
+    delta = sample - center
+    if mode in {"linear", "scale", "shrink"}:
+        factor = float(getattr(config, "timing_sample_shrink_factor", 1.0))
+        return center + factor * delta
+    if mode in {"tanh", "softcap", "soft_cap"}:
+        radius = float(getattr(config, "timing_sample_shrink_radius", 0.0) or 0.0)
+        if radius <= 0.0:
+            return sample
+        return center + radius * torch.tanh(delta / radius)
+    raise ValueError(f"Unsupported timing_sample_shrink_mode={mode}")
+
+
+def _skew_normal_mean_or_sample_timing(
+    config,
+    raw_loc,
+    raw_log_scale,
+    raw_alpha,
+    sampling_strategy="mean",
+    sigma_min=1e-4,
+    sigma_max=1e4,
+):
+    mode = str(sampling_strategy).lower()
+    radius = _timing_truncate_radius(config)
+    if mode not in {"sample", "sampling", "stochastic"}:
+        return _skew_normal_mean_or_sample(
+            raw_loc,
+            raw_log_scale,
+            raw_alpha,
+            sampling_strategy=sampling_strategy,
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
+        )
+    center_mode = _timing_truncate_center_mode(config)
+    center_strategy = "argmax" if center_mode in {"mode", "argmax", "greedy"} else "mean"
+    center = _skew_normal_mean_or_sample(
+        raw_loc,
+        raw_log_scale,
+        raw_alpha,
+        sampling_strategy=center_strategy,
+        sigma_min=sigma_min,
+        sigma_max=sigma_max,
+    )
+    if radius <= 0.0:
+        sample = _skew_normal_mean_or_sample(
+            raw_loc,
+            raw_log_scale,
+            raw_alpha,
+            sampling_strategy="sample",
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
+        )
+        return _apply_timing_sample_shrink(config, sample, center)
+    sample = center
+    accepted = torch.zeros_like(center, dtype=torch.bool)
+    for _ in range(32):
+        candidate = _skew_normal_mean_or_sample(
+            raw_loc,
+            raw_log_scale,
+            raw_alpha,
+            sampling_strategy="sample",
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
+        )
+        ok = (candidate >= center - radius) & (candidate <= center + radius)
+        sample = torch.where((~accepted) & ok, candidate, sample)
+        accepted = accepted | ok
+        if bool(accepted.all()):
+            break
+    return _apply_timing_sample_shrink(config, sample.clamp(center - radius, center + radius), center)
+
+
 def _mixture_logistic_normal_mean_or_sample(config, logits, raw_mu, raw_log_sigma, sampling_strategy="mean"):
     mode = str(sampling_strategy).lower()
     mu, sigma = _logistic_normal_params(
@@ -3289,6 +3743,53 @@ def _mixture_logistic_normal_mean_or_sample(config, logits, raw_mu, raw_log_sigm
         sampled_sigma = sigma.gather(dim=-1, index=index).squeeze(-1)
         return torch.sigmoid(torch.distributions.Normal(sampled_mu, sampled_sigma).sample())
     raise ValueError(f"Unsupported sampling_strategy: {sampling_strategy}")
+
+
+def _mixture_logistic_normal_mean_or_sample_timing(config, logits, raw_mu, raw_log_sigma, sampling_strategy="mean"):
+    mode = str(sampling_strategy).lower()
+    radius = _timing_truncate_radius(config)
+    if mode not in {"sample", "sampling", "stochastic"}:
+        return _mixture_logistic_normal_mean_or_sample(
+            config,
+            logits,
+            raw_mu,
+            raw_log_sigma,
+            sampling_strategy=sampling_strategy,
+        )
+    center_mode = _timing_truncate_center_mode(config)
+    center_strategy = "argmax" if center_mode in {"mode", "argmax", "greedy"} else "mean"
+    center = _mixture_logistic_normal_mean_or_sample(
+        config,
+        logits,
+        raw_mu,
+        raw_log_sigma,
+        sampling_strategy=center_strategy,
+    )
+    if radius <= 0.0:
+        sample = _mixture_logistic_normal_mean_or_sample(
+            config,
+            logits,
+            raw_mu,
+            raw_log_sigma,
+            sampling_strategy="sample",
+        )
+        return _apply_timing_sample_shrink(config, sample, center)
+    sample = center
+    accepted = torch.zeros_like(center, dtype=torch.bool)
+    for _ in range(32):
+        candidate = _mixture_logistic_normal_mean_or_sample(
+            config,
+            logits,
+            raw_mu,
+            raw_log_sigma,
+            sampling_strategy="sample",
+        )
+        ok = (candidate >= center - radius) & (candidate <= center + radius)
+        sample = torch.where((~accepted) & ok, candidate, sample)
+        accepted = accepted | ok
+        if bool(accepted.all()):
+            break
+    return _apply_timing_sample_shrink(config, sample.clamp(center - radius, center + radius), center)
 
 
 def _logistic_asymmetric_normal_mean_or_sample(
@@ -3345,6 +3846,8 @@ def _mixture_beta_mean_or_sample(config, logits, raw_alpha, raw_beta, sampling_s
         raw_alpha,
         raw_beta,
         alpha_min=getattr(config, "beta_alpha_min", 1e-4),
+        parameterization=getattr(config, "mixture_beta_parameterization", "alpha_beta"),
+        kappa_min=getattr(config, "mixture_beta_kappa_min", 1e-3),
     )
     probs = torch.softmax(logits.float(), dim=-1)
     if mode in {"mean", "deterministic", "mu", "expected", "expectation"}:
@@ -3362,6 +3865,14 @@ def _mixture_beta_mean_or_sample(config, logits, raw_alpha, raw_beta, sampling_s
 
 def _decode_mixture_value(config, logits, a, b, c=None, sampling_strategy="mean", distribution=None):
     distribution = (distribution or getattr(config, "epr_distribution", "point")).lower()
+    if distribution in TANH_T_DISTRIBUTIONS:
+        return _bounded_student_t_mean_or_sample(
+            config, a.squeeze(-1), b.squeeze(-1), logits.squeeze(-1), sampling_strategy=sampling_strategy
+        )
+    if distribution in BOUNDED_SN_DISTRIBUTIONS:
+        return _bounded_skew_normal_mean_or_sample(
+            config, a.squeeze(-1), b.squeeze(-1), logits.squeeze(-1), sampling_strategy=sampling_strategy
+        )
     if distribution in ACN_DISTRIBUTIONS:
         if c is None:
             raise ValueError("ACN decoding requires right-scale parameter c")
@@ -3417,6 +3928,16 @@ def _scalar_mln_loss_value(config, logits, raw_mu, raw_log_sigma, target, mask, 
 
 def _mixture_loss_value(config, logits, a, b, target, mask, eps, sigma_min, sigma_max, alpha_min, c=None, distribution=None):
     distribution = (distribution or getattr(config, "epr_distribution", "point")).lower()
+    if distribution in TANH_T_DISTRIBUTIONS:
+        return _bounded_student_t_nll(
+            a.squeeze(-1), b.squeeze(-1), logits.squeeze(-1), target, mask, eps, sigma_min, sigma_max
+        )
+    if distribution in BOUNDED_SN_DISTRIBUTIONS:
+        return _bounded_skew_normal_nll(
+            a.squeeze(-1), b.squeeze(-1), logits.squeeze(-1), target, mask, eps,
+            getattr(config, "skew_normal_sigma_min", sigma_min),
+            getattr(config, "skew_normal_sigma_max", sigma_max),
+        )
     if distribution in ACN_DISTRIBUTIONS:
         if c is None:
             raise ValueError("ACN loss requires right-scale parameter c")
@@ -3456,7 +3977,11 @@ def _mixture_loss_value(config, logits, a, b, target, mask, eps, sigma_min, sigm
             sigma_max,
         )
     if distribution == "mixture_beta":
-        return _mixture_beta_nll(logits, a, b, target, mask, eps, alpha_min)
+        return _mixture_beta_nll(
+            logits, a, b, target, mask, eps, alpha_min,
+            parameterization=getattr(config, "mixture_beta_parameterization", "alpha_beta"),
+            kappa_min=getattr(config, "mixture_beta_kappa_min", 1e-3),
+        )
     if distribution in ALN_DISTRIBUTIONS:
         if c is None:
             return _mixture_logistic_normal_nll(logits, a, b, target, mask, eps, sigma_min, sigma_max)
@@ -3545,11 +4070,62 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean", s
     strategy_name = str(sampling_strategy).lower()
     shared_strategy = "mean" if strategy_name in {"soft", "prob", "probs", "probability", "probabilities"} else sampling_strategy
     distribution = getattr(config, "epr_distribution", "point").lower()
+    if distribution in DLM_DISTRIBUTIONS:
+        params = _split_epr_mixture_params(config, raw_outputs)
+        if score_shared_raw is None:
+            raise ValueError("DLM materialization requires score_shared_raw for score-IOI group ranges")
+        zero_mask = _zero_score_ioi_mask(config, score_shared_raw)
+        ioi = _dlm_mean_or_sample(
+            config,
+            params["ioi_logits"],
+            params["ioi_loc"],
+            params["ioi_log_scale"],
+            "ioi",
+            sampling_strategy=shared_strategy,
+            zero_mask=zero_mask,
+        )
+        duration = _dlm_mean_or_sample(
+            config,
+            params["duration_logits"],
+            params["duration_loc"],
+            params["duration_log_scale"],
+            "duration",
+            sampling_strategy=shared_strategy,
+        )
+        velocity_distribution = str(getattr(config, "velocity_distribution", "skew_normal")).lower()
+        if velocity_distribution in DLM_DISTRIBUTIONS:
+            velocity_raw = _dlm_mean_or_sample(
+                config,
+                params["velocity_logits"],
+                params["velocity_loc"],
+                params["velocity_log_scale"],
+                "velocity",
+                sampling_strategy=shared_strategy,
+            )
+            velocity = (velocity_raw / 127.0).clamp(0.0, 1.0)
+        else:
+            sigma_min = getattr(config, "skew_normal_sigma_min", getattr(config, "logistic_normal_sigma_min", 1e-4))
+            sigma_max = getattr(config, "skew_normal_sigma_max", getattr(config, "logistic_normal_sigma_max", 1e4))
+            velocity = _skew_normal_mean_or_sample(
+                params["velocity_loc"],
+                params["velocity_log_scale"],
+                params["velocity_alpha"],
+                sampling_strategy=shared_strategy,
+                sigma_min=sigma_min,
+                sigma_max=sigma_max,
+            ).clamp(0.0, 1.0)
+        pedal = _materialize_binary4_logits(
+            params["pedal_binary_logits"],
+            sampling_strategy=sampling_strategy,
+        )
+        return torch.cat([torch.stack([ioi, duration, velocity], dim=-1), pedal], dim=-1)
+
     if distribution in SN_DISTRIBUTIONS:
         params = _split_epr_mixture_params(config, raw_outputs)
         sigma_min = getattr(config, "skew_normal_sigma_min", getattr(config, "logistic_normal_sigma_min", 1e-4))
         sigma_max = getattr(config, "skew_normal_sigma_max", getattr(config, "logistic_normal_sigma_max", 1e4))
-        logdev = _skew_normal_mean_or_sample(
+        logdev = _skew_normal_mean_or_sample_timing(
+            config,
             params["timing_log_loc"],
             params["timing_log_log_scale"],
             params["timing_log_alpha"],
@@ -3563,7 +4139,8 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean", s
         if zero_dual_mode not in {"none", "off", "false", "0"}:
             if score_shared_raw is None:
                 raise ValueError("zero-IOI dual distribution materialization requires score_shared_raw")
-            zero_logdev = _skew_normal_mean_or_sample(
+            zero_logdev = _skew_normal_mean_or_sample_timing(
+                config,
                 params["timing_zero_log_loc"],
                 params["timing_zero_log_log_scale"],
                 params["timing_zero_log_alpha"],
@@ -3655,10 +4232,28 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean", s
 
     if _is_scalar_distribution(distribution):
         params = _split_epr_mixture_params(config, raw_outputs)
+        bounded_floorlog = bool(getattr(config, "bounded_floorlog_support", False))
+        zero_mask = (
+            _zero_score_ioi_mask(config, score_shared_raw)
+            if bounded_floorlog and score_shared_raw is not None
+            else None
+        )
 
         def decode_shared(index):
             logits, a, b, c = _shared_scalar_params(config, params, index)
-            return _decode_mixture_value(
+            if (
+                distribution in {"logistic_normal", "mixture_logistic_normal"}
+                and index in {0, 1}
+                and not bounded_floorlog
+            ):
+                return _mixture_logistic_normal_mean_or_sample_timing(
+                    config,
+                    logits,
+                    a,
+                    b,
+                    sampling_strategy=shared_strategy,
+                )
+            value = _decode_mixture_value(
                 config,
                 logits,
                 a,
@@ -3666,6 +4261,14 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean", s
                 c,
                 sampling_strategy=shared_strategy,
             )
+            if bounded_floorlog and index < 2:
+                return _bounded_feature_from_unit(
+                    config,
+                    value,
+                    "ioi" if index == 0 else "duration",
+                    zero_mask=zero_mask if index == 0 else None,
+                )
+            return value
 
         shared = torch.stack([decode_shared(0), decode_shared(1), decode_shared(2)], dim=-1)
         pedal = _materialize_binary4_logits(
@@ -4333,6 +4936,262 @@ def _compute_epr_categorical_loss_components(config, raw_outputs, labels_epr_bin
     }
 
 
+def _dlm_scale(config, raw_log_scale, feature=None):
+    sigma_min = float(getattr(config, "dlm_scale_min", 1e-3))
+    sigma_max = float(getattr(config, "dlm_scale_max", 10.0))
+    parameterization = str(
+        getattr(config, "dlm_timing_scale_parameterization", "legacy_clamp")
+    ).lower()
+    if str(feature) in {"ioi", "duration"} and parameterization in {
+        "bounded_sigmoid",
+        "sigmoid",
+    }:
+        sigma_min = float(getattr(config, "dlm_timing_scale_min", sigma_min))
+        sigma_max = float(getattr(config, "dlm_timing_scale_max", sigma_max))
+        if sigma_max <= sigma_min:
+            raise ValueError(
+                f"DLM bounded scale requires max > min, got {sigma_min}, {sigma_max}"
+            )
+        return sigma_min + (sigma_max - sigma_min) * torch.sigmoid(raw_log_scale.float())
+    scale = F.softplus(raw_log_scale.float()) + sigma_min
+    if str(feature) == "velocity":
+        lo = float(getattr(config, "dlm_velocity_min", -0.5))
+        hi = float(getattr(config, "dlm_velocity_max", 127.5))
+        scale = scale + (hi - lo) / 16.0
+    return scale.clamp(max=sigma_max)
+
+
+def _dlm_loc(config, raw_loc, feature):
+    loc = raw_loc.float()
+    if str(feature) == "velocity":
+        lo = float(getattr(config, "dlm_velocity_min", -0.5))
+        hi = float(getattr(config, "dlm_velocity_max", 127.5))
+        return loc + (lo + hi) * 0.5
+    return loc
+
+
+def _dlm_feature_range(config, feature, zero_mask=None):
+    feature = str(feature)
+    if feature == "ioi":
+        if zero_mask is None:
+            return (
+                float(getattr(config, "dlm_ioi_nonzero_min", -2.5)),
+                float(getattr(config, "dlm_ioi_nonzero_max", 1.5)),
+            )
+        lo = torch.where(
+            zero_mask,
+            zero_mask.new_full((), float(getattr(config, "dlm_ioi_zero_min", 0.0)), dtype=torch.float32),
+            zero_mask.new_full((), float(getattr(config, "dlm_ioi_nonzero_min", -2.5)), dtype=torch.float32),
+        )
+        hi = torch.where(
+            zero_mask,
+            zero_mask.new_full((), float(getattr(config, "dlm_ioi_zero_max", 5.0)), dtype=torch.float32),
+            zero_mask.new_full((), float(getattr(config, "dlm_ioi_nonzero_max", 1.5)), dtype=torch.float32),
+        )
+        return lo, hi
+    if feature == "duration":
+        return (
+            float(getattr(config, "dlm_duration_min", -3.0)),
+            float(getattr(config, "dlm_duration_max", 2.0)),
+        )
+    if feature == "velocity":
+        return (
+            float(getattr(config, "dlm_velocity_min", -0.5)),
+            float(getattr(config, "dlm_velocity_max", 127.5)),
+        )
+    raise ValueError(f"Unsupported DLM feature={feature}")
+
+
+def _bounded_feature_to_unit(config, value, feature, zero_mask=None, eps=1e-5):
+    lo, hi = _dlm_feature_range(config, feature, zero_mask=zero_mask)
+    lo = torch.as_tensor(lo, device=value.device, dtype=value.dtype)
+    hi = torch.as_tensor(hi, device=value.device, dtype=value.dtype)
+    return ((value - lo) / (hi - lo)).clamp(float(eps), 1.0 - float(eps))
+
+
+def _bounded_feature_from_unit(config, value, feature, zero_mask=None):
+    lo, hi = _dlm_feature_range(config, feature, zero_mask=zero_mask)
+    lo = torch.as_tensor(lo, device=value.device, dtype=value.dtype)
+    hi = torch.as_tensor(hi, device=value.device, dtype=value.dtype)
+    return lo + value * (hi - lo)
+
+
+def _dlm_bins(config, feature):
+    return int(getattr(config, "dlm_velocity_bins", 128)) if feature == "velocity" else int(getattr(config, "dlm_timing_bins", 256))
+
+
+def _dlm_log_bin_probs(config, logits, raw_loc, raw_log_scale, feature, zero_mask=None):
+    bins = _dlm_bins(config, feature)
+    if bins < 2:
+        raise ValueError(f"DLM bins must be >= 2 for {feature}, got {bins}")
+    loc = _dlm_loc(config, raw_loc, feature)
+    scale = _dlm_scale(config, raw_log_scale, feature=feature)
+    lo, hi = _dlm_feature_range(config, feature, zero_mask=zero_mask)
+    if torch.is_tensor(lo):
+        lo = lo.to(device=loc.device, dtype=loc.dtype)
+        hi = hi.to(device=loc.device, dtype=loc.dtype)
+        t = torch.linspace(0.0, 1.0, bins + 1, device=loc.device, dtype=loc.dtype)
+        edges = lo.unsqueeze(-1) + (hi - lo).unsqueeze(-1) * t
+    else:
+        edges = torch.linspace(float(lo), float(hi), bins + 1, device=loc.device, dtype=loc.dtype)
+        view_shape = [1] * loc.ndim
+        view_shape[-1] = bins + 1
+        edges = edges.view(*view_shape)
+    left = edges[..., :-1].unsqueeze(-1)
+    right = edges[..., 1:].unsqueeze(-1)
+    z_left = (left - loc.unsqueeze(-2)) / scale.unsqueeze(-2)
+    z_right = (right - loc.unsqueeze(-2)) / scale.unsqueeze(-2)
+    cdf_left = torch.sigmoid(z_left)
+    cdf_right = torch.sigmoid(z_right)
+    first = cdf_right[..., 0:1, :]
+    middle = (cdf_right[..., 1:-1, :] - cdf_left[..., 1:-1, :]).clamp_min(1e-12)
+    last = (1.0 - cdf_left[..., -1:, :]).clamp_min(1e-12)
+    comp_probs = torch.cat([first.clamp_min(1e-12), middle, last], dim=-2)
+    log_comp = torch.log(comp_probs)
+    log_mix = torch.log_softmax(logits.float(), dim=-1).unsqueeze(-2)
+    return torch.logsumexp(log_mix + log_comp, dim=-1)
+
+
+def _dlm_target_bins(config, target, feature, zero_mask=None):
+    bins = _dlm_bins(config, feature)
+    lo, hi = _dlm_feature_range(config, feature, zero_mask=zero_mask)
+    target = target.float()
+    if torch.is_tensor(lo):
+        lo = lo.to(device=target.device, dtype=target.dtype)
+        hi = hi.to(device=target.device, dtype=target.dtype)
+        scaled = (target - lo) / (hi - lo).clamp_min(1e-12)
+    else:
+        scaled = (target - float(lo)) / max(float(hi) - float(lo), 1e-12)
+    return torch.floor(scaled * bins).long().clamp(0, bins - 1)
+
+
+def _dlm_nll(config, logits, raw_loc, raw_log_scale, target, mask, feature, zero_mask=None, weights=None):
+    log_probs = _dlm_log_bin_probs(config, logits, raw_loc, raw_log_scale, feature, zero_mask=zero_mask)
+    return _dlm_nll_from_log_probs(
+        config, log_probs, target, mask, feature, zero_mask=zero_mask, weights=weights
+    )
+
+
+def _dlm_nll_from_log_probs(config, log_probs, target, mask, feature, zero_mask=None, weights=None):
+    target_bins = _dlm_target_bins(config, target, feature, zero_mask=zero_mask)
+    nll = -log_probs.gather(-1, target_bins.unsqueeze(-1)).squeeze(-1)
+    if weights is not None:
+        weighted_mask = mask.to(dtype=nll.dtype, device=nll.device) * weights.to(dtype=nll.dtype, device=nll.device)
+        return (nll * weighted_mask).sum() / weighted_mask.sum().clamp_min(1.0)
+    return _masked_mean(nll, mask)
+
+
+def _dlm_bin_centers(config, feature, like, zero_mask=None):
+    bins = _dlm_bins(config, feature)
+    lo, hi = _dlm_feature_range(config, feature, zero_mask=zero_mask)
+    if torch.is_tensor(lo):
+        lo = lo.to(device=like.device, dtype=like.dtype)
+        hi = hi.to(device=like.device, dtype=like.dtype)
+        t = (torch.arange(bins, device=like.device, dtype=like.dtype) + 0.5) / float(bins)
+        return lo.unsqueeze(-1) + (hi - lo).unsqueeze(-1) * t
+    centers = torch.linspace(
+        float(lo) + (float(hi) - float(lo)) / (2 * bins),
+        float(hi) - (float(hi) - float(lo)) / (2 * bins),
+        bins,
+        device=like.device,
+        dtype=like.dtype,
+    )
+    view_shape = [1] * like.ndim
+    view_shape[-1] = bins
+    return centers.view(*view_shape)
+
+
+def _dlm_tail_mass(config, logits, raw_loc, raw_log_scale, mask, feature, zero_mask=None):
+    log_probs = _dlm_log_bin_probs(
+        config, logits, raw_loc, raw_log_scale, feature, zero_mask=zero_mask
+    )
+    return _dlm_tail_mass_from_log_probs(config, log_probs, mask, feature, zero_mask=zero_mask)
+
+
+def _dlm_tail_mass_from_log_probs(config, log_probs, mask, feature, zero_mask=None):
+    probs = torch.softmax(log_probs, dim=-1)
+    centers = _dlm_bin_centers(config, feature, log_probs, zero_mask=zero_mask).expand_as(probs)
+    mean = torch.sum(probs * centers, dim=-1, keepdim=True).detach()
+    radius = float(getattr(config, "dlm_tail_radius", 0.05))
+    outside = (centers - mean).abs() > radius
+    tail_mass = (probs * outside.to(dtype=probs.dtype)).sum(dim=-1)
+    return _masked_mean(tail_mass, mask)
+
+
+def _dlm_timing_nll_weights(config, score_time_ms, target_dev, mask):
+    alpha = float(getattr(config, "dlm_timing_weighted_nll_alpha", 0.0))
+    if alpha <= 0.0:
+        return None
+    target_time_ms = _torch_floor_log_reconstruct(score_time_ms, target_dev).detach()
+    valid = target_time_ms[mask.bool()]
+    reference = valid.median().clamp_min(1.0) if valid.numel() else target_time_ms.new_tensor(1.0)
+    weights = (target_time_ms / reference).clamp_min(1e-12).pow(alpha)
+    weight_min = float(getattr(config, "dlm_timing_weight_min", 0.5))
+    weight_max = float(getattr(config, "dlm_timing_weight_max", 4.0))
+    return weights.clamp(weight_min, weight_max)
+
+
+def _dlm_raw_ms_crps_from_log_probs(
+    config, log_probs, score_time_ms, target_dev, mask, feature, zero_mask=None
+):
+    probs = torch.softmax(log_probs, dim=-1)
+    dev_centers = _dlm_bin_centers(
+        config, feature, log_probs, zero_mask=zero_mask
+    ).expand_as(probs)
+    base = score_time_ms.float().clamp_min(1.0).unsqueeze(-1)
+    raw_centers = base * torch.exp(dev_centers)
+    target_ms = _torch_floor_log_reconstruct(score_time_ms, target_dev).unsqueeze(-1)
+
+    expected_abs = torch.sum(probs * (raw_centers - target_ms).abs(), dim=-1)
+    weighted_raw = probs * raw_centers
+    cumulative_prob_before = torch.cumsum(probs, dim=-1) - probs
+    cumulative_raw_before = torch.cumsum(weighted_raw, dim=-1) - weighted_raw
+    half_pairwise_abs = torch.sum(
+        probs * (raw_centers * cumulative_prob_before - cumulative_raw_before), dim=-1
+    )
+    crps_ms = (expected_abs - half_pairwise_abs).clamp_min(0.0)
+    scale_ms = float(getattr(config, "dlm_raw_ms_crps_scale_ms", 1000.0))
+    return _masked_mean(crps_ms / scale_ms, mask)
+
+
+def _dlm_mean_or_sample(config, logits, raw_loc, raw_log_scale, feature, sampling_strategy="mean", zero_mask=None):
+    log_probs = _dlm_log_bin_probs(config, logits, raw_loc, raw_log_scale, feature, zero_mask=zero_mask)
+    temperature = float(getattr(config, "dlm_sampling_temperature", 1.0))
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError(f"dlm_sampling_temperature must be finite and > 0, got {temperature}")
+    probs = torch.softmax(log_probs / temperature, dim=-1)
+    centers = _dlm_bin_centers(config, feature, log_probs, zero_mask=zero_mask)
+    mode = str(sampling_strategy).lower()
+    if mode in {"mean", "deterministic", "mu", "expected", "expectation"}:
+        return torch.sum(probs * centers, dim=-1)
+    centers = centers.expand_as(probs)
+    if mode in {"argmax", "greedy"}:
+        index = probs.argmax(dim=-1, keepdim=True)
+        return centers.gather(-1, index).squeeze(-1)
+    if mode in {"sample", "sampling", "stochastic"}:
+        sample_center = None
+        radius = _timing_truncate_radius(config)
+        if str(feature) in {"ioi", "duration"}:
+            center_mode = _timing_truncate_center_mode(config)
+            if center_mode in {"mode", "argmax", "greedy"}:
+                center_index = probs.argmax(dim=-1, keepdim=True)
+                sample_center = centers.gather(-1, center_index)
+            else:
+                sample_center = torch.sum(probs * centers, dim=-1, keepdim=True)
+        if radius > 0.0 and str(feature) in {"ioi", "duration"}:
+            local_mask = (centers >= sample_center - radius) & (centers <= sample_center + radius)
+            local_probs = probs.masked_fill(~local_mask, 0.0)
+            local_mass = local_probs.sum(dim=-1, keepdim=True)
+            probs = torch.where(local_mass > 0.0, local_probs / local_mass.clamp_min(1e-12), probs)
+        index = torch.distributions.Categorical(probs=probs.reshape(-1, probs.shape[-1])).sample()
+        index = index.reshape(probs.shape[:-1]).unsqueeze(-1)
+        sample = centers.gather(-1, index)
+        if sample_center is not None:
+            sample = _apply_timing_sample_shrink(config, sample, sample_center)
+        return sample.squeeze(-1)
+    raise ValueError(f"Unsupported sampling_strategy: {sampling_strategy}")
+
+
 def _compute_integrated_loss_components(
     config,
     continuous_pred,
@@ -4350,7 +5209,116 @@ def _compute_integrated_loss_components(
     mask = attention_mask.bool()
     distribution = getattr(config, "epr_distribution", "point").lower()
     detail_components = {}
-    if distribution in SN_DISTRIBUTIONS:
+    if distribution in DLM_DISTRIBUTIONS:
+        params = _split_epr_mixture_params(config, continuous_pred)
+        if score_shared_raw is None:
+            raise ValueError("DLM timing loss requires score_shared_raw for score-IOI group ranges")
+        zero_mask = _zero_score_ioi_mask(config, score_shared_raw, attention_mask=mask)
+        tail_lambda = float(getattr(config, "dlm_tail_loss_lambda", 0.0))
+        crps_lambda = float(getattr(config, "dlm_raw_ms_crps_lambda", 0.0))
+        ioi_nll_weights = _dlm_timing_nll_weights(
+            config, score_shared_raw[..., 0], labels_continuous[..., 0], mask
+        )
+        duration_nll_weights = _dlm_timing_nll_weights(
+            config, score_shared_raw[..., 1], labels_continuous[..., 1], mask
+        )
+        if tail_lambda > 0.0 or crps_lambda > 0.0:
+            ioi_log_probs = _dlm_log_bin_probs(
+                config, params["ioi_logits"], params["ioi_loc"], params["ioi_log_scale"],
+                "ioi", zero_mask=zero_mask,
+            )
+            duration_log_probs = _dlm_log_bin_probs(
+                config, params["duration_logits"], params["duration_loc"],
+                params["duration_log_scale"], "duration",
+            )
+            loss_ioi = _dlm_nll_from_log_probs(
+                config, ioi_log_probs, labels_continuous[..., 0], mask, "ioi",
+                zero_mask=zero_mask, weights=ioi_nll_weights,
+            )
+            loss_duration = _dlm_nll_from_log_probs(
+                config, duration_log_probs, labels_continuous[..., 1], mask, "duration",
+                weights=duration_nll_weights,
+            )
+        else:
+            loss_ioi = _dlm_nll(
+                config, params["ioi_logits"], params["ioi_loc"], params["ioi_log_scale"],
+                labels_continuous[..., 0], mask, "ioi", zero_mask=zero_mask,
+                weights=ioi_nll_weights,
+            )
+            loss_duration = _dlm_nll(
+                config, params["duration_logits"], params["duration_loc"],
+                params["duration_log_scale"], labels_continuous[..., 1], mask, "duration",
+                weights=duration_nll_weights,
+            )
+        velocity_distribution = str(getattr(config, "velocity_distribution", "skew_normal")).lower()
+        if velocity_distribution in DLM_DISTRIBUTIONS:
+            loss_velocity = _dlm_nll(
+                config,
+                params["velocity_logits"],
+                params["velocity_loc"],
+                params["velocity_log_scale"],
+                labels_continuous[..., 2] * 127.0,
+                mask,
+                "velocity",
+            )
+            detail_components["velocity_dlm_nll"] = loss_velocity
+        else:
+            sigma_min = getattr(config, "skew_normal_sigma_min", getattr(config, "logistic_normal_sigma_min", 1e-4))
+            sigma_max = getattr(config, "skew_normal_sigma_max", getattr(config, "logistic_normal_sigma_max", 1e4))
+            loss_velocity = _skew_normal_nll(
+                params["velocity_loc"],
+                params["velocity_log_scale"],
+                params["velocity_alpha"],
+                labels_continuous[..., 2],
+                mask,
+                sigma_min,
+                sigma_max,
+            )
+            detail_components["velocity_sn_nll"] = loss_velocity
+        loss_pedal = _bce_loss(
+            params["pedal_binary_logits"],
+            labels_continuous[..., 3:7],
+            mask.unsqueeze(-1).expand_as(labels_continuous[..., 3:7]),
+        )
+        pedal_logits_for_detail = params["pedal_binary_logits"]
+        pedal_target_for_detail = labels_continuous[..., 3:7]
+        detail_components.update(
+            {
+                "ioi_dlm_nll": loss_ioi,
+                "duration_dlm_nll": loss_duration,
+            }
+        )
+        if tail_lambda > 0.0:
+            ioi_tail_mass = _dlm_tail_mass_from_log_probs(
+                config, ioi_log_probs, mask, "ioi", zero_mask=zero_mask,
+            )
+            duration_tail_mass = _dlm_tail_mass_from_log_probs(
+                config, duration_log_probs, mask, "duration",
+            )
+            detail_components.update(
+                {
+                    "ioi_dlm_tail_mass": ioi_tail_mass,
+                    "duration_dlm_tail_mass": duration_tail_mass,
+                    "dlm_tail": tail_lambda * (ioi_tail_mass + duration_tail_mass),
+                }
+            )
+        if crps_lambda > 0.0:
+            ioi_raw_ms_crps = _dlm_raw_ms_crps_from_log_probs(
+                config, ioi_log_probs, score_shared_raw[..., 0], labels_continuous[..., 0],
+                mask, "ioi", zero_mask=zero_mask,
+            )
+            duration_raw_ms_crps = _dlm_raw_ms_crps_from_log_probs(
+                config, duration_log_probs, score_shared_raw[..., 1], labels_continuous[..., 1],
+                mask, "duration",
+            )
+            detail_components.update(
+                {
+                    "ioi_raw_ms_crps": ioi_raw_ms_crps,
+                    "duration_raw_ms_crps": duration_raw_ms_crps,
+                    "dlm_raw_ms_crps": crps_lambda * (ioi_raw_ms_crps + duration_raw_ms_crps),
+                }
+            )
+    elif distribution in SN_DISTRIBUTIONS:
         params = _split_epr_mixture_params(config, continuous_pred)
         sigma_min = getattr(config, "skew_normal_sigma_min", getattr(config, "logistic_normal_sigma_min", 1e-4))
         sigma_max = getattr(config, "skew_normal_sigma_max", getattr(config, "logistic_normal_sigma_max", 1e4))
@@ -4629,12 +5597,29 @@ def _compute_integrated_loss_components(
                 raw_c,
             )
 
+        bounded_floorlog = bool(getattr(config, "bounded_floorlog_support", False))
+        zero_mask = (
+            _zero_score_ioi_mask(config, score_shared_raw, attention_mask=mask)
+            if bounded_floorlog and score_shared_raw is not None
+            else None
+        )
+        ioi_target = labels_continuous[..., 0]
+        duration_target = labels_continuous[..., 1]
+        if bounded_floorlog:
+            if score_shared_raw is None:
+                raise ValueError("bounded floor-log distributions require score_shared_raw")
+            ioi_target = _bounded_feature_to_unit(config, ioi_target, "ioi", zero_mask=zero_mask, eps=eps)
+            duration_target = _bounded_feature_to_unit(config, duration_target, "duration", eps=eps)
+
         logits, a, b, c = _shared_scalar_params(config, params, 0)
-        loss_ioi = loss_one(logits, a, b, labels_continuous[..., 0], c)
+        loss_ioi = loss_one(logits, a, b, ioi_target, c)
+        ioi_variance_args = (logits, a, b)
         logits, a, b, c = _shared_scalar_params(config, params, 1)
-        loss_duration = loss_one(logits, a, b, labels_continuous[..., 1], c)
+        loss_duration = loss_one(logits, a, b, duration_target, c)
+        duration_variance_args = (logits, a, b)
         logits, a, b, c = _shared_scalar_params(config, params, 2)
         loss_velocity = loss_one(logits, a, b, labels_continuous[..., 2], c)
+        velocity_variance_args = (logits, a, b)
         loss_pedal = _bce_loss(
             params["pedal_binary_logits"],
             labels_continuous[..., 3:7],
@@ -4642,6 +5627,54 @@ def _compute_integrated_loss_components(
         )
         pedal_logits_for_detail = params["pedal_binary_logits"]
         pedal_target_for_detail = labels_continuous[..., 3:7]
+        variance_lambda = float(getattr(config, "predictive_variance_lambda", 0.0))
+        if variance_lambda > 0.0:
+            timing_radius = float(getattr(config, "predictive_timing_radius", 0.05))
+            velocity_radius = float(getattr(config, "predictive_velocity_radius", 0.05))
+            if zero_mask is None:
+                ioi_width = float(getattr(config, "dlm_ioi_nonzero_max", 1.5)) - float(
+                    getattr(config, "dlm_ioi_nonzero_min", -2.5)
+                )
+                ioi_radius_unit = timing_radius / ioi_width
+            else:
+                zero_width = float(getattr(config, "dlm_ioi_zero_max", 5.0)) - float(
+                    getattr(config, "dlm_ioi_zero_min", 0.0)
+                )
+                nonzero_width = float(getattr(config, "dlm_ioi_nonzero_max", 1.5)) - float(
+                    getattr(config, "dlm_ioi_nonzero_min", -2.5)
+                )
+                ioi_radius_unit = torch.where(
+                    zero_mask,
+                    zero_mask.new_full((), timing_radius / zero_width, dtype=torch.float32),
+                    zero_mask.new_full((), timing_radius / nonzero_width, dtype=torch.float32),
+                )
+            duration_width = float(getattr(config, "dlm_duration_max", 2.0)) - float(
+                getattr(config, "dlm_duration_min", -3.0)
+            )
+            variance_penalties = {
+                "ioi": _predictive_variance_penalty(
+                    config,
+                    _mixture_unit_variance(config, distribution, *ioi_variance_args),
+                    mask,
+                    ioi_radius_unit,
+                ),
+                "duration": _predictive_variance_penalty(
+                    config,
+                    _mixture_unit_variance(config, distribution, *duration_variance_args),
+                    mask,
+                    timing_radius / duration_width,
+                ),
+                "velocity": _predictive_variance_penalty(
+                    config,
+                    _mixture_unit_variance(config, distribution, *velocity_variance_args),
+                    mask,
+                    velocity_radius,
+                ),
+            }
+            detail_components["predictive_variance"] = sum(variance_penalties.values())
+            detail_components.update(
+                {f"{name}_variance_penalty": value for name, value in variance_penalties.items()}
+            )
     elif distribution == "beta_mu_kappa":
         params = _split_epr_distribution_params(continuous_pred)
         eps = getattr(config, "beta_eps", 1e-5)
@@ -4872,6 +5905,9 @@ def _compute_integrated_loss(
         + weights.get("duration", 1.0) * components["duration"]
         + weights.get("velocity", 1.0) * components["velocity"]
         + weights.get("pedal", 1.0) * components["pedal"]
+        + components.get("predictive_variance", 0.0)
+        + components.get("dlm_tail", 0.0)
+        + components.get("dlm_raw_ms_crps", 0.0)
     )
     return total
 

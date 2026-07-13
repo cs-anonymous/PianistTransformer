@@ -581,6 +581,104 @@ def performance_by_source(work, performance_source):
     raise ValueError(f"Performance source not found in work json: {performance_source}")
 
 
+def _score_onset_span_ms(score_raw):
+    return float(sum(float(row[0]) for row in score_raw[1:]))
+
+
+def _performance_shared_rows(perf):
+    shared_rows = perf.get("label_shared_raw")
+    if shared_rows is not None:
+        return [list(row[:3]) for row in shared_rows]
+    label_raw = perf.get("label_raw")
+    if label_raw is not None:
+        return [list(row[:3]) for row in label_raw]
+    raise ValueError(f"Performance has no shared raw timing rows: {perf.get('performance_source')}")
+
+
+def _performance_pedal4_rows(perf):
+    pedal_rows = perf.get("label_pedal4_raw")
+    if pedal_rows is None:
+        pedal_rows = perf.get("pedal4_raw")
+    if pedal_rows is not None:
+        return [list(row[:4]) for row in pedal_rows]
+    label_raw = perf.get("label_raw")
+    if label_raw is not None:
+        return [list(row[3:7]) for row in label_raw]
+    raise ValueError(f"Performance has no pedal4 raw rows: {perf.get('performance_source')}")
+
+
+def _raw7_rows_for_eval_gt(perf, score_raw, normalization="none"):
+    shared_rows = _performance_shared_rows(perf)
+    pedal_rows = _performance_pedal4_rows(perf)
+    if len(shared_rows) != len(score_raw) or len(pedal_rows) != len(score_raw):
+        raise ValueError(
+            "GT row length mismatch for "
+            f"{perf.get('performance_source')}: shared={len(shared_rows)}, "
+            f"pedal={len(pedal_rows)}, score={len(score_raw)}"
+        )
+
+    mode = str(normalization or "none").lower()
+    scale = 1.0
+    if mode == "score_onset_span":
+        score_span = _score_onset_span_ms(score_raw)
+        perf_span = float(sum(float(row[0]) for row in shared_rows[1:]))
+        if score_span <= 0.0 or perf_span <= 0.0:
+            raise ValueError(
+                f"Invalid GT score-span normalization for {perf.get('performance_source')}: "
+                f"score_span={score_span}, perf_span={perf_span}"
+            )
+        scale = score_span / perf_span
+    elif mode not in {"none", "off", "false", "0"}:
+        raise ValueError(f"Unsupported eval_gt_time_normalization={normalization}")
+
+    rows = []
+    for shared, pedal in zip(shared_rows, pedal_rows):
+        rows.append(
+            [
+                float(shared[0]) * scale,
+                float(shared[1]) * scale,
+                float(shared[2]),
+                *[float(value) for value in pedal[:4]],
+            ]
+        )
+    return rows, scale
+
+
+def build_eval_gt_midis(config, loaded, gt_rel_paths, pitch, output_dir, score_stem):
+    normalization = str(
+        config.get(
+            "eval_gt_time_normalization",
+            config.get("evaluation_gt_time_normalization", "none"),
+        )
+        or "none"
+    ).lower()
+    if normalization in {"none", "off", "false", "0"}:
+        return None
+
+    gt_dir = output_dir / "ground_truth_midis"
+    gt_dir.mkdir(parents=True, exist_ok=True)
+    score_raw = loaded["score"]["score_raw"]
+    output_paths = []
+    scales = {}
+    for gt_idx, gt_rel_path in enumerate(gt_rel_paths):
+        perf = performance_by_source(loaded, gt_rel_path)
+        raw7_rows, scale = _raw7_rows_for_eval_gt(perf, score_raw, normalization=normalization)
+        midi_obj = note_features_to_midi(
+            pitch=pitch,
+            continuous=raw7_rows,
+            target_ticks_per_beat=500,
+            target_tempo=120,
+            max_time_ms=config["max_time_ms"],
+            normalized=False,
+        )
+        gt_path = gt_dir / f"{score_stem}__gt_{gt_idx:03d}.mid"
+        gt_path.parent.mkdir(parents=True, exist_ok=True)
+        midi_obj.dump(str(gt_path))
+        output_paths.append(str(gt_path.resolve()))
+        scales[gt_rel_path] = scale
+    return output_paths, scales
+
+
 def predict_one_csr_work(model, device, config, work, args):
     score_source = work["score_source"]
     selected_sources = work.get("selected_performance_sources") or [None]
@@ -693,6 +791,29 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
     prediction_paths = []
     raw_output_paths = []
     score_stem = Path(score_source).with_suffix("").as_posix().replace("/", "__")
+    gt_midi_bundle = build_eval_gt_midis(
+        config,
+        loaded,
+        gt_rel_paths,
+        pitch,
+        args.output_dir,
+        score_stem,
+    )
+    score_midi_path = score_midi_dir / score_source
+    original_gt_paths = [str((score_midi_dir / gt_rel).resolve()) for gt_rel in gt_rel_paths]
+    if gt_midi_bundle is None:
+        gt_paths = original_gt_paths
+        eval_gt_scales = {}
+        eval_gt_time_normalization = "none"
+    else:
+        gt_paths, eval_gt_scales = gt_midi_bundle
+        eval_gt_time_normalization = str(
+            config.get(
+                "eval_gt_time_normalization",
+                config.get("evaluation_gt_time_normalization", "none"),
+            )
+            or "none"
+        )
     if args.oracle_gt_prefix_mode != "none" and args.merge_mode != "continuation":
         raise ValueError("--oracle-gt-prefix-mode requires --merge-mode continuation")
     perf_style_stats_mode = str(config.get("perf_style_stats_mode", "prefix") or "prefix").lower()
@@ -824,6 +945,10 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
             "predicted_target9": pred_continuous_list if pred_continuous.shape[-1] == 9 else None,
             "reconstructed_raw7": raw_rows_list,
             "ground_truth_paths": gt_rel_paths,
+            "ground_truth_eval_paths": gt_paths,
+            "original_ground_truth_paths": original_gt_paths,
+            "eval_gt_time_normalization": eval_gt_time_normalization,
+            "eval_gt_time_scales": eval_gt_scales,
         }
         raw_path.parent.mkdir(parents=True, exist_ok=True)
         raw_path.write_text(json.dumps(raw_payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -834,14 +959,15 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
         midi_obj.dump(str(pred_path))
         prediction_paths.append(str(pred_path.resolve()))
 
-    score_midi_path = score_midi_dir / score_source
-    gt_paths = [str((score_midi_dir / gt_rel).resolve()) for gt_rel in gt_rel_paths]
     return {
         "score_source": score_source,
         "score_midi": str(score_midi_path.resolve()),
         "prediction_paths": prediction_paths,
         "raw_output_paths": raw_output_paths,
         "ground_truth_paths": gt_paths,
+        "original_ground_truth_paths": original_gt_paths,
+        "eval_gt_time_normalization": eval_gt_time_normalization,
+        "eval_gt_time_scales": eval_gt_scales,
         "note_count": len(pitch),
         "num_windows": len(windows),
         "oracle_gt_prefix_mode": args.oracle_gt_prefix_mode,

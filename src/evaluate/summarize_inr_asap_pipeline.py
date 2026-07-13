@@ -250,7 +250,7 @@ def plot_distributions(
     det_paths = unique_paths(det_manifest, "prediction_paths")
     sampling_paths = unique_paths(sampling_manifest, "prediction_paths")
     array_cache = build_array_cache(
-        gt_paths + det_paths + sampling_paths,
+        gt_paths + sampling_paths,
         num_workers,
         timing_normalization=timing_normalization,
         max_time_ms=max_time_ms,
@@ -261,21 +261,18 @@ def plot_distributions(
     axes = axes.flatten()
     colors = {
         "gt": "#222222",
-        "det": "#2f6fed",
         "sampling": "#d0522b",
     }
 
     for idx, (feature, title) in enumerate(FEATURES):
         axis = axes[idx]
         gt = pooled_feature(array_cache, gt_paths, feature)
-        det = pooled_feature(array_cache, det_paths, feature)
         sampling = pooled_feature(array_cache, sampling_paths, feature)
-        low, high = histogram_range(gt, det, sampling)
+        low, high = histogram_range(gt, sampling)
         bins = np.linspace(low, high, 80)
 
         for values, label, color, alpha in [
-            (gt, "ground truth", colors["gt"], 0.26),
-            (det, "deterministic", colors["det"], 0.32),
+            (gt, "score-span GT", colors["gt"], 0.26),
             (sampling, "sampling", colors["sampling"], 0.32),
         ]:
             values = finite_values(values)
@@ -288,8 +285,8 @@ def plot_distributions(
         axis.grid(alpha=0.2)
 
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", ncol=3, frameon=False)
-    fig.suptitle("ASAP Test Label Distribution: Ground Truth vs INR Predictions", y=0.98)
+    fig.legend(handles, labels, loc="lower center", ncol=2, frameon=False)
+    fig.suptitle("ASAP Test Label Distribution: Score-Span GT vs Sampling", y=0.98)
     fig.tight_layout(rect=(0, 0.05, 1, 0.96))
     fig.savefig(output_plot, dpi=180)
     plt.close(fig)
@@ -315,6 +312,26 @@ def empty_dev_groups():
 
 def dev_group_name(score_ioi_ms):
     return "zero_ioi" if float(score_ioi_ms) <= 0.0 else "nonzero_ioi"
+
+
+def eval_gt_time_normalization(config):
+    return str(
+        config.get(
+            "eval_gt_time_normalization",
+            config.get("evaluation_gt_time_normalization", "none"),
+        )
+        or "none"
+    ).lower()
+
+
+def score_onset_span_scale(score_raw, shared_rows):
+    score_span = float(sum(float(row[0]) for row in score_raw[1:]))
+    perf_span = float(sum(float(row[0]) for row in shared_rows[1:]))
+    if not math.isfinite(score_span) or score_span <= 0.0:
+        raise ValueError(f"Invalid score onset span: {score_span}")
+    if not math.isfinite(perf_span) or perf_span <= 0.0:
+        raise ValueError(f"Invalid performance onset span: {perf_span}")
+    return score_span / perf_span
 
 
 def normalize_target_ioi_dev(score_ioi_ms, perf_ioi_ms, config):
@@ -359,9 +376,10 @@ def selected_gt_sources_from_manifest(manifest, config):
     refined_root = refined_root_from_config(config)
     selected = {}
     for item in manifest["items"]:
+        source_paths = item.get("original_ground_truth_paths") or item.get("ground_truth_paths", [])
         selected[item["score_source"]] = {
             relative_refined_path(path, refined_root)
-            for path in item.get("ground_truth_paths", [])
+            for path in source_paths
         }
     return selected
 
@@ -393,12 +411,20 @@ def extract_gt_dev_arrays(score_source_to_work_path, selected_gt_sources, config
                 shared_rows = [row[:3] for row in perf["label_raw"]]
             if len(shared_rows) != len(score_raw):
                 continue
+            normalization = eval_gt_time_normalization(config)
+            timing_scale = 1.0
+            if normalization == "score_onset_span":
+                timing_scale = score_onset_span_scale(score_raw, shared_rows)
+            elif normalization not in {"none", "off", "false", "0"}:
+                raise ValueError(f"Unsupported eval_gt_time_normalization={normalization}")
             for score_row, perf_row in zip(score_raw, shared_rows):
+                perf_ioi_ms = float(perf_row[0]) * timing_scale
+                perf_duration_ms = float(perf_row[1]) * timing_scale
                 group = dev_group_name(score_row[0])
-                groups[group]["log_dev_ioi"].append(normalize_target_ioi_dev(score_row[0], perf_row[0], config))
-                groups[group]["log_dev_duration"].append(normalize_target_duration_dev(score_row[1], perf_row[1], config))
-                groups[group]["raw_dev_ioi_s"].append((float(perf_row[0]) - float(score_row[0])) / 1000.0)
-                groups[group]["raw_dev_duration_s"].append((float(perf_row[1]) - float(score_row[1])) / 1000.0)
+                groups[group]["log_dev_ioi"].append(normalize_target_ioi_dev(score_row[0], perf_ioi_ms, config))
+                groups[group]["log_dev_duration"].append(normalize_target_duration_dev(score_row[1], perf_duration_ms, config))
+                groups[group]["raw_dev_ioi_s"].append((perf_ioi_ms - float(score_row[0])) / 1000.0)
+                groups[group]["raw_dev_duration_s"].append((perf_duration_ms - float(score_row[1])) / 1000.0)
     return dev_groups_to_arrays(groups)
 
 
@@ -498,12 +524,11 @@ def plot_dev_distributions(
             det = finite_values(det_arrays[group][feature])
             sampling = finite_values(sampling_arrays[group][feature])
 
-            low, high = dev_histogram_range(gt, det, sampling)
+            low, high = dev_histogram_range(gt, sampling)
             bins = np.linspace(low, high, 80)
 
             for values, label, color, alpha in [
-                (gt, "ground truth", colors["gt"], 0.26),
-                (det, "deterministic", colors["det"], 0.32),
+                (gt, "score-span GT", colors["gt"], 0.26),
                 (sampling, "sampling", colors["sampling"], 0.32),
             ]:
                 values = values[(values >= low) & (values <= high)]
@@ -515,8 +540,8 @@ def plot_dev_distributions(
             axis.grid(alpha=0.2)
 
     handles, labels = axes[0, 0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", ncol=3, frameon=False)
-    fig.suptitle("ASAP Test Normalized Dev Distribution by Score IOI", y=0.98)
+    fig.legend(handles, labels, loc="lower center", ncol=2, frameon=False)
+    fig.suptitle("ASAP Test Normalized Dev Distribution: Score-Span GT vs Sampling", y=0.98)
     fig.tight_layout(rect=(0, 0.07, 1, 0.94))
     fig.savefig(output_plot, dpi=180)
     plt.close(fig)

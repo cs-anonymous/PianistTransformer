@@ -520,8 +520,12 @@ def load_config(config_path, checkpoint):
         "log_dev",
         "raw_log_deviation",
         "raw_log_dev",
+        "floor_log_deviation",
+        "floor_log_dev",
+        "pure_log_deviation",
+        "pure_log_dev",
     }:
-        raise ValueError("This script only supports log_deviation/raw_log_deviation timing targets")
+        raise ValueError("This script only supports log_deviation/raw_log_deviation/floor_log_deviation timing targets")
     return config
 
 

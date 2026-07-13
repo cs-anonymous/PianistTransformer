@@ -208,6 +208,7 @@ def resolve_timing_control_mode(timing_control_mode="log_scaled", use_timing_sca
         "dual_log_linear",
         "dual_clip_linear",
         "log_scaled",
+        "floor_log",
         "raw_log",
     }
     if mode not in valid_modes:
@@ -222,7 +223,7 @@ def timing_control_feature_dim(timing_control_mode="log_scaled", use_timing_scal
     )
     if mode == "raw_log":
         return 5
-    return 3 if mode in {"piecewise_single", "log_scaled"} else 5
+    return 3 if mode in {"piecewise_single", "log_scaled", "floor_log"} else 5
 
 
 def musical_feature_dim(musical_feature_mode="categorical"):
@@ -519,11 +520,29 @@ def normalize_log_timing_dev(score_time_ms, perf_time_ms, scale=50.0, max_time_m
 
 
 def _uses_log_deviation_target(epr_timing_target):
-    return str(epr_timing_target or "").lower() in {"log_deviation", "log_dev", "raw_log_deviation", "raw_log_dev"}
+    return str(epr_timing_target or "").lower() in {
+        "log_deviation",
+        "log_dev",
+        "raw_log_deviation",
+        "raw_log_dev",
+        "floor_log_deviation",
+        "floor_log_dev",
+        "pure_log_deviation",
+        "pure_log_dev",
+    }
 
 
 def _uses_raw_log_deviation_target(epr_timing_target):
     return str(epr_timing_target or "").lower() in {"raw_log_deviation", "raw_log_dev"}
+
+
+def _uses_floor_log_deviation_target(epr_timing_target):
+    return str(epr_timing_target or "").lower() in {
+        "floor_log_deviation",
+        "floor_log_dev",
+        "pure_log_deviation",
+        "pure_log_dev",
+    }
 
 
 def _uses_raw_deviation_target(epr_timing_target):
@@ -551,6 +570,8 @@ def normalize_ioi_dev(
     log_scale=50.0,
 ):
     if _uses_log_deviation_target(epr_timing_target):
+        if _uses_floor_log_deviation_target(epr_timing_target):
+            return math.log(max(float(perf_ioi_ms), 1.0)) - math.log(max(float(score_ioi_ms), 1.0))
         if _uses_raw_log_deviation_target(epr_timing_target):
             return raw_log_timing_value(perf_ioi_ms, scale=log_scale) - raw_log_timing_value(
                 score_ioi_ms,
@@ -569,6 +590,8 @@ def normalize_ioi_dev(
 
 def normalize_duration_dev(score_duration_ms, perf_duration_ms, epr_timing_target="deviation", log_scale=50.0):
     if _uses_log_deviation_target(epr_timing_target):
+        if _uses_floor_log_deviation_target(epr_timing_target):
+            return math.log(max(float(perf_duration_ms), 1.0)) - math.log(max(float(score_duration_ms), 1.0))
         if _uses_raw_log_deviation_target(epr_timing_target):
             return raw_log_timing_value(perf_duration_ms, scale=log_scale) - raw_log_timing_value(
                 score_duration_ms,
@@ -683,6 +706,8 @@ def encode_timing_control_features(time_ms, timing_control_mode="log_scaled", us
         ]
     if mode == "log_scaled":
         return [normalize_log_timing_value(value, scale=log_scale, max_time_ms=5000.0)]
+    if mode == "floor_log":
+        return [math.log(max(value, 1.0))]
     if mode == "dual_clip_linear":
         return [
             min(value / 500.0, 1.0),
@@ -1409,6 +1434,10 @@ class PianoCoReNodeSFTDataset(Dataset):
                 "log_dev",
                 "raw_log_deviation",
                 "raw_log_dev",
+                "floor_log_deviation",
+                "floor_log_dev",
+                "pure_log_deviation",
+                "pure_log_dev",
                 "raw_deviation",
                 "raw_dev",
                 "raw_seconds_deviation",
@@ -1690,6 +1719,10 @@ class PianoCoReNodeSFTDataset(Dataset):
             "log_dev",
             "raw_log_deviation",
             "raw_log_dev",
+            "floor_log_deviation",
+            "floor_log_dev",
+            "pure_log_deviation",
+            "pure_log_dev",
             "raw_deviation",
             "raw_dev",
             "raw_seconds_deviation",
@@ -2336,6 +2369,9 @@ class NodeSFTTrainer(Trainer):
                 contribution = float(weights.get(name, 1.0)) * values[name]
                 values[f"weighted_{name}"] = contribution
                 weighted_total += contribution
+            for name in ("predictive_variance", "dlm_tail", "dlm_raw_ms_crps"):
+                if name in values:
+                    weighted_total += values[name]
             values["components_total"] = weighted_total
             accumulator = getattr(self, "_train_loss_component_sums", None)
             if accumulator is None:
@@ -2945,13 +2981,17 @@ def create_model(train_config):
         timing_control_mode=train_config.get("timing_control_mode"),
         use_timing_scale_bit=train_config.get("use_timing_scale_bit", False),
     )
-    if task_type in {"epr", "csr"} and timing_control_mode not in {"log_scaled", "raw_log", "raw", "raw_seconds"}:
-        raise ValueError("Integrated INR requires timing_control_mode=log_scaled, raw_log, or raw")
+    if task_type in {"epr", "csr"} and timing_control_mode not in {"log_scaled", "floor_log", "raw_log", "raw", "raw_seconds"}:
+        raise ValueError("Integrated INR requires timing_control_mode=log_scaled, floor_log, raw_log, or raw")
     if task_type == "epr" and epr_timing_target not in {
         "log_deviation",
         "log_dev",
         "raw_log_deviation",
         "raw_log_dev",
+        "floor_log_deviation",
+        "floor_log_dev",
+        "pure_log_deviation",
+        "pure_log_dev",
         "raw_deviation",
         "raw_dev",
         "raw_seconds_deviation",
@@ -3018,8 +3058,14 @@ def create_model(train_config):
             "logistic_normal",
             "mixture_logistic_normal",
             "mixture_beta",
+            "dlm",
+            "discretized_logistic_mixture",
             "sn",
             "skew_normal",
+            "bounded_skew_normal",
+            "bounded_sn",
+            "tanh_student_t",
+            "bounded_tanh_student_t",
         }
         if distribution not in supported_distributions:
             raise ValueError(f"Unsupported epr_distribution={distribution}")
@@ -3033,6 +3079,10 @@ def create_model(train_config):
             "mixture_beta",
             "sn",
             "skew_normal",
+            "bounded_skew_normal",
+            "bounded_sn",
+            "tanh_student_t",
+            "bounded_tanh_student_t",
         }
         pedal_distribution = str(train_config.get("pedal_distribution", distribution)).lower()
         if pedal_distribution not in supported_distributions:
@@ -3060,12 +3110,22 @@ def create_model(train_config):
             components = int(train_config["epr_mixture_components"])
             if components < 1:
                 raise ValueError(f"epr_mixture_components must be >= 1, got {components}")
-            if distribution in {"sn", "skew_normal", "lan", "can", "ican", "iln", "logistic_normal"} and components != 1:
+            if distribution in {"sn", "skew_normal", "bounded_skew_normal", "bounded_sn", "tanh_student_t", "bounded_tanh_student_t", "lan", "can", "ican", "iln", "logistic_normal"} and components != 1:
                 raise ValueError(f"epr_distribution={distribution} requires epr_mixture_components=1")
             if distribution in {"mixture_logistic_normal", "mixture_beta"} and components < 2:
                 raise ValueError(f"epr_distribution={distribution} requires epr_mixture_components >= 2")
             if pedal_distribution in {"mixture_logistic_normal", "mixture_beta"} and components < 2:
                 raise ValueError(f"pedal_distribution={pedal_distribution} requires epr_mixture_components >= 2")
+        if distribution in {"dlm", "discretized_logistic_mixture"}:
+            dlm_components = int(train_config.get("dlm_components", train_config.get("epr_mixture_components", 8)))
+            if dlm_components < 1:
+                raise ValueError(f"dlm_components must be >= 1, got {dlm_components}")
+            velocity_distribution = str(train_config.get("velocity_distribution", "skew_normal")).lower()
+            if velocity_distribution not in {"sn", "skew_normal", "dlm", "discretized_logistic_mixture"}:
+                raise ValueError(
+                    "DLM supports velocity_distribution=skew_normal or dlm, "
+                    f"got {velocity_distribution}"
+                )
         if distribution == "beta_mu_kappa":
             missing_beta_keys = [
                 key for key in ("beta_eps", "beta_kappa_min")
@@ -3078,7 +3138,14 @@ def create_model(train_config):
             if pedal_representation != "binary_4":
                 raise ValueError("deviation EPR requires pedal_representation=binary_4")
             expected_output_dim = 7
-        elif epr_timing_target in {"raw_log_deviation", "raw_log_dev"}:
+        elif epr_timing_target in {
+            "raw_log_deviation",
+            "raw_log_dev",
+            "floor_log_deviation",
+            "floor_log_dev",
+            "pure_log_deviation",
+            "pure_log_dev",
+        }:
             pedal_representation = str(train_config.get("pedal_representation", "binary_4")).lower()
             if pedal_representation != "binary_4":
                 raise ValueError("raw_log EPR requires pedal_representation=binary_4")
@@ -3119,6 +3186,12 @@ def create_model(train_config):
             "mixture_beta",
             "sn",
             "skew_normal",
+            "bounded_skew_normal",
+            "bounded_sn",
+            "tanh_student_t",
+            "bounded_tanh_student_t",
+            "dlm",
+            "discretized_logistic_mixture",
         }:
             raise ValueError(
                 "deviation EPR currently supports point/huber, SN, lan/can/ican, LN/MLN, beta, and mixture_beta, "
@@ -3264,12 +3337,50 @@ def create_model(train_config):
         logistic_normal_sigma_max=train_config.get("logistic_normal_sigma_max", 10.0),
         skew_normal_sigma_min=train_config.get("skew_normal_sigma_min", train_config.get("logistic_normal_sigma_min", 1e-4)),
         skew_normal_sigma_max=train_config.get("skew_normal_sigma_max", train_config.get("logistic_normal_sigma_max", 1e4)),
+        bounded_floorlog_support=train_config.get("bounded_floorlog_support", False),
+        velocity_distribution=train_config.get("velocity_distribution"),
+        dlm_components=train_config.get("dlm_components"),
+        dlm_timing_bins=train_config.get("dlm_timing_bins", 256),
+        dlm_velocity_bins=train_config.get("dlm_velocity_bins", 128),
+        dlm_ioi_zero_min=train_config.get("dlm_ioi_zero_min", 0.0),
+        dlm_ioi_zero_max=train_config.get("dlm_ioi_zero_max", 5.0),
+        dlm_ioi_nonzero_min=train_config.get("dlm_ioi_nonzero_min", -2.5),
+        dlm_ioi_nonzero_max=train_config.get("dlm_ioi_nonzero_max", 1.5),
+        dlm_duration_min=train_config.get("dlm_duration_min", -3.0),
+        dlm_duration_max=train_config.get("dlm_duration_max", 2.0),
+        dlm_velocity_min=train_config.get("dlm_velocity_min", -0.5),
+        dlm_velocity_max=train_config.get("dlm_velocity_max", 127.5),
+        dlm_scale_min=train_config.get("dlm_scale_min", 1e-3),
+        dlm_scale_max=train_config.get("dlm_scale_max", 10.0),
+        dlm_timing_scale_min=train_config.get("dlm_timing_scale_min"),
+        dlm_timing_scale_max=train_config.get("dlm_timing_scale_max"),
+        dlm_timing_scale_parameterization=train_config.get("dlm_timing_scale_parameterization", "legacy_clamp"),
+        dlm_tail_loss_lambda=train_config.get("dlm_tail_loss_lambda", 0.0),
+        dlm_tail_radius=train_config.get("dlm_tail_radius", 0.05),
+        dlm_timing_weighted_nll_alpha=train_config.get("dlm_timing_weighted_nll_alpha", 0.0),
+        dlm_timing_weight_min=train_config.get("dlm_timing_weight_min", 0.5),
+        dlm_timing_weight_max=train_config.get("dlm_timing_weight_max", 4.0),
+        dlm_raw_ms_crps_lambda=train_config.get("dlm_raw_ms_crps_lambda", 0.0),
+        dlm_raw_ms_crps_scale_ms=train_config.get("dlm_raw_ms_crps_scale_ms", 1000.0),
+        dlm_sampling_temperature=train_config.get("dlm_sampling_temperature", 1.0),
+        dlm_timing_sample_truncate_radius=train_config.get("dlm_timing_sample_truncate_radius", 0.0),
+        dlm_timing_sample_truncate_center=train_config.get("dlm_timing_sample_truncate_center", "mean"),
+        timing_sample_truncate_radius=train_config.get("timing_sample_truncate_radius"),
+        timing_sample_truncate_center=train_config.get("timing_sample_truncate_center"),
+        timing_sample_shrink_mode=train_config.get("timing_sample_shrink_mode", "none"),
+        timing_sample_shrink_factor=train_config.get("timing_sample_shrink_factor", 1.0),
+        timing_sample_shrink_radius=train_config.get("timing_sample_shrink_radius", 0.0),
         raw_timing_loss_lambda=train_config.get("raw_timing_loss_lambda", 0.5),
         legacy_dual_timing_head=train_config.get("legacy_dual_timing_head", False),
         raw_timing_head_type=train_config.get("raw_timing_head_type"),
         beta_eps=train_config.get("beta_eps", 1e-5),
         beta_kappa_min=train_config.get("beta_kappa_min", 1e-3),
         beta_alpha_min=train_config.get("beta_alpha_min", 1e-4),
+        mixture_beta_parameterization=train_config.get("mixture_beta_parameterization", "alpha_beta"),
+        mixture_beta_kappa_min=train_config.get("mixture_beta_kappa_min", 1e-3),
+        predictive_variance_lambda=train_config.get("predictive_variance_lambda", 0.0),
+        predictive_timing_radius=train_config.get("predictive_timing_radius", 0.05),
+        predictive_velocity_radius=train_config.get("predictive_velocity_radius", 0.05),
         epr_inflated_features=train_config.get("epr_inflated_features"),
         epr_timing_bins=train_config.get("epr_timing_bins", 5000),
         epr_value_bins=train_config.get("epr_value_bins", 128),
@@ -3602,13 +3713,17 @@ def main():
         timing_control_mode=train_config.get("timing_control_mode"),
         use_timing_scale_bit=train_config.get("use_timing_scale_bit", False),
     )
-    if task_type in {"epr", "csr"} and timing_control_mode not in {"log_scaled", "raw_log"}:
-        raise ValueError("Integrated INR requires timing_control_mode=log_scaled or raw_log")
+    if task_type in {"epr", "csr"} and timing_control_mode not in {"log_scaled", "floor_log", "raw_log"}:
+        raise ValueError("Integrated INR requires timing_control_mode=log_scaled, floor_log, or raw_log")
     if task_type == "epr" and str(train_config.get("epr_timing_target", "log_deviation")).lower() not in {
         "log_deviation",
         "log_dev",
         "raw_log_deviation",
         "raw_log_dev",
+        "floor_log_deviation",
+        "floor_log_dev",
+        "pure_log_deviation",
+        "pure_log_dev",
         "raw_deviation",
         "raw_dev",
         "raw_seconds_deviation",
