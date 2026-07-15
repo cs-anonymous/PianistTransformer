@@ -36,6 +36,7 @@ IACN_DISTRIBUTIONS = {"ican"}
 ILN_DISTRIBUTIONS = {"iln"}
 SN_DISTRIBUTIONS = {"sn", "skew_normal"}
 DLM_DISTRIBUTIONS = {"dlm", "discretized_logistic_mixture"}
+DINR_DISTRIBUTIONS = {"dinr", "dinr_categorical", "metric_categorical"}
 TANH_T_DISTRIBUTIONS = {"tanh_student_t", "bounded_tanh_student_t"}
 BOUNDED_SN_DISTRIBUTIONS = {"bounded_skew_normal", "bounded_sn"}
 
@@ -84,6 +85,7 @@ def resolve_timing_control_mode(timing_control_mode="log_scaled", use_timing_sca
         "dual_clip_linear",
         "log_scaled",
         "floor_log",
+        "dinr_floor_log",
         "raw_log",
     }
     if mode not in valid_modes:
@@ -98,7 +100,7 @@ def timing_control_feature_dim(timing_control_mode="log_scaled", use_timing_scal
     )
     if mode == "raw_log":
         return 5
-    return 3 if mode in {"piecewise_single", "log_scaled", "floor_log"} else 5
+    return 3 if mode in {"piecewise_single", "log_scaled", "floor_log", "dinr_floor_log"} else 5
 
 
 def musical_feature_dim(musical_feature_mode="categorical"):
@@ -114,12 +116,15 @@ def musical_feature_dim(musical_feature_mode="categorical"):
         "musical51_full",
         "musical51_onset_only",
         "musical51_annotation_only",
+        "musical51_duration_only",
         "musical51_onset_annotation",
         "musical51_no_duration",
         "musical51_no_length",
         "musical51_no_duration_length",
     }:
         return 51
+    if mode in {"musical145_onset_annotation", "onset145_annotation"}:
+        return 151
     if mode in {"categorical62", "musical62"}:
         return 62
     raise ValueError(f"Unsupported musical_feature_mode={musical_feature_mode}")
@@ -133,6 +138,8 @@ def normalize_slot_version(slot_version=None):
         return "slot5"
     if value in {"slot6", "6slot", "pt6", "a6", "a6_pt_musical"}:
         return "slot6"
+    if value in {"slot7", "7slot", "pt7", "a7", "a7_pt_onset_annotation"}:
+        return "slot7"
     if value in {"slot8", "8slot", "8slot_rawlog_nomus_0709", "inr8", "b8", "b8_inr_logdev_nomus"}:
         return "slot8"
     if value in {"slot9", "9slot", "pt9", "a9", "a9_pt_absolute_musical"}:
@@ -144,11 +151,11 @@ def normalize_slot_version(slot_version=None):
 
 def slot_version_num_slots(slot_version):
     value = normalize_slot_version(slot_version)
-    return {"slot5": 5, "slot6": 6, "slot8": 8, "slot9": 9, "slot12": 12}[value]
+    return {"slot5": 5, "slot6": 6, "slot7": 7, "slot8": 8, "slot9": 9, "slot12": 12}[value]
 
 
 def slot_version_is_pt(slot_version):
-    return normalize_slot_version(slot_version) in {"slot5", "slot6", "slot9"}
+    return normalize_slot_version(slot_version) in {"slot5", "slot6", "slot7", "slot9"}
 
 
 def normalize_pedal_representation(pedal_representation="start_valley"):
@@ -289,6 +296,12 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         dlm_timing_scale_min=None,
         dlm_timing_scale_max=None,
         dlm_timing_scale_parameterization="legacy_clamp",
+        dlm_ioi_nonzero_scale_max=None,
+        dlm_ioi_zero_scale_max=None,
+        dlm_duration_scale_max=None,
+        dlm_velocity_scale_min=None,
+        dlm_velocity_scale_max=None,
+        dlm_velocity_scale_parameterization="legacy_clamp",
         dlm_tail_loss_lambda=0.0,
         dlm_tail_radius=0.05,
         dlm_target_tail_loss_lambda=0.0,
@@ -311,12 +324,37 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         timing_sample_shrink_mode="none",
         timing_sample_shrink_factor=1.0,
         timing_sample_shrink_radius=0.0,
+        dlm_ioi_zero_sample_shrink_factor=None,
+        dlm_ioi_nonzero_sample_shrink_factor=None,
+        dlm_duration_sample_shrink_factor=None,
+        dlm_velocity_sample_shrink_factor=None,
+        pn_mean_loss_lambda=0.0,
+        pn_var_ioi_zero_lambda=0.0,
+        pn_var_ioi_nonzero_lambda=0.0,
+        pn_var_duration_lambda=0.0,
+        pn_var_velocity_lambda=0.0,
+        pn_variance_shrinkage_tau=4.0,
+        pn_variance_epsilon=1e-4,
         raw_timing_loss_lambda=0.5,
         legacy_dual_timing_head=False,
         raw_timing_head_type=None,
         epr_inflated_features=None,
         epr_timing_bins=5000,
         epr_value_bins=128,
+        dinr_timing_bins=512,
+        dinr_zero_bin=93,
+        dinr_timing_step=2.0 / 93.0,
+        dinr_output_timing_bins=None,
+        dinr_output_zero_bin=None,
+        dinr_output_timing_step=None,
+        dinr_vocabulary_mode="unified",
+        dinr_absolute_max_ms=8000.0,
+        dinr_deviation_min=-2.0,
+        dinr_deviation_max=2.0,
+        dinr_zero_ioi_min=0.0,
+        dinr_zero_ioi_max=5.0,
+        dinr_sampling_temperature=1.0,
+        dinr_numerical_frequencies=16,
         epr_timing_target="log_deviation",
         timing_control_mode="log_scaled",
         timing_log_scale=50.0,
@@ -486,6 +524,22 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
             dlm_scale_max if dlm_timing_scale_max is None else dlm_timing_scale_max
         )
         self.dlm_timing_scale_parameterization = str(dlm_timing_scale_parameterization).lower()
+        self.dlm_ioi_nonzero_scale_max = float(
+            self.dlm_timing_scale_max if dlm_ioi_nonzero_scale_max is None else dlm_ioi_nonzero_scale_max
+        )
+        self.dlm_ioi_zero_scale_max = float(
+            self.dlm_timing_scale_max if dlm_ioi_zero_scale_max is None else dlm_ioi_zero_scale_max
+        )
+        self.dlm_duration_scale_max = float(
+            self.dlm_timing_scale_max if dlm_duration_scale_max is None else dlm_duration_scale_max
+        )
+        self.dlm_velocity_scale_min = float(
+            self.dlm_scale_min if dlm_velocity_scale_min is None else dlm_velocity_scale_min
+        )
+        self.dlm_velocity_scale_max = float(
+            self.dlm_scale_max if dlm_velocity_scale_max is None else dlm_velocity_scale_max
+        )
+        self.dlm_velocity_scale_parameterization = str(dlm_velocity_scale_parameterization).lower()
         self.dlm_tail_loss_lambda = float(dlm_tail_loss_lambda)
         self.dlm_tail_radius = float(dlm_tail_radius)
         self.dlm_target_tail_loss_lambda = float(dlm_target_tail_loss_lambda)
@@ -529,6 +583,17 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.timing_sample_shrink_mode = str(timing_sample_shrink_mode or "none").lower()
         self.timing_sample_shrink_factor = float(timing_sample_shrink_factor)
         self.timing_sample_shrink_radius = float(timing_sample_shrink_radius or 0.0)
+        self.dlm_ioi_zero_sample_shrink_factor = dlm_ioi_zero_sample_shrink_factor
+        self.dlm_ioi_nonzero_sample_shrink_factor = dlm_ioi_nonzero_sample_shrink_factor
+        self.dlm_duration_sample_shrink_factor = dlm_duration_sample_shrink_factor
+        self.dlm_velocity_sample_shrink_factor = dlm_velocity_sample_shrink_factor
+        self.pn_mean_loss_lambda = float(pn_mean_loss_lambda)
+        self.pn_var_ioi_zero_lambda = float(pn_var_ioi_zero_lambda)
+        self.pn_var_ioi_nonzero_lambda = float(pn_var_ioi_nonzero_lambda)
+        self.pn_var_duration_lambda = float(pn_var_duration_lambda)
+        self.pn_var_velocity_lambda = float(pn_var_velocity_lambda)
+        self.pn_variance_shrinkage_tau = float(pn_variance_shrinkage_tau)
+        self.pn_variance_epsilon = float(pn_variance_epsilon)
         self.raw_timing_loss_lambda = raw_timing_loss_lambda
         self.legacy_dual_timing_head = bool(legacy_dual_timing_head)
         self.raw_timing_head_type = str(
@@ -546,6 +611,28 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         }
         self.epr_timing_bins = int(epr_timing_bins)
         self.epr_value_bins = int(epr_value_bins)
+        self.dinr_timing_bins = int(dinr_timing_bins)
+        self.dinr_zero_bin = int(dinr_zero_bin)
+        self.dinr_timing_step = float(dinr_timing_step)
+        self.dinr_output_timing_bins = int(dinr_output_timing_bins or self.dinr_timing_bins)
+        self.dinr_output_zero_bin = int(self.dinr_zero_bin if dinr_output_zero_bin is None else dinr_output_zero_bin)
+        self.dinr_output_timing_step = float(self.dinr_timing_step if dinr_output_timing_step is None else dinr_output_timing_step)
+        self.dinr_vocabulary_mode = str(dinr_vocabulary_mode or "unified").lower()
+        self.dinr_absolute_max_ms = float(dinr_absolute_max_ms)
+        self.dinr_deviation_min = float(dinr_deviation_min)
+        self.dinr_deviation_max = float(dinr_deviation_max)
+        self.dinr_zero_ioi_min = float(dinr_zero_ioi_min)
+        self.dinr_zero_ioi_max = float(dinr_zero_ioi_max)
+        self.dinr_sampling_temperature = float(dinr_sampling_temperature)
+        self.dinr_numerical_frequencies = int(dinr_numerical_frequencies)
+        if self.dinr_timing_bins < 2 or self.dinr_timing_step <= 0.0:
+            raise ValueError("DINR requires at least two timing bins and a positive timing step")
+        if not (0 <= self.dinr_zero_bin < self.dinr_timing_bins):
+            raise ValueError("dinr_zero_bin must index the DINR timing vocabulary")
+        if self.dinr_output_timing_bins < 2 or self.dinr_output_timing_step <= 0.0:
+            raise ValueError("DINR requires at least two output timing bins and a positive output timing step")
+        if not (0 <= self.dinr_output_zero_bin < self.dinr_output_timing_bins):
+            raise ValueError("dinr_output_zero_bin must index the DINR output timing vocabulary")
         self.epr_timing_target = str(epr_timing_target).lower()
         self.timing_log_scale = float(timing_log_scale)
         self.timing_control_mode = resolve_timing_control_mode(
@@ -812,7 +899,8 @@ class IntegratedNoteEncoder(nn.Module):
             else 7
         )
         self.decoder_target_mask_dim = 3
-        if self.role == "decoder" and self.schema == "integrated":
+        shared_dinr_encoder = str(getattr(config, "epr_distribution", "point")).lower() in DINR_DISTRIBUTIONS
+        if (self.role == "decoder" or shared_dinr_encoder) and self.schema == "integrated":
             self.performance_missing_embeddings = nn.Parameter(
                 torch.zeros(self.performance_control_dim, config.hidden_size)
             )
@@ -890,6 +978,31 @@ class IntegratedNoteEncoder(nn.Module):
         self.slot_fusion = None
         self.slot_gate_logits = None
         self.slot_timing_dim = max(1, (self.score_control_dim - 1) // 2) if self.mode == "slot_attribute" else 0
+        self.dinr_enabled = (
+            self.mode == "slot_attribute"
+            and str(getattr(config, "epr_distribution", "point")).lower() in DINR_DISTRIBUTIONS
+        )
+        self.dinr_timing_table = None
+        self.dinr_velocity_table = None
+        self.dinr_field_embedding = None
+        self.dinr_role_embedding = None
+        if self.dinr_enabled:
+            timing_coordinates = (
+                torch.arange(int(config.dinr_timing_bins), dtype=torch.float32)
+                - int(config.dinr_zero_bin)
+            ) * float(config.dinr_timing_step)
+            self.dinr_timing_table = DINRValueTable(
+                timing_coordinates,
+                self.slot_dim,
+                frequencies=int(getattr(config, "dinr_numerical_frequencies", 16)),
+            )
+            self.dinr_velocity_table = DINRValueTable(
+                torch.arange(128, dtype=torch.float32) / 127.0,
+                self.slot_dim,
+                frequencies=int(getattr(config, "dinr_numerical_frequencies", 16)),
+            )
+            self.dinr_field_embedding = nn.Embedding(2, self.slot_dim)
+            self.dinr_role_embedding = nn.Embedding(2, self.slot_dim)
 
         if self.role == "decoder" and self.schema == "perf_target":
             self.decoder_target_projection = _make_mlp(
@@ -971,6 +1084,11 @@ class IntegratedNoteEncoder(nn.Module):
                     f"{self.slot_version} expects musical_feature_dim in {{0, 51}}, got {self.musical_dim}. "
                     "Use musical_feature_mode='musical51' or disable musical features."
                 )
+            if self.slot_version == "slot7" and self.musical_dim not in {0, 151}:
+                raise ValueError(
+                    "slot7 expects musical_feature_dim in {0, 151}. "
+                    "Use musical_feature_mode='musical145_onset_annotation' or disable musical features."
+                )
             self.slot_score_ioi_projection = _make_mlp(
                 self.slot_timing_dim,
                 self.slot_dim,
@@ -1020,19 +1138,9 @@ class IntegratedNoteEncoder(nn.Module):
                 self.embedding_depth,
                 self.activation,
             )
-            if self.slot_version in {"slot6", "slot9", "slot12"}:
-                self.slot_musical_onset_embedding = nn.Embedding(18, self.slot_dim)
-                self.slot_musical_duration_embedding = nn.Embedding(18, self.slot_dim)
-                self.slot_musical_length_embedding = nn.Embedding(10, self.slot_dim)
-                self.slot_musical_onset_scalar_projection = _make_mlp(
-                    1, self.slot_dim, self.slot_dim, self.embedding_depth, self.activation
-                )
-                self.slot_musical_duration_scalar_projection = _make_mlp(
-                    1, self.slot_dim, self.slot_dim, self.embedding_depth, self.activation
-                )
-                self.slot_musical_length_scalar_projection = _make_mlp(
-                    2, self.slot_dim, self.slot_dim, self.embedding_depth, self.activation
-                )
+            if self.slot_version in {"slot6", "slot7", "slot9", "slot12"}:
+                onset_embeddings = 147 if self.slot_version == "slot7" else 18
+                self.slot_musical_onset_embedding = nn.Embedding(onset_embeddings, self.slot_dim)
                 self.slot_musical_binary_projection = _make_mlp(
                     6,
                     self.slot_dim,
@@ -1040,6 +1148,18 @@ class IntegratedNoteEncoder(nn.Module):
                     self.embedding_depth,
                     self.activation,
                 )
+                if self.slot_version != "slot7":
+                    self.slot_musical_duration_embedding = nn.Embedding(18, self.slot_dim)
+                    self.slot_musical_length_embedding = nn.Embedding(10, self.slot_dim)
+                    self.slot_musical_onset_scalar_projection = _make_mlp(
+                        1, self.slot_dim, self.slot_dim, self.embedding_depth, self.activation
+                    )
+                    self.slot_musical_duration_scalar_projection = _make_mlp(
+                        1, self.slot_dim, self.slot_dim, self.embedding_depth, self.activation
+                    )
+                    self.slot_musical_length_scalar_projection = _make_mlp(
+                        2, self.slot_dim, self.slot_dim, self.embedding_depth, self.activation
+                    )
                 if self.slot_version == "slot6":
                     self.slot_musical_fusion = _make_mlp(
                         self.slot_dim * 4,
@@ -1143,6 +1263,36 @@ class IntegratedNoteEncoder(nn.Module):
         mask = mask.to(dtype=encoded.dtype, device=encoded.device)
         return encoded * mask + self._slot_mask_embedding(slot_index, encoded) * (1.0 - mask)
 
+    def _dinr_slot_encode(self, features, mask, slot_index, field, role, velocity=False):
+        if velocity:
+            ids = torch.round(features[..., 0].float().clamp(0.0, 1.0) * 127.0).long()
+            encoded = self.dinr_velocity_table.encode_ids(ids)
+        else:
+            coordinate = features[..., 0].float()
+            ids = torch.round(
+                coordinate / float(self.config.dinr_timing_step)
+                + int(self.config.dinr_zero_bin)
+            ).long().clamp(0, int(self.config.dinr_timing_bins) - 1)
+            encoded = self.dinr_timing_table.encode_ids(ids)
+        field_ids = torch.full_like(ids, int(field))
+        role_ids = torch.full_like(ids, int(role))
+        encoded = (
+            encoded
+            + self.dinr_field_embedding(field_ids)
+            + self.dinr_role_embedding(role_ids)
+        )
+        if mask is None:
+            return encoded
+        mask = mask.to(dtype=encoded.dtype, device=encoded.device)
+        return encoded * mask + self._slot_mask_embedding(slot_index, encoded) * (1.0 - mask)
+
+    def _slot_value_encode(self, projection, features, mask, slot_index, field, role, velocity=False):
+        if self.dinr_enabled:
+            return self._dinr_slot_encode(
+                features, mask, slot_index, field=field, role=role, velocity=velocity
+            )
+        return self._slot_encode(projection, features, mask, slot_index)
+
     def _slot_encode_with_missing(
         self,
         projection,
@@ -1167,8 +1317,36 @@ class IntegratedNoteEncoder(nn.Module):
             raise ValueError(f"Unsupported slot missing replacement: {missing_replacement}")
         return encoded * (1.0 - missing) + missing_embedding * missing
 
+    def _slot_value_encode_with_missing(
+        self,
+        projection,
+        features,
+        mask,
+        slot_index,
+        field,
+        role,
+        velocity=False,
+        missing_mask=None,
+        missing_replacement="pad",
+    ):
+        encoded = self._slot_value_encode(
+            projection, features, mask, slot_index, field=field, role=role, velocity=velocity
+        )
+        if missing_mask is None:
+            return encoded
+        missing = missing_mask.to(dtype=encoded.dtype, device=encoded.device).clamp(0.0, 1.0)
+        if missing.shape[-1] != 1:
+            missing = missing.amax(dim=-1, keepdim=True)
+        replacement = str(missing_replacement or "pad").lower()
+        missing_embedding = (
+            self._slot_mask_embedding(slot_index, encoded)
+            if replacement == "mask"
+            else self._slot_pad_embedding(slot_index, encoded)
+        )
+        return encoded * (1.0 - missing) + missing_embedding * missing
+
     def _zero_score_ioi_condition(self, score_ioi, reference):
-        if self.slot_zero_score_ioi_embedding is None:
+        if self.dinr_enabled or self.slot_zero_score_ioi_embedding is None:
             return reference.new_zeros(reference.shape)
         zero_bit = (
             score_ioi[..., 0].float().abs()
@@ -1210,6 +1388,13 @@ class IntegratedNoteEncoder(nn.Module):
         musical_binary = musical[..., 45:51]
         return musical_onset, musical_duration, musical_length, musical_binary
 
+    def _split_slot_musical145_onset_annotation(self, musical):
+        if musical.shape[-1] < 151:
+            raise ValueError(f"slot7 expects musical145_onset_annotation rows, got dim={musical.shape[-1]}")
+        musical_onset = musical[..., 0:145]
+        musical_binary = musical[..., 145:151]
+        return musical_onset, musical_binary
+
     def _categorical_slot_embedding(self, table, one_hot, scalar_features, scalar_projection, slot_index, mask):
         category = one_hot.float().argmax(dim=-1).clamp(0, table.num_embeddings - 3)
         no_value_id = table.num_embeddings - 2
@@ -1224,6 +1409,19 @@ class IntegratedNoteEncoder(nn.Module):
         if scalar_projection is not None and scalar_features.shape[-1] > 0:
             emb = emb + scalar_projection(scalar_features) * active.unsqueeze(-1).to(dtype=emb.dtype)
         return emb
+
+    def _category_only_slot_embedding(self, table, one_hot, slot_index, mask):
+        category_count = table.num_embeddings - 2
+        category_scores = one_hot[..., :category_count].float()
+        category = category_scores.argmax(dim=-1).clamp(0, category_count - 1)
+        has_value = category_scores.sum(dim=-1).to(device=category.device) > 0.5
+        no_value_id = table.num_embeddings - 2
+        pad_id = table.num_embeddings - 1
+        ids = torch.where(has_value, category, category.new_full(category.shape, no_value_id))
+        if mask is not None:
+            active = mask.squeeze(-1).to(device=category.device) > 0.5
+            ids = torch.where(active, ids, category.new_full(category.shape, pad_id))
+        return table(ids).to(dtype=one_hot.dtype)
 
     def _musical_length_slot_embedding(self, one_hot, scalar, present, slot_index, mask):
         category = one_hot.float().argmax(dim=-1).clamp(0, self.slot_musical_length_embedding.num_embeddings - 3)
@@ -1246,7 +1444,10 @@ class IntegratedNoteEncoder(nn.Module):
         musical,
         masks,
         performance_missing_mask=None,
+        role=None,
     ):
+        effective_role = str(role or self.role).lower()
+        is_decoder = effective_role == "decoder"
         m_score = masks[..., 0:1] if self.mask_dim >= 1 else None
         m_perf = masks[..., 1:2] if self.mask_dim >= 2 else None
         m_musical = masks[..., 2:3] if self.mask_dim >= 3 else None
@@ -1262,81 +1463,115 @@ class IntegratedNoteEncoder(nn.Module):
             missing_perf = self._split_slot_performance(performance_missing_mask)
 
         if self.slot_is_pt:
-            value_mask = m_score if self.role != "decoder" else m_perf
-            ioi_projection = self.slot_score_ioi_projection if self.role != "decoder" else self.slot_perf_ioi_projection
+            value_mask = m_perf if is_decoder else m_score
+            ioi_projection = self.slot_perf_ioi_projection if is_decoder else self.slot_score_ioi_projection
             duration_projection = (
-                self.slot_score_duration_projection if self.role != "decoder" else self.slot_perf_duration_projection
+                self.slot_perf_duration_projection if is_decoder else self.slot_score_duration_projection
             )
             velocity_projection = (
-                self.slot_score_velocity_projection if self.role != "decoder" else self.slot_perf_velocity_projection
+                self.slot_perf_velocity_projection if is_decoder else self.slot_score_velocity_projection
             )
-            ioi_features = score_ioi if self.role != "decoder" else perf_ioi
-            duration_features = score_duration if self.role != "decoder" else perf_duration
-            velocity_features = score_velocity if self.role != "decoder" else perf_velocity
-            pedal_mask = m_perf if self.role == "decoder" else None
+            ioi_features = perf_ioi if is_decoder else score_ioi
+            duration_features = perf_duration if is_decoder else score_duration
+            velocity_features = perf_velocity if is_decoder else score_velocity
+            pedal_mask = m_perf if is_decoder else None
+            value_role = 1 if is_decoder else 0
             pedal_embedding = (
                 self._slot_encode_with_missing(
                     self.slot_perf_pedal_projection,
                     perf_pedal,
                     pedal_mask,
                     4,
-                    missing_perf[3] if self.role == "decoder" and missing_perf is not None else None,
+                    missing_perf[3] if is_decoder and missing_perf is not None else None,
                     missing_replacement,
                 )
-                if self.role == "decoder"
-                else self._slot_null_embedding(4, pitch_embeds).expand_as(pitch_embeds)
+                if is_decoder
+                else self._slot_mask_embedding(4, pitch_embeds).expand_as(pitch_embeds)
             )
-            ioi_embedding = self._slot_encode_with_missing(
+            ioi_embedding = self._slot_value_encode_with_missing(
                 ioi_projection,
                 ioi_features,
                 value_mask,
                 1,
-                missing_perf[0] if self.role == "decoder" and missing_perf is not None else None,
-                missing_replacement,
+                field=0,
+                role=value_role,
+                missing_mask=missing_perf[0] if is_decoder and missing_perf is not None else None,
+                missing_replacement=missing_replacement,
             )
             ioi_embedding = ioi_embedding + self._zero_score_ioi_condition(score_ioi, ioi_embedding)
             slot_embeddings = [
                 self._slot_apply_gate(0, pitch_embeds),
                 self._slot_apply_gate(1, ioi_embedding),
-                self._slot_apply_gate(2, self._slot_encode_with_missing(duration_projection, duration_features, value_mask, 2, missing_perf[1] if self.role == "decoder" and missing_perf is not None else None, missing_replacement)),
-                self._slot_apply_gate(3, self._slot_encode_with_missing(velocity_projection, velocity_features, value_mask, 3, missing_perf[2] if self.role == "decoder" and missing_perf is not None else None, missing_replacement)),
+                self._slot_apply_gate(2, self._slot_value_encode_with_missing(duration_projection, duration_features, value_mask, 2, field=1, role=value_role, missing_mask=missing_perf[1] if is_decoder and missing_perf is not None else None, missing_replacement=missing_replacement)),
+                self._slot_apply_gate(3, self._slot_value_encode_with_missing(velocity_projection, velocity_features, value_mask, 3, field=0, role=value_role, velocity=True, missing_mask=missing_perf[2] if is_decoder and missing_perf is not None else None, missing_replacement=missing_replacement)),
                 self._slot_apply_gate(4, pedal_embedding),
             ]
         else:
-            if self.role != "decoder":
+            if not is_decoder:
                 perf_slots = [
                     self._slot_null_embedding(slot_index, pitch_embeds).expand_as(pitch_embeds)
                     for slot_index in range(4, 8)
                 ]
             else:
                 perf_slots = [
-                    self._slot_encode_with_missing(self.slot_perf_ioi_projection, perf_ioi, m_perf, 4, missing_perf[0] if missing_perf is not None else None, missing_replacement),
-                    self._slot_encode_with_missing(self.slot_perf_duration_projection, perf_duration, m_perf, 5, missing_perf[1] if missing_perf is not None else None, missing_replacement),
-                    self._slot_encode_with_missing(self.slot_perf_velocity_projection, perf_velocity, m_perf, 6, missing_perf[2] if missing_perf is not None else None, missing_replacement),
+                    self._slot_value_encode_with_missing(self.slot_perf_ioi_projection, perf_ioi, m_perf, 4, field=0, role=1, missing_mask=missing_perf[0] if missing_perf is not None else None, missing_replacement=missing_replacement),
+                    self._slot_value_encode_with_missing(self.slot_perf_duration_projection, perf_duration, m_perf, 5, field=1, role=1, missing_mask=missing_perf[1] if missing_perf is not None else None, missing_replacement=missing_replacement),
+                    self._slot_value_encode_with_missing(self.slot_perf_velocity_projection, perf_velocity, m_perf, 6, field=0, role=1, velocity=True, missing_mask=missing_perf[2] if missing_perf is not None else None, missing_replacement=missing_replacement),
                     self._slot_encode_with_missing(self.slot_perf_pedal_projection, perf_pedal, m_perf, 7, missing_perf[3] if missing_perf is not None else None, missing_replacement),
                 ]
-            score_ioi_embedding = self._slot_encode(self.slot_score_ioi_projection, score_ioi, m_score, 1)
+            score_ioi_embedding = self._slot_value_encode(self.slot_score_ioi_projection, score_ioi, m_score, 1, field=0, role=0)
             score_ioi_embedding = score_ioi_embedding + self._zero_score_ioi_condition(score_ioi, score_ioi_embedding)
             slot_embeddings = [
                 self._slot_apply_gate(0, pitch_embeds),
                 self._slot_apply_gate(1, score_ioi_embedding),
-                self._slot_apply_gate(2, self._slot_encode(self.slot_score_duration_projection, score_duration, m_score, 2)),
-                self._slot_apply_gate(3, self._slot_encode(self.slot_score_velocity_projection, score_velocity, m_score, 3)),
+                self._slot_apply_gate(2, self._slot_value_encode(self.slot_score_duration_projection, score_duration, m_score, 2, field=1, role=0)),
+                self._slot_apply_gate(3, self._slot_value_encode(self.slot_score_velocity_projection, score_velocity, m_score, 3, field=0, role=0, velocity=True)),
                 self._slot_apply_gate(4, perf_slots[0]),
                 self._slot_apply_gate(5, perf_slots[1]),
                 self._slot_apply_gate(6, perf_slots[2]),
                 self._slot_apply_gate(7, perf_slots[3]),
             ]
-        if self.slot_version in {"slot6", "slot9", "slot12"}:
-            if self.musical_dim <= 0:
+        if self.slot_version in {"slot6", "slot7", "slot9", "slot12"}:
+            if self.slot_version == "slot7" and self.musical_dim > 0:
+                musical_onset, musical_binary = self._split_slot_musical145_onset_annotation(musical)
+                musical_duration = musical_length = None
+            elif self.musical_dim <= 0:
                 batch_shape = score_control.shape[:-1]
-                musical_onset = score_control.new_zeros(*batch_shape, 17)
+                onset_dim = 145 if self.slot_version == "slot7" else 17
+                musical_onset = score_control.new_zeros(*batch_shape, onset_dim)
                 musical_duration = score_control.new_zeros(*batch_shape, 17)
                 musical_length = score_control.new_zeros(*batch_shape, 10)
                 musical_binary = score_control.new_zeros(*batch_shape, 6)
             else:
                 musical_onset, musical_duration, musical_length, musical_binary = self._split_slot_musical51(musical)
             musical_base = len(slot_embeddings)
+            if self.slot_version == "slot7":
+                if is_decoder:
+                    onset_slot = self._slot_mask_embedding(musical_base, pitch_embeds).expand_as(pitch_embeds)
+                    annotation_slot = self._slot_mask_embedding(musical_base + 1, pitch_embeds).expand_as(pitch_embeds)
+                else:
+                    onset_slot = self._category_only_slot_embedding(
+                        self.slot_musical_onset_embedding,
+                        musical_onset,
+                        musical_base,
+                        m_musical,
+                    )
+                    annotation_slot = self._slot_encode(
+                        self.slot_musical_binary_projection,
+                        musical_binary,
+                        m_musical,
+                        musical_base + 1,
+                    )
+                slot_embeddings.extend(
+                    [
+                        self._slot_apply_gate(musical_base, onset_slot),
+                        self._slot_apply_gate(musical_base + 1, annotation_slot),
+                    ]
+                )
+                fused = torch.cat(slot_embeddings, dim=-1)
+                if self.slot_fusion is None:
+                    return fused
+                return self.slot_fusion(fused)
             musical_onset_embedding = self._categorical_slot_embedding(
                 self.slot_musical_onset_embedding,
                 musical_onset[..., :16],
@@ -1367,7 +1602,7 @@ class IntegratedNoteEncoder(nn.Module):
                 musical_base if self.slot_version == "slot6" else musical_base + 3,
             )
             if self.slot_version == "slot6":
-                if self.role == "decoder":
+                if is_decoder:
                     musical_slot = self._slot_mask_embedding(musical_base, pitch_embeds).expand_as(pitch_embeds)
                 else:
                     musical_slot = self.slot_musical_fusion(
@@ -1396,7 +1631,8 @@ class IntegratedNoteEncoder(nn.Module):
             return fused
         return self.slot_fusion(fused)
 
-    def forward(self, pitch_ids, continuous, special_note_ids=None, performance_missing_mask=None):
+    def forward(self, pitch_ids, continuous, special_note_ids=None, performance_missing_mask=None, role=None):
+        effective_role = str(role or self.role).lower()
         try:
             projection_dtype = next(self.parameters()).dtype
         except StopIteration:
@@ -1410,7 +1646,7 @@ class IntegratedNoteEncoder(nn.Module):
         else:
             pitch_embeds = self.pitch_projection(pitch_factors)
 
-        if self.role == "decoder" and self.schema == "perf_target":
+        if effective_role == "decoder" and self.schema == "perf_target":
             target_features, masks = self._split_perf_target(continuous)
             target_embeds = self.decoder_target_projection(target_features)
             mask_embeds = self.mask_projection(masks)
@@ -1445,6 +1681,7 @@ class IntegratedNoteEncoder(nn.Module):
                 musical,
                 masks,
                 performance_missing_mask=performance_missing_mask,
+                role=effective_role,
             )
         else:
             m_score_control = masks[..., 0:1]
@@ -1474,6 +1711,10 @@ class IntegratedNoteEncoder(nn.Module):
     def pad_embedding(self):
         pad_id = int(self.config.special_note_ids.get("pad", 0))
         return self.special_note_embeddings.weight[pad_id]
+
+    def mask_embedding(self):
+        mask_id = int(self.config.special_note_ids.get("mask", 1))
+        return self.special_note_embeddings.weight[mask_id]
 
     def _apply_special_embeddings(self, embeddings, special_note_ids):
         if special_note_ids is None:
@@ -1736,6 +1977,60 @@ class IntegratedStyleTokenMixin:
         return adjusted
 
 
+class DINRValueTable(nn.Module):
+    """Categorical identities augmented with an explicit numerical coordinate."""
+
+    def __init__(self, coordinates, dim, frequencies=16):
+        super().__init__()
+        coordinates = torch.as_tensor(coordinates, dtype=torch.float32)
+        self.register_buffer("coordinates", coordinates, persistent=True)
+        self.lookup = nn.Embedding(int(coordinates.numel()), int(dim))
+        self.frequencies = max(1, int(frequencies))
+        self.numeric_projection = nn.Linear(1 + 2 * self.frequencies, int(dim), bias=False)
+
+    def numerical_features(self, values):
+        values = values.float().unsqueeze(-1)
+        frequencies = torch.arange(
+            1,
+            self.frequencies + 1,
+            device=values.device,
+            dtype=values.dtype,
+        )
+        angles = values * frequencies * math.pi
+        return torch.cat([values, torch.sin(angles), torch.cos(angles)], dim=-1)
+
+    def encode_ids(self, ids):
+        ids = ids.long().clamp(0, self.lookup.num_embeddings - 1)
+        coordinates = self.coordinates.to(device=ids.device)[ids]
+        return self.lookup(ids) + self.numeric_projection(self.numerical_features(coordinates))
+
+    def prototypes(self):
+        coordinates = self.coordinates.to(device=self.lookup.weight.device)
+        return self.lookup.weight + self.numeric_projection(self.numerical_features(coordinates))
+
+
+class DINRQueryHead(nn.Module):
+    def __init__(self, input_dim, prototype_dim, output_bins, hidden_dim, depth, activation, value_table):
+        super().__init__()
+        self.query = _make_decoder_head(
+            input_dim,
+            prototype_dim,
+            hidden_dim,
+            depth=depth,
+            activation=activation,
+            layout="mlp",
+            expand_ratio=1.0,
+            shrink_ratio=1.0,
+        )
+        self.bias = nn.Parameter(torch.zeros(int(output_bins)))
+        self.value_table = value_table
+
+    def forward(self, hidden_states):
+        query = self.query(hidden_states)
+        prototypes = self.value_table.prototypes().to(dtype=query.dtype, device=query.device)
+        return torch.matmul(query, prototypes.transpose(0, 1)) + self.bias.to(dtype=query.dtype)
+
+
 class IntegratedContinuousDecoder(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -1757,6 +2052,14 @@ class IntegratedContinuousDecoder(nn.Module):
         shared_dim = score_dim = perf_dim = full_dim
         shared_pack_mode = "concat"
         if (
+            getattr(config, "task_type", "epr") == "epr"
+            and self.epr_distribution in DINR_DISTRIBUTIONS
+        ):
+            ioi_output_dim = int(config.dinr_output_timing_bins)
+            duration_output_dim = int(config.dinr_output_timing_bins)
+            velocity_output_dim = 128
+            pedal_output_dim = 8 if self.pedal_representation == "binary_4" else self.pedal_dim
+        elif (
             getattr(config, "task_type", "epr") == "epr"
             and self.epr_distribution in {"categorical", "hard_categorical", "soft_categorical"}
         ):
@@ -1850,7 +2153,46 @@ class IntegratedContinuousDecoder(nn.Module):
         ):
             residual_targets = tuple(getattr(config, "zero_ioi_residual_targets", ("ioi",)))
             self.zero_ioi_residual = nn.Parameter(torch.zeros(3 * len(residual_targets)))
-        if self.split_shared_heads:
+        self.dinr_timing_table = None
+        self.dinr_velocity_table = None
+        if self.split_shared_heads and self.epr_distribution in DINR_DISTRIBUTIONS:
+            timing_coordinates = (
+                torch.arange(int(config.dinr_output_timing_bins), dtype=torch.float32)
+                - int(config.dinr_output_zero_bin)
+            ) * float(config.dinr_output_timing_step)
+            velocity_coordinates = torch.arange(128, dtype=torch.float32) / 127.0
+            prototype_dim = int(getattr(config, "slot_dim", None) or 128)
+            frequencies = int(getattr(config, "dinr_numerical_frequencies", 16))
+            self.dinr_timing_table = DINRValueTable(
+                timing_coordinates, prototype_dim, frequencies=frequencies
+            )
+            self.dinr_velocity_table = DINRValueTable(
+                velocity_coordinates, prototype_dim, frequencies=frequencies
+            )
+            head_args = dict(
+                input_dim=shared_dim,
+                prototype_dim=prototype_dim,
+                hidden_dim=head_hidden_dim,
+                depth=head_depth,
+                activation=activation,
+            )
+            self.ioi_head = DINRQueryHead(
+                output_bins=int(config.dinr_output_timing_bins),
+                value_table=self.dinr_timing_table,
+                **head_args,
+            )
+            self.duration_head = DINRQueryHead(
+                output_bins=int(config.dinr_output_timing_bins),
+                value_table=self.dinr_timing_table,
+                **head_args,
+            )
+            self.velocity_head = DINRQueryHead(
+                output_bins=128,
+                value_table=self.dinr_velocity_table,
+                **head_args,
+            )
+            self.shared_extra_head = None
+        elif self.split_shared_heads:
             self.ioi_head = _make_decoder_head(
                 shared_dim,
                 ioi_output_dim,
@@ -1977,6 +2319,7 @@ class IntegratedContinuousDecoder(nn.Module):
                 "mixture_logistic_normal",
                 "mixture_beta",
                 *DLM_DISTRIBUTIONS,
+                *DINR_DISTRIBUTIONS,
             }:
                 return torch.cat([shared, pedal], dim=-1)
             shared = torch.sigmoid(shared)
@@ -2008,6 +2351,7 @@ class IntegratedContinuousDecoder(nn.Module):
             "mixture_logistic_normal",
             "mixture_beta",
             *DLM_DISTRIBUTIONS,
+            *DINR_DISTRIBUTIONS,
         }:
             return torch.cat([shared, pedal], dim=-1)
 
@@ -2042,6 +2386,64 @@ def _split_epr_categorical_logits(config, raw_outputs):
         "velocity": raw_outputs[..., duration_end:velocity_end],
         "pedal": raw_outputs[..., pedal_start:pedal_end].reshape(*raw_outputs.shape[:-1], 4, value_bins),
     }
+
+
+def _split_dinr_logits(config, raw_outputs):
+    timing_bins = int(config.dinr_output_timing_bins)
+    ioi_end = timing_bins
+    duration_end = ioi_end + timing_bins
+    velocity_end = duration_end + 128
+    pedal_dim = 8 if normalize_pedal_representation(getattr(config, "pedal_representation", "binary_4")) == "binary_4" else pedal_representation_dim(getattr(config, "pedal_representation", "binary_4"))
+    pedal_end = velocity_end + pedal_dim
+    if raw_outputs.shape[-1] != pedal_end:
+        raise ValueError(
+            f"Unexpected DINR output width {raw_outputs.shape[-1]}, expected {pedal_end}"
+        )
+    pedal = raw_outputs[..., velocity_end:pedal_end]
+    if pedal_dim == 8:
+        pedal = pedal.reshape(*raw_outputs.shape[:-1], 4, 2)
+    return {
+        "ioi": raw_outputs[..., :ioi_end],
+        "duration": raw_outputs[..., ioi_end:duration_end],
+        "velocity": raw_outputs[..., duration_end:velocity_end],
+        "pedal": pedal,
+    }
+
+
+def _dinr_coordinates(config, reference):
+    return (
+        torch.arange(int(config.dinr_output_timing_bins), device=reference.device, dtype=torch.float32)
+        - int(config.dinr_output_zero_bin)
+    ) * float(config.dinr_output_timing_step)
+
+
+def _dinr_support_mask(config, logits, feature, score_shared_raw=None):
+    coordinates = _dinr_coordinates(config, logits)
+    if _uses_absolute_epr_targets(config):
+        valid = (coordinates >= 0.0) & (coordinates <= 9.0)
+        return logits.masked_fill(~valid.view(*([1] * (logits.ndim - 1)), -1), float("-inf"))
+    if feature == "duration":
+        valid = (coordinates >= float(config.dinr_deviation_min)) & (
+            coordinates <= float(config.dinr_deviation_max)
+        )
+        return logits.masked_fill(~valid.view(*([1] * (logits.ndim - 1)), -1), float("-inf"))
+    if feature != "ioi":
+        return logits
+    if score_shared_raw is None:
+        raise ValueError("DINR IOI support masking requires score_shared_raw")
+    nonzero_valid = (coordinates >= float(config.dinr_deviation_min)) & (
+        coordinates <= float(config.dinr_deviation_max)
+    )
+    zero_valid = (coordinates >= float(config.dinr_zero_ioi_min)) & (
+        coordinates <= float(config.dinr_zero_ioi_max)
+    )
+    zero_score = score_shared_raw[..., 0].abs() <= float(getattr(config, "zero_ioi_support_eps", 1e-6))
+    valid = torch.where(
+        zero_score.unsqueeze(-1),
+        zero_valid.view(*([1] * (logits.ndim - 1)), -1),
+        nonzero_valid.view(*([1] * (logits.ndim - 1)), -1),
+    )
+    return logits.masked_fill(~valid, float("-inf"))
 
 
 def _beta_params(raw_mu, raw_kappa, eps=1e-5, kappa_min=1e-3):
@@ -2567,11 +2969,12 @@ def _torch_floor_log_reconstruct(score_time_ms, dev):
 
 
 def _torch_timing_control_code(time_ms, timing_control_mode="log_scaled", use_scale_bit=False, log_scale=50.0):
-    value = time_ms.float().clamp(0.0, 5000.0)
     mode = resolve_timing_control_mode(
         timing_control_mode=timing_control_mode,
         use_timing_scale_bit=use_scale_bit,
     )
+    max_ms = 8000.0 if mode == "dinr_floor_log" else 5000.0
+    value = time_ms.float().clamp(0.0, max_ms)
     if mode == "piecewise_scale_bit":
         scale_bit = (value > 500.0).to(dtype=value.dtype)
         cont = torch.where(value > 500.0, value / 5000.0, value / 500.0)
@@ -2593,7 +2996,7 @@ def _torch_timing_control_code(time_ms, timing_control_mode="log_scaled", use_sc
         )
     if mode == "log_scaled":
         return _torch_log_timing_code(value, scale=log_scale, max_time_ms=5000.0).unsqueeze(-1)
-    if mode == "floor_log":
+    if mode in {"floor_log", "dinr_floor_log"}:
         return torch.log(value.clamp_min(1.0)).unsqueeze(-1)
     if mode == "raw_log":
         return torch.stack(
@@ -2663,6 +3066,10 @@ def _target7_to_raw7(score_shared_raw, target_predictions, config=None):
     if _uses_floor_log_deviation_targets(config):
         perf_ioi_ms = _torch_floor_log_reconstruct(score_shared_raw[..., 0], target_predictions[..., 0])
         perf_duration_ms = _torch_floor_log_reconstruct(score_shared_raw[..., 1], target_predictions[..., 1])
+        if str(_config_value(config, "epr_distribution", "point")).lower() in DINR_DISTRIBUTIONS:
+            max_ms = float(_config_value(config, "dinr_absolute_max_ms", 8000.0))
+            perf_ioi_ms = perf_ioi_ms.clamp(0.0, max_ms)
+            perf_duration_ms = perf_duration_ms.clamp(0.0, max_ms)
         velocity = target_predictions[..., 2].clamp(0.0, 1.0) * 127.0
         pedal = pedal_raw4(3)
         return torch.cat([perf_ioi_ms.unsqueeze(-1), perf_duration_ms.unsqueeze(-1), velocity.unsqueeze(-1), pedal], dim=-1)
@@ -2689,6 +3096,7 @@ def _uses_absolute_epr_targets(config):
             "log_absolute",
             "raw_log_absolute",
             "absolute_raw_log",
+            "floor_log_absolute",
         }
     )
 
@@ -2698,6 +3106,10 @@ def _uses_raw_log_absolute_targets(config):
         "raw_log_absolute",
         "absolute_raw_log",
     }
+
+
+def _uses_floor_log_absolute_targets(config):
+    return str(_config_value(config, "epr_timing_target", "absolute")).lower() == "floor_log_absolute"
 
 
 def _uses_epr_targets(config):
@@ -2729,9 +3141,14 @@ def _target_predictions_to_feedback7(config, target_predictions):
                 ],
                 dim=-1,
             )
-        log_scale = float(_config_value(config, "timing_log_scale", 50.0))
-        perf_ioi_ms = _torch_raw_log_timing_decode(target_predictions[..., 0:1], scale=log_scale)
-        perf_duration_ms = _torch_raw_log_timing_decode(target_predictions[..., 1:2], scale=log_scale)
+        if _uses_floor_log_absolute_targets(config):
+            max_ms = float(_config_value(config, "dinr_absolute_max_ms", 8000.0))
+            perf_ioi_ms = torch.exp(target_predictions[..., 0:1]).clamp(1.0, max_ms)
+            perf_duration_ms = torch.exp(target_predictions[..., 1:2]).clamp(1.0, max_ms)
+        else:
+            log_scale = float(_config_value(config, "timing_log_scale", 50.0))
+            perf_ioi_ms = _torch_raw_log_timing_decode(target_predictions[..., 0:1], scale=log_scale)
+            perf_duration_ms = _torch_raw_log_timing_decode(target_predictions[..., 1:2], scale=log_scale)
         return torch.cat(
             [
                 perf_ioi_ms,
@@ -2797,8 +3214,8 @@ def _build_epr_decoder_rows(config, score_shared_raw, target_predictions, score_
     timing_control_mode = getattr(config, "timing_control_mode", None)
     use_timing_scale_bit = getattr(config, "use_timing_scale_bit", True)
     log_scale = getattr(config, "timing_log_scale", 50.0)
-    if resolve_timing_control_mode(timing_control_mode, use_timing_scale_bit) not in {"log_scaled", "floor_log", "raw_log"}:
-        raise ValueError("EPR decoder feedback requires timing_control_mode=log_scaled, floor_log, or raw_log")
+    if resolve_timing_control_mode(timing_control_mode, use_timing_scale_bit) not in {"log_scaled", "floor_log", "dinr_floor_log", "raw_log"}:
+        raise ValueError("EPR decoder feedback requires timing_control_mode=log_scaled, floor_log, dinr_floor_log, or raw_log")
     target7 = _target_predictions_to_feedback7(config, target_predictions)
     score_ioi = _torch_timing_control_code(
         score_shared_raw[..., 0],
@@ -2859,8 +3276,33 @@ def _build_epr_decoder_rows(config, score_shared_raw, target_predictions, score_
             log_scale=log_scale,
         )
     elif _uses_floor_log_deviation_targets(config):
-        perf_ioi_ms = _torch_floor_log_reconstruct(score_shared_raw[..., 0:1], target7[..., 0:1])
-        duration_ms = _torch_floor_log_reconstruct(score_shared_raw[..., 1:2], target7[..., 1:2])
+        ioi_dev = target7[..., 0:1]
+        duration_dev = target7[..., 1:2]
+        if str(_config_value(config, "epr_distribution", "point")).lower() in DINR_DISTRIBUTIONS:
+            zero_score = score_shared_raw[..., 0:1].abs() <= float(
+                _config_value(config, "zero_ioi_support_eps", 1e-6)
+            )
+            ioi_dev = torch.where(
+                zero_score,
+                ioi_dev.clamp(
+                    float(_config_value(config, "dinr_zero_ioi_min", 0.0)),
+                    float(_config_value(config, "dinr_zero_ioi_max", 5.0)),
+                ),
+                ioi_dev.clamp(
+                    float(_config_value(config, "dinr_deviation_min", -2.0)),
+                    float(_config_value(config, "dinr_deviation_max", 2.0)),
+                ),
+            )
+            duration_dev = duration_dev.clamp(
+                float(_config_value(config, "dinr_deviation_min", -2.0)),
+                float(_config_value(config, "dinr_deviation_max", 2.0)),
+            )
+        perf_ioi_ms = _torch_floor_log_reconstruct(score_shared_raw[..., 0:1], ioi_dev)
+        duration_ms = _torch_floor_log_reconstruct(score_shared_raw[..., 1:2], duration_dev)
+        if str(_config_value(config, "epr_distribution", "point")).lower() in DINR_DISTRIBUTIONS:
+            max_ms = float(_config_value(config, "dinr_absolute_max_ms", 8000.0))
+            perf_ioi_ms = perf_ioi_ms.clamp(0.0, max_ms)
+            duration_ms = duration_ms.clamp(0.0, max_ms)
         perf_ioi = _torch_timing_control_code(
             perf_ioi_ms.squeeze(-1),
             timing_control_mode=timing_control_mode,
@@ -3799,6 +4241,39 @@ def _apply_timing_sample_shrink(config, sample, center):
     raise ValueError(f"Unsupported timing_sample_shrink_mode={mode}")
 
 
+def _apply_dlm_attribute_sample_shrink(config, sample, center, feature, zero_mask=None):
+    """Shrink stochastic DLM draws around their exact discrete mean at inference only."""
+    feature = str(feature)
+    if feature == "ioi":
+        nonzero = getattr(config, "dlm_ioi_nonzero_sample_shrink_factor", None)
+        zero = getattr(config, "dlm_ioi_zero_sample_shrink_factor", None)
+        if nonzero is None and zero is None:
+            return _apply_timing_sample_shrink(config, sample, center)
+        nonzero = 1.0 if nonzero is None else float(nonzero)
+        zero = nonzero if zero is None else float(zero)
+        factor = sample.new_full(sample.shape, nonzero)
+        if zero_mask is not None:
+            factor = torch.where(zero_mask.bool(), factor.new_full((), zero), factor)
+    elif feature == "duration":
+        factor = getattr(config, "dlm_duration_sample_shrink_factor", None)
+        if factor is None:
+            return _apply_timing_sample_shrink(config, sample, center)
+        factor = float(factor)
+    elif feature == "velocity":
+        factor = getattr(config, "dlm_velocity_sample_shrink_factor", None)
+        if factor is None:
+            return sample
+        factor = float(factor)
+    else:
+        return sample
+    if torch.is_tensor(factor):
+        if not torch.isfinite(factor).all() or (factor < 0.0).any():
+            raise ValueError(f"Invalid DLM {feature} sample shrink factor")
+    elif not math.isfinite(factor) or factor < 0.0:
+        raise ValueError(f"Invalid DLM {feature} sample shrink factor={factor}")
+    return center + factor * (sample - center)
+
+
 def _skew_normal_mean_or_sample_timing(
     config,
     raw_loc,
@@ -4269,6 +4744,26 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean", s
     strategy_name = str(sampling_strategy).lower()
     shared_strategy = "mean" if strategy_name in {"soft", "prob", "probs", "probability", "probabilities"} else sampling_strategy
     distribution = getattr(config, "epr_distribution", "point").lower()
+    if distribution in DINR_DISTRIBUTIONS:
+        logits = _split_dinr_logits(config, raw_outputs)
+        ioi_logits = _dinr_support_mask(config, logits["ioi"], "ioi", score_shared_raw)
+        duration_logits = _dinr_support_mask(config, logits["duration"], "duration")
+        temperature = float(getattr(config, "dinr_sampling_temperature", 1.0))
+        if not math.isfinite(temperature) or temperature <= 0.0:
+            raise ValueError("dinr_sampling_temperature must be finite and positive")
+        ioi_bins = _categorical_sample_or_argmax(ioi_logits / temperature, shared_strategy)
+        duration_bins = _categorical_sample_or_argmax(duration_logits / temperature, shared_strategy)
+        velocity_bins = _categorical_sample_or_argmax(logits["velocity"] / temperature, shared_strategy)
+        step = float(config.dinr_output_timing_step)
+        zero_bin = int(config.dinr_output_zero_bin)
+        ioi = (ioi_bins.float() - zero_bin) * step
+        duration = (duration_bins.float() - zero_bin) * step
+        velocity = velocity_bins.float().clamp(0.0, 127.0) / 127.0
+        if logits["pedal"].ndim == raw_outputs.ndim + 1 and logits["pedal"].shape[-1] == 2:
+            pedal = _categorical_sample_or_argmax(logits["pedal"] / temperature, sampling_strategy).float()
+        else:
+            pedal = _materialize_binary4_logits(logits["pedal"], sampling_strategy=sampling_strategy)
+        return torch.cat([torch.stack([ioi, duration, velocity], dim=-1), pedal], dim=-1)
     if distribution in DLM_DISTRIBUTIONS:
         params = _split_epr_mixture_params(config, raw_outputs)
         if score_shared_raw is None:
@@ -4470,13 +4965,14 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean", s
                 c,
                 sampling_strategy=shared_strategy,
             )
-            if bounded_floorlog and index < 2:
-                return _bounded_feature_from_unit(
+            if bounded_floorlog and index < 3:
+                bounded_value = _bounded_feature_from_unit(
                     config,
                     value,
-                    "ioi" if index == 0 else "duration",
+                    "ioi" if index == 0 else "duration" if index == 1 else "velocity",
                     zero_mask=zero_mask if index == 0 else None,
                 )
+                return bounded_value / 127.0 if index == 2 else bounded_value
             return value
 
         shared = torch.stack([decode_shared(0), decode_shared(1), decode_shared(2)], dim=-1)
@@ -4776,8 +5272,8 @@ def _apply_tf_embedding_mask(note_encoder, embeddings, attention_mask, keep_prob
     drop_mask = valid_mask & (~keep_mask)
     if not drop_mask.any():
         return embeddings
-    pad_embed = note_encoder.pad_embedding().to(dtype=embeddings.dtype, device=embeddings.device)
-    return torch.where(drop_mask.unsqueeze(-1), pad_embed.view(1, 1, -1), embeddings)
+    mask_embed = note_encoder.mask_embedding().to(dtype=embeddings.dtype, device=embeddings.device)
+    return torch.where(drop_mask.unsqueeze(-1), mask_embed.view(1, 1, -1), embeddings)
 
 
 def _share_slot_attribute_encoders(score_encoder, decoder_encoder):
@@ -4803,6 +5299,24 @@ def _share_slot_attribute_encoders(score_encoder, decoder_encoder):
     decoder_encoder.slot_zero_score_ioi_embedding = score_encoder.slot_zero_score_ioi_embedding
     decoder_encoder.slot_gate_logits = score_encoder.slot_gate_logits
     decoder_encoder.slot_fusion = score_encoder.slot_fusion
+    decoder_encoder.dinr_timing_table = score_encoder.dinr_timing_table
+    decoder_encoder.dinr_velocity_table = score_encoder.dinr_velocity_table
+    decoder_encoder.dinr_field_embedding = score_encoder.dinr_field_embedding
+    decoder_encoder.dinr_role_embedding = score_encoder.dinr_role_embedding
+
+
+def _share_dinr_value_tables(note_encoder, decoder_note_encoder, output_decoder):
+    if not bool(getattr(note_encoder, "dinr_enabled", False)):
+        return
+    if getattr(output_decoder, "dinr_timing_table", None) is None:
+        raise ValueError("DINR note encoding requires DINR categorical output heads")
+    share_timing = str(getattr(note_encoder.config, "dinr_vocabulary_mode", "unified")).lower() == "unified"
+    if share_timing:
+        note_encoder.dinr_timing_table = output_decoder.dinr_timing_table
+    note_encoder.dinr_velocity_table = output_decoder.dinr_velocity_table
+    if share_timing:
+        decoder_note_encoder.dinr_timing_table = output_decoder.dinr_timing_table
+    decoder_note_encoder.dinr_velocity_table = output_decoder.dinr_velocity_table
 
 
 def _build_ar_special_note_ids(config, attention_mask):
@@ -5202,21 +5716,132 @@ def _compute_epr_categorical_loss_components(config, raw_outputs, labels_epr_bin
     }
 
 
-def _dlm_scale(config, raw_log_scale, feature=None):
+def _dinr_quantize(config, values):
+    return torch.round(
+        values.float() / float(config.dinr_output_timing_step) + int(config.dinr_output_zero_bin)
+    ).long().clamp(0, int(config.dinr_output_timing_bins) - 1)
+
+
+def _dinr_support_bin(config, value, upper=False):
+    raw = float(value) / float(config.dinr_output_timing_step) + int(config.dinr_output_zero_bin)
+    index = math.floor(raw + 1e-9) if upper else math.ceil(raw - 1e-9)
+    return max(0, min(int(config.dinr_output_timing_bins) - 1, int(index)))
+
+
+def _compute_dinr_loss_components(
+    config,
+    raw_outputs,
+    labels_continuous,
+    mask,
+    score_shared_raw,
+    label_valid_mask=None,
+):
+    logits = _split_dinr_logits(config, raw_outputs)
+    ioi_logits = _dinr_support_mask(config, logits["ioi"], "ioi", score_shared_raw)
+    duration_logits = _dinr_support_mask(config, logits["duration"], "duration")
+    absolute_targets = _uses_absolute_epr_targets(config)
+    zero_score = score_shared_raw[..., 0].abs() <= float(getattr(config, "zero_ioi_support_eps", 1e-6))
+    if absolute_targets:
+        ioi_min = labels_continuous.new_full(zero_score.shape, 0.0)
+        ioi_max = labels_continuous.new_full(zero_score.shape, 9.0)
+        duration_min, duration_max = 0.0, 9.0
+    else:
+        ioi_min = torch.where(
+            zero_score,
+            labels_continuous.new_full((), float(config.dinr_zero_ioi_min)),
+            labels_continuous.new_full((), float(config.dinr_deviation_min)),
+        )
+        ioi_max = torch.where(
+            zero_score,
+            labels_continuous.new_full((), float(config.dinr_zero_ioi_max)),
+            labels_continuous.new_full((), float(config.dinr_deviation_max)),
+        )
+        duration_min, duration_max = float(config.dinr_deviation_min), float(config.dinr_deviation_max)
+    ioi_target_value = labels_continuous[..., 0]
+    duration_target_value = labels_continuous[..., 1]
+    ioi_mask = mask.bool() & (ioi_target_value >= ioi_min) & (ioi_target_value <= ioi_max)
+    duration_mask = mask.bool() & (
+        duration_target_value >= duration_min
+    ) & (duration_target_value <= duration_max)
+    velocity_mask = mask.bool()
+    if label_valid_mask is not None:
+        ioi_mask &= label_valid_mask[..., 0].bool()
+        duration_mask &= label_valid_mask[..., 1].bool()
+        if label_valid_mask.shape[-1] > 2:
+            velocity_mask &= label_valid_mask[..., 2].bool()
+    ioi_target = _dinr_quantize(config, ioi_target_value)
+    nonzero_lo = _dinr_support_bin(config, 0.0 if absolute_targets else config.dinr_deviation_min)
+    nonzero_hi = _dinr_support_bin(config, 9.0 if absolute_targets else config.dinr_deviation_max, upper=True)
+    zero_lo = _dinr_support_bin(config, 0.0 if absolute_targets else config.dinr_zero_ioi_min)
+    zero_hi = _dinr_support_bin(config, 9.0 if absolute_targets else config.dinr_zero_ioi_max, upper=True)
+    ioi_target = torch.maximum(
+        torch.minimum(ioi_target, torch.where(zero_score, ioi_target.new_full((), zero_hi), ioi_target.new_full((), nonzero_hi))),
+        torch.where(zero_score, ioi_target.new_full((), zero_lo), ioi_target.new_full((), nonzero_lo)),
+    )
+    duration_target = _dinr_quantize(config, duration_target_value).clamp(nonzero_lo, nonzero_hi)
+    velocity_target = torch.round(labels_continuous[..., 2].float().clamp(0.0, 1.0) * 127.0).long()
+    losses = {
+        "ioi": _hard_categorical_loss(ioi_logits, ioi_target, ioi_mask),
+        "duration": _hard_categorical_loss(duration_logits, duration_target, duration_mask),
+        "velocity": _hard_categorical_loss(logits["velocity"], velocity_target, velocity_mask),
+    }
+    pedal_dim = pedal_representation_dim(getattr(config, "pedal_representation", "binary_4"))
+    if pedal_dim == 4 and logits["pedal"].shape[-1] == 2:
+        pedal_losses = []
+        for idx in range(4):
+            target = (labels_continuous[..., 3 + idx] >= 0.5).long()
+            pedal_losses.append(_hard_categorical_loss(logits["pedal"][..., idx, :], target, mask))
+        losses["pedal"] = torch.stack(pedal_losses).mean()
+    else:
+        losses["pedal"] = F.binary_cross_entropy_with_logits(
+            logits["pedal"].float(),
+            labels_continuous[..., 3 : 3 + pedal_dim].float(),
+            reduction="none",
+        ).mean(dim=-1)
+        losses["pedal"] = _masked_mean(losses["pedal"], mask)
+    return losses
+
+
+def _dlm_scale(config, raw_log_scale, feature=None, zero_mask=None):
     sigma_min = float(getattr(config, "dlm_scale_min", 1e-3))
     sigma_max = float(getattr(config, "dlm_scale_max", 10.0))
     parameterization = str(
         getattr(config, "dlm_timing_scale_parameterization", "legacy_clamp")
     ).lower()
-    if str(feature) in {"ioi", "duration"} and parameterization in {
+    feature = str(feature)
+    if feature in {"ioi", "duration"} and parameterization in {
         "bounded_sigmoid",
         "sigmoid",
     }:
         sigma_min = float(getattr(config, "dlm_timing_scale_min", sigma_min))
-        sigma_max = float(getattr(config, "dlm_timing_scale_max", sigma_max))
+        if feature == "duration":
+            sigma_max = float(getattr(config, "dlm_duration_scale_max", getattr(config, "dlm_timing_scale_max", sigma_max)))
+        else:
+            nonzero_max = float(getattr(config, "dlm_ioi_nonzero_scale_max", getattr(config, "dlm_timing_scale_max", sigma_max)))
+            zero_max = float(getattr(config, "dlm_ioi_zero_scale_max", nonzero_max))
+            sigma_max = nonzero_max
         if sigma_max <= sigma_min:
             raise ValueError(
                 f"DLM bounded scale requires max > min, got {sigma_min}, {sigma_max}"
+            )
+        unit = torch.sigmoid(raw_log_scale.float())
+        if feature == "ioi" and zero_mask is not None and zero_max != nonzero_max:
+            max_value = torch.where(
+                zero_mask.bool().unsqueeze(-1),
+                unit.new_tensor(zero_max),
+                unit.new_tensor(nonzero_max),
+            )
+            return sigma_min + (max_value - sigma_min) * unit
+        return sigma_min + (sigma_max - sigma_min) * unit
+    velocity_parameterization = str(
+        getattr(config, "dlm_velocity_scale_parameterization", "legacy_clamp")
+    ).lower()
+    if feature == "velocity" and velocity_parameterization in {"bounded_sigmoid", "sigmoid"}:
+        sigma_min = float(getattr(config, "dlm_velocity_scale_min", sigma_min))
+        sigma_max = float(getattr(config, "dlm_velocity_scale_max", sigma_max))
+        if sigma_max <= sigma_min:
+            raise ValueError(
+                f"DLM bounded velocity scale requires max > min, got {sigma_min}, {sigma_max}"
             )
         return sigma_min + (sigma_max - sigma_min) * torch.sigmoid(raw_log_scale.float())
     scale = F.softplus(raw_log_scale.float()) + sigma_min
@@ -5293,7 +5918,7 @@ def _dlm_log_bin_probs(config, logits, raw_loc, raw_log_scale, feature, zero_mas
     if bins < 2:
         raise ValueError(f"DLM bins must be >= 2 for {feature}, got {bins}")
     loc = _dlm_loc(config, raw_loc, feature)
-    scale = _dlm_scale(config, raw_log_scale, feature=feature)
+    scale = _dlm_scale(config, raw_log_scale, feature=feature, zero_mask=zero_mask)
     lo, hi = _dlm_feature_range(config, feature, zero_mask=zero_mask)
     if torch.is_tensor(lo):
         lo = lo.to(device=loc.device, dtype=loc.dtype)
@@ -5551,15 +6176,13 @@ def _dlm_mean_or_sample(config, logits, raw_loc, raw_log_scale, feature, samplin
         index = probs.argmax(dim=-1, keepdim=True)
         return centers.gather(-1, index).squeeze(-1)
     if mode in {"sample", "sampling", "stochastic"}:
-        sample_center = None
+        sample_center = torch.sum(probs * centers, dim=-1, keepdim=True)
         radius = _timing_truncate_radius(config)
         if str(feature) in {"ioi", "duration"}:
             center_mode = _timing_truncate_center_mode(config)
             if center_mode in {"mode", "argmax", "greedy"}:
                 center_index = probs.argmax(dim=-1, keepdim=True)
                 sample_center = centers.gather(-1, center_index)
-            else:
-                sample_center = torch.sum(probs * centers, dim=-1, keepdim=True)
         if radius > 0.0 and str(feature) in {"ioi", "duration"}:
             local_mask = (centers >= sample_center - radius) & (centers <= sample_center + radius)
             local_probs = probs.masked_fill(~local_mask, 0.0)
@@ -5568,8 +6191,9 @@ def _dlm_mean_or_sample(config, logits, raw_loc, raw_log_scale, feature, samplin
         index = torch.distributions.Categorical(probs=probs.reshape(-1, probs.shape[-1])).sample()
         index = index.reshape(probs.shape[:-1]).unsqueeze(-1)
         sample = centers.gather(-1, index)
-        if sample_center is not None:
-            sample = _apply_timing_sample_shrink(config, sample, sample_center)
+        sample = _apply_dlm_attribute_sample_shrink(
+            config, sample, sample_center, feature, zero_mask=zero_mask
+        )
         return sample.squeeze(-1)
     raise ValueError(f"Unsupported sampling_strategy: {sampling_strategy}")
 
@@ -5671,6 +6295,17 @@ def _compute_integrated_loss_components(
     feature_mask = label_valid_mask.bool() if label_valid_mask is not None else None
     distribution = getattr(config, "epr_distribution", "point").lower()
     detail_components = {}
+    if distribution in DINR_DISTRIBUTIONS:
+        if score_shared_raw is None:
+            raise ValueError("DINR loss requires score_shared_raw")
+        return _compute_dinr_loss_components(
+            config,
+            continuous_pred,
+            labels_continuous,
+            mask,
+            score_shared_raw,
+            label_valid_mask=feature_mask,
+        )
     if distribution in DLM_DISTRIBUTIONS:
         params = _split_epr_mixture_params(config, continuous_pred)
         if score_shared_raw is None:
@@ -6158,11 +6793,15 @@ def _compute_integrated_loss_components(
         )
         ioi_target = labels_continuous[..., 0]
         duration_target = labels_continuous[..., 1]
+        velocity_target = labels_continuous[..., 2]
         if bounded_floorlog:
             if score_shared_raw is None:
                 raise ValueError("bounded floor-log distributions require score_shared_raw")
             ioi_target = _bounded_feature_to_unit(config, ioi_target, "ioi", zero_mask=zero_mask, eps=eps)
             duration_target = _bounded_feature_to_unit(config, duration_target, "duration", eps=eps)
+            velocity_target = _bounded_feature_to_unit(
+                config, velocity_target * 127.0, "velocity", eps=eps
+            )
 
         logits, a, b, c = _shared_scalar_params(config, params, 0)
         loss_ioi = loss_one(logits, a, b, ioi_target, c)
@@ -6171,7 +6810,7 @@ def _compute_integrated_loss_components(
         loss_duration = loss_one(logits, a, b, duration_target, c)
         duration_variance_args = (logits, a, b)
         logits, a, b, c = _shared_scalar_params(config, params, 2)
-        loss_velocity = loss_one(logits, a, b, labels_continuous[..., 2], c)
+        loss_velocity = loss_one(logits, a, b, velocity_target, c)
         velocity_variance_args = (logits, a, b)
         pedal_representation = normalize_pedal_representation(getattr(config, "pedal_representation", "start_valley"))
         pedal_dim = pedal_representation_dim(pedal_representation)
@@ -6715,18 +7354,34 @@ class IntegratedPianoTransformer(IntegratedStyleTokenMixin, nn.Module):
             continuous_dim=getattr(config, "score_input_continuous_dim", config.input_continuous_dim),
             role="score",
         )
-        self._decoder_note_encoder = IntegratedNoteEncoder(
-            config,
-            continuous_dim=getattr(config, "decoder_input_continuous_dim", config.input_continuous_dim),
-            role="decoder",
+        share_note_encoder = (
+            str(getattr(config, "note_embedding_mode", "")).lower() == "slot_attribute"
+            and bool(getattr(config, "slot_share_role_encoders", True))
         )
+        self._shared_note_encoder = share_note_encoder
+        if share_note_encoder:
+            if score_note_input_schema(config) != decoder_note_input_schema(config):
+                raise ValueError("A shared slot note encoder requires matching score and decoder note-input schemas")
+            if int(getattr(config, "score_input_continuous_dim", config.input_continuous_dim)) != int(
+                getattr(config, "decoder_input_continuous_dim", config.input_continuous_dim)
+            ):
+                raise ValueError("A shared slot note encoder requires matching score and decoder continuous dimensions")
+        else:
+            self._decoder_note_encoder = IntegratedNoteEncoder(
+                config,
+                continuous_dim=getattr(config, "decoder_input_continuous_dim", config.input_continuous_dim),
+                role="decoder",
+            )
         if (
+            not share_note_encoder
+            and
             str(getattr(config, "note_embedding_mode", "")).lower() == "slot_attribute"
             and bool(getattr(config, "slot_share_role_encoders", True))
         ):
-            _share_slot_attribute_encoders(self.note_encoder, self._decoder_note_encoder)
+            _share_slot_attribute_encoders(self.note_encoder, self.decoder_note_encoder)
         self.style_token_encoder = IntegratedStyleTokenEncoder(config) if config.use_style_tokens else None
         self.continuous_decoder = IntegratedContinuousDecoder(config)
+        _share_dinr_value_tables(self.note_encoder, self.decoder_note_encoder, self.continuous_decoder)
         backbone_type = config.backbone_type.lower()
         self.backbone_type = backbone_type
         if backbone_type == "bert":
@@ -6738,7 +7393,7 @@ class IntegratedPianoTransformer(IntegratedStyleTokenMixin, nn.Module):
 
     @property
     def decoder_note_encoder(self):
-        return self._decoder_note_encoder
+        return self.note_encoder if self._shared_note_encoder else self._decoder_note_encoder
 
     def forward(
         self,
@@ -6838,6 +7493,7 @@ class IntegratedPianoTransformer(IntegratedStyleTokenMixin, nn.Module):
                     decoder_input_continuous,
                     special_note_ids=special_note_ids,
                     performance_missing_mask=decoder_missing_mask,
+                    role="decoder",
                 )
                 performance_embeds = self._apply_style_to_decoder_inputs(
                     performance_embeds,
@@ -7019,6 +7675,7 @@ class IntegratedPianoTransformer(IntegratedStyleTokenMixin, nn.Module):
                 decoder_pitch_ids[:, : step + 1],
                 decoder_input_continuous[:, : step + 1],
                 special_note_ids=special_note_ids[:, : step + 1],
+                role="decoder",
             )
             perf_prefix_embeds = self._apply_style_to_decoder_inputs(
                 perf_prefix_embeds,
@@ -7085,24 +7742,40 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
             continuous_dim=getattr(config, "score_input_continuous_dim", config.input_continuous_dim),
             role="score",
         )
-        self._decoder_note_encoder = IntegratedNoteEncoder(
-            config,
-            continuous_dim=getattr(config, "decoder_input_continuous_dim", config.input_continuous_dim),
-            role="decoder",
+        share_note_encoder = (
+            str(getattr(config, "note_embedding_mode", "")).lower() == "slot_attribute"
+            and bool(getattr(config, "slot_share_role_encoders", True))
         )
+        self._shared_note_encoder = share_note_encoder
+        if share_note_encoder:
+            if score_note_input_schema(config) != decoder_note_input_schema(config):
+                raise ValueError("A shared slot note encoder requires matching score and decoder note-input schemas")
+            if int(getattr(config, "score_input_continuous_dim", config.input_continuous_dim)) != int(
+                getattr(config, "decoder_input_continuous_dim", config.input_continuous_dim)
+            ):
+                raise ValueError("A shared slot note encoder requires matching score and decoder continuous dimensions")
+        else:
+            self._decoder_note_encoder = IntegratedNoteEncoder(
+                config,
+                continuous_dim=getattr(config, "decoder_input_continuous_dim", config.input_continuous_dim),
+                role="decoder",
+            )
         if (
+            not share_note_encoder
+            and
             str(getattr(config, "note_embedding_mode", "")).lower() == "slot_attribute"
             and bool(getattr(config, "slot_share_role_encoders", True))
         ):
-            _share_slot_attribute_encoders(self.note_encoder, self._decoder_note_encoder)
+            _share_slot_attribute_encoders(self.note_encoder, self.decoder_note_encoder)
         self.style_token_encoder = IntegratedStyleTokenEncoder(config) if config.use_style_tokens else None
         self.model = IntegratedPianoT5GemmaModel(config)
         self.continuous_decoder = IntegratedContinuousDecoder(config)
+        _share_dinr_value_tables(self.note_encoder, self.decoder_note_encoder, self.continuous_decoder)
         self.post_init()
 
     @property
     def decoder_note_encoder(self):
-        return self._decoder_note_encoder
+        return self.note_encoder if self._shared_note_encoder else self._decoder_note_encoder
 
     def get_encoder(self):
         return self.model.encoder
@@ -7167,6 +7840,7 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
                 decoder_input_continuous,
                 special_note_ids=special_note_ids,
                 performance_missing_mask=decoder_missing_mask,
+                role="decoder",
             )
             return decoder_inputs_embeds, attention_mask
         raise ValueError(f"Unsupported decoder_input_mode: {self.config.decoder_input_mode}")
@@ -7494,6 +8168,7 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
                 decoder_pitch_ids[:, :prime_len],
                 decoder_input_continuous[:, :prime_len],
                 special_note_ids=special_note_ids[:, :prime_len],
+                role="decoder",
             )
             decoder_inputs_embeds = self._apply_style_to_decoder_inputs(
                 decoder_inputs_embeds,
@@ -7518,6 +8193,7 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
                     decoder_pitch_ids[:, :1],
                     decoder_input_continuous[:, :1],
                     special_note_ids=special_note_ids[:, :1],
+                    role="decoder",
                 )
                 decoder_inputs_embeds = self._apply_style_to_decoder_inputs(
                     decoder_inputs_embeds,
@@ -7544,6 +8220,7 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
                     decoder_pitch_ids[:, step_idx:step_idx+1],
                     decoder_input_continuous[:, step_idx:step_idx+1],
                     special_note_ids=special_note_ids[:, step_idx:step_idx+1],
+                    role="decoder",
                 )
                 decoder_inputs_embeds = self._apply_style_to_decoder_inputs(
                     decoder_inputs_embeds,

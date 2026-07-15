@@ -1,4 +1,7 @@
 import math
+import os
+from pathlib import Path
+import torch
 
 
 def _normalize_performance_to_score_onset_span(score_raw, perf):
@@ -120,3 +123,50 @@ def build_sidecar_for_work(
     prepared["performance_time_normalization"] = performance_time_normalization or "none"
     dataset._save_prepared_to_disk(path, prepared)
     return dataset._prepared_disk_cache_path(path)
+
+
+def build_ready_sidecar_for_work(dataset, path, selected_sources=None):
+    work = dataset._load_work(path)
+    if selected_sources is not None:
+        selected_sources = set(selected_sources)
+        work = dict(work)
+        work["performances"] = [
+            perf for perf in work.get("performances", [])
+            if perf.get("performance_source") in selected_sources
+        ]
+    prepared = dataset._prepare_work(
+        path,
+        work,
+        eager_labels=True,
+        slim_performances=True,
+        split_filter=False,
+        force_rebuild=True,
+        derive_features=True,
+    )
+    raw_by_source = {
+        perf.get("performance_source"): perf
+        for perf in work.get("performances", [])
+        if perf.get("performance_source") is not None
+    }
+    original_target = dataset.epr_timing_target
+    try:
+        for perf in prepared.get("performances", []):
+            deviation_labels = perf.pop("labels")
+            raw_perf = raw_by_source[perf.get("performance_source")]
+            dataset.epr_timing_target = "floor_log_absolute"
+            absolute_labels, _ = dataset._compute_performance_labels(prepared, raw_perf)
+            perf["labels_by_target"] = {
+                "floor_log_deviation": deviation_labels,
+                "floor_log_absolute": absolute_labels,
+            }
+            perf.pop("label_bins", None)
+    finally:
+        dataset.epr_timing_target = original_target
+    prepared["_cache_signature"] = dataset._build_ready_sidecar_signature()
+    prepared["_source_identity"] = dataset._source_identity(path)
+    cache_path = dataset._prepared_disk_cache_path(path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.tmp")
+    torch.save(prepared, tmp_path)
+    os.replace(tmp_path, cache_path)
+    return Path(cache_path)

@@ -10,7 +10,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from src.data_process.work_manifest import build_work_manifest
-from src.data_process.sidecar_builder import build_sidecar_for_work
+from src.data_process.sidecar_builder import build_ready_sidecar_for_work, build_sidecar_for_work
 from src.train.train_inr import (
     PianoCoReNodeSFTDataset,
     infer_input_feature_mode,
@@ -87,6 +87,7 @@ def build_dataset(config, manifest, split):
             "musical_feature_mode",
             "continuous" if str(config.get("task_type", "epr")).lower() == "csr" else "categorical",
         ),
+        disable_musical_features=config.get("disable_musical_features", False),
         epr_timing_target=config.get("epr_timing_target", "log_deviation"),
         use_timing_scale_bit=config.get("use_timing_scale_bit", False),
         timing_control_mode=config.get("timing_control_mode", "log_scaled"),
@@ -97,7 +98,7 @@ def build_dataset(config, manifest, split):
 
 
 def worker(args):
-    config, split, work_path, selected_sources, performance_time_normalization = args
+    config, split, work_path, selected_sources, performance_time_normalization, ready = args
     manifest = [
         {
             "path": work_path,
@@ -106,12 +107,15 @@ def worker(args):
         }
     ]
     dataset = build_dataset(config, manifest, split)
-    sidecar = build_sidecar_for_work(
-        dataset,
-        work_path,
-        selected_sources=selected_sources,
-        performance_time_normalization=performance_time_normalization,
-    )
+    if ready:
+        sidecar = build_ready_sidecar_for_work(dataset, work_path, selected_sources=selected_sources)
+    else:
+        sidecar = build_sidecar_for_work(
+            dataset,
+            work_path,
+            selected_sources=selected_sources,
+            performance_time_normalization=performance_time_normalization,
+        )
     if sidecar is None or not Path(sidecar).exists():
         raise RuntimeError(f"Failed to write sidecar for {work_path}: {sidecar}")
     return str(work_path), str(sidecar)
@@ -132,6 +136,7 @@ def main():
     parser.add_argument("--pedal-representation", default="start_valley")
     parser.add_argument("--pedal-valley-pos-weight", type=float, default=None)
     parser.add_argument("--musical-feature-mode", default="musical51")
+    parser.add_argument("--disable-musical-features", action="store_true")
     parser.add_argument("--epr-timing-target", default="log_deviation")
     parser.add_argument("--use-timing-scale-bit", type=int, default=0)
     parser.add_argument("--timing-control-mode", default="log_scaled")
@@ -154,6 +159,7 @@ def main():
     parser.add_argument("--workers", type=int, default=36)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--sidecar-tag", default=None)
+    parser.add_argument("--ready", action="store_true", help="Persist derived score inputs and eager labels")
     parser.add_argument(
         "--performance-time-normalization",
         choices=["none", "score_onset_span"],
@@ -175,6 +181,7 @@ def main():
         "pedal_representation": args.pedal_representation,
         "pedal_valley_pos_weight": args.pedal_valley_pos_weight,
         "musical_feature_mode": args.musical_feature_mode,
+        "disable_musical_features": args.disable_musical_features,
         "epr_timing_target": args.epr_timing_target,
         "use_timing_scale_bit": bool(args.use_timing_scale_bit),
         "timing_control_mode": args.timing_control_mode,
@@ -225,7 +232,7 @@ def main():
     done = 0
     if args.workers <= 1:
         for path in paths:
-            worker((config, args.split, path, selected_by_path.get(path), args.performance_time_normalization))
+            worker((config, args.split, path, selected_by_path.get(path), args.performance_time_normalization, args.ready))
             done += 1
             if done % 10 == 0 or done == len(paths):
                 print(json.dumps({"event": "inr_sidecar_prebuild_progress", "done": done, "works": len(paths)}), flush=True)
@@ -234,7 +241,7 @@ def main():
             futures = [
                 pool.submit(
                     worker,
-                    (config, args.split, path, selected_by_path.get(path), args.performance_time_normalization),
+                    (config, args.split, path, selected_by_path.get(path), args.performance_time_normalization, args.ready),
                 )
                 for path in paths
             ]

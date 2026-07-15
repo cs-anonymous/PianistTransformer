@@ -32,7 +32,11 @@ from src.model.integrated_pianoformer import (
     IntegratedPianoT5GemmaConfig,
     IntegratedPianoTransformer,
     _compute_integrated_loss_components,
+    _dlm_bin_centers,
+    _dlm_log_bin_probs,
     _materialize_epr_prediction,
+    _split_epr_mixture_params,
+    _zero_score_ioi_mask,
 )
 from src.data_process.work_manifest import build_work_manifest
 from src.utils.func import filter_valid_args
@@ -150,6 +154,65 @@ def filter_resume_state_dict(model, state_dict, train_config):
 
 
 def apply_trainable_parameter_policy(model, train_config):
+    if train_config.get("train_scale_only", False):
+        distribution = str(train_config.get("epr_distribution", "dlm")).lower()
+        components = int(train_config.get("epr_mixture_components", 1))
+        velocity_distribution = str(
+            train_config.get("velocity_distribution", distribution)
+        ).lower()
+        velocity_components = int(
+            train_config.get("velocity_mixture_components") or components
+        )
+        if distribution != "dlm" or components != 1:
+            raise ValueError(
+                "train_scale_only currently requires epr_distribution=dlm and "
+                "epr_mixture_components=1"
+            )
+        if velocity_distribution != "dlm" or velocity_components != 1:
+            raise ValueError(
+                "train_scale_only currently requires velocity DLM K=1"
+            )
+
+        for param in model.parameters():
+            param.requires_grad = False
+
+        # A DLM K=1 final projection has rows [mixture_logit, loc, log_scale].
+        # Keep the original module/state-dict layout, but mask gradients so only
+        # log_scale is optimized. Stage-2 configs must set weight_decay=0 to
+        # prevent decoupled AdamW decay from moving the two frozen rows.
+        hook_handles = []
+        trainable = []
+        for head_name in ("ioi_head", "duration_head", "velocity_head"):
+            head = getattr(model.continuous_decoder, head_name)
+            linear = next(
+                (module for module in reversed(list(head.modules())) if isinstance(module, torch.nn.Linear)),
+                None,
+            )
+            if linear is None or linear.out_features != 3:
+                raise ValueError(
+                    f"Expected {head_name} final projection to have 3 DLM K=1 rows; "
+                    f"got {None if linear is None else linear.out_features}"
+                )
+
+            def scale_row_only(grad):
+                masked = torch.zeros_like(grad)
+                masked[2] = grad[2]
+                return masked
+
+            linear.weight.requires_grad = True
+            hook_handles.append(linear.weight.register_hook(scale_row_only))
+            trainable.append(f"continuous_decoder.{head_name}.final.weight[2]")
+            if linear.bias is not None:
+                linear.bias.requires_grad = True
+                hook_handles.append(linear.bias.register_hook(scale_row_only))
+                trainable.append(f"continuous_decoder.{head_name}.final.bias[2]")
+        model._scale_only_gradient_hook_handles = hook_handles
+        print(f"Freeze policy: DLM K=1 scale rows only ({len(trainable)} row slices trainable)")
+        print(f"  trainable slices: {trainable}")
+        if float(train_config.get("weight_decay", 0.0) or 0.0) != 0.0:
+            raise ValueError("train_scale_only requires weight_decay=0")
+        return
+
     if train_config.get("freeze_non_output_heads", False):
         trainable = []
         train_input_embedding = bool(train_config.get("freeze_train_input_embedding", False))
@@ -209,6 +272,7 @@ def resolve_timing_control_mode(timing_control_mode="log_scaled", use_timing_sca
         "dual_clip_linear",
         "log_scaled",
         "floor_log",
+        "dinr_floor_log",
         "raw_log",
     }
     if mode not in valid_modes:
@@ -223,7 +287,7 @@ def timing_control_feature_dim(timing_control_mode="log_scaled", use_timing_scal
     )
     if mode == "raw_log":
         return 5
-    return 3 if mode in {"piecewise_single", "log_scaled", "floor_log"} else 5
+    return 3 if mode in {"piecewise_single", "log_scaled", "floor_log", "dinr_floor_log"} else 5
 
 
 def musical_feature_dim(musical_feature_mode="categorical"):
@@ -239,12 +303,15 @@ def musical_feature_dim(musical_feature_mode="categorical"):
         "musical51_full",
         "musical51_onset_only",
         "musical51_annotation_only",
+        "musical51_duration_only",
         "musical51_onset_annotation",
         "musical51_no_duration",
         "musical51_no_length",
         "musical51_no_duration_length",
     }:
         return 51
+    if mode in {"musical145_onset_annotation", "onset145_annotation"}:
+        return 151
     if mode in {"categorical62", "musical62"}:
         return 62
     raise ValueError(f"Unsupported musical_feature_mode={musical_feature_mode}")
@@ -619,6 +686,7 @@ def _uses_absolute_target(epr_timing_target):
         "log_absolute",
         "raw_log_absolute",
         "absolute_raw_log",
+        "floor_log_absolute",
     }
 
 
@@ -733,10 +801,16 @@ def performance_dev_velocity_pedal4_binary_rows(
                 ]
             )
         elif _uses_absolute_target(epr_timing_target):
+            if str(epr_timing_target).lower() == "floor_log_absolute":
+                absolute_ioi = math.log(max(float(perf_row[0]), 1.0))
+                absolute_duration = math.log(max(float(perf_row[1]), 1.0))
+            else:
+                absolute_ioi = raw_log_timing_value(perf_row[0], scale=log_scale)
+                absolute_duration = raw_log_timing_value(perf_row[1], scale=log_scale)
             rows.append(
                 [
-                    raw_log_timing_value(perf_row[0], scale=log_scale),
-                    raw_log_timing_value(perf_row[1], scale=log_scale),
+                    absolute_ioi,
+                    absolute_duration,
                     velocity,
                     *pedal,
                 ]
@@ -757,7 +831,8 @@ def performance_dev_velocity_pedal4_binary_rows(
 
 
 def normalize_piecewise_time_value(time_ms):
-    value = min(max(float(time_ms), 0.0), 5000.0)
+    max_ms = 8000.0 if mode == "dinr_floor_log" else 5000.0
+    value = min(max(float(time_ms), 0.0), max_ms)
     if value <= 500.0:
         return value / 500.0
     return value / 5000.0
@@ -783,7 +858,7 @@ def encode_timing_control_features(time_ms, timing_control_mode="log_scaled", us
         ]
     if mode == "log_scaled":
         return [normalize_log_timing_value(value, scale=log_scale, max_time_ms=5000.0)]
-    if mode == "floor_log":
+    if mode in {"floor_log", "dinr_floor_log"}:
         return [math.log(max(value, 1.0))]
     if mode == "dual_clip_linear":
         return [
@@ -872,6 +947,7 @@ MUSICAL51_ABLATION_MODES = {
     "musical51_full",
     "musical51_onset_only",
     "musical51_annotation_only",
+    "musical51_duration_only",
     "musical51_onset_annotation",
     "musical51_no_duration",
     "musical51_no_length",
@@ -899,6 +975,8 @@ def _apply_musical51_ablation(row, mode):
         spans = [(27, 44)]
     elif mode == "musical51_annotation_only":
         spans = [(45, 51)]
+    elif mode == "musical51_duration_only":
+        spans = [(17, 27)]
     elif mode in {"musical51_onset_annotation", "musical51_no_duration_length"}:
         spans = [(27, 44), (45, 51)]
     else:
@@ -988,6 +1066,24 @@ def build_score_musical_rows(score, musical_feature_mode="continuous"):
                 1.0 if stem_code == 2 else 0.0,
             ]
             rows.append(continuous)
+            continue
+
+        if base_mode in {"musical145_onset_annotation", "onset145_annotation"}:
+            onset_idx = int(round(mo * 24.0))
+            onset_idx = min(max(onset_idx, 0), 144)
+            onset = [0.0] * 145
+            onset[onset_idx] = 1.0
+            rows.append(
+                [
+                    *onset,
+                    hand,
+                    trill,
+                    grace,
+                    stacc,
+                    1.0 if stem_code == 1 else 0.0,
+                    1.0 if stem_code == 2 else 0.0,
+                ]
+            )
             continue
 
         if base_mode in {"categorical62", "musical62"}:
@@ -1413,6 +1509,8 @@ class PianoCoReNodeSFTDataset(Dataset):
         source_vocab=None,
         perf_style_stats_mode="prefix",
         legacy_dual_timing_head=False,
+        multi_perf_group_size=1,
+        multi_perf_min_group_size=3,
     ):
         super().__init__()
         self.split = split
@@ -1434,6 +1532,8 @@ class PianoCoReNodeSFTDataset(Dataset):
         )
         self.timing_log_scale = float(timing_log_scale)
         self.legacy_dual_timing_head = bool(legacy_dual_timing_head)
+        self.multi_perf_group_size = max(1, int(multi_perf_group_size or 1))
+        self.multi_perf_min_group_size = max(2, int(multi_perf_min_group_size or 3))
         self.use_style_tokens = bool(use_style_tokens)
         self.perf_style_stats_mode = str(perf_style_stats_mode or "prefix").lower()
         if self.perf_style_stats_mode not in {"prefix", "window"}:
@@ -1454,7 +1554,26 @@ class PianoCoReNodeSFTDataset(Dataset):
             if max_windows_per_work is not None:
                 windows = windows[:max_windows_per_work]
             selected_sources = item.get("selected_performance_sources")
-            performance_count = len(selected_sources) if selected_sources is not None else int(item["estimated_performances"])
+            if self.multi_perf_group_size > 1:
+                # Manifest estimates can include metadata rows absent from the
+                # current processed work. Resolve against the actual aligned
+                # performances so group counts and __getitem__ stay consistent.
+                work_payload = json.loads(Path(item["path"]).read_text(encoding="utf-8"))
+                available_sources = {
+                    perf.get("performance_source")
+                    for perf in work_payload.get("performances", [])
+                    if perf.get("split", self.split) == self.split
+                    and perf.get("performance_source") is not None
+                }
+                if selected_sources is not None:
+                    selected_sources = [source for source in selected_sources if source in available_sources]
+                    performance_count = len(selected_sources)
+                else:
+                    performance_count = len(available_sources)
+            else:
+                performance_count = None
+            if performance_count is None:
+                performance_count = len(selected_sources) if selected_sources is not None else int(item["estimated_performances"])
             if max_performances_per_work is not None:
                 performance_count = min(performance_count, max_performances_per_work)
                 if selected_sources is not None:
@@ -1467,7 +1586,15 @@ class PianoCoReNodeSFTDataset(Dataset):
             if selected_sources is not None:
                 item["selected_performance_sources"] = selected_sources
             item["effective_performances"] = performance_count
-            item["effective_examples"] = performance_count * len(windows)
+            if self.multi_perf_group_size > 1:
+                full_groups, remainder = divmod(performance_count, self.multi_perf_group_size)
+                group_count = full_groups + int(remainder >= self.multi_perf_min_group_size)
+                if group_count <= 0:
+                    continue
+                item["multi_perf_group_count"] = group_count
+                item["effective_examples"] = group_count * len(windows)
+            else:
+                item["effective_examples"] = performance_count * len(windows)
             self.items.append(item)
             total += item["effective_examples"]
             self.cumulative_sizes.append(total)
@@ -1521,6 +1648,19 @@ class PianoCoReNodeSFTDataset(Dataset):
             "kind": "inr_raw_sidecar",
         }
         return json.dumps(signature, sort_keys=True, separators=(",", ":"))
+
+    def _build_ready_sidecar_signature(self):
+        return json.dumps(
+            {
+                "schema": 7,
+                "kind": "inr_multi_target_ready_sidecar",
+                "feature_signature": self._derived_feature_cache_signature,
+                "legacy_dual_timing_head": self.legacy_dual_timing_head,
+                "pedal_representation": normalize_pedal_representation(self.pedal_representation),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
     def _is_raw_sidecar_signature(self, signature):
         if signature == self._prepared_sidecar_signature:
@@ -1647,6 +1787,25 @@ class PianoCoReNodeSFTDataset(Dataset):
             signature = prepared.get("_cache_signature")
             if prepared.get("_source_identity") != self._source_identity(path):
                 continue
+            if signature == self._build_ready_sidecar_signature():
+                target = self.epr_timing_target
+                selected = dict(prepared)
+                selected_performances = []
+                for perf in prepared.get("performances", []):
+                    labels_by_target = perf.get("labels_by_target") or {}
+                    if target not in labels_by_target:
+                        break
+                    selected_perf = dict(perf)
+                    selected_perf["labels"] = labels_by_target[target]
+                    selected_performances.append(selected_perf)
+                else:
+                    selected["performances"] = selected_performances
+                    selected["performances_by_source"] = {
+                        perf.get("performance_source"): perf
+                        for perf in selected_performances
+                        if perf.get("performance_source") is not None
+                    }
+                    return selected
             if self._is_raw_sidecar_signature(signature):
                 if self._has_raw_sidecar_payload(prepared):
                     return self._normalize_loaded_raw_sidecar(prepared)
@@ -1854,6 +2013,7 @@ class PianoCoReNodeSFTDataset(Dataset):
             "log_absolute",
             "raw_log_absolute",
             "absolute_raw_log",
+            "floor_log_absolute",
         }:
             labels = performance_dev_velocity_pedal4_binary_rows(
                 perf,
@@ -1990,33 +2150,8 @@ class PianoCoReNodeSFTDataset(Dataset):
                 flush=True,
             )
 
-    def __getitem__(self, index):
-        if index < 0:
-            index += len(self)
-        if index < 0 or index >= len(self):
-            raise IndexError(index)
-
-        item_idx = bisect.bisect_right(self.cumulative_sizes, index)
-        prev_size = 0 if item_idx == 0 else self.cumulative_sizes[item_idx - 1]
-        local_index = index - prev_size
-        item = self.items[item_idx]
-
-        windows = item["windows"]
-        window_count = len(windows)
-        perf_slot = local_index // window_count
-        window_slot = local_index % window_count
-        start, end = windows[window_slot]
-
-        prepared = self._load_or_prepare_work(item["path"])
+    def _sample_for_performance(self, prepared, perf, start, end, index):
         score = prepared["score"]
-        performances = self._selected_performances(prepared, item)
-        if not performances:
-            raise IndexError(f"No performances for split={self.split} in {item['path']}")
-
-        # A tiny number of PianoCoRe-A rows were skipped for pitch mismatch. If
-        # metadata counted one of those rows, wrap to a valid performance instead
-        # of making DistributedSampler lengths uneven.
-        perf = performances[int(perf_slot) % len(performances)]
         labels, label_bins = self._performance_labels(prepared, perf)
         interpolated = perf["interpolated"]
         task_type = self.task_type.lower()
@@ -2043,11 +2178,6 @@ class PianoCoReNodeSFTDataset(Dataset):
             "performance_dataset": perf.get("performance_dataset", "unknown"),
             "performance_id": perf.get("performance_id", "unknown"),
         }
-        dagger_prefix = self._dagger_prefix_cache.get(index)
-        if dagger_prefix is not None:
-            sample["dagger_prefix_continuous"] = dagger_prefix
-        if index in self._dagger_mask_cache:
-            sample["dagger_feedback_mask_enabled"] = True
         if self.use_style_tokens:
             sample.update(
                 {
@@ -2063,6 +2193,138 @@ class PianoCoReNodeSFTDataset(Dataset):
         if label_mask is not None:
             sample["label_mask"] = label_mask
         return sample
+
+    def __getitem__(self, index):
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+
+        item_idx = bisect.bisect_right(self.cumulative_sizes, index)
+        prev_size = 0 if item_idx == 0 else self.cumulative_sizes[item_idx - 1]
+        local_index = index - prev_size
+        item = self.items[item_idx]
+
+        windows = item["windows"]
+        window_count = len(windows)
+        perf_slot = local_index // window_count
+        window_slot = local_index % window_count
+        start, end = windows[window_slot]
+
+        prepared = self._load_or_prepare_work(item["path"])
+        performances = self._selected_performances(prepared, item)
+        if not performances:
+            raise IndexError(f"No performances for split={self.split} in {item['path']}")
+
+        if self.multi_perf_group_size > 1:
+            group_start = int(perf_slot) * self.multi_perf_group_size
+            group = performances[group_start : group_start + self.multi_perf_group_size]
+            if len(group) < self.multi_perf_min_group_size:
+                raise IndexError(
+                    f"Multi-perf group has only {len(group)} performances in {item['path']}"
+                )
+            return {
+                "pn_group_examples": [
+                    self._sample_for_performance(prepared, perf, start, end, index)
+                    for perf in group
+                ]
+            }
+
+        # A tiny number of PianoCoRe-A rows were skipped for pitch mismatch. If
+        # metadata counted one of those rows, wrap to a valid performance instead.
+        perf = performances[int(perf_slot) % len(performances)]
+        sample = self._sample_for_performance(prepared, perf, start, end, index)
+        dagger_prefix = self._dagger_prefix_cache.get(index)
+        if dagger_prefix is not None:
+            sample["dagger_prefix_continuous"] = dagger_prefix
+        if index in self._dagger_mask_cache:
+            sample["dagger_feedback_mask_enabled"] = True
+        return sample
+
+
+def _pn_group_calibration_loss(config, logits, labels, score_shared_raw, attention_mask, group_index):
+    """PN moment supervision over aligned performances of the same score window."""
+    params = _split_epr_mixture_params(config, logits)
+    valid = attention_mask.bool()
+    zero_mask = _zero_score_ioi_mask(config, score_shared_raw, attention_mask=valid)
+    moments = {}
+    for feature, target_col in (("ioi", 0), ("duration", 1), ("velocity", 2)):
+        feature_zero = zero_mask if feature == "ioi" else None
+        log_probs = _dlm_log_bin_probs(
+            config,
+            params[f"{feature}_logits"],
+            params[f"{feature}_loc"],
+            params[f"{feature}_log_scale"],
+            feature,
+            zero_mask=feature_zero,
+        )
+        probs = log_probs.exp()
+        centers = _dlm_bin_centers(
+            config, feature, log_probs, zero_mask=feature_zero
+        ).expand_as(probs)
+        mean = (probs * centers).sum(-1)
+        variance = (probs * (centers - mean.unsqueeze(-1)).square()).sum(-1)
+        target = labels[..., target_col].float()
+        if feature == "velocity":
+            target = target * 127.0
+        moments[feature] = (mean, variance, target)
+
+    tau = max(float(getattr(config, "pn_variance_shrinkage_tau", 4.0)), 0.0)
+    eps = max(float(getattr(config, "pn_variance_epsilon", 1e-4)), 1e-12)
+    mean_terms = []
+    variance_terms = {"ioi_zero": [], "ioi_nonzero": [], "duration": [], "velocity": []}
+    unique_groups = torch.unique(group_index, sorted=True)
+    for group_id in unique_groups:
+        rows = group_index == group_id
+        count = int(rows.sum().item())
+        if count < 2:
+            continue
+        group_valid = valid[rows].all(dim=0)
+        if not group_valid.any():
+            continue
+        group_zero = zero_mask[rows][0]
+        rho = float(count) / float(count + tau) if tau > 0.0 else 1.0
+        for feature, (pred_mean, pred_var, target) in moments.items():
+            pm = pred_mean[rows]
+            pv = pred_var[rows]
+            yt = target[rows]
+            gt_mean = yt.mean(dim=0)
+            gt_var = yt.var(dim=0, unbiased=True)
+            model_mean = pm.mean(dim=0)
+            model_var = (pv + pm.square()).mean(dim=0) - model_mean.square()
+            model_var = model_var.clamp_min(0.0)
+            width = 128.0 if feature == "velocity" else 3.0 if feature == "duration" else 5.0
+            mean_terms.append(
+                torch.nn.functional.smooth_l1_loss(
+                    model_mean[group_valid] / width,
+                    gt_mean[group_valid] / width,
+                    reduction="mean",
+                )
+            )
+            if feature == "ioi":
+                feature_groups = (("ioi_zero", group_valid & group_zero), ("ioi_nonzero", group_valid & ~group_zero))
+            else:
+                feature_groups = ((feature, group_valid),)
+            for name, feature_valid in feature_groups:
+                if not feature_valid.any():
+                    continue
+                # Batch-group prior gives a stable target when only 3-4 references exist.
+                prior = gt_var[feature_valid].mean().detach()
+                shrunk_gt_var = rho * gt_var[feature_valid] + (1.0 - rho) * prior
+                variance_terms[name].append(
+                    torch.nn.functional.smooth_l1_loss(
+                        torch.log(model_var[feature_valid] + eps),
+                        torch.log(shrunk_gt_var + eps),
+                        reduction="mean",
+                    )
+                )
+
+    zero = logits.sum() * 0.0
+    pn_mean = torch.stack(mean_terms).mean() if mean_terms else zero
+    result = {"pn_mean": pn_mean}
+    for name, terms in variance_terms.items():
+        result[f"pn_var_{name}"] = torch.stack(terms).mean() if terms else zero
+    return result
 
 
 class NodeSFTTrainer(Trainer):
@@ -2524,8 +2786,37 @@ class NodeSFTTrainer(Trainer):
             )
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        group_index = inputs.pop("pn_group_index", None)
+        inputs.pop("pn_group_sizes", None)
         outputs = model(**inputs)
         loss = outputs.loss
+        pn_components = None
+        if group_index is not None:
+            config = self._model_config(model)
+            pn_components = _pn_group_calibration_loss(
+                config,
+                outputs.logits,
+                inputs["labels_continuous"],
+                inputs["score_shared_raw"],
+                inputs["attention_mask"],
+                group_index,
+            )
+            weights = {
+                "pn_mean": float(getattr(config, "pn_mean_loss_lambda", 0.0)),
+                "pn_var_ioi_zero": float(getattr(config, "pn_var_ioi_zero_lambda", 0.0)),
+                "pn_var_ioi_nonzero": float(getattr(config, "pn_var_ioi_nonzero_lambda", 0.0)),
+                "pn_var_duration": float(getattr(config, "pn_var_duration_lambda", 0.0)),
+                "pn_var_velocity": float(getattr(config, "pn_var_velocity_lambda", 0.0)),
+            }
+            loss = loss + sum(weights[name] * value for name, value in pn_components.items())
+            if self.model.training and self.is_world_process_zero():
+                accumulator = getattr(self, "_train_loss_component_sums", None)
+                if accumulator is None:
+                    accumulator = {}
+                    self._train_loss_component_sums = accumulator
+                for name, value in pn_components.items():
+                    accumulator[name] = accumulator.get(name, 0.0) + float(value.detach().cpu())
+                # _accumulate_train_loss_components below increments the shared count.
         self._accumulate_train_loss_components(inputs, outputs)
         return (loss, outputs) if return_outputs else loss
 
@@ -2953,6 +3244,16 @@ class NodeSFTDataCollator:
         return last_spec
 
     def __call__(self, examples):
+        pn_group_index = None
+        pn_group_sizes = None
+        if examples and all("pn_group_examples" in example for example in examples):
+            grouped = [example["pn_group_examples"] for example in examples]
+            pn_group_sizes = torch.tensor([len(group) for group in grouped], dtype=torch.long)
+            pn_group_index = torch.tensor(
+                [group_idx for group_idx, group in enumerate(grouped) for _ in group],
+                dtype=torch.long,
+            )
+            examples = [sample for group in grouped for sample in group]
         pitch_tensors = [torch.tensor(example["pitch_ids"], dtype=torch.long) for example in examples]
         continuous_tensors = [
             torch.tensor(example["continuous"], dtype=torch.float32) for example in examples
@@ -3047,6 +3348,9 @@ class NodeSFTDataCollator:
             "attention_mask": attention_mask,
             "interpolated": interpolated,
         }
+        if pn_group_index is not None:
+            batch["pn_group_index"] = pn_group_index
+            batch["pn_group_sizes"] = pn_group_sizes
         if self.tail_mask_enabled:
             batch["label_valid_mask"] = label_valid_mask
         if decoder_feedback_continuous is not None:
@@ -3169,8 +3473,8 @@ def create_model(train_config):
         timing_control_mode=train_config.get("timing_control_mode"),
         use_timing_scale_bit=train_config.get("use_timing_scale_bit", False),
     )
-    if task_type in {"epr", "csr"} and timing_control_mode not in {"log_scaled", "floor_log", "raw_log", "raw", "raw_seconds"}:
-        raise ValueError("Integrated INR requires timing_control_mode=log_scaled, floor_log, raw_log, or raw")
+    if task_type in {"epr", "csr"} and timing_control_mode not in {"log_scaled", "floor_log", "dinr_floor_log", "raw_log", "raw", "raw_seconds"}:
+        raise ValueError("Integrated INR requires timing_control_mode=log_scaled, floor_log, dinr_floor_log, raw_log, or raw")
     if task_type == "epr" and epr_timing_target not in {
         "log_deviation",
         "log_dev",
@@ -3189,6 +3493,7 @@ def create_model(train_config):
         "log_absolute",
         "raw_log_absolute",
         "absolute_raw_log",
+        "floor_log_absolute",
     }:
         raise ValueError("EPR requires a supported deviation or absolute timing target")
     use_timing_scale_bit = timing_control_mode == "piecewise_scale_bit"
@@ -3250,6 +3555,9 @@ def create_model(train_config):
             "categorical",
             "hard_categorical",
             "soft_categorical",
+            "dinr",
+            "dinr_categorical",
+            "metric_categorical",
             "lan",
             "can",
             "ican",
@@ -3311,10 +3619,6 @@ def create_model(train_config):
                 raise ValueError(f"epr_mixture_components must be >= 1, got {components}")
             if distribution in {"sn", "skew_normal", "bounded_skew_normal", "bounded_sn", "tanh_student_t", "bounded_tanh_student_t", "lan", "can", "ican", "iln", "logistic_normal"} and components != 1:
                 raise ValueError(f"epr_distribution={distribution} requires epr_mixture_components=1")
-            if distribution in {"mixture_logistic_normal", "mixture_beta"} and components < 2:
-                raise ValueError(f"epr_distribution={distribution} requires epr_mixture_components >= 2")
-            if pedal_distribution in {"mixture_logistic_normal", "mixture_beta"} and components < 2:
-                raise ValueError(f"pedal_distribution={pedal_distribution} requires epr_mixture_components >= 2")
         if distribution in {"dlm", "discretized_logistic_mixture"}:
             dlm_components = int(train_config.get("dlm_components", train_config.get("epr_mixture_components", 8)))
             if dlm_components < 1:
@@ -3383,6 +3687,9 @@ def create_model(train_config):
             "bounded_tanh_student_t",
             "dlm",
             "discretized_logistic_mixture",
+            "dinr",
+            "dinr_categorical",
+            "metric_categorical",
         }:
             raise ValueError(
                 "deviation EPR currently supports point/huber, SN, lan/can/ican, LN/MLN, beta, and mixture_beta, "
@@ -3547,6 +3854,12 @@ def create_model(train_config):
         dlm_timing_scale_min=train_config.get("dlm_timing_scale_min"),
         dlm_timing_scale_max=train_config.get("dlm_timing_scale_max"),
         dlm_timing_scale_parameterization=train_config.get("dlm_timing_scale_parameterization", "legacy_clamp"),
+        dlm_ioi_nonzero_scale_max=train_config.get("dlm_ioi_nonzero_scale_max"),
+        dlm_ioi_zero_scale_max=train_config.get("dlm_ioi_zero_scale_max"),
+        dlm_duration_scale_max=train_config.get("dlm_duration_scale_max"),
+        dlm_velocity_scale_min=train_config.get("dlm_velocity_scale_min"),
+        dlm_velocity_scale_max=train_config.get("dlm_velocity_scale_max"),
+        dlm_velocity_scale_parameterization=train_config.get("dlm_velocity_scale_parameterization", "legacy_clamp"),
         dlm_tail_loss_lambda=train_config.get("dlm_tail_loss_lambda", 0.0),
         dlm_tail_radius=train_config.get("dlm_tail_radius", 0.05),
         dlm_target_tail_loss_lambda=train_config.get("dlm_target_tail_loss_lambda", 0.0),
@@ -3569,6 +3882,17 @@ def create_model(train_config):
         timing_sample_shrink_mode=train_config.get("timing_sample_shrink_mode", "none"),
         timing_sample_shrink_factor=train_config.get("timing_sample_shrink_factor", 1.0),
         timing_sample_shrink_radius=train_config.get("timing_sample_shrink_radius", 0.0),
+        dlm_ioi_zero_sample_shrink_factor=train_config.get("dlm_ioi_zero_sample_shrink_factor"),
+        dlm_ioi_nonzero_sample_shrink_factor=train_config.get("dlm_ioi_nonzero_sample_shrink_factor"),
+        dlm_duration_sample_shrink_factor=train_config.get("dlm_duration_sample_shrink_factor"),
+        dlm_velocity_sample_shrink_factor=train_config.get("dlm_velocity_sample_shrink_factor"),
+        pn_mean_loss_lambda=train_config.get("pn_mean_loss_lambda", 0.0),
+        pn_var_ioi_zero_lambda=train_config.get("pn_var_ioi_zero_lambda", 0.0),
+        pn_var_ioi_nonzero_lambda=train_config.get("pn_var_ioi_nonzero_lambda", 0.0),
+        pn_var_duration_lambda=train_config.get("pn_var_duration_lambda", 0.0),
+        pn_var_velocity_lambda=train_config.get("pn_var_velocity_lambda", 0.0),
+        pn_variance_shrinkage_tau=train_config.get("pn_variance_shrinkage_tau", 4.0),
+        pn_variance_epsilon=train_config.get("pn_variance_epsilon", 1e-4),
         raw_timing_loss_lambda=train_config.get("raw_timing_loss_lambda", 0.5),
         legacy_dual_timing_head=train_config.get("legacy_dual_timing_head", False),
         raw_timing_head_type=train_config.get("raw_timing_head_type"),
@@ -3583,6 +3907,20 @@ def create_model(train_config):
         epr_inflated_features=train_config.get("epr_inflated_features"),
         epr_timing_bins=train_config.get("epr_timing_bins", 5000),
         epr_value_bins=train_config.get("epr_value_bins", 128),
+        dinr_timing_bins=train_config.get("dinr_timing_bins", 512),
+        dinr_zero_bin=train_config.get("dinr_zero_bin", 93),
+        dinr_timing_step=train_config.get("dinr_timing_step", 2.0 / 93.0),
+        dinr_output_timing_bins=train_config.get("dinr_output_timing_bins"),
+        dinr_output_zero_bin=train_config.get("dinr_output_zero_bin"),
+        dinr_output_timing_step=train_config.get("dinr_output_timing_step"),
+        dinr_vocabulary_mode=train_config.get("dinr_vocabulary_mode", "unified"),
+        dinr_absolute_max_ms=train_config.get("dinr_absolute_max_ms", 8000.0),
+        dinr_deviation_min=train_config.get("dinr_deviation_min", -2.0),
+        dinr_deviation_max=train_config.get("dinr_deviation_max", 2.0),
+        dinr_zero_ioi_min=train_config.get("dinr_zero_ioi_min", 0.0),
+        dinr_zero_ioi_max=train_config.get("dinr_zero_ioi_max", 5.0),
+        dinr_sampling_temperature=train_config.get("dinr_sampling_temperature", 1.0),
+        dinr_numerical_frequencies=train_config.get("dinr_numerical_frequencies", 16),
         epr_timing_target=epr_timing_target,
         timing_control_mode=timing_control_mode,
         timing_log_scale=train_config.get("timing_log_scale", 50.0),
@@ -3912,8 +4250,8 @@ def main():
         timing_control_mode=train_config.get("timing_control_mode"),
         use_timing_scale_bit=train_config.get("use_timing_scale_bit", False),
     )
-    if task_type in {"epr", "csr"} and timing_control_mode not in {"log_scaled", "floor_log", "raw_log"}:
-        raise ValueError("Integrated INR requires timing_control_mode=log_scaled, floor_log, or raw_log")
+    if task_type in {"epr", "csr"} and timing_control_mode not in {"log_scaled", "floor_log", "dinr_floor_log", "raw_log"}:
+        raise ValueError("Integrated INR requires timing_control_mode=log_scaled, floor_log, dinr_floor_log, or raw_log")
     if task_type == "epr" and str(train_config.get("epr_timing_target", "log_deviation")).lower() not in {
         "log_deviation",
         "log_dev",
@@ -3932,6 +4270,7 @@ def main():
         "log_absolute",
         "raw_log_absolute",
         "absolute_raw_log",
+        "floor_log_absolute",
     }:
         raise ValueError("EPR requires a supported deviation or absolute timing target")
     train_config["timing_control_mode"] = timing_control_mode
@@ -4154,6 +4493,8 @@ def main():
         source_vocab=train_config.get("style_source_vocab"),
         perf_style_stats_mode=train_config.get("perf_style_stats_mode", "prefix"),
         legacy_dual_timing_head=train_config.get("legacy_dual_timing_head", False),
+        multi_perf_group_size=train_config.get("multi_perf_group_size", 1),
+        multi_perf_min_group_size=train_config.get("multi_perf_min_group_size", 3),
     )
     eval_dataset = PianoCoReNodeSFTDataset(
         eval_manifest,

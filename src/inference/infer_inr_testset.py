@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import json
+import math
 import multiprocessing as mp
 import random
 import sys
@@ -67,6 +68,10 @@ def parse_args():
     parser.add_argument("--batch-size-windows", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--dlm-ioi-zero-sample-shrink-factor", type=float, default=None)
+    parser.add_argument("--dlm-ioi-nonzero-sample-shrink-factor", type=float, default=None)
+    parser.add_argument("--dlm-duration-sample-shrink-factor", type=float, default=None)
+    parser.add_argument("--dlm-velocity-sample-shrink-factor", type=float, default=None)
     parser.add_argument("--max-gt-per-score", type=int, default=None)
     parser.add_argument("--performance-dataset", type=str, default=None,
                         help="Optional performance_dataset filter, e.g. ASAP. Restricts scores and GT refs.")
@@ -1183,6 +1188,17 @@ def main():
         raise ValueError("--num-workers must be >= 1")
 
     config = load_config(args.config, args.checkpoint)
+    for key in (
+        "dlm_ioi_zero_sample_shrink_factor",
+        "dlm_ioi_nonzero_sample_shrink_factor",
+        "dlm_duration_sample_shrink_factor",
+        "dlm_velocity_sample_shrink_factor",
+    ):
+        value = getattr(args, key)
+        if value is not None:
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"--{key.replace('_', '-')} must be finite and >= 0")
+            config[key] = float(value)
     if args.block_notes is not None:
         config["block_notes"] = int(args.block_notes)
     if args.overlap_ratio is not None:

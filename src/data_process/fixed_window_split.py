@@ -9,6 +9,15 @@ def _normalized_work_path(path):
     return str(Path(path).expanduser().resolve())
 
 
+def _processed_relative_path(path):
+    parts = Path(path).parts
+    try:
+        processed_index = parts.index("processed")
+    except ValueError:
+        return None
+    return "/".join(parts[processed_index + 1 :])
+
+
 def _load_fixed_window_split_index(summary_path, scheme_name):
     cache_key = (str(summary_path), str(scheme_name))
     if cache_key in _FIXED_WINDOW_SPLIT_INDEX_CACHE:
@@ -35,6 +44,9 @@ def _load_fixed_window_split_index(summary_path, scheme_name):
         }
         index[str(work_path)] = entry
         index[_normalized_work_path(work_path)] = entry
+        relative_path = _processed_relative_path(work_path)
+        if relative_path:
+            index[("processed-relative", relative_path)] = entry
     _FIXED_WINDOW_SPLIT_INDEX_CACHE[cache_key] = index
     return index
 
@@ -43,6 +55,10 @@ def load_windows_from_fixed_split(path, scheme_name, split_name, canonical_windo
     if summary_path:
         index = _load_fixed_window_split_index(summary_path, scheme_name)
         entry = index.get(str(path)) or index.get(_normalized_work_path(path))
+        if entry is None:
+            relative_path = _processed_relative_path(path)
+            if relative_path:
+                entry = index.get(("processed-relative", relative_path))
         if entry is None:
             raise KeyError(f"Missing work entry for fixed split scheme={scheme_name} in summary {summary_path}: {path}")
         if canonical_windows is None:

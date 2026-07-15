@@ -17,6 +17,7 @@ MERGE_MODE="${MERGE_MODE:-continuation}"
 CONTINUATION_DROP_RATIO="${CONTINUATION_DROP_RATIO:-0.0}"
 BASE_NUM_TRAIN_EPOCHS="${BASE_NUM_TRAIN_EPOCHS:-8}"
 ADAPT_NUM_TRAIN_EPOCHS="${ADAPT_NUM_TRAIN_EPOCHS:-16}"
+ADAPT_PREPARED_SIDECAR_TAG="${ADAPT_PREPARED_SIDECAR_TAG:-}"
 BASE_ASAP_ONLY="${BASE_ASAP_ONLY:-0}"
 SKIP_BASE_TRAIN="${SKIP_BASE_TRAIN:-0}"
 BASE_CHECKPOINT_OVERRIDE="${BASE_CHECKPOINT_OVERRIDE:-}"
@@ -133,12 +134,12 @@ run_train() {
 write_train_config() {
   local src="$1" dst="$2" output_root="$3" log_root="$4" epochs="$5" resume_path="$6" asap_only="$7"
   python - "$src" "$dst" "$output_root" "$log_root" "$epochs" "$resume_path" "$asap_only" \
-    "$BATCH_SIZE_PER_DEVICE" "$GRADIENT_ACCUMULATION_STEPS" "$GLOBAL_BATCH_SIZE" <<'PY'
+    "$BATCH_SIZE_PER_DEVICE" "$GRADIENT_ACCUMULATION_STEPS" "$GLOBAL_BATCH_SIZE" "${ADAPT_PREPARED_SIDECAR_TAG}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-src, dst, output_root, log_root, epochs, resume_path, asap_only, per_device_bs, grad_accum, global_bs = sys.argv[1:11]
+src, dst, output_root, log_root, epochs, resume_path, asap_only, per_device_bs, grad_accum, global_bs, adapt_sidecar_tag = sys.argv[1:12]
 cfg = json.loads(Path(src).read_text(encoding="utf-8"))
 if cfg.get("task_type", "epr").lower() != "epr":
     raise SystemExit("run_inr_epr_pipeline.sh requires task_type=epr")
@@ -187,7 +188,7 @@ cfg["per_device_train_batch_size"] = int(per_device_bs)
 cfg["per_device_eval_batch_size"] = int(per_device_bs)
 cfg["gradient_accumulation_steps"] = int(grad_accum)
 cfg["global_batch_size"] = int(global_bs)
-cfg["use_prepared_sidecar"] = True
+cfg.setdefault("use_prepared_sidecar", True)
 cfg["precompute_dataset_items"] = False
 cfg["precompute_eval_dataset_items"] = False
 cfg["fixed_window_split_scheme"] = cfg.get("fixed_window_split_scheme") or "train_valid_asap3_nonasap05_v1"
@@ -224,7 +225,7 @@ if asap_only == "1":
     cfg["train_performance_dataset"] = "ASAP"
     cfg["eval_performance_dataset"] = "ASAP"
     cfg["eval_split"] = "valid"
-    cfg["prepared_sidecar_tag"] = cfg.get("prepared_sidecar_tag") or "ASAP"
+    cfg["prepared_sidecar_tag"] = adapt_sidecar_tag or cfg.get("prepared_sidecar_tag") or "ASAP"
 else:
     cfg.pop("train_performance_dataset", None)
     cfg.pop("eval_performance_dataset", None)
