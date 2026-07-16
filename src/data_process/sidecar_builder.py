@@ -1,5 +1,6 @@
 import math
 import os
+import copy
 from pathlib import Path
 import torch
 
@@ -125,8 +126,29 @@ def build_sidecar_for_work(
     return dataset._prepared_disk_cache_path(path)
 
 
-def build_ready_sidecar_for_work(dataset, path, selected_sources=None):
+def build_ready_sidecar_for_work(
+    dataset,
+    path,
+    selected_sources=None,
+    performance_time_normalization=None,
+):
     work = dataset._load_work(path)
+    # Ready sidecars normally derive labels directly from the source payload.
+    # Apply the same optional normalization as raw sidecars before eager label
+    # construction so a raw score-span cache can be upgraded in place without
+    # changing its target semantics.
+    if performance_time_normalization not in (None, "none"):
+        work = copy.deepcopy(work)
+        if performance_time_normalization == "score_onset_span":
+            score_raw = (work.get("score") or {}).get("score_raw")
+            if not score_raw:
+                raise ValueError("Work has no score_raw for score_onset_span normalization")
+            for perf in work.get("performances", []):
+                _normalize_performance_to_score_onset_span(score_raw, perf)
+        else:
+            raise ValueError(
+                f"Unsupported performance_time_normalization={performance_time_normalization}"
+            )
     if selected_sources is not None:
         selected_sources = set(selected_sources)
         work = dict(work)
@@ -143,6 +165,31 @@ def build_ready_sidecar_for_work(dataset, path, selected_sources=None):
         force_rebuild=True,
         derive_features=True,
     )
+    score_payload = prepared.get("score") or {}
+    if "score_feature" not in score_payload:
+        source = Path(path)
+        for annotation_path in (
+            source.with_suffix(".ASAP.pt"),
+            source.with_suffix(".pt"),
+        ):
+            if not annotation_path.exists():
+                continue
+            annotation_payload = torch.load(
+                annotation_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+            annotation_score = annotation_payload.get("score") or {}
+            if annotation_score.get("pitch") != score_payload.get("pitch"):
+                continue
+            if "score_feature" not in annotation_score:
+                continue
+            score_payload["score_feature"] = annotation_score["score_feature"]
+            score_payload["has_score_feature"] = annotation_score.get(
+                "has_score_feature",
+                [1] * len(score_payload.get("pitch", [])),
+            )
+            break
     raw_by_source = {
         perf.get("performance_source"): perf
         for perf in work.get("performances", [])
@@ -164,6 +211,7 @@ def build_ready_sidecar_for_work(dataset, path, selected_sources=None):
         dataset.epr_timing_target = original_target
     prepared["_cache_signature"] = dataset._build_ready_sidecar_signature()
     prepared["_source_identity"] = dataset._source_identity(path)
+    prepared["performance_time_normalization"] = performance_time_normalization or "none"
     cache_path = dataset._prepared_disk_cache_path(path)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.tmp")

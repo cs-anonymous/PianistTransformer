@@ -1542,6 +1542,8 @@ class PianoCoReNodeSFTDataset(Dataset):
         self.source_vocab = dict(source_vocab or {})
         self.unknown_composer_id = int(self.composer_vocab.get("<unk>", 0))
         self.unknown_source_id = int(self.source_vocab.get("<unk>", 0))
+        self.use_prepared_sidecar = bool(use_prepared_sidecar)
+        self.prepared_sidecar_tag = str(prepared_sidecar_tag) if prepared_sidecar_tag else None
         items = list(manifest)
         if shuffle:
             random.Random(seed).shuffle(items)
@@ -1554,14 +1556,20 @@ class PianoCoReNodeSFTDataset(Dataset):
             if max_windows_per_work is not None:
                 windows = windows[:max_windows_per_work]
             selected_sources = item.get("selected_performance_sources")
-            if self.multi_perf_group_size > 1:
-                # Manifest estimates can include metadata rows absent from the
-                # current processed work. Resolve against the actual aligned
-                # performances so group counts and __getitem__ stay consistent.
-                work_payload = json.loads(Path(item["path"]).read_text(encoding="utf-8"))
+            if self.use_prepared_sidecar:
+                sidecar_path = next(
+                    (candidate for candidate in self._prepared_sidecar_paths(item["path"]) if candidate.exists()),
+                    None,
+                )
+                if sidecar_path is None:
+                    candidates = ", ".join(str(path) for path in self._prepared_sidecar_paths(item["path"]))
+                    raise FileNotFoundError(
+                        f"PT sidecar required for training: {item['path']}. Candidates: {candidates}"
+                    )
+                sidecar_payload = self._torch_load_prepared(sidecar_path)
                 available_sources = {
                     perf.get("performance_source")
-                    for perf in work_payload.get("performances", [])
+                    for perf in sidecar_payload.get("performances", [])
                     if perf.get("split", self.split) == self.split
                     and perf.get("performance_source") is not None
                 }
@@ -1602,8 +1610,6 @@ class PianoCoReNodeSFTDataset(Dataset):
         self.total_examples = total
         self.precompute_items = bool(precompute_items)
         self.cache_size = max(int(cache_size), len(self.items)) if self.precompute_items else int(cache_size)
-        self.use_prepared_sidecar = bool(use_prepared_sidecar)
-        self.prepared_sidecar_tag = str(prepared_sidecar_tag) if prepared_sidecar_tag else None
         self._derived_feature_cache_signature = json.dumps(
             {
                 "task_type": self.task_type,
@@ -1660,6 +1666,26 @@ class PianoCoReNodeSFTDataset(Dataset):
             },
             sort_keys=True,
             separators=(",", ":"),
+        )
+
+    def _is_ready_sidecar_signature(self, signature):
+        """Validate only fields that affect cached performance labels.
+
+        Score inputs (including musical features) are derived at runtime from
+        the current source score, so feature-selection flags must not make an
+        otherwise compatible label sidecar unusable.
+        """
+        try:
+            payload = json.loads(signature)
+        except (TypeError, json.JSONDecodeError):
+            return False
+        return (
+            payload.get("schema") == 7
+            and payload.get("kind") == "inr_multi_target_ready_sidecar"
+            and bool(payload.get("legacy_dual_timing_head", False))
+            == bool(self.legacy_dual_timing_head)
+            and normalize_pedal_representation(payload.get("pedal_representation"))
+            == normalize_pedal_representation(self.pedal_representation)
         )
 
     def _is_raw_sidecar_signature(self, signature):
@@ -1787,9 +1813,17 @@ class PianoCoReNodeSFTDataset(Dataset):
             signature = prepared.get("_cache_signature")
             if prepared.get("_source_identity") != self._source_identity(path):
                 continue
-            if signature == self._build_ready_sidecar_signature():
+            if self._is_ready_sidecar_signature(signature):
                 target = self.epr_timing_target
                 selected = dict(prepared)
+                selected_score = dict(selected.get("score") or {})
+                if musical_feature_dim(self.musical_feature_mode) > 0 and (
+                    "score_feature" not in selected_score
+                    or "has_score_feature" not in selected_score
+                ):
+                    continue
+                selected["score"] = selected_score
+                selected.pop("score_input", None)
                 selected_performances = []
                 for perf in prepared.get("performances", []):
                     labels_by_target = perf.get("labels_by_target") or {}
@@ -1831,27 +1865,16 @@ class PianoCoReNodeSFTDataset(Dataset):
             self._prepared_cache.move_to_end(path)
             return self._prepared_cache[path]
 
-        prepared = None
-        cache_path = self._prepared_disk_cache_path(path) if self.use_prepared_sidecar else None
-        if cache_path is not None:
-            prepared = self._load_prepared_from_disk(path)
-            if prepared is None:
-                sidecar_candidates = ", ".join(str(p) for p in self._prepared_sidecar_paths(path))
-                raise FileNotFoundError(
-                    "Prepared sidecar missing or invalid during training. "
-                    "Sidecars must be prebuilt in data_process before training and are treated as read-only at runtime. "
-                    f"Source: {path}. Candidates: {sidecar_candidates}"
-                )
-
+        if not self.use_prepared_sidecar:
+            raise RuntimeError(
+                "Training requires a prebuilt PT sidecar; JSON runtime preparation is disabled"
+            )
+        prepared = self._load_prepared_from_disk(path)
         if prepared is None:
-            work = self._load_work(path)
-            prepared = self._prepare_work(
-                path,
-                work,
-                eager_labels=False,
-                slim_performances=False,
-                split_filter=True,
-                force_rebuild=False,
+            sidecar_candidates = ", ".join(str(p) for p in self._prepared_sidecar_paths(path))
+            raise FileNotFoundError(
+                "Prepared PT sidecar missing or invalid during training. "
+                f"Source: {path}. Candidates: {sidecar_candidates}"
             )
 
         self._prepared_cache[path] = prepared
@@ -3565,6 +3588,12 @@ def create_model(train_config):
             "logistic_normal",
             "mixture_logistic_normal",
             "mixture_beta",
+            "discrete_logistic_normal",
+            "discretized_logistic_normal",
+            "discrete_beta",
+            "discretized_beta",
+            "truncated_logistic",
+            "discrete_truncated_logistic",
             "dlm",
             "discretized_logistic_mixture",
             "sn",
@@ -3584,6 +3613,12 @@ def create_model(train_config):
             "logistic_normal",
             "mixture_logistic_normal",
             "mixture_beta",
+            "discrete_logistic_normal",
+            "discretized_logistic_normal",
+            "discrete_beta",
+            "discretized_beta",
+            "truncated_logistic",
+            "discrete_truncated_logistic",
             "sn",
             "skew_normal",
             "bounded_skew_normal",
@@ -3679,6 +3714,12 @@ def create_model(train_config):
             "mixture_logistic_normal",
             "beta_mu_kappa",
             "mixture_beta",
+            "discrete_logistic_normal",
+            "discretized_logistic_normal",
+            "discrete_beta",
+            "discretized_beta",
+            "truncated_logistic",
+            "discrete_truncated_logistic",
             "sn",
             "skew_normal",
             "bounded_skew_normal",
@@ -3872,6 +3913,7 @@ def create_model(train_config):
         dlm_raw_ms_crps_lambda=train_config.get("dlm_raw_ms_crps_lambda", 0.0),
         dlm_raw_ms_crps_scale_ms=train_config.get("dlm_raw_ms_crps_scale_ms", 1000.0),
         dlm_sampling_temperature=train_config.get("dlm_sampling_temperature", 1.0),
+        dlm_sampling_top_p=train_config.get("dlm_sampling_top_p", train_config.get("sampling_top_p", 1.0)),
         dlm_ioi_zero_inflated=train_config.get("dlm_ioi_zero_inflated", False),
         dlm_pedal_zero_one_inflated=train_config.get("dlm_pedal_zero_one_inflated", False),
         dlm_pedal_inflated_eps=train_config.get("dlm_pedal_inflated_eps", 0.5),
@@ -3920,7 +3962,12 @@ def create_model(train_config):
         dinr_zero_ioi_min=train_config.get("dinr_zero_ioi_min", 0.0),
         dinr_zero_ioi_max=train_config.get("dinr_zero_ioi_max", 5.0),
         dinr_sampling_temperature=train_config.get("dinr_sampling_temperature", 1.0),
+        dinr_sampling_top_p=train_config.get("dinr_sampling_top_p", train_config.get("sampling_top_p", 1.0)),
+        dinr_sampling_top_k=train_config.get("dinr_sampling_top_k", train_config.get("sampling_top_k", 0)),
         dinr_numerical_frequencies=train_config.get("dinr_numerical_frequencies", 16),
+        dinr_output_deviation_numerical_coordinates=train_config.get(
+            "dinr_output_deviation_numerical_coordinates", True
+        ),
         epr_timing_target=epr_timing_target,
         timing_control_mode=timing_control_mode,
         timing_log_scale=train_config.get("timing_log_scale", 50.0),

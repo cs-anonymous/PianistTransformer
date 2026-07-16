@@ -39,6 +39,14 @@ DLM_DISTRIBUTIONS = {"dlm", "discretized_logistic_mixture"}
 DINR_DISTRIBUTIONS = {"dinr", "dinr_categorical", "metric_categorical"}
 TANH_T_DISTRIBUTIONS = {"tanh_student_t", "bounded_tanh_student_t"}
 BOUNDED_SN_DISTRIBUTIONS = {"bounded_skew_normal", "bounded_sn"}
+DISCRETE_LN_DISTRIBUTIONS = {"discrete_logistic_normal", "discretized_logistic_normal"}
+DISCRETE_BETA_DISTRIBUTIONS = {"discrete_beta", "discretized_beta"}
+TRUNCATED_LOGISTIC_DISTRIBUTIONS = {"truncated_logistic", "discrete_truncated_logistic"}
+DISCRETE_BOUNDED_DISTRIBUTIONS = {
+    *DISCRETE_LN_DISTRIBUTIONS,
+    *DISCRETE_BETA_DISTRIBUTIONS,
+    *TRUNCATED_LOGISTIC_DISTRIBUTIONS,
+}
 
 
 def _is_scalar_distribution(distribution):
@@ -46,6 +54,7 @@ def _is_scalar_distribution(distribution):
         "logistic_normal",
         "mixture_logistic_normal",
         "mixture_beta",
+        *DISCRETE_BOUNDED_DISTRIBUTIONS,
         *TANH_T_DISTRIBUTIONS,
         *BOUNDED_SN_DISTRIBUTIONS,
         *SN_DISTRIBUTIONS,
@@ -57,7 +66,7 @@ def _is_scalar_distribution(distribution):
 
 
 def _scalar_distribution_dim(distribution):
-    if distribution in {*ACN_DISTRIBUTIONS, "logistic_normal", "mixture_logistic_normal", "mixture_beta", *SN_DISTRIBUTIONS, *TANH_T_DISTRIBUTIONS, *BOUNDED_SN_DISTRIBUTIONS}:
+    if distribution in {*ACN_DISTRIBUTIONS, "logistic_normal", "mixture_logistic_normal", "mixture_beta", *DISCRETE_BOUNDED_DISTRIBUTIONS, *SN_DISTRIBUTIONS, *TANH_T_DISTRIBUTIONS, *BOUNDED_SN_DISTRIBUTIONS}:
         return 3
     if distribution in IACN_DISTRIBUTIONS:
         return 5
@@ -314,6 +323,7 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         dlm_raw_ms_crps_lambda=0.0,
         dlm_raw_ms_crps_scale_ms=1000.0,
         dlm_sampling_temperature=1.0,
+        dlm_sampling_top_p=1.0,
         dlm_ioi_zero_inflated=False,
         dlm_pedal_zero_one_inflated=False,
         dlm_pedal_inflated_eps=0.5,
@@ -354,7 +364,10 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         dinr_zero_ioi_min=0.0,
         dinr_zero_ioi_max=5.0,
         dinr_sampling_temperature=1.0,
+        dinr_sampling_top_p=1.0,
+        dinr_sampling_top_k=0,
         dinr_numerical_frequencies=16,
+        dinr_output_deviation_numerical_coordinates=True,
         epr_timing_target="log_deviation",
         timing_control_mode="log_scaled",
         timing_log_scale=50.0,
@@ -567,6 +580,7 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         if self.dlm_target_tail_loss_lambda < 0.0 or self.dlm_target_tail_radius_frac < 0.0:
             raise ValueError("DLM target-tail loss requires lambda >= 0 and radius_frac >= 0")
         self.dlm_sampling_temperature = float(dlm_sampling_temperature)
+        self.dlm_sampling_top_p = float(dlm_sampling_top_p)
         if not math.isfinite(self.dlm_sampling_temperature) or self.dlm_sampling_temperature <= 0.0:
             raise ValueError(
                 "dlm_sampling_temperature must be finite and > 0, got "
@@ -624,7 +638,12 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.dinr_zero_ioi_min = float(dinr_zero_ioi_min)
         self.dinr_zero_ioi_max = float(dinr_zero_ioi_max)
         self.dinr_sampling_temperature = float(dinr_sampling_temperature)
+        self.dinr_sampling_top_p = float(dinr_sampling_top_p)
+        self.dinr_sampling_top_k = int(dinr_sampling_top_k)
         self.dinr_numerical_frequencies = int(dinr_numerical_frequencies)
+        self.dinr_output_deviation_numerical_coordinates = bool(
+            dinr_output_deviation_numerical_coordinates
+        )
         if self.dinr_timing_bins < 2 or self.dinr_timing_step <= 0.0:
             raise ValueError("DINR requires at least two timing bins and a positive timing step")
         if not (0 <= self.dinr_zero_bin < self.dinr_timing_bins):
@@ -2004,13 +2023,25 @@ class DINRValueTable(nn.Module):
         coordinates = self.coordinates.to(device=ids.device)[ids]
         return self.lookup(ids) + self.numeric_projection(self.numerical_features(coordinates))
 
-    def prototypes(self):
+    def prototypes(self, include_numerical_coordinates=True):
         coordinates = self.coordinates.to(device=self.lookup.weight.device)
+        if not include_numerical_coordinates:
+            return self.lookup.weight
         return self.lookup.weight + self.numeric_projection(self.numerical_features(coordinates))
 
 
 class DINRQueryHead(nn.Module):
-    def __init__(self, input_dim, prototype_dim, output_bins, hidden_dim, depth, activation, value_table):
+    def __init__(
+        self,
+        input_dim,
+        prototype_dim,
+        output_bins,
+        hidden_dim,
+        depth,
+        activation,
+        value_table,
+        use_numerical_coordinates=True,
+    ):
         super().__init__()
         self.query = _make_decoder_head(
             input_dim,
@@ -2024,11 +2055,25 @@ class DINRQueryHead(nn.Module):
         )
         self.bias = nn.Parameter(torch.zeros(int(output_bins)))
         self.value_table = value_table
+        self.use_numerical_coordinates = bool(use_numerical_coordinates)
+        self.alternate_value_table = None
+        self.alternate_bias = None
+        self.alternate_use_numerical_coordinates = True
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, use_alternate=None):
         query = self.query(hidden_states)
-        prototypes = self.value_table.prototypes().to(dtype=query.dtype, device=query.device)
-        return torch.matmul(query, prototypes.transpose(0, 1)) + self.bias.to(dtype=query.dtype)
+        prototypes = self.value_table.prototypes(
+            include_numerical_coordinates=self.use_numerical_coordinates
+        ).to(dtype=query.dtype, device=query.device)
+        logits = torch.matmul(query, prototypes.transpose(0, 1)) + self.bias.to(dtype=query.dtype)
+        if use_alternate is None or self.alternate_value_table is None:
+            return logits
+        alternate_prototypes = self.alternate_value_table.prototypes(
+            include_numerical_coordinates=self.alternate_use_numerical_coordinates
+        ).to(dtype=query.dtype, device=query.device)
+        alternate_logits = torch.matmul(query, alternate_prototypes.transpose(0, 1))
+        alternate_logits = alternate_logits + self.alternate_bias.to(dtype=query.dtype)
+        return torch.where(use_alternate.unsqueeze(-1), alternate_logits, logits)
 
 
 class IntegratedContinuousDecoder(nn.Module):
@@ -2154,6 +2199,7 @@ class IntegratedContinuousDecoder(nn.Module):
             residual_targets = tuple(getattr(config, "zero_ioi_residual_targets", ("ioi",)))
             self.zero_ioi_residual = nn.Parameter(torch.zeros(3 * len(residual_targets)))
         self.dinr_timing_table = None
+        self.dinr_absolute_timing_table = None
         self.dinr_velocity_table = None
         if self.split_shared_heads and self.epr_distribution in DINR_DISTRIBUTIONS:
             timing_coordinates = (
@@ -2166,6 +2212,17 @@ class IntegratedContinuousDecoder(nn.Module):
             self.dinr_timing_table = DINRValueTable(
                 timing_coordinates, prototype_dim, frequencies=frequencies
             )
+            separated_vocabulary = str(getattr(config, "dinr_vocabulary_mode", "unified")).lower() == "separated"
+            if separated_vocabulary:
+                absolute_coordinates = (
+                    torch.arange(int(config.dinr_timing_bins), dtype=torch.float32)
+                    - int(config.dinr_zero_bin)
+                ) * float(config.dinr_timing_step)
+                if int(config.dinr_timing_bins) != int(config.dinr_output_timing_bins):
+                    raise ValueError("Separated DINR currently requires equal absolute/deviation vocabulary sizes")
+                self.dinr_absolute_timing_table = DINRValueTable(
+                    absolute_coordinates, prototype_dim, frequencies=frequencies
+                )
             self.dinr_velocity_table = DINRValueTable(
                 velocity_coordinates, prototype_dim, frequencies=frequencies
             )
@@ -2179,11 +2236,20 @@ class IntegratedContinuousDecoder(nn.Module):
             self.ioi_head = DINRQueryHead(
                 output_bins=int(config.dinr_output_timing_bins),
                 value_table=self.dinr_timing_table,
+                use_numerical_coordinates=bool(
+                    getattr(config, "dinr_output_deviation_numerical_coordinates", True)
+                ),
                 **head_args,
             )
+            if separated_vocabulary:
+                self.ioi_head.alternate_value_table = self.dinr_absolute_timing_table
+                self.ioi_head.alternate_bias = nn.Parameter(torch.zeros(int(config.dinr_timing_bins)))
             self.duration_head = DINRQueryHead(
                 output_bins=int(config.dinr_output_timing_bins),
                 value_table=self.dinr_timing_table,
+                use_numerical_coordinates=bool(
+                    getattr(config, "dinr_output_deviation_numerical_coordinates", True)
+                ),
                 **head_args,
             )
             self.velocity_head = DINRQueryHead(
@@ -2278,7 +2344,15 @@ class IntegratedContinuousDecoder(nn.Module):
             return self.shared_head(shared_hidden)
 
         timing_hidden = self._timing_conditioned_hidden(shared_hidden, score_shared_raw)
-        ioi = self.ioi_head(timing_hidden)
+        if self.epr_distribution in DINR_DISTRIBUTIONS and self.ioi_head.alternate_value_table is not None:
+            if score_shared_raw is None:
+                raise ValueError("Separated DINR IOI routing requires score_shared_raw")
+            zero_score_ioi = score_shared_raw[..., 0].abs() <= float(
+                getattr(self.config, "zero_ioi_support_eps", 1e-6)
+            )
+            ioi = self.ioi_head(timing_hidden, use_alternate=zero_score_ioi)
+        else:
+            ioi = self.ioi_head(timing_hidden)
         duration = (
             self.duration_head(timing_hidden)
             if self.duration_head is not None
@@ -2318,6 +2392,7 @@ class IntegratedContinuousDecoder(nn.Module):
                 "logistic_normal",
                 "mixture_logistic_normal",
                 "mixture_beta",
+                *DISCRETE_BOUNDED_DISTRIBUTIONS,
                 *DLM_DISTRIBUTIONS,
                 *DINR_DISTRIBUTIONS,
             }:
@@ -2350,6 +2425,7 @@ class IntegratedContinuousDecoder(nn.Module):
             "logistic_normal",
             "mixture_logistic_normal",
             "mixture_beta",
+            *DISCRETE_BOUNDED_DISTRIBUTIONS,
             *DLM_DISTRIBUTIONS,
             *DINR_DISTRIBUTIONS,
         }:
@@ -2410,11 +2486,18 @@ def _split_dinr_logits(config, raw_outputs):
     }
 
 
-def _dinr_coordinates(config, reference):
+def _dinr_coordinates(config, reference, vocabulary="deviation"):
+    if vocabulary == "absolute":
+        bins = int(config.dinr_timing_bins)
+        zero_bin = int(config.dinr_zero_bin)
+        step = float(config.dinr_timing_step)
+    else:
+        bins = int(config.dinr_output_timing_bins)
+        zero_bin = int(config.dinr_output_zero_bin)
+        step = float(config.dinr_output_timing_step)
     return (
-        torch.arange(int(config.dinr_output_timing_bins), device=reference.device, dtype=torch.float32)
-        - int(config.dinr_output_zero_bin)
-    ) * float(config.dinr_output_timing_step)
+        torch.arange(bins, device=reference.device, dtype=torch.float32) - zero_bin
+    ) * step
 
 
 def _dinr_support_mask(config, logits, feature, score_shared_raw=None):
@@ -2434,8 +2517,13 @@ def _dinr_support_mask(config, logits, feature, score_shared_raw=None):
     nonzero_valid = (coordinates >= float(config.dinr_deviation_min)) & (
         coordinates <= float(config.dinr_deviation_max)
     )
-    zero_valid = (coordinates >= float(config.dinr_zero_ioi_min)) & (
-        coordinates <= float(config.dinr_zero_ioi_max)
+    zero_coordinates = (
+        _dinr_coordinates(config, logits, vocabulary="absolute")
+        if str(getattr(config, "dinr_vocabulary_mode", "unified")).lower() == "separated"
+        else coordinates
+    )
+    zero_valid = (zero_coordinates >= float(config.dinr_zero_ioi_min)) & (
+        zero_coordinates <= float(config.dinr_zero_ioi_max)
     )
     zero_score = score_shared_raw[..., 0].abs() <= float(getattr(config, "zero_ioi_support_eps", 1e-6))
     valid = torch.where(
@@ -3874,6 +3962,148 @@ def _mixture_beta_nll(
     return _masked_mean(values, mask)
 
 
+def _discrete_bounded_component_log_probs(config, distribution, raw_a, raw_b):
+    """Return normalized component log-masses on a strict unit-interval grid."""
+    bins = int(getattr(config, "dlm_timing_bins", 256))
+    if bins < 2:
+        raise ValueError(f"Discrete bounded distributions require at least two bins, got {bins}")
+    dtype = torch.float32
+    device = raw_a.device
+    edges = torch.linspace(0.0, 1.0, bins + 1, device=device, dtype=dtype)
+    centers = (edges[:-1] + edges[1:]) * 0.5
+    distribution = str(distribution).lower()
+
+    if distribution in DISCRETE_LN_DISTRIBUTIONS:
+        sigma_min = float(getattr(config, "logistic_normal_sigma_min", 1e-5))
+        mu = raw_a.float().unsqueeze(-2)
+        sigma = (F.softplus(raw_b.float()) + sigma_min).unsqueeze(-2)
+        z_edges = torch.logit(edges[1:-1].clamp(1e-12, 1.0 - 1e-12))
+        interior = (
+            z_edges.view(*([1] * (raw_a.ndim - 1)), -1, 1) - mu
+        ) / sigma
+        standardized = torch.cat(
+            (
+                torch.full_like(interior[..., :1, :], -1e6),
+                interior,
+                torch.full_like(interior[..., :1, :], 1e6),
+            ),
+            dim=-2,
+        )
+        lower, upper = standardized[..., :-1, :], standardized[..., 1:, :]
+
+        def logdiffexp(log_hi, log_lo):
+            delta = (log_lo - log_hi).clamp_max(-torch.finfo(log_hi.dtype).eps)
+            return log_hi + torch.log(-torch.expm1(delta))
+
+        def stable_log_ndtr(value):
+            # PyTorch's log_ndtr backward becomes NaN deep in the negative
+            # tail. Use its Mills-ratio asymptotic there, with a clamped safe
+            # input for the unselected regular branch.
+            regular = torch.special.log_ndtr(value.clamp_min(-20.0))
+            tail = value.clamp_max(-20.0)
+            inv_sq = tail.reciprocal().square()
+            correction = torch.log1p(-inv_sq + 3.0 * inv_sq.square())
+            asymptotic = (
+                -0.5 * tail.square()
+                - torch.log(-tail)
+                - 0.5 * math.log(2.0 * math.pi)
+                + correction
+            )
+            return torch.where(value < -20.0, asymptotic, regular)
+
+        # Subtract log-CDFs in the nearer tail. This avoids float32 CDF
+        # cancellation and retains gradients even for very narrow components.
+        use_left_tail = upper <= 0.0
+        near_hi = torch.where(use_left_tail, upper, -lower)
+        near_lo = torch.where(use_left_tail, lower, -upper)
+        component_log_probs = logdiffexp(
+            stable_log_ndtr(near_hi), stable_log_ndtr(near_lo)
+        )
+    elif distribution in DISCRETE_BETA_DISTRIBUTIONS:
+        alpha_min = float(getattr(config, "beta_alpha_min", 1e-5))
+        kappa_min = float(getattr(config, "mixture_beta_kappa_min", 1e-5))
+        mean = torch.sigmoid(raw_a.float()).unsqueeze(-2)
+        kappa = (F.softplus(raw_b.float()) + kappa_min).unsqueeze(-2)
+        alpha = mean * kappa + alpha_min
+        beta = (1.0 - mean) * kappa + alpha_min
+        # A Beta-binomial is the genuinely discrete analogue of Beta: each
+        # integer bin receives an analytic probability, including endpoints.
+        n = bins - 1
+        k = torch.arange(bins, device=device, dtype=dtype).view(
+            *([1] * (raw_a.ndim - 1)), -1, 1
+        )
+        log_choose = torch.lgamma(torch.tensor(float(n + 1), device=device))
+        log_choose = log_choose - torch.lgamma(k + 1.0) - torch.lgamma(n - k + 1.0)
+        log_beta_num = (
+            torch.lgamma(k + alpha)
+            + torch.lgamma(n - k + beta)
+            - torch.lgamma(n + alpha + beta)
+        )
+        log_beta_den = torch.lgamma(alpha) + torch.lgamma(beta) - torch.lgamma(alpha + beta)
+        component_log_probs = log_choose + log_beta_num - log_beta_den
+        component_log_probs = component_log_probs - torch.logsumexp(component_log_probs, dim=-2, keepdim=True)
+    elif distribution in TRUNCATED_LOGISTIC_DISTRIBUTIONS:
+        scale_min = float(getattr(config, "dlm_scale_min", 1e-5))
+        loc = raw_a.float().unsqueeze(-2)
+        scale = (F.softplus(raw_b.float()) + scale_min).unsqueeze(-2)
+        edge_view = edges.view(*([1] * (raw_a.ndim - 1)), -1, 1)
+        standardized = (edge_view - loc) / scale
+        lower, upper = standardized[..., :-1, :], standardized[..., 1:, :]
+        component_log_probs = (
+            F.logsigmoid(upper)
+            + F.logsigmoid(-lower)
+            + torch.log(-torch.expm1(lower - upper))
+        )
+        component_log_probs = component_log_probs - torch.logsumexp(
+            component_log_probs, dim=-2, keepdim=True
+        )
+    else:
+        raise ValueError(f"Unsupported discrete bounded distribution={distribution}")
+    return component_log_probs
+
+
+def _discrete_bounded_log_probs(config, distribution, logits, raw_a, raw_b):
+    component_log_probs = _discrete_bounded_component_log_probs(
+        config, distribution, raw_a, raw_b
+    )
+    log_mix = F.log_softmax(logits.float(), dim=-1).unsqueeze(-2)
+    log_probs = torch.logsumexp(log_mix + component_log_probs, dim=-1)
+    return log_probs - torch.logsumexp(log_probs, dim=-1, keepdim=True)
+
+
+def _discrete_bounded_nll(config, distribution, logits, raw_a, raw_b, target, mask):
+    log_probs = _discrete_bounded_log_probs(config, distribution, logits, raw_a, raw_b)
+    bins = log_probs.shape[-1]
+    target_bins = torch.floor(target.float().clamp(0.0, 1.0) * bins).long().clamp(0, bins - 1)
+    values = -log_probs.gather(-1, target_bins.unsqueeze(-1)).squeeze(-1)
+    return _masked_mean(values, mask)
+
+
+def _discrete_bounded_mean_or_sample(
+    config, distribution, logits, raw_a, raw_b, sampling_strategy="mean"
+):
+    log_probs = _discrete_bounded_log_probs(config, distribution, logits, raw_a, raw_b)
+    temperature = float(getattr(config, "dlm_sampling_temperature", 1.0))
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError(f"sampling temperature must be finite and > 0, got {temperature}")
+    probs = torch.softmax(log_probs / temperature, dim=-1)
+    bins = probs.shape[-1]
+    centers = (torch.arange(bins, device=probs.device, dtype=probs.dtype) + 0.5) / bins
+    mode = str(sampling_strategy).lower()
+    if mode in {"mean", "deterministic", "mu", "expected", "expectation"}:
+        return torch.sum(probs * centers, dim=-1)
+    if mode in {"argmax", "greedy"}:
+        return centers[probs.argmax(dim=-1)]
+    if mode in {"sample", "sampling", "stochastic"}:
+        top_p = float(getattr(config, "dlm_sampling_top_p", 1.0))
+        probs = _nucleus_probs(probs, top_p=top_p)
+        index = torch.distributions.Categorical(
+            probs=probs.reshape(-1, probs.shape[-1])
+        ).sample().reshape(probs.shape[:-1])
+        return centers[index]
+    raise ValueError(f"Unsupported sampling_strategy={sampling_strategy}")
+
+
 def _mixture_unit_variance(config, distribution, logits, raw_a, raw_b):
     probs = torch.softmax(logits.float(), dim=-1)
     distribution = str(distribution).lower()
@@ -4475,6 +4705,10 @@ def _mixture_beta_mean_or_sample(config, logits, raw_alpha, raw_beta, sampling_s
 
 def _decode_mixture_value(config, logits, a, b, c=None, sampling_strategy="mean", distribution=None):
     distribution = (distribution or getattr(config, "epr_distribution", "point")).lower()
+    if distribution in DISCRETE_BOUNDED_DISTRIBUTIONS:
+        return _discrete_bounded_mean_or_sample(
+            config, distribution, logits, a, b, sampling_strategy=sampling_strategy
+        )
     if distribution in TANH_T_DISTRIBUTIONS:
         return _bounded_student_t_mean_or_sample(
             config, a.squeeze(-1), b.squeeze(-1), logits.squeeze(-1), sampling_strategy=sampling_strategy
@@ -4538,6 +4772,10 @@ def _scalar_mln_loss_value(config, logits, raw_mu, raw_log_sigma, target, mask, 
 
 def _mixture_loss_value(config, logits, a, b, target, mask, eps, sigma_min, sigma_max, alpha_min, c=None, distribution=None):
     distribution = (distribution or getattr(config, "epr_distribution", "point")).lower()
+    if distribution in DISCRETE_BOUNDED_DISTRIBUTIONS:
+        return _discrete_bounded_nll(
+            config, distribution, logits, a, b, target, mask
+        )
     if distribution in TANH_T_DISTRIBUTIONS:
         return _bounded_student_t_nll(
             a.squeeze(-1), b.squeeze(-1), logits.squeeze(-1), target, mask, eps, sigma_min, sigma_max
@@ -4607,6 +4845,35 @@ def _categorical_sample_or_argmax(logits, sampling_strategy="mean"):
         probs = torch.softmax(logits.float(), dim=-1)
         return torch.distributions.Categorical(probs=probs).sample()
     raise ValueError(f"Unsupported sampling_strategy: {sampling_strategy}")
+
+
+def _nucleus_probs(probs, top_p=1.0):
+    """Keep the smallest highest-probability set whose cumulative mass reaches top_p."""
+    top_p = float(top_p)
+    if not math.isfinite(top_p) or top_p <= 0.0 or top_p > 1.0:
+        raise ValueError(f"sampling top_p must be in (0, 1], got {top_p}")
+    if top_p >= 1.0:
+        return probs
+    sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
+    remove = torch.cumsum(sorted_probs, dim=-1) - sorted_probs >= top_p
+    sorted_probs = sorted_probs.masked_fill(remove, 0.0)
+    filtered = torch.zeros_like(probs).scatter(-1, sorted_indices, sorted_probs)
+    return filtered / filtered.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+def _categorical_sample_with_temperature_top_p(
+    logits, sampling_strategy, temperature=1.0, top_p=1.0, top_k=0
+):
+    scaled = logits.float() / float(temperature)
+    mode = str(sampling_strategy).lower()
+    if mode in {"sample", "sampling", "stochastic"}:
+        top_k = int(top_k)
+        if top_k > 0 and top_k < scaled.shape[-1]:
+            threshold = torch.topk(scaled, top_k, dim=-1).values[..., -1, None]
+            scaled = scaled.masked_fill(scaled < threshold, float("-inf"))
+        probs = _nucleus_probs(torch.softmax(scaled, dim=-1), top_p=top_p)
+        return torch.distributions.Categorical(probs=probs).sample()
+    return _categorical_sample_or_argmax(scaled, sampling_strategy)
 
 
 def _soft_categorical_sample_or_expected(logits, sampling_strategy="mean"):
@@ -4751,13 +5018,25 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean", s
         temperature = float(getattr(config, "dinr_sampling_temperature", 1.0))
         if not math.isfinite(temperature) or temperature <= 0.0:
             raise ValueError("dinr_sampling_temperature must be finite and positive")
-        ioi_bins = _categorical_sample_or_argmax(ioi_logits / temperature, shared_strategy)
-        duration_bins = _categorical_sample_or_argmax(duration_logits / temperature, shared_strategy)
-        velocity_bins = _categorical_sample_or_argmax(logits["velocity"] / temperature, shared_strategy)
-        step = float(config.dinr_output_timing_step)
-        zero_bin = int(config.dinr_output_zero_bin)
-        ioi = (ioi_bins.float() - zero_bin) * step
-        duration = (duration_bins.float() - zero_bin) * step
+        top_p = float(getattr(config, "dinr_sampling_top_p", getattr(config, "sampling_top_p", 1.0)))
+        top_k = int(getattr(config, "dinr_sampling_top_k", getattr(config, "sampling_top_k", 0)))
+        ioi_bins = _categorical_sample_with_temperature_top_p(ioi_logits, shared_strategy, temperature, top_p, top_k)
+        duration_bins = _categorical_sample_with_temperature_top_p(duration_logits, shared_strategy, temperature, top_p, top_k)
+        velocity_bins = _categorical_sample_with_temperature_top_p(logits["velocity"], shared_strategy, temperature, top_p, top_k)
+        dev_step = float(config.dinr_output_timing_step)
+        dev_zero_bin = int(config.dinr_output_zero_bin)
+        ioi = (ioi_bins.float() - dev_zero_bin) * dev_step
+        if str(getattr(config, "dinr_vocabulary_mode", "unified")).lower() == "separated":
+            if score_shared_raw is None:
+                raise ValueError("Separated DINR materialization requires score_shared_raw")
+            absolute_ioi = (
+                ioi_bins.float() - int(config.dinr_zero_bin)
+            ) * float(config.dinr_timing_step)
+            zero_score = score_shared_raw[..., 0].abs() <= float(
+                getattr(config, "zero_ioi_support_eps", 1e-6)
+            )
+            ioi = torch.where(zero_score, absolute_ioi, ioi)
+        duration = (duration_bins.float() - dev_zero_bin) * dev_step
         velocity = velocity_bins.float().clamp(0.0, 127.0) / 127.0
         if logits["pedal"].ndim == raw_outputs.ndim + 1 and logits["pedal"].shape[-1] == 2:
             pedal = _categorical_sample_or_argmax(logits["pedal"] / temperature, sampling_strategy).float()
@@ -5313,9 +5592,13 @@ def _share_dinr_value_tables(note_encoder, decoder_note_encoder, output_decoder)
     share_timing = str(getattr(note_encoder.config, "dinr_vocabulary_mode", "unified")).lower() == "unified"
     if share_timing:
         note_encoder.dinr_timing_table = output_decoder.dinr_timing_table
+    elif getattr(output_decoder, "dinr_absolute_timing_table", None) is not None:
+        note_encoder.dinr_timing_table = output_decoder.dinr_absolute_timing_table
     note_encoder.dinr_velocity_table = output_decoder.dinr_velocity_table
     if share_timing:
         decoder_note_encoder.dinr_timing_table = output_decoder.dinr_timing_table
+    elif getattr(output_decoder, "dinr_absolute_timing_table", None) is not None:
+        decoder_note_encoder.dinr_timing_table = output_decoder.dinr_absolute_timing_table
     decoder_note_encoder.dinr_velocity_table = output_decoder.dinr_velocity_table
 
 
@@ -5716,16 +5999,32 @@ def _compute_epr_categorical_loss_components(config, raw_outputs, labels_epr_bin
     }
 
 
-def _dinr_quantize(config, values):
+def _dinr_quantize(config, values, vocabulary="deviation"):
+    if vocabulary == "absolute":
+        step = float(config.dinr_timing_step)
+        zero_bin = int(config.dinr_zero_bin)
+        bins = int(config.dinr_timing_bins)
+    else:
+        step = float(config.dinr_output_timing_step)
+        zero_bin = int(config.dinr_output_zero_bin)
+        bins = int(config.dinr_output_timing_bins)
     return torch.round(
-        values.float() / float(config.dinr_output_timing_step) + int(config.dinr_output_zero_bin)
-    ).long().clamp(0, int(config.dinr_output_timing_bins) - 1)
+        values.float() / step + zero_bin
+    ).long().clamp(0, bins - 1)
 
 
-def _dinr_support_bin(config, value, upper=False):
-    raw = float(value) / float(config.dinr_output_timing_step) + int(config.dinr_output_zero_bin)
+def _dinr_support_bin(config, value, upper=False, vocabulary="deviation"):
+    if vocabulary == "absolute":
+        step = float(config.dinr_timing_step)
+        zero_bin = int(config.dinr_zero_bin)
+        bins = int(config.dinr_timing_bins)
+    else:
+        step = float(config.dinr_output_timing_step)
+        zero_bin = int(config.dinr_output_zero_bin)
+        bins = int(config.dinr_output_timing_bins)
+    raw = float(value) / step + zero_bin
     index = math.floor(raw + 1e-9) if upper else math.ceil(raw - 1e-9)
-    return max(0, min(int(config.dinr_output_timing_bins) - 1, int(index)))
+    return max(0, min(bins - 1, int(index)))
 
 
 def _compute_dinr_loss_components(
@@ -5769,11 +6068,20 @@ def _compute_dinr_loss_components(
         duration_mask &= label_valid_mask[..., 1].bool()
         if label_valid_mask.shape[-1] > 2:
             velocity_mask &= label_valid_mask[..., 2].bool()
+    separated_vocabulary = str(getattr(config, "dinr_vocabulary_mode", "unified")).lower() == "separated"
     ioi_target = _dinr_quantize(config, ioi_target_value)
+    if separated_vocabulary:
+        absolute_ioi_target = _dinr_quantize(config, ioi_target_value, vocabulary="absolute")
+        ioi_target = torch.where(zero_score, absolute_ioi_target, ioi_target)
     nonzero_lo = _dinr_support_bin(config, 0.0 if absolute_targets else config.dinr_deviation_min)
     nonzero_hi = _dinr_support_bin(config, 9.0 if absolute_targets else config.dinr_deviation_max, upper=True)
-    zero_lo = _dinr_support_bin(config, 0.0 if absolute_targets else config.dinr_zero_ioi_min)
-    zero_hi = _dinr_support_bin(config, 9.0 if absolute_targets else config.dinr_zero_ioi_max, upper=True)
+    zero_vocabulary = "absolute" if separated_vocabulary and not absolute_targets else "deviation"
+    zero_lo = _dinr_support_bin(
+        config, 0.0 if absolute_targets else config.dinr_zero_ioi_min, vocabulary=zero_vocabulary
+    )
+    zero_hi = _dinr_support_bin(
+        config, 9.0 if absolute_targets else config.dinr_zero_ioi_max, upper=True, vocabulary=zero_vocabulary
+    )
     ioi_target = torch.maximum(
         torch.minimum(ioi_target, torch.where(zero_score, ioi_target.new_full((), zero_hi), ioi_target.new_full((), nonzero_hi))),
         torch.where(zero_score, ioi_target.new_full((), zero_lo), ioi_target.new_full((), nonzero_lo)),
@@ -5849,6 +6157,16 @@ def _dlm_scale(config, raw_log_scale, feature=None, zero_mask=None):
         lo = float(getattr(config, f"dlm_{feature}_min", getattr(config, "dlm_velocity_min", -0.5)))
         hi = float(getattr(config, f"dlm_{feature}_max", getattr(config, "dlm_velocity_max", 127.5)))
         scale = scale + (hi - lo) / 16.0
+    active_parameterization = (
+        velocity_parameterization if feature == "velocity" else parameterization
+    )
+    if active_parameterization in {
+        "softplus_unbounded",
+        "unbounded_softplus",
+        "softplus_no_clamp",
+        "no_clamp",
+    }:
+        return scale
     return scale.clamp(max=sigma_max)
 
 
@@ -6176,6 +6494,8 @@ def _dlm_mean_or_sample(config, logits, raw_loc, raw_log_scale, feature, samplin
         index = probs.argmax(dim=-1, keepdim=True)
         return centers.gather(-1, index).squeeze(-1)
     if mode in {"sample", "sampling", "stochastic"}:
+        top_p = float(getattr(config, "dlm_sampling_top_p", getattr(config, "sampling_top_p", 1.0)))
+        probs = _nucleus_probs(probs, top_p=top_p)
         sample_center = torch.sum(probs * centers, dim=-1, keepdim=True)
         radius = _timing_truncate_radius(config)
         if str(feature) in {"ioi", "duration"}:

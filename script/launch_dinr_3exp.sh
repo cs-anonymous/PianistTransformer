@@ -93,7 +93,7 @@ for spec in \
 do
   IFS=: read -r session gpu variant <<<"${spec}"
   tmux has-session -t "${session}" 2>/dev/null && tmux kill-session -t "${session}"
-  command="cd '${ROOT_DIR}' && CUDA_VISIBLE_DEVICES=${gpu} CONFIG='${CONFIG_DIR}/${variant}.json' RUN_DIR_OVERRIDE='${RUN_ROOT}/${variant}' BASE_NUM_TRAIN_EPOCHS=${BASE_NUM_TRAIN_EPOCHS:-4} BASE_ASAP_ONLY=${BASE_ASAP_ONLY:-0} ADAPT_NUM_TRAIN_EPOCHS=${ADAPT_NUM_TRAIN_EPOCHS:-8} BATCH_SIZE_PER_DEVICE=${BATCH_SIZE_PER_DEVICE:-16} GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-64} DET_NUM_SAMPLES=${DET_NUM_SAMPLES:-1} SAMPLING_NUM_SAMPLES=${SAMPLING_NUM_SAMPLES:-10} bash script/run_inr_epr_pipeline.sh"
+  command="cd '${ROOT_DIR}' && CUDA_VISIBLE_DEVICES=${gpu} CONFIG='${CONFIG_DIR}/${variant}.json' RUN_DIR_OVERRIDE='${RUN_ROOT}/${variant}' BASE_NUM_TRAIN_EPOCHS=${BASE_NUM_TRAIN_EPOCHS:-4} BASE_ASAP_ONLY=${BASE_ASAP_ONLY:-0} ADAPT_NUM_TRAIN_EPOCHS=${ADAPT_NUM_TRAIN_EPOCHS:-8} BATCH_SIZE_PER_DEVICE=${BATCH_SIZE_PER_DEVICE:-16} GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-64} DET_NUM_SAMPLES=${DET_NUM_SAMPLES:-1} SAMPLING_NUM_SAMPLES=${SAMPLING_NUM_SAMPLES:-1} bash script/run_inr_epr_pipeline.sh"
   tmux new-session -d -s "${session}" "bash -lc \"${command}\""
 done
 

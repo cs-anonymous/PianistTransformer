@@ -108,7 +108,12 @@ def worker(args):
     ]
     dataset = build_dataset(config, manifest, split)
     if ready:
-        sidecar = build_ready_sidecar_for_work(dataset, work_path, selected_sources=selected_sources)
+        sidecar = build_ready_sidecar_for_work(
+            dataset,
+            work_path,
+            selected_sources=selected_sources,
+            performance_time_normalization=performance_time_normalization,
+        )
     else:
         sidecar = build_sidecar_for_work(
             dataset,

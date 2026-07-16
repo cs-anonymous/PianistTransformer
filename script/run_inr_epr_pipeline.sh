@@ -18,6 +18,7 @@ CONTINUATION_DROP_RATIO="${CONTINUATION_DROP_RATIO:-0.0}"
 BASE_NUM_TRAIN_EPOCHS="${BASE_NUM_TRAIN_EPOCHS:-8}"
 ADAPT_NUM_TRAIN_EPOCHS="${ADAPT_NUM_TRAIN_EPOCHS:-16}"
 ADAPT_PREPARED_SIDECAR_TAG="${ADAPT_PREPARED_SIDECAR_TAG:-}"
+BASE_PREPARED_SIDECAR_TAG="${BASE_PREPARED_SIDECAR_TAG:-}"
 BASE_ASAP_ONLY="${BASE_ASAP_ONLY:-0}"
 SKIP_BASE_TRAIN="${SKIP_BASE_TRAIN:-0}"
 BASE_CHECKPOINT_OVERRIDE="${BASE_CHECKPOINT_OVERRIDE:-}"
@@ -134,12 +135,12 @@ run_train() {
 write_train_config() {
   local src="$1" dst="$2" output_root="$3" log_root="$4" epochs="$5" resume_path="$6" asap_only="$7"
   python - "$src" "$dst" "$output_root" "$log_root" "$epochs" "$resume_path" "$asap_only" \
-    "$BATCH_SIZE_PER_DEVICE" "$GRADIENT_ACCUMULATION_STEPS" "$GLOBAL_BATCH_SIZE" "${ADAPT_PREPARED_SIDECAR_TAG}" <<'PY'
+    "$BATCH_SIZE_PER_DEVICE" "$GRADIENT_ACCUMULATION_STEPS" "$GLOBAL_BATCH_SIZE" "${ADAPT_PREPARED_SIDECAR_TAG}" "${BASE_PREPARED_SIDECAR_TAG}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-src, dst, output_root, log_root, epochs, resume_path, asap_only, per_device_bs, grad_accum, global_bs, adapt_sidecar_tag = sys.argv[1:12]
+src, dst, output_root, log_root, epochs, resume_path, asap_only, per_device_bs, grad_accum, global_bs, adapt_sidecar_tag, base_sidecar_tag = sys.argv[1:13]
 cfg = json.loads(Path(src).read_text(encoding="utf-8"))
 if cfg.get("task_type", "epr").lower() != "epr":
     raise SystemExit("run_inr_epr_pipeline.sh requires task_type=epr")
@@ -229,7 +230,10 @@ if asap_only == "1":
 else:
     cfg.pop("train_performance_dataset", None)
     cfg.pop("eval_performance_dataset", None)
-    cfg.pop("prepared_sidecar_tag", None)
+    if base_sidecar_tag:
+        cfg["prepared_sidecar_tag"] = base_sidecar_tag
+    else:
+        cfg.pop("prepared_sidecar_tag", None)
 Path(dst).parent.mkdir(parents=True, exist_ok=True)
 Path(dst).write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 PY
