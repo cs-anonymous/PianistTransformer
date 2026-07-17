@@ -46,6 +46,12 @@ def parse_args():
         default=None,
         help="Optional performance_dataset filter, e.g. ASAP. Restricts scores and GT refs.",
     )
+    parser.add_argument(
+        "--score-source-list",
+        type=Path,
+        default=None,
+        help="Optional newline-delimited refined_score_midi_path list to restrict evaluated scores.",
+    )
     return parser.parse_args()
 
 
@@ -59,7 +65,7 @@ def select_device(device_arg):
     return torch.device("cpu")
 
 
-def collect_test_items(metadata_path, midi_root, split, performance_dataset=None):
+def collect_test_items(metadata_path, midi_root, split, performance_dataset=None, score_source_list=None):
     columns = [
         "tier_a",
         "split",
@@ -74,6 +80,13 @@ def collect_test_items(metadata_path, midi_root, split, performance_dataset=None
     df = df[df["refined_performance_midi_path"].notna()]
     if performance_dataset is not None:
         df = df[df["performance_dataset"].fillna("").astype(str) == str(performance_dataset)]
+    if score_source_list is not None:
+        allowed = [
+            line.strip()
+            for line in score_source_list.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        df = df[df["refined_score_midi_path"].isin(set(allowed))]
     df = df.sort_values(["refined_score_midi_path", "refined_performance_midi_path"], kind="stable")
 
     items = []
@@ -286,6 +299,7 @@ def main():
         midi_root=args.midi_root,
         split=args.split,
         performance_dataset=args.performance_dataset,
+        score_source_list=args.score_source_list,
     )
     if args.num_shards < 1:
         raise ValueError("--num-shards must be >= 1")
@@ -323,6 +337,7 @@ def main():
         "top_p": args.top_p,
         "overlap_ratio": args.overlap_ratio,
         "max_context_length": args.max_context_length,
+        "score_source_list": str(args.score_source_list.resolve()) if args.score_source_list else None,
         "items": manifest_items,
     }
     manifest_path = args.output_dir / "prediction_manifest.json"

@@ -37,6 +37,13 @@ def parse_args():
     parser.add_argument("--max-gt-per-score", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=10)
     parser.add_argument("--score-source-list", type=Path, default=None)
+    parser.add_argument(
+        "--pedal-support",
+        choices=["auto", "raw", "binary"],
+        default="auto",
+        help="Pedal metric support. Binary thresholds MIDI CC64 values into {0,1}.",
+    )
+    parser.add_argument("--pedal-binary-threshold", type=float, default=64.0)
     return parser.parse_args()
 
 
@@ -102,6 +109,12 @@ def log_time_values(values, scale=LOG_WASS_SCALE, max_time_ms=LOG_WASS_MAX_TIME_
     return np.log1p(values / float(scale))
 
 
+def floorlog_time_values(values, max_time_ms=LOG_WASS_MAX_TIME_MS):
+    values = np.asarray(values, dtype=np.float64)
+    values = np.clip(values, 0.0, float(max_time_ms))
+    return np.log(np.maximum(values, 1.0))
+
+
 def pp_wass_metrics(prediction_paths, gt_paths, raw_output_paths=None, pedal_binary_support=False, pedal_binary_threshold=64.0):
     pred_arrays = [cached_note_arrays(path) for path in prediction_paths]
     gt_arrays = [cached_note_arrays(path) for path in gt_paths]
@@ -133,6 +146,10 @@ def pp_wass_metrics(prediction_paths, gt_paths, raw_output_paths=None, pedal_bin
             output[f"{metric_name}_log50_wass"] = feature_wasserstein(
                 log_time_values(pred_pool),
                 log_time_values(gt_pool),
+            )
+            output[f"{metric_name}_floorlog_wass"] = feature_wasserstein(
+                floorlog_time_values(pred_pool),
+                floorlog_time_values(gt_pool),
             )
 
     pedal_keys = [f"{name}_wass" for name in ("pedal_0", "pedal_25", "pedal_50", "pedal_75")]
@@ -189,6 +206,14 @@ def pn_wass_metrics(prediction_paths, gt_paths, raw_output_paths=None, pedal_bin
                 for note_idx in range(usable)
             ]
             output[f"{metric_name}_log50_wass"] = finite_mean(note_log_wass)
+            note_floorlog_wass = [
+                feature_wasserstein(
+                    [floorlog_time_values([item[feature_name][note_idx]])[0] for item in pred_source],
+                    [floorlog_time_values([item[feature_name][note_idx]])[0] for item in gt_source],
+                )
+                for note_idx in range(usable)
+            ]
+            output[f"{metric_name}_floorlog_wass"] = finite_mean(note_floorlog_wass)
 
     pedal_keys = [f"{name}_wass" for name in ("pedal_0", "pedal_25", "pedal_50", "pedal_75")]
     output["pedal_wass"] = finite_mean([output[key] for key in pedal_keys])
@@ -332,13 +357,21 @@ def main():
     args = parse_args()
     score_source_list = load_score_source_filter(args.score_source_list)
     manifest, config = load_manifest_and_config(args.prediction_manifest, score_source_list=score_source_list)
-    pedal_binary_support = str(config.get("pedal_representation", "")).lower() == "binary_4"
+    if args.pedal_support == "auto":
+        pedal_binary_support = str(config.get("pedal_representation", "")).lower() == "binary_4"
+    else:
+        pedal_binary_support = args.pedal_support == "binary"
+    pedal_binary_threshold = (
+        args.pedal_binary_threshold
+        if args.pedal_support != "auto"
+        else float(config.get("pedal_binary_threshold", args.pedal_binary_threshold))
+    )
     evaluation = evaluate_manifest(
         manifest,
         max_gt_per_score=args.max_gt_per_score,
         num_workers=args.num_workers,
         pedal_binary_support=pedal_binary_support,
-        pedal_binary_threshold=float(config.get("pedal_binary_threshold", 64.0)),
+        pedal_binary_threshold=pedal_binary_threshold,
     )
     score_rows = evaluation["score_rows"]
 
@@ -348,11 +381,13 @@ def main():
         "num_samples": manifest["num_samples"],
         "num_scores": len(score_rows),
         "log_wass": {
-            "scale": LOG_WASS_SCALE,
+            "log50_scale": LOG_WASS_SCALE,
             "max_time_ms": LOG_WASS_MAX_TIME_MS,
             "features": ["ioi", "duration"],
+            "floorlog": "log(max(clamp(t_ms, 0, max_time_ms), 1.0))",
         },
         "pedal_metric_support": "binary_0_1" if pedal_binary_support else "raw_0_127",
+        "pedal_binary_threshold": pedal_binary_threshold if pedal_binary_support else None,
         "aggregate": {
             "pn_wass": aggregate_score_metrics(score_rows, "pn_wass"),
             "pp_wass": aggregate_score_metrics(score_rows, "pp_wass"),

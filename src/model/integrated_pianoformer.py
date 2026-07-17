@@ -324,6 +324,7 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         dlm_raw_ms_crps_scale_ms=1000.0,
         dlm_sampling_temperature=1.0,
         dlm_sampling_top_p=1.0,
+        dlm_sampling_top_k=0,
         dlm_ioi_zero_inflated=False,
         dlm_pedal_zero_one_inflated=False,
         dlm_pedal_inflated_eps=0.5,
@@ -581,9 +582,10 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
             raise ValueError("DLM target-tail loss requires lambda >= 0 and radius_frac >= 0")
         self.dlm_sampling_temperature = float(dlm_sampling_temperature)
         self.dlm_sampling_top_p = float(dlm_sampling_top_p)
-        if not math.isfinite(self.dlm_sampling_temperature) or self.dlm_sampling_temperature <= 0.0:
+        self.dlm_sampling_top_k = int(dlm_sampling_top_k)
+        if not math.isfinite(self.dlm_sampling_temperature) or self.dlm_sampling_temperature < 0.0:
             raise ValueError(
-                "dlm_sampling_temperature must be finite and > 0, got "
+                "dlm_sampling_temperature must be finite and >= 0, got "
                 f"{self.dlm_sampling_temperature}"
             )
         if timing_sample_truncate_radius is None:
@@ -4084,17 +4086,25 @@ def _discrete_bounded_mean_or_sample(
 ):
     log_probs = _discrete_bounded_log_probs(config, distribution, logits, raw_a, raw_b)
     temperature = float(getattr(config, "dlm_sampling_temperature", 1.0))
-    if not math.isfinite(temperature) or temperature <= 0.0:
-        raise ValueError(f"sampling temperature must be finite and > 0, got {temperature}")
-    probs = torch.softmax(log_probs / temperature, dim=-1)
-    bins = probs.shape[-1]
-    centers = (torch.arange(bins, device=probs.device, dtype=probs.dtype) + 0.5) / bins
+    if not math.isfinite(temperature):
+        raise ValueError(f"sampling temperature must be finite, got {temperature}")
+    bins = log_probs.shape[-1]
+    centers = (torch.arange(bins, device=log_probs.device, dtype=log_probs.dtype) + 0.5) / bins
     mode = str(sampling_strategy).lower()
+    if temperature <= 0.0:
+        index = log_probs.argmax(dim=-1)
+        return centers[index]
+    probs = torch.softmax(log_probs / temperature, dim=-1)
     if mode in {"mean", "deterministic", "mu", "expected", "expectation"}:
         return torch.sum(probs * centers, dim=-1)
     if mode in {"argmax", "greedy"}:
         return centers[probs.argmax(dim=-1)]
     if mode in {"sample", "sampling", "stochastic"}:
+        top_k = int(getattr(config, "dlm_sampling_top_k", getattr(config, "sampling_top_k", 0)))
+        if top_k > 0 and top_k < probs.shape[-1]:
+            threshold = torch.topk(probs, top_k, dim=-1).values[..., -1, None]
+            probs = probs.masked_fill(probs < threshold, 0.0)
+            probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
         top_p = float(getattr(config, "dlm_sampling_top_p", 1.0))
         probs = _nucleus_probs(probs, top_p=top_p)
         index = torch.distributions.Categorical(
@@ -6482,11 +6492,14 @@ def _dlm_raw_ms_crps_from_log_probs(
 def _dlm_mean_or_sample(config, logits, raw_loc, raw_log_scale, feature, sampling_strategy="mean", zero_mask=None):
     log_probs = _dlm_log_bin_probs(config, logits, raw_loc, raw_log_scale, feature, zero_mask=zero_mask)
     temperature = float(getattr(config, "dlm_sampling_temperature", 1.0))
-    if not math.isfinite(temperature) or temperature <= 0.0:
-        raise ValueError(f"dlm_sampling_temperature must be finite and > 0, got {temperature}")
-    probs = torch.softmax(log_probs / temperature, dim=-1)
+    if not math.isfinite(temperature):
+        raise ValueError(f"dlm_sampling_temperature must be finite, got {temperature}")
     centers = _dlm_bin_centers(config, feature, log_probs, zero_mask=zero_mask)
     mode = str(sampling_strategy).lower()
+    if temperature <= 0.0:
+        index = log_probs.argmax(dim=-1, keepdim=True)
+        return centers.expand_as(log_probs).gather(-1, index).squeeze(-1)
+    probs = torch.softmax(log_probs / temperature, dim=-1)
     if mode in {"mean", "deterministic", "mu", "expected", "expectation"}:
         return torch.sum(probs * centers, dim=-1)
     centers = centers.expand_as(probs)
@@ -6494,6 +6507,11 @@ def _dlm_mean_or_sample(config, logits, raw_loc, raw_log_scale, feature, samplin
         index = probs.argmax(dim=-1, keepdim=True)
         return centers.gather(-1, index).squeeze(-1)
     if mode in {"sample", "sampling", "stochastic"}:
+        top_k = int(getattr(config, "dlm_sampling_top_k", getattr(config, "sampling_top_k", 0)))
+        if top_k > 0 and top_k < probs.shape[-1]:
+            threshold = torch.topk(probs, top_k, dim=-1).values[..., -1, None]
+            probs = probs.masked_fill(probs < threshold, 0.0)
+            probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
         top_p = float(getattr(config, "dlm_sampling_top_p", getattr(config, "sampling_top_p", 1.0)))
         probs = _nucleus_probs(probs, top_p=top_p)
         sample_center = torch.sum(probs * centers, dim=-1, keepdim=True)

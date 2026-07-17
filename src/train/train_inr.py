@@ -3914,6 +3914,7 @@ def create_model(train_config):
         dlm_raw_ms_crps_scale_ms=train_config.get("dlm_raw_ms_crps_scale_ms", 1000.0),
         dlm_sampling_temperature=train_config.get("dlm_sampling_temperature", 1.0),
         dlm_sampling_top_p=train_config.get("dlm_sampling_top_p", train_config.get("sampling_top_p", 1.0)),
+        dlm_sampling_top_k=train_config.get("dlm_sampling_top_k", train_config.get("sampling_top_k", 0)),
         dlm_ioi_zero_inflated=train_config.get("dlm_ioi_zero_inflated", False),
         dlm_pedal_zero_one_inflated=train_config.get("dlm_pedal_zero_one_inflated", False),
         dlm_pedal_inflated_eps=train_config.get("dlm_pedal_inflated_eps", 0.5),
