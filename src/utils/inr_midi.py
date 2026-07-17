@@ -76,35 +76,16 @@ def denormalize_time_ms(time_norm, max_time_ms=10000.0):
     return math.expm1(clipped * math.log1p(float(max_time_ms)))
 
 
-def normalize_time_ms_for_inr_input(time_ms, normalization="legacy_log1p", max_time_ms=10000.0):
-    normalization = str(normalization or "legacy_log1p").lower()
-    if normalization in {"legacy_log1p", "log1p", "log1p_10000"}:
-        return normalize_time_ms(time_ms, max_time_ms=max_time_ms)
-    if normalization in {"scaled_log_5000_s10", "log1p_t_over_10_5000", "log1p_x_over_10_5000"}:
-        clipped = min(max(float(time_ms), 0.0), 5000.0)
-        return math.log1p(clipped / 10.0) / math.log1p(500.0)
-    if normalization in {"log1p_t_over_50_5000", "log1p_x_over_50_5000"}:
-        clipped = min(max(float(time_ms), 0.0), 5000.0)
-        return math.log1p(clipped / 50.0) / math.log1p(100.0)
-    if normalization in {"log1p_t_over_100_5000", "log1p_x_over_100_5000"}:
-        clipped = min(max(float(time_ms), 0.0), 5000.0)
-        return math.log1p(clipped / 100.0) / math.log1p(50.0)
+def normalize_time_ms_for_inr_input(time_ms, normalization="linear_5000", max_time_ms=10000.0):
+    normalization = str(normalization or "linear_5000").lower()
     if normalization in {"linear_5000", "raw_linear_5000"}:
         return min(max(float(time_ms), 0.0), 5000.0) / 5000.0
     raise ValueError(f"Unsupported timing normalization: {normalization}")
 
 
-def denormalize_time_ms_from_inr_input(time_norm, normalization="legacy_log1p", max_time_ms=10000.0):
-    normalization = str(normalization or "legacy_log1p").lower()
+def denormalize_time_ms_from_inr_input(time_norm, normalization="linear_5000", max_time_ms=10000.0):
+    normalization = str(normalization or "linear_5000").lower()
     clipped = min(max(float(time_norm), 0.0), 1.0)
-    if normalization in {"legacy_log1p", "log1p", "log1p_10000"}:
-        return denormalize_time_ms(clipped, max_time_ms=max_time_ms)
-    if normalization in {"scaled_log_5000_s10", "log1p_t_over_10_5000", "log1p_x_over_10_5000"}:
-        return math.expm1(clipped * math.log1p(500.0)) * 10.0
-    if normalization in {"log1p_t_over_50_5000", "log1p_x_over_50_5000"}:
-        return math.expm1(clipped * math.log1p(100.0)) * 50.0
-    if normalization in {"log1p_t_over_100_5000", "log1p_x_over_100_5000"}:
-        return math.expm1(clipped * math.log1p(50.0)) * 100.0
     if normalization in {"linear_5000", "raw_linear_5000"}:
         return clipped * 5000.0
     raise ValueError(f"Unsupported timing normalization: {normalization}")

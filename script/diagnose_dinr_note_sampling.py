@@ -52,7 +52,7 @@ def main():
     pitch, continuous, score_raw, loaded = load_score_from_node(
         sidecar,
         use_timing_scale_bit=config.get("use_timing_scale_bit", False),
-        timing_control_mode=config.get("timing_control_mode", "log_scaled"),
+        timing_control_mode=config.get("timing_control_mode", "dinr_floor_log"),
         timing_log_scale=config.get("timing_log_scale", 50.0),
         musical_feature_mode=config.get("musical_feature_mode", "categorical"),
         score_note_schema=config.get("score_note_input_schema", "integrated"),

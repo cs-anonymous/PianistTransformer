@@ -10,14 +10,14 @@ common_args=(
   --overlap-ratio 0.125
   --min-notes 64
   --input-feature-mode integrated
-  --timing-input-normalization log1p_t_over_50_5000
+  --timing-input-normalization linear_5000
   --max-time-ms 10000
   --pedal-representation binary_4
-  --musical-feature-mode none
+  --musical-feature-mode musical51_full
   --epr-timing-target floor_log_deviation
   --timing-control-mode dinr_floor_log
   --timing-log-scale 50
-  --sidecar-tag ASAP_FLOORLOG_NOMUS_SCORESPAN
+  --sidecar-tag ASAP_DINR_SCORESPAN
   --ready
   --performance-time-normalization score_onset_span
   --performance-dataset ASAP
@@ -32,7 +32,7 @@ import glob
 import json
 import torch
 
-paths = glob.glob("PianoCoRe/processed/**/*.ASAP_FLOORLOG_NOMUS_SCORESPAN.pt", recursive=True)
+paths = glob.glob("PianoCoRe/processed/**/*.ASAP_DINR_SCORESPAN.pt", recursive=True)
 # ASAP-only training contains 188 works and the held-out ASAP test protocol
 # contributes another 19 score works.
 assert len(paths) == 207, len(paths)

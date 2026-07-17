@@ -40,7 +40,7 @@ from src.train.train_inr import (
     create_model,
     default_input_continuous_dim,
     infer_input_feature_mode,
-    integrated_csr_output_dim,
+    integrated_removed_task_output_dim,
     integrated_epr_input_dim,
     load_torch_state_dict,
     resolve_timing_control_mode,
@@ -213,7 +213,7 @@ def normalize_train_config(train_config: dict) -> dict:
         use_timing_scale_bit=cfg.get("use_timing_scale_bit", False),
     )
     musical_feature_mode = str(
-        cfg.get("musical_feature_mode", "continuous" if task_type == "csr" else "categorical")
+        cfg.get("musical_feature_mode", "continuous" if task_type == "removed_task" else "categorical")
     ).lower()
     cfg["musical_feature_mode"] = musical_feature_mode
     cfg.setdefault(
@@ -224,7 +224,7 @@ def normalize_train_config(train_config: dict) -> dict:
             musical_feature_mode=musical_feature_mode,
             pedal_control_dim=4,
         )
-        if task_type in {"epr", "csr"} and input_feature_mode == "integrated"
+        if task_type in {"epr", "removed_task"} and input_feature_mode == "integrated"
         else default_input_continuous_dim(
             task_type,
             input_feature_mode,
@@ -233,8 +233,8 @@ def normalize_train_config(train_config: dict) -> dict:
             musical_feature_mode=musical_feature_mode,
         ),
     )
-    if task_type == "csr":
-        cfg.setdefault("output_continuous_dim", integrated_csr_output_dim())
+    if task_type == "removed_task":
+        cfg.setdefault("output_continuous_dim", integrated_removed_task_output_dim())
     return cfg
 
 
@@ -278,7 +278,7 @@ def build_eval_dataset(train_config: dict) -> PianoCoReNodeSFTDataset:
         musical_feature_mode=musical_feature_mode,
         epr_timing_target=cfg.get("epr_timing_target", "log_deviation"),
         use_timing_scale_bit=cfg.get("use_timing_scale_bit", False),
-        timing_control_mode=cfg.get("timing_control_mode", "log_scaled"),
+        timing_control_mode=cfg.get("timing_control_mode", "dinr_floor_log"),
         timing_log_scale=cfg.get("timing_log_scale", 50.0),
         precompute_items=cfg.get(
             "precompute_eval_dataset_items",

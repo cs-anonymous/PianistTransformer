@@ -83,60 +83,26 @@ def _scalar_distribution_components(config, distribution):
     return int(getattr(config, "epr_mixture_components", 1))
 
 
-def resolve_timing_control_mode(timing_control_mode="log_scaled", use_timing_scale_bit=False):
-    if timing_control_mode is None:
-        return "log_scaled"
-    mode = str(timing_control_mode).lower()
-    valid_modes = {
-        "piecewise_scale_bit",
-        "piecewise_single",
-        "dual_log_linear",
-        "dual_clip_linear",
-        "log_scaled",
-        "floor_log",
-        "dinr_floor_log",
-        "raw_log",
-    }
-    if mode not in valid_modes:
-        raise ValueError(f"Unsupported timing_control_mode={timing_control_mode}")
-    return mode
+def resolve_timing_control_mode(timing_control_mode="dinr_floor_log", use_timing_scale_bit=False):
+    mode = "dinr_floor_log" if timing_control_mode is None else str(timing_control_mode).lower()
+    if mode != "dinr_floor_log":
+        raise ValueError("Only timing_control_mode=dinr_floor_log is supported")
+    return "dinr_floor_log"
 
 
-def timing_control_feature_dim(timing_control_mode="log_scaled", use_timing_scale_bit=False):
-    mode = resolve_timing_control_mode(
+def timing_control_feature_dim(timing_control_mode="dinr_floor_log", use_timing_scale_bit=False):
+    resolve_timing_control_mode(
         timing_control_mode=timing_control_mode,
         use_timing_scale_bit=use_timing_scale_bit,
     )
-    if mode == "raw_log":
-        return 5
-    return 3 if mode in {"piecewise_single", "log_scaled", "floor_log", "dinr_floor_log"} else 5
+    return 3
 
 
-def musical_feature_dim(musical_feature_mode="categorical"):
+def musical_feature_dim(musical_feature_mode="musical51_full"):
     mode = str(musical_feature_mode).lower()
-    if mode in {"none", "off", "disabled", "no_musical", "nomus"}:
-        return 0
-    if mode == "continuous":
-        return 12
-    if mode in {
-        "categorical",
-        "categorical51",
-        "musical51",
-        "musical51_full",
-        "musical51_onset_only",
-        "musical51_annotation_only",
-        "musical51_duration_only",
-        "musical51_onset_annotation",
-        "musical51_no_duration",
-        "musical51_no_length",
-        "musical51_no_duration_length",
-    }:
+    if mode in {"musical51", "musical51_full"}:
         return 51
-    if mode in {"musical145_onset_annotation", "onset145_annotation"}:
-        return 151
-    if mode in {"categorical62", "musical62"}:
-        return 62
-    raise ValueError(f"Unsupported musical_feature_mode={musical_feature_mode}")
+    raise ValueError("Only musical_feature_mode=musical51_full is supported")
 
 
 def normalize_slot_version(slot_version=None):
@@ -242,15 +208,15 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         score_feature_dim=8,
         time_loss_type="huber",
         value_loss_type="mse",
-        csr_grid_loss_type="huber",
-        csr_grid_step=1.0 / 24.0,
-        csr_grid_soft_ce_tau=1.5,
-        csr_mo_max=6.0,
-        csr_md_max=6.0,
-        csr_ml_max=6.0,
+        removed_task_grid_loss_type="huber",
+        removed_task_grid_step=1.0 / 24.0,
+        removed_task_grid_soft_ce_tau=1.5,
+        removed_task_mo_max=6.0,
+        removed_task_md_max=6.0,
+        removed_task_ml_max=6.0,
         huber_delta=0.05,
         loss_weights=None,
-        csr_loss_weights=None,
+        removed_task_loss_weights=None,
         decoder_input_mode="score",
         note_embedding_mode="sine",
         score_note_input_schema="integrated",
@@ -294,10 +260,10 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         dlm_velocity_bins=128,
         dlm_ioi_zero_min=0.0,
         dlm_ioi_zero_max=5.0,
-        dlm_ioi_nonzero_min=-2.5,
-        dlm_ioi_nonzero_max=1.5,
-        dlm_duration_min=-3.0,
-        dlm_duration_max=2.0,
+        dlm_ioi_nonzero_min=-2.0,
+        dlm_ioi_nonzero_max=1.0,
+        dlm_duration_min=-2.0,
+        dlm_duration_max=1.0,
         dlm_velocity_min=-0.5,
         dlm_velocity_max=127.5,
         dlm_scale_min=1e-3,
@@ -370,7 +336,7 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         dinr_numerical_frequencies=16,
         dinr_output_deviation_numerical_coordinates=True,
         epr_timing_target="log_deviation",
-        timing_control_mode="log_scaled",
+        timing_control_mode="dinr_floor_log",
         timing_log_scale=50.0,
         use_timing_scale_bit=False,
         soft_ce_tau=None,
@@ -443,12 +409,12 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.score_feature_dim = score_feature_dim
         self.time_loss_type = time_loss_type
         self.value_loss_type = value_loss_type
-        self.csr_grid_loss_type = csr_grid_loss_type
-        self.csr_grid_step = float(csr_grid_step)
-        self.csr_grid_soft_ce_tau = float(csr_grid_soft_ce_tau)
-        self.csr_mo_max = float(csr_mo_max)
-        self.csr_md_max = float(csr_md_max)
-        self.csr_ml_max = float(csr_ml_max)
+        self.removed_task_grid_loss_type = removed_task_grid_loss_type
+        self.removed_task_grid_step = float(removed_task_grid_step)
+        self.removed_task_grid_soft_ce_tau = float(removed_task_grid_soft_ce_tau)
+        self.removed_task_mo_max = float(removed_task_mo_max)
+        self.removed_task_md_max = float(removed_task_md_max)
+        self.removed_task_ml_max = float(removed_task_ml_max)
         self.huber_delta = huber_delta
         self.loss_weights = loss_weights or {
             "ioi": 1.0,
@@ -456,7 +422,7 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
             "velocity": 1.0,
             "pedal": 1.0,
         }
-        self.csr_loss_weights = csr_loss_weights or {
+        self.removed_task_loss_weights = removed_task_loss_weights or {
             "mo": 1.0,
             "ioi_zero": 1.0,
             "md": 1.0,
@@ -772,7 +738,7 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.zero_ioi_dual_duration = bool(zero_ioi_dual_duration)
         self.piano_pitch_min = int(piano_pitch_min)
         if bool(use_style_tokens):
-            raise ValueError("use_style_tokens is disabled for the simplified EPR/CSR pipelines")
+            raise ValueError("use_style_tokens is disabled for the simplified EPR/removed_task pipelines")
         self.use_style_tokens = bool(use_style_tokens)
         self.style_creator_vocab_size = int(style_creator_vocab_size)
         self.style_source_vocab_size = int(style_source_vocab_size)
@@ -2180,8 +2146,8 @@ class IntegratedContinuousDecoder(nn.Module):
             pedal_output_dim = self.pedal_dim
 
         generic_output_dim = self.output_dim
-        if getattr(config, "task_type", "epr") == "csr" and _csr_uses_grid_head(config):
-            generic_output_dim = _csr_grid_raw_output_dim(config)
+        if getattr(config, "task_type", "epr") == "removed_task" and _removed_task_uses_grid_head(config):
+            generic_output_dim = _removed_task_grid_raw_output_dim(config)
 
         self.split_shared_heads = getattr(config, "task_type", "epr") == "epr"
         self.shared_pack_mode = shared_pack_mode
@@ -3058,53 +3024,13 @@ def _torch_floor_log_reconstruct(score_time_ms, dev):
     return (base * torch.exp(dev.float())).clamp_min(0.0)
 
 
-def _torch_timing_control_code(time_ms, timing_control_mode="log_scaled", use_scale_bit=False, log_scale=50.0):
-    mode = resolve_timing_control_mode(
+def _torch_timing_control_code(time_ms, timing_control_mode="dinr_floor_log", use_scale_bit=False, log_scale=50.0):
+    resolve_timing_control_mode(
         timing_control_mode=timing_control_mode,
         use_timing_scale_bit=use_scale_bit,
     )
-    max_ms = 8000.0 if mode == "dinr_floor_log" else 5000.0
-    value = time_ms.float().clamp(0.0, max_ms)
-    if mode == "piecewise_scale_bit":
-        scale_bit = (value > 500.0).to(dtype=value.dtype)
-        cont = torch.where(value > 500.0, value / 5000.0, value / 500.0)
-        return torch.stack([scale_bit, cont], dim=-1)
-    if mode == "piecewise_single":
-        return torch.stack(
-            [
-                torch.where(value > 500.0, value / 5000.0, value / 500.0),
-            ],
-            dim=-1,
-        )
-    if mode == "dual_log_linear":
-        return torch.stack(
-            [
-                torch.log1p(value) / torch.log1p(value.new_tensor(5000.0)),
-                value / 5000.0,
-            ],
-            dim=-1,
-        )
-    if mode == "log_scaled":
-        return _torch_log_timing_code(value, scale=log_scale, max_time_ms=5000.0).unsqueeze(-1)
-    if mode in {"floor_log", "dinr_floor_log"}:
-        return torch.log(value.clamp_min(1.0)).unsqueeze(-1)
-    if mode == "raw_log":
-        return torch.stack(
-            [
-                value / 1000.0,
-                _torch_raw_log_timing_code(value, scale=log_scale, max_time_ms=5000.0),
-            ],
-            dim=-1,
-        )
-    if mode == "dual_clip_linear":
-        return torch.stack(
-            [
-                torch.clamp(value / 500.0, max=1.0),
-                value / 5000.0,
-            ],
-            dim=-1,
-        )
-    raise ValueError(f"Unsupported timing_control_mode={mode}")
+    value = time_ms.float().clamp(0.0, 8000.0)
+    return torch.log(value.clamp_min(1.0)).unsqueeze(-1)
 
 
 def _target7_to_raw7(score_shared_raw, target_predictions, config=None):
@@ -3304,8 +3230,7 @@ def _build_epr_decoder_rows(config, score_shared_raw, target_predictions, score_
     timing_control_mode = getattr(config, "timing_control_mode", None)
     use_timing_scale_bit = getattr(config, "use_timing_scale_bit", True)
     log_scale = getattr(config, "timing_log_scale", 50.0)
-    if resolve_timing_control_mode(timing_control_mode, use_timing_scale_bit) not in {"log_scaled", "floor_log", "dinr_floor_log", "raw_log"}:
-        raise ValueError("EPR decoder feedback requires timing_control_mode=log_scaled, floor_log, dinr_floor_log, or raw_log")
+    resolve_timing_control_mode(timing_control_mode, use_timing_scale_bit)
     target7 = _target_predictions_to_feedback7(config, target_predictions)
     score_ioi = _torch_timing_control_code(
         score_shared_raw[..., 0],
@@ -3448,7 +3373,7 @@ def _build_epr_decoder_rows(config, score_shared_raw, target_predictions, score_
     return torch.cat([score_control, performance_control, musical, masks], dim=-1)
 
 
-def _build_csr_decoder_rows(config, musical_predictions):
+def _build_removed_task_decoder_rows(config, musical_predictions):
     musical = musical_predictions.float().clamp(0.0, 1.0)
     score_control_dim = int(getattr(config, "score_control_feature_dim", getattr(config, "control_feature_dim", 5)))
     performance_control_dim = int(
@@ -3459,8 +3384,8 @@ def _build_csr_decoder_rows(config, musical_predictions):
     return torch.cat([zeros, musical, masks], dim=-1)
 
 
-def _csr_uses_grid_head(config):
-    return str(getattr(config, "csr_grid_loss_type", "huber")).lower() in {
+def _removed_task_uses_grid_head(config):
+    return str(getattr(config, "removed_task_grid_loss_type", "huber")).lower() in {
         "soft_ce",
         "soft_ce_huber",
         "ce",
@@ -3470,27 +3395,27 @@ def _csr_uses_grid_head(config):
     }
 
 
-def _csr_grid_bins(config, name):
-    step = max(float(getattr(config, "csr_grid_step", 1.0 / 24.0)), 1e-12)
-    max_value = float(getattr(config, f"csr_{name}_max"))
+def _removed_task_grid_bins(config, name):
+    step = max(float(getattr(config, "removed_task_grid_step", 1.0 / 24.0)), 1e-12)
+    max_value = float(getattr(config, f"removed_task_{name}_max"))
     return int(round(max_value / step)) + 1
 
 
-def _csr_grid_raw_output_dim(config):
+def _removed_task_grid_raw_output_dim(config):
     return (
-        _csr_grid_bins(config, "mo")
-        + _csr_grid_bins(config, "md")
-        + _csr_grid_bins(config, "ml")
+        _removed_task_grid_bins(config, "mo")
+        + _removed_task_grid_bins(config, "md")
+        + _removed_task_grid_bins(config, "ml")
         + 1
         + 8
     )
 
 
-def _split_csr_grid_outputs(config, raw_outputs):
+def _split_removed_task_grid_outputs(config, raw_outputs):
     start = 0
     outputs = {}
     for name in ("mo", "md", "ml"):
-        bins = _csr_grid_bins(config, name)
+        bins = _removed_task_grid_bins(config, name)
         outputs[name] = raw_outputs[..., start : start + bins]
         start += bins
     outputs["tempo"] = raw_outputs[..., start]
@@ -3499,24 +3424,24 @@ def _split_csr_grid_outputs(config, raw_outputs):
     return outputs
 
 
-def _csr_grid_to_normalized(config, name, logits):
+def _removed_task_grid_to_normalized(config, name, logits):
     bins = logits.shape[-1]
     values = torch.arange(bins, device=logits.device, dtype=torch.float32)
-    step = float(getattr(config, "csr_grid_step", 1.0 / 24.0))
-    max_value = max(float(getattr(config, f"csr_{name}_max")), step)
+    step = float(getattr(config, "removed_task_grid_step", 1.0 / 24.0))
+    max_value = max(float(getattr(config, f"removed_task_{name}_max")), step)
     indices = logits.float().argmax(dim=-1).to(dtype=torch.float32)
     return (indices * step / max_value).clamp(0.0, 1.0)
 
 
-def _materialize_csr_prediction(config, raw_outputs):
-    if not _csr_uses_grid_head(config):
+def _materialize_removed_task_prediction(config, raw_outputs):
+    if not _removed_task_uses_grid_head(config):
         return torch.sigmoid(raw_outputs)
-    parts = _split_csr_grid_outputs(config, raw_outputs)
+    parts = _split_removed_task_grid_outputs(config, raw_outputs)
     continuous = [
-        _csr_grid_to_normalized(config, "mo", parts["mo"]),
+        _removed_task_grid_to_normalized(config, "mo", parts["mo"]),
         (torch.sigmoid(parts["binary"][..., 0]) >= 0.5).to(dtype=raw_outputs.dtype),
-        _csr_grid_to_normalized(config, "md", parts["md"]),
-        _csr_grid_to_normalized(config, "ml", parts["ml"]),
+        _removed_task_grid_to_normalized(config, "md", parts["md"]),
+        _removed_task_grid_to_normalized(config, "ml", parts["ml"]),
         torch.sigmoid(parts["tempo"]),
     ]
     binary = (torch.sigmoid(parts["binary"][..., 1:]) >= 0.5).to(dtype=raw_outputs.dtype)
@@ -4904,27 +4829,10 @@ def _epr_bins_to_normalized(config, ioi_bins, duration_bins, velocity_bins, peda
     timing_bins = max(1, int(config.epr_timing_bins))
     value_bins = max(1, int(config.epr_value_bins))
     value_scale = float(value_bins - 1) if value_bins > 1 else 1.0
-    timing_norm = str(getattr(config, "timing_input_normalization", "scaled_log_5000_s10")).lower()
+    timing_norm = str(getattr(config, "timing_input_normalization", "linear_5000")).lower()
     ioi_ms = ioi_bins.to(dtype=torch.float32).clamp(0.0, float(timing_bins - 1))
     duration_ms = duration_bins.to(dtype=torch.float32).clamp(0.0, float(timing_bins - 1))
-    if timing_norm in {"scaled_log_5000_s10", "log1p_t_over_10_5000", "log1p_x_over_10_5000"}:
-        denom = torch.log1p(ioi_ms.new_tensor(500.0))
-        ioi_norm = torch.log1p(ioi_ms.clamp(max=5000.0) / 10.0) / denom
-        duration_norm = torch.log1p(duration_ms.clamp(max=5000.0) / 10.0) / denom
-    elif timing_norm in {"log1p_t_over_50_5000", "log1p_x_over_50_5000"}:
-        denom = torch.log1p(ioi_ms.new_tensor(100.0))
-        ioi_norm = torch.log1p(ioi_ms.clamp(max=5000.0) / 50.0) / denom
-        duration_norm = torch.log1p(duration_ms.clamp(max=5000.0) / 50.0) / denom
-    elif timing_norm in {"log1p_t_over_100_5000", "log1p_x_over_100_5000"}:
-        denom = torch.log1p(ioi_ms.new_tensor(50.0))
-        ioi_norm = torch.log1p(ioi_ms.clamp(max=5000.0) / 100.0) / denom
-        duration_norm = torch.log1p(duration_ms.clamp(max=5000.0) / 100.0) / denom
-    elif timing_norm in {"legacy_log1p", "log1p", "log1p_10000"}:
-        max_time = float(getattr(config, "max_time_ms", 10000.0))
-        denom = torch.log1p(ioi_ms.new_tensor(max_time))
-        ioi_norm = torch.log1p(ioi_ms.clamp(max=max_time)) / denom
-        duration_norm = torch.log1p(duration_ms.clamp(max=max_time)) / denom
-    elif timing_norm in {"linear_5000", "raw_linear_5000"}:
+    if timing_norm in {"linear_5000", "raw_linear_5000"}:
         ioi_norm = ioi_ms.clamp(max=5000.0) / 5000.0
         duration_norm = duration_ms.clamp(max=5000.0) / 5000.0
     else:
@@ -5629,7 +5537,7 @@ def _build_prefilled_ar_note_inputs(
     score_input_continuous=None,
 ):
     batch_size, seq_len = attention_mask.shape
-    if _uses_epr_targets(config) or getattr(config, "task_type", "epr") == "csr":
+    if _uses_epr_targets(config) or getattr(config, "task_type", "epr") == "removed_task":
         decoder_dim = int(getattr(config, "decoder_input_continuous_dim", getattr(config, "input_continuous_dim")))
     else:
         decoder_dim = output_dim + 2
@@ -5674,8 +5582,8 @@ def _build_prefilled_ar_note_inputs(
                         else None
                     ),
                 )
-            elif config.task_type == "csr":
-                decoder_input_continuous[:, 1 : prefix_len + 1] = _build_csr_decoder_rows(
+            elif config.task_type == "removed_task":
+                decoder_input_continuous[:, 1 : prefix_len + 1] = _build_removed_task_decoder_rows(
                     config,
                     prefix_predictions[:, :prefix_len].to(
                         dtype=decoder_input_continuous.dtype,
@@ -5685,7 +5593,7 @@ def _build_prefilled_ar_note_inputs(
             else:
                 if config.task_type == "epr":
                     decoder_input_continuous[:, 1 : prefix_len + 1, 1] = 1.0
-                elif config.task_type == "csr":
+                elif config.task_type == "removed_task":
                     decoder_input_continuous[:, 1 : prefix_len + 1, 0] = 1.0
                 decoder_input_continuous[:, 1 : prefix_len + 1, 2:] = prefix_predictions[:, :prefix_len].to(
                     dtype=decoder_input_continuous.dtype,
@@ -5712,8 +5620,8 @@ def _build_ar_note_continuous(
             labels_continuous,
             score_input_continuous=score_input_continuous,
         )
-    if task_type == "csr":
-        return _build_csr_decoder_rows(config, labels_continuous)
+    if task_type == "removed_task":
+        return _build_removed_task_decoder_rows(config, labels_continuous)
     batch_size, seq_len, _ = labels_continuous.shape
     if task_type == "epr":
         type_bits = labels_continuous.new_zeros(batch_size, seq_len, 2)
@@ -6624,8 +6532,8 @@ def _compute_integrated_loss_components(
     label_valid_mask=None,
 ):
     del labels_epr_bins
-    if getattr(config, "task_type", "epr") == "csr":
-        return _compute_csr_loss_components(config, continuous_pred, labels_continuous, attention_mask)
+    if getattr(config, "task_type", "epr") == "removed_task":
+        return _compute_removed_task_loss_components(config, continuous_pred, labels_continuous, attention_mask)
     if not _uses_epr_targets(config):
         raise ValueError("EPR loss only supports INR log_deviation targets")
 
@@ -7332,16 +7240,16 @@ def _bce_loss(logits, target, mask):
     return _masked_mean(values, mask)
 
 
-def _normalized_to_csr_grid_target(config, name, target):
-    step = max(float(getattr(config, "csr_grid_step", 1.0 / 24.0)), 1e-12)
-    max_value = float(getattr(config, f"csr_{name}_max"))
-    bins = _csr_grid_bins(config, name)
+def _normalized_to_removed_task_grid_target(config, name, target):
+    step = max(float(getattr(config, "removed_task_grid_step", 1.0 / 24.0)), 1e-12)
+    max_value = float(getattr(config, f"removed_task_{name}_max"))
+    bins = _removed_task_grid_bins(config, name)
     return torch.round(target.float().clamp(0.0, 1.0) * max_value / step).long().clamp(0, bins - 1)
 
 
-def _csr_grid_loss(config, name, logits, target, mask):
-    target_bin = _normalized_to_csr_grid_target(config, name, target)
-    grid_loss_type = str(getattr(config, "csr_grid_loss_type", "huber")).lower()
+def _removed_task_grid_loss(config, name, logits, target, mask):
+    target_bin = _normalized_to_removed_task_grid_target(config, name, target)
+    grid_loss_type = str(getattr(config, "removed_task_grid_loss_type", "huber")).lower()
     if grid_loss_type in {"ce", "hard_ce", "ordinal", "grid"}:
         return _hard_categorical_loss(logits, target_bin, mask)
     if grid_loss_type in {"soft_ce", "soft_ce_huber"}:
@@ -7349,25 +7257,25 @@ def _csr_grid_loss(config, name, logits, target, mask):
             logits,
             target_bin,
             mask,
-            tau=float(getattr(config, "csr_grid_soft_ce_tau", 1.5)),
+            tau=float(getattr(config, "removed_task_grid_soft_ce_tau", 1.5)),
         )
-    raise ValueError(f"Unsupported CSR grid loss type: {grid_loss_type}")
+    raise ValueError(f"Unsupported removed_task grid loss type: {grid_loss_type}")
 
 
-def _compute_csr_loss_components(config, musical_logits, labels_musical, musical_mask):
+def _compute_removed_task_loss_components(config, musical_logits, labels_musical, musical_mask):
     score_mask = musical_mask.bool()
     first_target = labels_musical[..., 5].float()
     ml_mask = score_mask & (first_target >= 0.5)
-    grid_loss_type = getattr(config, "csr_grid_loss_type", "huber")
+    grid_loss_type = getattr(config, "removed_task_grid_loss_type", "huber")
 
-    if _csr_uses_grid_head(config):
-        parts = _split_csr_grid_outputs(config, musical_logits)
+    if _removed_task_uses_grid_head(config):
+        parts = _split_removed_task_grid_outputs(config, musical_logits)
         binary = parts["binary"]
         return {
-            "mo": _csr_grid_loss(config, "mo", parts["mo"], labels_musical[..., 0], score_mask),
+            "mo": _removed_task_grid_loss(config, "mo", parts["mo"], labels_musical[..., 0], score_mask),
             "ioi_zero": _bce_loss(binary[..., 0], labels_musical[..., 1], score_mask),
-            "md": _csr_grid_loss(config, "md", parts["md"], labels_musical[..., 2], score_mask),
-            "ml": _csr_grid_loss(config, "ml", parts["ml"], labels_musical[..., 3], ml_mask),
+            "md": _removed_task_grid_loss(config, "md", parts["md"], labels_musical[..., 2], score_mask),
+            "ml": _removed_task_grid_loss(config, "ml", parts["ml"], labels_musical[..., 3], ml_mask),
             "tempo": _regression_loss(
                 torch.sigmoid(parts["tempo"]),
                 labels_musical[..., 4],
@@ -7446,8 +7354,8 @@ def _compute_integrated_loss(
         score_shared_raw=score_shared_raw,
         label_valid_mask=label_valid_mask,
     )
-    if getattr(config, "task_type", "epr") == "csr":
-        weights = config.csr_loss_weights
+    if getattr(config, "task_type", "epr") == "removed_task":
+        weights = config.removed_task_loss_weights
         alias = {
             "hand": ("hand", "staff"),
             "stacc": ("stacc", "staccato"),
@@ -7887,12 +7795,12 @@ class IntegratedPianoTransformer(IntegratedStyleTokenMixin, nn.Module):
                     sampling_strategy=continuous_sampling_strategy,
                     score_shared_raw=score_shared_raw,
                 )
-            elif self.config.task_type == "csr":
-                continuous_pred = _materialize_csr_prediction(self.config, continuous_pred)
+            elif self.config.task_type == "removed_task":
+                continuous_pred = _materialize_removed_task_prediction(self.config, continuous_pred)
 
         loss = None
         if labels_continuous is not None:
-            loss_mask = label_mask if (self.config.task_type == "csr" and label_mask is not None) else attention_mask
+            loss_mask = label_mask if (self.config.task_type == "removed_task" and label_mask is not None) else attention_mask
             loss = _compute_integrated_loss(
                 self.config,
                 continuous_pred,
@@ -8032,8 +7940,8 @@ class IntegratedPianoTransformer(IntegratedStyleTokenMixin, nn.Module):
                 score_shared_raw=score_shared_raw[:, step : step + 1],
             )
             step_raw = self._apply_zero_ioi_residual(step_raw, score_shared_raw[:, step : step + 1])
-            if self.config.task_type == "csr":
-                step_pred = _materialize_csr_prediction(self.config, step_raw)
+            if self.config.task_type == "removed_task":
+                step_pred = _materialize_removed_task_prediction(self.config, step_raw)
             else:
                 step_pred = _materialize_epr_prediction(
                     self.config,
@@ -8052,12 +7960,12 @@ class IntegratedPianoTransformer(IntegratedStyleTokenMixin, nn.Module):
                     )[:, 0]
                 elif self.config.task_type == "epr":
                     decoder_input_continuous[:, step + 1, 1] = 1.0
-                elif self.config.task_type == "csr":
-                    decoder_input_continuous[:, step + 1] = _build_csr_decoder_rows(
+                elif self.config.task_type == "removed_task":
+                    decoder_input_continuous[:, step + 1] = _build_removed_task_decoder_rows(
                         self.config,
                         step_pred,
                     )[:, 0]
-                if not _uses_epr_targets(self.config) and self.config.task_type != "csr":
+                if not _uses_epr_targets(self.config) and self.config.task_type != "removed_task":
                     decoder_input_continuous[:, step + 1, 2:] = step_pred[:, 0, :]
 
         output = torch.cat(predictions, dim=1) if predictions else continuous.new_zeros((batch_size, 0, self.config.output_continuous_dim))
@@ -8295,7 +8203,7 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
             )
             loss = None
             if labels_continuous is not None:
-                loss_mask = label_mask if (self.config.task_type == "csr" and label_mask is not None) else attention_mask
+                loss_mask = label_mask if (self.config.task_type == "removed_task" and label_mask is not None) else attention_mask
                 loss = _compute_integrated_loss(
                     self.config,
                     continuous_pred,
@@ -8348,12 +8256,12 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
                     sampling_strategy=continuous_sampling_strategy,
                     score_shared_raw=score_shared_raw,
                 )
-            elif self.config.task_type == "csr":
-                continuous_pred = _materialize_csr_prediction(self.config, continuous_pred)
+            elif self.config.task_type == "removed_task":
+                continuous_pred = _materialize_removed_task_prediction(self.config, continuous_pred)
 
         loss = None
         if labels_continuous is not None:
-            loss_mask = label_mask if (self.config.task_type == "csr" and label_mask is not None) else attention_mask
+            loss_mask = label_mask if (self.config.task_type == "removed_task" and label_mask is not None) else attention_mask
             loss = _compute_integrated_loss(
                 self.config,
                 continuous_pred,
@@ -8591,8 +8499,8 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
                 score_shared_raw=score_shared_raw[:, step : step + 1],
             )
             step_raw = self._apply_zero_ioi_residual(step_raw, score_shared_raw[:, step : step + 1])
-            if self.config.task_type == "csr":
-                step_pred = _materialize_csr_prediction(self.config, step_raw)
+            if self.config.task_type == "removed_task":
+                step_pred = _materialize_removed_task_prediction(self.config, step_raw)
             else:
                 step_pred = _materialize_epr_prediction(
                     self.config,
@@ -8612,12 +8520,12 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
                     )[:, 0]
                 elif self.config.task_type == "epr":
                     decoder_input_continuous[:, step + 1, 1] = 1.0
-                elif self.config.task_type == "csr":
-                    decoder_input_continuous[:, step + 1] = _build_csr_decoder_rows(
+                elif self.config.task_type == "removed_task":
+                    decoder_input_continuous[:, step + 1] = _build_removed_task_decoder_rows(
                         self.config,
                         step_pred,
                     )[:, 0]
-                if not _uses_epr_targets(self.config) and self.config.task_type != "csr":
+                if not _uses_epr_targets(self.config) and self.config.task_type != "removed_task":
                     decoder_input_continuous[:, step + 1, 2:] = step_pred[:, 0, :]
 
         output = torch.cat(predictions, dim=1) if predictions else continuous.new_zeros((batch_size, 0, self.config.output_continuous_dim))

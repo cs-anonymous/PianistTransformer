@@ -47,7 +47,7 @@ def main():
     pitch, continuous, score_raw, _ = load_score_from_node(
         args.score_json,
         use_timing_scale_bit=cfg.get("use_timing_scale_bit", False),
-        timing_control_mode=cfg.get("timing_control_mode", "log_scaled"),
+        timing_control_mode=cfg.get("timing_control_mode", "dinr_floor_log"),
         timing_log_scale=cfg.get("timing_log_scale", 50.0),
         musical_feature_mode=cfg.get("musical_feature_mode", "categorical"),
         score_note_schema=cfg.get("score_note_input_schema", "integrated"),

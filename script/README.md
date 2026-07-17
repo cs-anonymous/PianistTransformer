@@ -59,11 +59,11 @@ tmux attach -t inr0624_sine_d4w1
 ### 3. 其他仍保留的 shell 脚本
 
 - `script/build_pianocore_inr_sidecars.sh`: 当前标准 INR 数据处理链
-- `script/run_inr_csr_pipeline.sh`: CSR 流水线
+- `script/run_inr_removed_task_pipeline.sh`: removed_task 流水线
 - `script/run_head_capacity_pipeline.sh`: head capacity 对比实验
 - `script/run_pt_pipeline.sh`: Pianist Transformer 旧主线流水线
 - `script/launch_inr0624_epr_logscale_4gpu.sh`: 特定 INR0624 EPR 批量启动器
-- `script/launch_inr0624_csr_4gpu.sh`: 特定 INR0624 CSR 批量启动器
+- `script/launch_inr0624_removed_task_4gpu.sh`: 特定 INR0624 removed_task 批量启动器
 
 ## Python 工具的新位置
 

@@ -5,7 +5,6 @@ import math
 import multiprocessing as mp
 import random
 import sys
-from collections import defaultdict
 from pathlib import Path
 
 import pandas as pd
@@ -20,7 +19,6 @@ if str(ROOT_DIR) not in sys.path:
 from src.data_process.work_manifest import build_work_manifest
 from src.train.train_inr import (
     build_perf_style_prefix_cache,
-    build_csr_performance_input_rows,
     build_epr_score_input_rows,
     build_score_musical_rows,
     build_style_vocabs,
@@ -165,7 +163,9 @@ def load_config(path: Path, checkpoint: str | None):
             config.get("pedal_representation", "start_valley"),
             legacy_dual_timing_head=config.get("legacy_dual_timing_head", False),
         )
-    musical_mode = str(config.get("musical_feature_mode", "categorical")).lower()
+    if config.get("task_type", "epr").lower() != "epr":
+        raise ValueError("Only task_type=epr is supported")
+    musical_mode = str(config.get("musical_feature_mode", "musical51_full")).lower()
     config["musical_feature_dim"] = musical_feature_dim(musical_mode)
     config["mask_feature_dim"] = 2 if int(config["musical_feature_dim"]) == 0 else 3
     config["score_control_feature_dim"] = int(config.get("score_control_feature_dim", config.get("control_feature_dim", 5)))
@@ -173,7 +173,7 @@ def load_config(path: Path, checkpoint: str | None):
     config["performance_control_feature_dim"] = int(
         config.get("performance_control_feature_dim", config.get("control_feature_dim", 5) + pedal_dim)
     )
-    if config.get("task_type", "epr").lower() in {"epr", "csr"} and config["input_feature_mode"] == "integrated":
+    if config.get("task_type", "epr").lower() == "epr" and config["input_feature_mode"] == "integrated":
         score_schema = score_note_input_schema(config)
         decoder_schema = decoder_note_input_schema(config)
         if config.get("task_type", "epr").lower() == "epr" and score_schema == "score_musical":
@@ -239,7 +239,7 @@ def list_gt_midis(
 def load_score_from_node(
     path: Path,
     use_timing_scale_bit=False,
-    timing_control_mode="log_scaled",
+    timing_control_mode="dinr_floor_log",
     timing_log_scale=50.0,
     musical_feature_mode="categorical",
     score_note_schema="integrated",
@@ -252,35 +252,16 @@ def load_score_from_node(
         work = json.load(file)
     score = work["score"]
     pitch = score["pitch"]
-    if str(task_type).lower() == "csr":
-        performances = work.get("performances", [])
-        perf = None
-        if performance_source is not None:
-            for candidate in performances:
-                if candidate.get("performance_source") == performance_source:
-                    perf = candidate
-                    break
-        if perf is None:
-            perf = performances[0] if performances else None
-        if perf is None:
-            raise ValueError(f"No performance rows available for CSR inference in {path}")
-        continuous = build_csr_performance_input_rows(
-            perf,
-            use_timing_scale_bit=use_timing_scale_bit,
-            timing_control_mode=timing_control_mode,
-            log_scale=timing_log_scale,
-        )
-    else:
-        continuous = build_epr_score_input_rows(
-            score,
-            use_timing_scale_bit=use_timing_scale_bit,
-            timing_control_mode=timing_control_mode,
-            log_scale=timing_log_scale,
-            musical_feature_mode=musical_feature_mode,
-            score_note_schema=score_note_schema,
-            disable_musical_features=disable_musical_features,
-            pedal_control_dim=pedal_control_dim,
-        )
+    continuous = build_epr_score_input_rows(
+        score,
+        use_timing_scale_bit=use_timing_scale_bit,
+        timing_control_mode=timing_control_mode,
+        log_scale=timing_log_scale,
+        musical_feature_mode=musical_feature_mode,
+        score_note_schema=score_note_schema,
+        disable_musical_features=disable_musical_features,
+        pedal_control_dim=pedal_control_dim,
+    )
     score_shared_raw = [row[:3] for row in score["score_raw"]]
     return pitch, continuous, score_shared_raw, work
 
@@ -544,37 +525,6 @@ def musical_rows_to_score_features(rows):
     return features
 
 
-def csr_metric_summary(pred_rows, target_rows, mask):
-    valid = torch.tensor(mask, dtype=torch.bool)
-    if not valid.any():
-        return {"valid_notes": 0}
-    pred = torch.tensor(pred_rows, dtype=torch.float32)[valid]
-    target = torch.tensor(target_rows, dtype=torch.float32)[valid]
-
-    def mae(idx, scale=1.0):
-        return float((pred[:, idx] * scale - target[:, idx] * scale).abs().mean().item())
-
-    def acc(idx):
-        return float(((pred[:, idx] >= 0.5) == (target[:, idx] >= 0.5)).float().mean().item())
-
-    stem_pred = pred[:, 10:12].argmax(dim=-1)
-    stem_target = target[:, 10:12].argmax(dim=-1)
-    return {
-        "valid_notes": int(valid.sum().item()),
-        "mo_mae_quarter": mae(0, 6.0),
-        "ioi_zero_acc": acc(1),
-        "md_mae_quarter": mae(2, 6.0),
-        "ml_mae_quarter": mae(3, 6.0),
-        "tempo_mae_norm": mae(4, 1.0),
-        "first_acc": acc(5),
-        "grace_acc": acc(6),
-        "hand_acc": acc(7),
-        "trill_acc": acc(8),
-        "stacc_acc": acc(9),
-        "stem_acc": float((stem_pred == stem_target).float().mean().item()),
-    }
-
-
 def labels_for_perf(config, perf, score_shared_raw):
     labels = performance_dev_velocity_pedal4_binary_rows(
         perf,
@@ -695,97 +645,14 @@ def build_eval_gt_midis(config, loaded, gt_rel_paths, pitch, output_dir, score_s
     return output_paths, scales
 
 
-def predict_one_csr_work(model, device, config, work, args):
-    score_source = work["score_source"]
-    selected_sources = work.get("selected_performance_sources") or [None]
-    performance_source = selected_sources[0]
-    pitch, continuous, score_shared_raw, loaded = load_score_from_node(
-        Path(work["path"]),
-        use_timing_scale_bit=config.get("use_timing_scale_bit", False),
-        timing_control_mode=config.get("timing_control_mode", "log_scaled"),
-        timing_log_scale=config.get("timing_log_scale", 50.0),
-        musical_feature_mode="continuous",
-        score_note_schema=config.get("score_note_input_schema", "integrated"),
-        task_type="csr",
-        performance_source=performance_source,
-    )
-    score = loaded["score"]
-    windows = build_windows(len(pitch), config["block_notes"], config["overlap_ratio"])
-    style_creator_id, style_source_id = style_ids_for_work(config, loaded, args.performance_dataset)
-
-    pred_continuous = batch_window_predictions(
-        model=model,
-        pitch=pitch,
-        continuous=continuous,
-        score_shared_raw=score_shared_raw,
-        score=score,
-        windows=windows,
-        pitch_pad_id=config["pitch_pad_id"],
-        device=device,
-        batch_size=args.batch_size_windows,
-        sampling_strategy=resolve_sampling_strategy(args),
-        style_creator_id=style_creator_id,
-        style_source_id=style_source_id,
-    ) if args.merge_mode == "average" else continuation_window_predictions(
-        model=model,
-        pitch=pitch,
-        continuous=continuous,
-        score_shared_raw=score_shared_raw,
-        score=score,
-        windows=windows,
-        pitch_pad_id=config["pitch_pad_id"],
-        device=device,
-        sampling_strategy=resolve_sampling_strategy(args),
-        drop_ratio=args.continuation_drop_ratio,
-        style_creator_id=style_creator_id,
-        style_source_id=style_source_id,
-    )
-
-    target_rows = build_score_musical_rows(score, musical_feature_mode="continuous")
-    has_score_feature = score.get("has_score_feature", [0] * len(pitch))
-    pred_rows = pred_continuous.float().cpu().tolist()
-    score_features = musical_rows_to_score_features(pred_rows)
-
-    raw_dir = args.output_dir / "raw_outputs"
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    score_stem = Path(score_source).with_suffix("").as_posix().replace("/", "__")
-    raw_path = raw_dir / f"{score_stem}__csr.json"
-    payload = {
-        "score_source": score_source,
-        "performance_source": performance_source,
-        "protocol": args.protocol,
-        "timing_representation": "inr0624_csr_musical12",
-        "pitch": [int(value) for value in pitch],
-        "predicted_musical": pred_rows,
-        "predicted_score_feature": score_features,
-        "target_musical": target_rows,
-        "has_score_feature": has_score_feature,
-        "metrics": csr_metric_summary(pred_rows, target_rows, has_score_feature),
-        "note_count": len(pitch),
-        "num_windows": len(windows),
-    }
-    raw_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    return {
-        "score_source": score_source,
-        "performance_source": performance_source,
-        "raw_output_paths": [str(raw_path.resolve())],
-        "metrics": payload["metrics"],
-        "note_count": len(pitch),
-        "num_windows": len(windows),
-    }
-
-
 def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir):
-    if str(config.get("task_type", "epr")).lower() == "csr":
-        return predict_one_csr_work(model, device, config, work, args)
-
     score_source = work["score_source"]
     pitch, continuous, score_shared_raw, loaded = load_score_from_node(
         Path(work["path"]),
         use_timing_scale_bit=config.get("use_timing_scale_bit", False),
-        timing_control_mode=config.get("timing_control_mode", "log_scaled"),
+        timing_control_mode=config.get("timing_control_mode", "dinr_floor_log"),
         timing_log_scale=config.get("timing_log_scale", 50.0),
-        musical_feature_mode=config.get("musical_feature_mode", "categorical"),
+        musical_feature_mode=config.get("musical_feature_mode", "musical51_full"),
         score_note_schema=config.get("score_note_input_schema", "integrated"),
         task_type="epr",
         disable_musical_features=config.get("disable_musical_features", False),
@@ -1084,22 +951,6 @@ def build_pair_list(items):
     ]
 
 
-def summarize_csr_items(items):
-    metric_sums = defaultdict(float)
-    metric_counts = defaultdict(int)
-    for item in items:
-        metrics = item.get("metrics") or {}
-        for key, value in metrics.items():
-            if key == "valid_notes":
-                continue
-            metric_sums[key] += float(value)
-            metric_counts[key] += 1
-    return {
-        key: metric_sums[key] / max(metric_counts[key], 1)
-        for key in sorted(metric_sums)
-    }
-
-
 def filter_manifest_by_performance_dataset(
     manifest,
     metadata_path,
@@ -1247,8 +1098,6 @@ def main():
         "exclude_performance_dataset": args.exclude_performance_dataset,
         "items": items,
     }
-    if str(config.get("task_type", "epr")).lower() == "csr":
-        manifest_payload["csr_summary"] = summarize_csr_items(items)
     pair_list = build_pair_list(items)
     manifest_path.write_text(json.dumps(manifest_payload, indent=2, ensure_ascii=False))
     pair_list_path.write_text(json.dumps(pair_list, indent=2, ensure_ascii=False))

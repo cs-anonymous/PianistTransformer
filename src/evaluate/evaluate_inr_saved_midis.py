@@ -20,15 +20,12 @@ FEATURE_KEYS = [
     ("ioi", "ioi"),
     ("duration", "duration"),
     ("velocity", "velocity"),
-    ("pedal_0", "pedal_0"),
-    ("pedal_25", "pedal_25"),
-    ("pedal_50", "pedal_50"),
-    ("pedal_75", "pedal_75"),
 ]
-
-LOG_WASS_SCALE = 50.0
-LOG_WASS_MAX_TIME_MS = 5000.0
-
+LOG_FEATURE_KEYS = [
+    ("log_ioi", "ioi"),
+    ("log_duration", "duration"),
+]
+PEDAL_FEATURES = ("pedal_0", "pedal_25", "pedal_50", "pedal_75")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate deterministic or sampling INR predictions against multi-reference GT sets.")
@@ -87,6 +84,11 @@ def feature_wasserstein(pred_values, gt_values):
     return float(wasserstein_distance(pred_values, gt_values))
 
 
+def log_timing_values(values, scale=50.0):
+    values = np.asarray(values, dtype=np.float64)
+    return np.log1p(np.clip(values, 0.0, None) / float(scale))
+
+
 def binary_pedal_arrays(note_arrays, threshold=64.0):
     return {
         key: (np.asarray(note_arrays[key], dtype=np.float64) >= float(threshold)).astype(np.float64)
@@ -101,18 +103,6 @@ def raw_or_thresholded_pred_pedal_arrays(prediction_path, raw_output_path=None, 
         except Exception:
             pass
     return binary_pedal_arrays(cached_note_arrays(str(Path(prediction_path).resolve())), threshold=threshold)
-
-
-def log_time_values(values, scale=LOG_WASS_SCALE, max_time_ms=LOG_WASS_MAX_TIME_MS):
-    values = np.asarray(values, dtype=np.float64)
-    values = np.clip(values, 0.0, float(max_time_ms))
-    return np.log1p(values / float(scale))
-
-
-def floorlog_time_values(values, max_time_ms=LOG_WASS_MAX_TIME_MS):
-    values = np.asarray(values, dtype=np.float64)
-    values = np.clip(values, 0.0, float(max_time_ms))
-    return np.log(np.maximum(values, 1.0))
 
 
 def pp_wass_metrics(prediction_paths, gt_paths, raw_output_paths=None, pedal_binary_support=False, pedal_binary_threshold=64.0):
@@ -133,30 +123,28 @@ def pp_wass_metrics(prediction_paths, gt_paths, raw_output_paths=None, pedal_bin
 
     output = {}
     for metric_name, feature_name in FEATURE_KEYS:
-        if metric_name.startswith("pedal_") and pedal_binary_support:
-            pred_source = pred_pedal_arrays
-            gt_source = gt_pedal_arrays
-        else:
-            pred_source = pred_arrays
-            gt_source = gt_arrays
+        pred_source = pred_arrays
+        gt_source = gt_arrays
         pred_pool = np.concatenate([item[feature_name] for item in pred_source]) if pred_source else np.asarray([], dtype=np.float64)
         gt_pool = np.concatenate([item[feature_name] for item in gt_source]) if gt_source else np.asarray([], dtype=np.float64)
         output[f"{metric_name}_wass"] = feature_wasserstein(pred_pool, gt_pool)
-        if metric_name in {"ioi", "duration"}:
-            output[f"{metric_name}_log50_wass"] = feature_wasserstein(
-                log_time_values(pred_pool),
-                log_time_values(gt_pool),
-            )
-            output[f"{metric_name}_floorlog_wass"] = feature_wasserstein(
-                floorlog_time_values(pred_pool),
-                floorlog_time_values(gt_pool),
-            )
+    for metric_name, feature_name in LOG_FEATURE_KEYS:
+        pred_source = pred_arrays
+        gt_source = gt_arrays
+        pred_pool = np.concatenate([log_timing_values(item[feature_name]) for item in pred_source]) if pred_source else np.asarray([], dtype=np.float64)
+        gt_pool = np.concatenate([log_timing_values(item[feature_name]) for item in gt_source]) if gt_source else np.asarray([], dtype=np.float64)
+        output[f"{metric_name}_wass"] = feature_wasserstein(pred_pool, gt_pool)
 
-    pedal_keys = [f"{name}_wass" for name in ("pedal_0", "pedal_25", "pedal_50", "pedal_75")]
-    output["pedal_wass"] = finite_mean([output[key] for key in pedal_keys])
-    output["pedal_start_wass"] = feature_wasserstein(
-        np.concatenate([item["pedal_0"] for item in pred_arrays]) if pred_arrays else np.asarray([], dtype=np.float64),
-        np.concatenate([item["pedal_0"] for item in gt_arrays]) if gt_arrays else np.asarray([], dtype=np.float64),
+    pedal_pred_source = pred_pedal_arrays if pedal_binary_support else pred_arrays
+    pedal_gt_source = gt_pedal_arrays if pedal_binary_support else gt_arrays
+    output["pedal_wass"] = finite_mean(
+        [
+            feature_wasserstein(
+                np.concatenate([item[name] for item in pedal_pred_source]) if pedal_pred_source else np.asarray([], dtype=np.float64),
+                np.concatenate([item[name] for item in pedal_gt_source]) if pedal_gt_source else np.asarray([], dtype=np.float64),
+            )
+            for name in PEDAL_FEATURES
+        ]
     )
     return output
 
@@ -180,14 +168,9 @@ def pn_wass_metrics(prediction_paths, gt_paths, raw_output_paths=None, pedal_bin
 
     output = {}
     for metric_name, feature_name in FEATURE_KEYS:
-        if metric_name.startswith("pedal_") and pedal_binary_support:
-            pred_source = pred_pedal_arrays
-            gt_source = gt_pedal_arrays
-            all_source = pred_pedal_arrays + gt_pedal_arrays
-        else:
-            pred_source = pred_arrays
-            gt_source = gt_arrays
-            all_source = all_arrays
+        pred_source = pred_arrays
+        gt_source = gt_arrays
+        all_source = all_arrays
         usable = min((len(item[feature_name]) for item in all_source), default=0)
         note_wass = [
             feature_wasserstein(
@@ -197,34 +180,35 @@ def pn_wass_metrics(prediction_paths, gt_paths, raw_output_paths=None, pedal_bin
             for note_idx in range(usable)
         ]
         output[f"{metric_name}_wass"] = finite_mean(note_wass)
-        if metric_name in {"ioi", "duration"}:
-            note_log_wass = [
-                feature_wasserstein(
-                    [log_time_values([item[feature_name][note_idx]])[0] for item in pred_source],
-                    [log_time_values([item[feature_name][note_idx]])[0] for item in gt_source],
-                )
-                for note_idx in range(usable)
-            ]
-            output[f"{metric_name}_log50_wass"] = finite_mean(note_log_wass)
-            note_floorlog_wass = [
-                feature_wasserstein(
-                    [floorlog_time_values([item[feature_name][note_idx]])[0] for item in pred_source],
-                    [floorlog_time_values([item[feature_name][note_idx]])[0] for item in gt_source],
-                )
-                for note_idx in range(usable)
-            ]
-            output[f"{metric_name}_floorlog_wass"] = finite_mean(note_floorlog_wass)
-
-    pedal_keys = [f"{name}_wass" for name in ("pedal_0", "pedal_25", "pedal_50", "pedal_75")]
-    output["pedal_wass"] = finite_mean([output[key] for key in pedal_keys])
-    usable = min((len(item["pedal_0"]) for item in all_arrays), default=0)
-    output["pedal_start_wass"] = finite_mean(
-        [
+    for metric_name, feature_name in LOG_FEATURE_KEYS:
+        pred_source = pred_arrays
+        gt_source = gt_arrays
+        all_source = all_arrays
+        usable = min((len(item[feature_name]) for item in all_source), default=0)
+        note_wass = [
             feature_wasserstein(
-                [item["pedal_0"][note_idx] for item in pred_arrays],
-                [item["pedal_0"][note_idx] for item in gt_arrays],
+                [log_timing_values([item[feature_name][note_idx]])[0] for item in pred_source],
+                [log_timing_values([item[feature_name][note_idx]])[0] for item in gt_source],
             )
             for note_idx in range(usable)
+        ]
+        output[f"{metric_name}_wass"] = finite_mean(note_wass)
+
+    pedal_pred_source = pred_pedal_arrays if pedal_binary_support else pred_arrays
+    pedal_gt_source = gt_pedal_arrays if pedal_binary_support else gt_arrays
+    pedal_all_source = (pred_pedal_arrays + gt_pedal_arrays) if pedal_binary_support else all_arrays
+    output["pedal_wass"] = finite_mean(
+        [
+            finite_mean(
+                [
+                    feature_wasserstein(
+                        [item[name][note_idx] for item in pedal_pred_source],
+                        [item[name][note_idx] for item in pedal_gt_source],
+                    )
+                    for note_idx in range(min((len(item[name]) for item in pedal_all_source), default=0))
+                ]
+            )
+            for name in PEDAL_FEATURES
         ]
     )
     return output
@@ -380,12 +364,6 @@ def main():
         "protocol": manifest["protocol"],
         "num_samples": manifest["num_samples"],
         "num_scores": len(score_rows),
-        "log_wass": {
-            "log50_scale": LOG_WASS_SCALE,
-            "max_time_ms": LOG_WASS_MAX_TIME_MS,
-            "features": ["ioi", "duration"],
-            "floorlog": "log(max(clamp(t_ms, 0, max_time_ms), 1.0))",
-        },
         "pedal_metric_support": "binary_0_1" if pedal_binary_support else "raw_0_127",
         "pedal_binary_threshold": pedal_binary_threshold if pedal_binary_support else None,
         "aggregate": {

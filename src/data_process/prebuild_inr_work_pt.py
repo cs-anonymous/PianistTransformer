@@ -85,12 +85,12 @@ def build_dataset(config, manifest, split):
         pedal_representation=config.get("pedal_representation", "start_valley"),
         musical_feature_mode=config.get(
             "musical_feature_mode",
-            "continuous" if str(config.get("task_type", "epr")).lower() == "csr" else "categorical",
+            "musical51_full",
         ),
         disable_musical_features=config.get("disable_musical_features", False),
         epr_timing_target=config.get("epr_timing_target", "log_deviation"),
         use_timing_scale_bit=config.get("use_timing_scale_bit", False),
-        timing_control_mode=config.get("timing_control_mode", "log_scaled"),
+        timing_control_mode=config.get("timing_control_mode", "dinr_floor_log"),
         timing_log_scale=config.get("timing_log_scale", 50.0),
         use_prepared_sidecar=True,
         prepared_sidecar_tag=config.get("prepared_sidecar_tag"),
@@ -136,7 +136,7 @@ def main():
     parser.add_argument("--min-notes", type=int, default=64)
     parser.add_argument("--task-type", default="epr")
     parser.add_argument("--input-feature-mode", default="integrated")
-    parser.add_argument("--timing-input-normalization", default="log1p_t_over_50_5000")
+    parser.add_argument("--timing-input-normalization", default="linear_5000")
     parser.add_argument("--max-time-ms", type=float, default=10000.0)
     parser.add_argument("--pedal-representation", default="start_valley")
     parser.add_argument("--pedal-valley-pos-weight", type=float, default=None)
@@ -144,7 +144,7 @@ def main():
     parser.add_argument("--disable-musical-features", action="store_true")
     parser.add_argument("--epr-timing-target", default="log_deviation")
     parser.add_argument("--use-timing-scale-bit", type=int, default=0)
-    parser.add_argument("--timing-control-mode", default="log_scaled")
+    parser.add_argument("--timing-control-mode", default="dinr_floor_log")
     parser.add_argument("--timing-log-scale", type=float, default=50.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--node-cache-size", type=int, default=8)

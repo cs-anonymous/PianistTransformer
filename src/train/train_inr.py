@@ -247,10 +247,9 @@ def default_input_continuous_dim(
     musical_feature_mode="categorical",
 ):
     if input_feature_mode == "integrated":
-        if task_type == "epr":
-            return integrated_epr_input_dim(musical_feature_mode=musical_feature_mode)
-        if task_type == "csr":
-            return integrated_epr_input_dim(musical_feature_mode="continuous")
+        if task_type != "epr":
+            raise ValueError("Only task_type=epr is supported")
+        return integrated_epr_input_dim(musical_feature_mode=musical_feature_mode)
     return continuous_dim
 
 
@@ -261,60 +260,26 @@ def infer_input_feature_mode(config):
     return "integrated"
 
 
-def resolve_timing_control_mode(timing_control_mode="log_scaled", use_timing_scale_bit=False):
-    if timing_control_mode is None:
-        return "log_scaled"
-    mode = str(timing_control_mode).lower()
-    valid_modes = {
-        "piecewise_scale_bit",
-        "piecewise_single",
-        "dual_log_linear",
-        "dual_clip_linear",
-        "log_scaled",
-        "floor_log",
-        "dinr_floor_log",
-        "raw_log",
-    }
-    if mode not in valid_modes:
-        raise ValueError(f"Unsupported timing_control_mode={timing_control_mode}")
-    return mode
+def resolve_timing_control_mode(timing_control_mode="dinr_floor_log", use_timing_scale_bit=False):
+    mode = "dinr_floor_log" if timing_control_mode is None else str(timing_control_mode).lower()
+    if mode != "dinr_floor_log":
+        raise ValueError("Only timing_control_mode=dinr_floor_log is supported")
+    return "dinr_floor_log"
 
 
-def timing_control_feature_dim(timing_control_mode="log_scaled", use_timing_scale_bit=False):
-    mode = resolve_timing_control_mode(
+def timing_control_feature_dim(timing_control_mode="dinr_floor_log", use_timing_scale_bit=False):
+    resolve_timing_control_mode(
         timing_control_mode=timing_control_mode,
         use_timing_scale_bit=use_timing_scale_bit,
     )
-    if mode == "raw_log":
-        return 5
-    return 3 if mode in {"piecewise_single", "log_scaled", "floor_log", "dinr_floor_log"} else 5
+    return 3
 
 
-def musical_feature_dim(musical_feature_mode="categorical"):
+def musical_feature_dim(musical_feature_mode="musical51_full"):
     mode = str(musical_feature_mode).lower()
-    if mode in {"none", "off", "disabled", "no_musical", "nomus"}:
-        return 0
-    if mode == "continuous":
-        return 12
-    if mode in {
-        "categorical",
-        "categorical51",
-        "musical51",
-        "musical51_full",
-        "musical51_onset_only",
-        "musical51_annotation_only",
-        "musical51_duration_only",
-        "musical51_onset_annotation",
-        "musical51_no_duration",
-        "musical51_no_length",
-        "musical51_no_duration_length",
-    }:
+    if mode in {"musical51", "musical51_full"}:
         return 51
-    if mode in {"musical145_onset_annotation", "onset145_annotation"}:
-        return 151
-    if mode in {"categorical62", "musical62"}:
-        return 62
-    raise ValueError(f"Unsupported musical_feature_mode={musical_feature_mode}")
+    raise ValueError("Only musical_feature_mode=musical51_full is supported")
 
 
 def score_note_input_schema(config_or_value=None):
@@ -432,7 +397,7 @@ def stable_target_columns(channels=None):
 
 
 def integrated_epr_input_dim(
-    timing_control_mode="log_scaled",
+    timing_control_mode="dinr_floor_log",
     use_timing_scale_bit=False,
     musical_feature_mode="categorical",
     pedal_control_dim=2,
@@ -487,7 +452,7 @@ def default_epr_output_dim(epr_timing_target="log_deviation", pedal_representati
     return 3 + pedal_dim
 
 
-def score_musical_input_dim(timing_control_mode="log_scaled", use_timing_scale_bit=False, musical_feature_mode="categorical"):
+def score_musical_input_dim(timing_control_mode="dinr_floor_log", use_timing_scale_bit=False, musical_feature_mode="categorical"):
     control_dim = timing_control_feature_dim(
         timing_control_mode=timing_control_mode,
         use_timing_scale_bit=use_timing_scale_bit,
@@ -499,7 +464,7 @@ def decoder_perf_target_input_dim(output_dim=5):
     return int(output_dim) + 3
 
 
-def integrated_csr_output_dim():
+def integrated_removed_task_output_dim():
     return 12
 
 
@@ -831,49 +796,22 @@ def performance_dev_velocity_pedal4_binary_rows(
 
 
 def normalize_piecewise_time_value(time_ms):
-    max_ms = 8000.0 if mode == "dinr_floor_log" else 5000.0
-    value = min(max(float(time_ms), 0.0), max_ms)
+    value = min(max(float(time_ms), 0.0), 8000.0)
     if value <= 500.0:
         return value / 500.0
     return value / 5000.0
 
 
-def encode_timing_control_features(time_ms, timing_control_mode="log_scaled", use_timing_scale_bit=False, log_scale=50.0):
-    mode = resolve_timing_control_mode(
+def encode_timing_control_features(time_ms, timing_control_mode="dinr_floor_log", use_timing_scale_bit=False, log_scale=50.0):
+    resolve_timing_control_mode(
         timing_control_mode=timing_control_mode,
         use_timing_scale_bit=use_timing_scale_bit,
     )
-    value = min(max(float(time_ms), 0.0), 5000.0)
-    if mode == "piecewise_scale_bit":
-        return [
-            1.0 if value > 500.0 else 0.0,
-            normalize_piecewise_time_value(value),
-        ]
-    if mode == "piecewise_single":
-        return [normalize_piecewise_time_value(value)]
-    if mode == "dual_log_linear":
-        return [
-            normalize_log_timing_value(value, scale=1.0, max_time_ms=5000.0),
-            value / 5000.0,
-        ]
-    if mode == "log_scaled":
-        return [normalize_log_timing_value(value, scale=log_scale, max_time_ms=5000.0)]
-    if mode in {"floor_log", "dinr_floor_log"}:
-        return [math.log(max(value, 1.0))]
-    if mode == "dual_clip_linear":
-        return [
-            min(value / 500.0, 1.0),
-            value / 5000.0,
-        ]
-    if mode == "raw_log":
-        return [
-            value / 1000.0,
-            raw_log_timing_value(value, scale=log_scale),
-        ]
-    raise ValueError(f"Unsupported timing_control_mode={mode}")
+    value = min(max(float(time_ms), 0.0), 8000.0)
+    return [math.log(max(value, 1.0))]
 
 
-def encode_shared_control_row(raw_shared_row, use_timing_scale_bit=False, timing_control_mode="log_scaled", log_scale=50.0):
+def encode_shared_control_row(raw_shared_row, use_timing_scale_bit=False, timing_control_mode="dinr_floor_log", log_scale=50.0):
     ioi_ms = float(raw_shared_row[0])
     duration_ms = float(raw_shared_row[1])
     velocity = min(max(float(raw_shared_row[2]), 0.0), 127.0) / 127.0
@@ -1136,7 +1074,7 @@ def build_score_musical_rows(score, musical_feature_mode="continuous"):
 def build_epr_score_input_rows(
     score,
     use_timing_scale_bit=False,
-    timing_control_mode="log_scaled",
+    timing_control_mode="dinr_floor_log",
     log_scale=50.0,
     musical_feature_mode="categorical",
     score_note_schema="integrated",
@@ -1384,10 +1322,10 @@ def perf_style_stats_range_from_cache(cache, start, end):
     return stats
 
 
-def build_csr_performance_input_rows(
+def build_removed_task_performance_input_rows(
     perf,
     use_timing_scale_bit=False,
-    timing_control_mode="log_scaled",
+    timing_control_mode="dinr_floor_log",
     log_scale=50.0,
     pedal_binary_threshold=64.0,
 ):
@@ -1499,7 +1437,7 @@ class PianoCoReNodeSFTDataset(Dataset):
         epr_timing_target="log_deviation",
         disable_musical_features=False,
         use_timing_scale_bit=False,
-        timing_control_mode="log_scaled",
+        timing_control_mode="dinr_floor_log",
         timing_log_scale=50.0,
         precompute_items=False,
         use_prepared_sidecar=True,
@@ -1703,7 +1641,7 @@ class PianoCoReNodeSFTDataset(Dataset):
             return False
         if "pitch" not in score or "score_raw" not in score:
             return False
-        if self.task_type.lower() in {"epr", "csr"}:
+        if self.task_type.lower() == "epr":
             if "score_feature" not in score or "has_score_feature" not in score:
                 return False
 
@@ -1960,10 +1898,6 @@ class PianoCoReNodeSFTDataset(Dataset):
                 disable_musical_features=self.disable_musical_features,
                 pedal_control_dim=pedal_representation_dim(self.pedal_representation),
             )
-        elif derive_features and task_type == "csr":
-            prepared["score_musical"] = build_score_musical_rows(score, musical_feature_mode="continuous")
-            prepared["has_score_feature"] = score["has_score_feature"]
-
         if eager_labels:
             slimmed = []
             label_prepared = dict(prepared)
@@ -2050,17 +1984,6 @@ class PianoCoReNodeSFTDataset(Dataset):
             if labels is None:
                 raise KeyError(missing)
             return labels, None
-        if self.task_type.lower() == "csr":
-            labels = build_csr_performance_input_rows(
-                perf,
-                use_timing_scale_bit=self.use_timing_scale_bit,
-                timing_control_mode=self.timing_control_mode,
-                log_scale=self.timing_log_scale,
-            )
-            if labels is None:
-                raise KeyError("Missing label_shared_raw/label_pedal4_raw for CSR inputs")
-            return labels, None
-
         labels = performance_label_rows_for_representation(
             perf,
             pedal_representation=self.pedal_representation,
@@ -2183,11 +2106,6 @@ class PianoCoReNodeSFTDataset(Dataset):
             labels_continuous = labels[start:end]
             labels_epr_bins = label_bins[start:end] if label_bins is not None else None
             label_mask = None
-        elif task_type == "csr":
-            continuous = labels[start:end]
-            labels_continuous = self._score_musical_rows(prepared)[start:end]
-            labels_epr_bins = None
-            label_mask = self._score_feature_mask(prepared)[start:end]
         else:
             raise ValueError(f"Unsupported task_type: {self.task_type}")
 
@@ -2759,7 +2677,7 @@ class NodeSFTTrainer(Trainer):
         if labels is None or attention_mask is None or getattr(outputs, "logits", None) is None:
             return
         try:
-            loss_mask = inputs.get("label_mask") if str(getattr(self._model_config(self.model), "task_type", "epr")).lower() == "csr" and inputs.get("label_mask") is not None else attention_mask
+            loss_mask = attention_mask
             components = _compute_integrated_loss_components(
                 self._model_config(self.model),
                 outputs.logits,
@@ -3356,11 +3274,6 @@ class NodeSFTDataCollator:
                     decoder_feedback_continuous[..., 1],
                 )
         label_mask = None
-        if self.task_type == "csr":
-            label_mask_tensors = [
-                torch.tensor(example["label_mask"], dtype=torch.long) for example in examples
-            ]
-            label_mask = pad_sequence(label_mask_tensors, batch_first=True, padding_value=0)
 
         batch = {
             "example_index": torch.tensor([int(example["example_index"]) for example in examples], dtype=torch.long),
@@ -3496,30 +3409,11 @@ def create_model(train_config):
         timing_control_mode=train_config.get("timing_control_mode"),
         use_timing_scale_bit=train_config.get("use_timing_scale_bit", False),
     )
-    if task_type in {"epr", "csr"} and timing_control_mode not in {"log_scaled", "floor_log", "dinr_floor_log", "raw_log", "raw", "raw_seconds"}:
-        raise ValueError("Integrated INR requires timing_control_mode=log_scaled, floor_log, dinr_floor_log, raw_log, or raw")
-    if task_type == "epr" and epr_timing_target not in {
-        "log_deviation",
-        "log_dev",
-        "raw_log_deviation",
-        "raw_log_dev",
-        "floor_log_deviation",
-        "floor_log_dev",
-        "pure_log_deviation",
-        "pure_log_dev",
-        "raw_deviation",
-        "raw_dev",
-        "raw_seconds_deviation",
-        "raw_seconds_dev",
-        "absolute",
-        "absolute_log",
-        "log_absolute",
-        "raw_log_absolute",
-        "absolute_raw_log",
-        "floor_log_absolute",
-    }:
-        raise ValueError("EPR requires a supported deviation or absolute timing target")
-    use_timing_scale_bit = timing_control_mode == "piecewise_scale_bit"
+    if task_type != "epr":
+        raise ValueError("Only task_type=epr is supported")
+    if epr_timing_target not in {"floor_log_deviation", "floor_log_dev"}:
+        raise ValueError("Only epr_timing_target=floor_log_deviation is supported")
+    use_timing_scale_bit = False
     note_embedding_mode = str(train_config.get("note_embedding_mode", "sine")).lower()
     slot_share_role_encoders = train_config.get("slot_share_role_encoders")
     resume_path = train_config.get("resume_path")
@@ -3736,19 +3630,12 @@ def create_model(train_config):
                 "deviation EPR currently supports point/huber, SN, lan/can/ican, LN/MLN, beta, and mixture_beta, "
                 f"got epr_distribution={distribution}"
             )
-    elif task_type == "csr":
-        expected_output_dim = integrated_csr_output_dim()
-        actual_output_dim = int(train_config.get("output_continuous_dim", train_config["continuous_dim"]))
-        if actual_output_dim != expected_output_dim:
-            raise ValueError(
-                f"Integrated INR0624 CSR expects output_continuous_dim={expected_output_dim}, got {actual_output_dim}"
-            )
     score_feature_dim = train_config.get("score_feature_dim", 8)
     pedal_dim = pedal_representation_dim(train_config.get("pedal_representation", "start_valley"))
     musical_feature_mode = str(
         train_config.get(
             "musical_feature_mode",
-            "continuous" if task_type == "csr" else "categorical",
+            "musical51_full",
         )
     ).lower()
     default_score_input_dim = (
@@ -3764,7 +3651,7 @@ def create_model(train_config):
             musical_feature_mode=musical_feature_mode,
             pedal_control_dim=pedal_dim,
         )
-        if task_type in {"epr", "csr"} and input_feature_mode == "integrated"
+        if task_type == "epr" and input_feature_mode == "integrated"
         else default_input_continuous_dim(
             task_type,
             input_feature_mode,
@@ -3785,7 +3672,7 @@ def create_model(train_config):
     train_config["input_continuous_dim"] = input_continuous_dim
     train_config["score_input_continuous_dim"] = score_input_continuous_dim
     train_config["decoder_input_continuous_dim"] = decoder_input_continuous_dim
-    if task_type in {"epr", "csr"} and input_feature_mode == "integrated":
+    if task_type == "epr" and input_feature_mode == "integrated":
         if task_type == "epr" and score_note_schema == "score_musical":
             expected_score_dim = score_musical_input_dim(
                 timing_control_mode=timing_control_mode,
@@ -3838,15 +3725,15 @@ def create_model(train_config):
         task_type=task_type,
         time_loss_type=train_config["time_loss_type"],
         value_loss_type=train_config["value_loss_type"],
-        csr_grid_loss_type=train_config.get("csr_grid_loss_type", "huber"),
-        csr_grid_step=train_config.get("csr_grid_step", 1.0 / 24.0),
-        csr_grid_soft_ce_tau=train_config.get("csr_grid_soft_ce_tau", 1.5),
-        csr_mo_max=train_config.get("csr_mo_max", 6.0),
-        csr_md_max=train_config.get("csr_md_max", 6.0),
-        csr_ml_max=train_config.get("csr_ml_max", 6.0),
+        removed_task_grid_loss_type=train_config.get("removed_task_grid_loss_type", "huber"),
+        removed_task_grid_step=train_config.get("removed_task_grid_step", 1.0 / 24.0),
+        removed_task_grid_soft_ce_tau=train_config.get("removed_task_grid_soft_ce_tau", 1.5),
+        removed_task_mo_max=train_config.get("removed_task_mo_max", 6.0),
+        removed_task_md_max=train_config.get("removed_task_md_max", 6.0),
+        removed_task_ml_max=train_config.get("removed_task_ml_max", 6.0),
         huber_delta=train_config["huber_delta"],
         loss_weights=train_config["loss_weights"],
-        csr_loss_weights=train_config.get("csr_loss_weights"),
+        removed_task_loss_weights=train_config.get("removed_task_loss_weights"),
         decoder_input_mode=train_config["decoder_input_mode"],
         input_feature_mode=input_feature_mode,
         note_embedding_mode=note_embedding_mode,
@@ -3884,10 +3771,10 @@ def create_model(train_config):
         dlm_velocity_bins=train_config.get("dlm_velocity_bins", 128),
         dlm_ioi_zero_min=train_config.get("dlm_ioi_zero_min", 0.0),
         dlm_ioi_zero_max=train_config.get("dlm_ioi_zero_max", 5.0),
-        dlm_ioi_nonzero_min=train_config.get("dlm_ioi_nonzero_min", -2.5),
-        dlm_ioi_nonzero_max=train_config.get("dlm_ioi_nonzero_max", 1.5),
-        dlm_duration_min=train_config.get("dlm_duration_min", -3.0),
-        dlm_duration_max=train_config.get("dlm_duration_max", 2.0),
+        dlm_ioi_nonzero_min=-2.0,
+        dlm_ioi_nonzero_max=1.0,
+        dlm_duration_min=-2.0,
+        dlm_duration_max=1.0,
         dlm_velocity_min=train_config.get("dlm_velocity_min", -0.5),
         dlm_velocity_max=train_config.get("dlm_velocity_max", 127.5),
         dlm_scale_min=train_config.get("dlm_scale_min", 1e-3),
@@ -3959,7 +3846,7 @@ def create_model(train_config):
         dinr_vocabulary_mode=train_config.get("dinr_vocabulary_mode", "unified"),
         dinr_absolute_max_ms=train_config.get("dinr_absolute_max_ms", 8000.0),
         dinr_deviation_min=train_config.get("dinr_deviation_min", -2.0),
-        dinr_deviation_max=train_config.get("dinr_deviation_max", 2.0),
+        dinr_deviation_max=train_config.get("dinr_deviation_max", 1.0),
         dinr_zero_ioi_min=train_config.get("dinr_zero_ioi_min", 0.0),
         dinr_zero_ioi_max=train_config.get("dinr_zero_ioi_max", 5.0),
         dinr_sampling_temperature=train_config.get("dinr_sampling_temperature", 1.0),
@@ -4298,35 +4185,19 @@ def main():
         timing_control_mode=train_config.get("timing_control_mode"),
         use_timing_scale_bit=train_config.get("use_timing_scale_bit", False),
     )
-    if task_type in {"epr", "csr"} and timing_control_mode not in {"log_scaled", "floor_log", "dinr_floor_log", "raw_log"}:
-        raise ValueError("Integrated INR requires timing_control_mode=log_scaled, floor_log, dinr_floor_log, or raw_log")
-    if task_type == "epr" and str(train_config.get("epr_timing_target", "log_deviation")).lower() not in {
-        "log_deviation",
-        "log_dev",
-        "raw_log_deviation",
-        "raw_log_dev",
+    if task_type != "epr":
+        raise ValueError("Only task_type=epr is supported")
+    if str(train_config.get("epr_timing_target", "floor_log_deviation")).lower() not in {
         "floor_log_deviation",
         "floor_log_dev",
-        "pure_log_deviation",
-        "pure_log_dev",
-        "raw_deviation",
-        "raw_dev",
-        "raw_seconds_deviation",
-        "raw_seconds_dev",
-        "absolute",
-        "absolute_log",
-        "log_absolute",
-        "raw_log_absolute",
-        "absolute_raw_log",
-        "floor_log_absolute",
     }:
-        raise ValueError("EPR requires a supported deviation or absolute timing target")
+        raise ValueError("Only epr_timing_target=floor_log_deviation is supported")
     train_config["timing_control_mode"] = timing_control_mode
-    train_config["use_timing_scale_bit"] = timing_control_mode == "piecewise_scale_bit"
+    train_config["use_timing_scale_bit"] = False
     musical_feature_mode = str(
         train_config.get(
             "musical_feature_mode",
-            "continuous" if task_type == "csr" else "categorical",
+            "musical51_full",
         )
     ).lower()
     train_config["musical_feature_mode"] = musical_feature_mode
@@ -4362,8 +4233,8 @@ def main():
         train_config["continuous_dim"] = base_output_dim
         train_config["output_continuous_dim"] = base_output_dim
     if train_config.get("use_style_tokens", False):
-        raise ValueError("use_style_tokens is disabled for the simplified EPR/CSR pipelines")
-    if task_type in {"epr", "csr"} and input_feature_mode == "integrated":
+        raise ValueError("use_style_tokens is disabled for the simplified EPR pipeline")
+    if task_type == "epr" and input_feature_mode == "integrated":
         if task_type == "epr" and score_note_input_schema(train_config) == "score_musical":
             inferred_input_dim = score_musical_input_dim(
                 timing_control_mode=timing_control_mode,
@@ -4397,9 +4268,6 @@ def main():
                 musical_feature_mode=musical_feature_mode,
             ),
         )
-    if task_type == "csr":
-        train_config.setdefault("output_continuous_dim", integrated_csr_output_dim())
-
     if args.max_steps is not None:
         train_config["max_steps"] = args.max_steps
     if args.limit_works is not None:

@@ -30,7 +30,7 @@ def common(cfg, name):
             "run_name": f"unified_musical_{name}",
             "output_dir": str(run_root / name / "training"),
             "logging_dir": str(run_root / name / "tf-logs"),
-            "slot_version": "slot8",
+            "slot_version": "slot6",
             "slot_dim": 128,
             "slot_fusion": "mlp",
             "slot_gates": False,
@@ -41,7 +41,7 @@ def common(cfg, name):
             "timing_control_mode": "dinr_floor_log",
             "epr_timing_target": "floor_log_deviation",
             "eval_gt_time_normalization": "score_onset_span",
-            "prepared_sidecar_tag": "ASAP_FLOORLOG_NOMUS_SCORESPAN",
+            "prepared_sidecar_tag": "ASAP_DINR_SCORESPAN",
             "train_performance_dataset": "ASAP",
             "eval_performance_dataset": "ASAP",
             "eval_include_all_performance_dataset": "ASAP",
@@ -137,7 +137,7 @@ for name, cfg in configs.items():
         {
             "sampling": {"temperature": 1.0, "top_p": 0.90, "top_k": 0, "num_samples": 2, "seed": 42},
             "shared": {
-                "slot_version": "slot8",
+                "slot_version": "slot6",
                 "musical_feature_mode": "musical51_full",
                 "timing_control_mode": "dinr_floor_log",
                 "ioi_nonzero_support": [-2.0, 1.0],
