@@ -133,32 +133,17 @@ def slot_version_is_pt(slot_version):
     return normalize_slot_version(slot_version) in {"slot5", "slot6", "slot7", "slot9"}
 
 
-def normalize_pedal_representation(pedal_representation="start_valley"):
-    value = str(pedal_representation or "start_valley").lower()
-    aliases = {
-        "binary4": "binary_4",
-        "pedal4_binary": "binary_4",
-        "start-valley": "start_valley",
-        "pedal_start_valley": "start_valley",
-        "pedal_start_has_valley": "start_valley",
-        "pedal_start": "start",
-        "start_only": "start",
-        "start_dlm": "start",
-    }
+def normalize_pedal_representation(pedal_representation="binary_4"):
+    value = str(pedal_representation or "binary_4").lower()
+    aliases = {"binary4": "binary_4", "pedal4_binary": "binary_4"}
     value = aliases.get(value, value)
-    if value not in {"binary_4", "start_valley", "start"}:
-        raise ValueError(
-            f"Unsupported pedal_representation={pedal_representation}; use binary_4, start_valley, or start"
-        )
+    if value != "binary_4":
+        raise ValueError("Only pedal_representation=binary_4 is supported")
     return value
 
 
-def pedal_representation_dim(pedal_representation="start_valley"):
-    representation = normalize_pedal_representation(pedal_representation)
-    if representation == "start_valley":
-        return 2
-    if representation == "start":
-        return 1
+def pedal_representation_dim(pedal_representation="binary_4"):
+    normalize_pedal_representation(pedal_representation)
     return 4
 
 
@@ -335,12 +320,12 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         dinr_sampling_top_k=0,
         dinr_numerical_frequencies=16,
         dinr_output_deviation_numerical_coordinates=True,
-        epr_timing_target="log_deviation",
+        epr_timing_target="floor_log_deviation",
         timing_control_mode="dinr_floor_log",
         timing_log_scale=50.0,
         use_timing_scale_bit=False,
         soft_ce_tau=None,
-        timing_input_normalization="scaled_log_5000_s10",
+        timing_input_normalization="linear_5000",
         musical_feature_mode="categorical",
         slot_version=None,
         slot_dim=None,
@@ -380,7 +365,7 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         zero_ioi_dual_distribution_mode="none",
         zero_ioi_dual_duration=True,
         piano_pitch_min=21,
-        pedal_representation="start_valley",
+        pedal_representation="binary_4",
         use_style_tokens=False,
         style_creator_vocab_size=1,
         style_source_vocab_size=1,
@@ -870,7 +855,7 @@ class IntegratedNoteEncoder(nn.Module):
         self.score_control_dim = int(
             getattr(config, "score_control_feature_dim", getattr(config, "control_feature_dim", 5))
         )
-        self.pedal_dim = pedal_representation_dim(getattr(config, "pedal_representation", "start_valley"))
+        self.pedal_dim = pedal_representation_dim(getattr(config, "pedal_representation", "binary_4"))
         self.performance_control_dim = int(
             getattr(
                 config,
@@ -1056,7 +1041,7 @@ class IntegratedNoteEncoder(nn.Module):
             )
         else:
             expected_perf_dim = self.slot_timing_dim * 2 + 1 + pedal_representation_dim(
-                getattr(config, "pedal_representation", "start_valley")
+                getattr(config, "pedal_representation", "binary_4")
             )
             if self.score_control_dim != self.slot_timing_dim * 2 + 1:
                 raise ValueError(
@@ -2051,7 +2036,7 @@ class IntegratedContinuousDecoder(nn.Module):
         self.output_dim = config.output_continuous_dim
         self.epr_distribution = getattr(config, "epr_distribution", "point").lower()
         self.pedal_distribution = getattr(config, "pedal_distribution", self.epr_distribution).lower()
-        self.pedal_representation = normalize_pedal_representation(getattr(config, "pedal_representation", "start_valley"))
+        self.pedal_representation = normalize_pedal_representation(getattr(config, "pedal_representation", "binary_4"))
         self.pedal_dim = pedal_representation_dim(self.pedal_representation)
         head_depth = getattr(config, "head_depth", 2)
         head_width_multiplier = float(getattr(config, "head_width_multiplier", 1.0))
@@ -2071,7 +2056,7 @@ class IntegratedContinuousDecoder(nn.Module):
             ioi_output_dim = int(config.dinr_output_timing_bins)
             duration_output_dim = int(config.dinr_output_timing_bins)
             velocity_output_dim = 128
-            pedal_output_dim = 8 if self.pedal_representation == "binary_4" else self.pedal_dim
+            pedal_output_dim = self.pedal_dim
         elif (
             getattr(config, "task_type", "epr") == "epr"
             and self.epr_distribution in {"categorical", "hard_categorical", "soft_categorical"}
@@ -2080,12 +2065,12 @@ class IntegratedContinuousDecoder(nn.Module):
             duration_output_dim = int(config.epr_timing_bins)
             velocity_output_dim = int(config.epr_value_bins)
             pedal_output_dim = int(config.epr_value_bins) * 4
-            if self.pedal_representation == "start_valley":
-                pedal_output_dim = 2
+            if self.pedal_representation == "binary_4":
+                pedal_output_dim = self.pedal_dim
         elif getattr(config, "task_type", "epr") == "epr" and self.epr_distribution == "beta_mu_kappa":
             ioi_output_dim = duration_output_dim = velocity_output_dim = 2
             shared_pack_mode = "beta_mu_kappa"
-            pedal_output_dim = 8 if self.pedal_representation == "binary_4" else 2
+            pedal_output_dim = self.pedal_dim
         elif (
             getattr(config, "task_type", "epr") == "epr"
             and _is_scalar_distribution(self.epr_distribution)
@@ -2120,7 +2105,7 @@ class IntegratedContinuousDecoder(nn.Module):
                 velocity_output_dim = components * 3
             pedal_components = _scalar_distribution_components(config, self.pedal_distribution)
             pedal_output_dim = pedal_components * _scalar_distribution_dim(self.pedal_distribution) * 4
-            if self.pedal_representation in {"binary_4", "start_valley"}:
+            if self.pedal_representation == "binary_4":
                 pedal_output_dim = self.pedal_dim
         elif (
             getattr(config, "task_type", "epr") == "epr"
@@ -2134,13 +2119,7 @@ class IntegratedContinuousDecoder(nn.Module):
             duration_output_dim = per_feature_dim
             velocity_distribution = str(getattr(config, "velocity_distribution", "skew_normal")).lower()
             velocity_output_dim = per_feature_dim if velocity_distribution in DLM_DISTRIBUTIONS else 3
-            pedal_distribution = str(getattr(config, "pedal_distribution", "point")).lower()
-            if self.pedal_representation == "start" and pedal_distribution in DLM_DISTRIBUTIONS:
-                pedal_output_dim = per_feature_dim + (
-                    2 if bool(getattr(config, "dlm_pedal_zero_one_inflated", False)) else 0
-                )
-            else:
-                pedal_output_dim = self.pedal_dim
+            pedal_output_dim = self.pedal_dim
         else:
             ioi_output_dim = duration_output_dim = velocity_output_dim = 1
             pedal_output_dim = self.pedal_dim
@@ -2437,15 +2416,13 @@ def _split_dinr_logits(config, raw_outputs):
     ioi_end = timing_bins
     duration_end = ioi_end + timing_bins
     velocity_end = duration_end + 128
-    pedal_dim = 8 if normalize_pedal_representation(getattr(config, "pedal_representation", "binary_4")) == "binary_4" else pedal_representation_dim(getattr(config, "pedal_representation", "binary_4"))
+    pedal_dim = pedal_representation_dim(getattr(config, "pedal_representation", "binary_4"))
     pedal_end = velocity_end + pedal_dim
     if raw_outputs.shape[-1] != pedal_end:
         raise ValueError(
             f"Unexpected DINR output width {raw_outputs.shape[-1]}, expected {pedal_end}"
         )
     pedal = raw_outputs[..., velocity_end:pedal_end]
-    if pedal_dim == 8:
-        pedal = pedal.reshape(*raw_outputs.shape[:-1], 4, 2)
     return {
         "ioi": raw_outputs[..., :ioi_end],
         "duration": raw_outputs[..., ioi_end:duration_end],
@@ -2470,9 +2447,6 @@ def _dinr_coordinates(config, reference, vocabulary="deviation"):
 
 def _dinr_support_mask(config, logits, feature, score_shared_raw=None):
     coordinates = _dinr_coordinates(config, logits)
-    if _uses_absolute_epr_targets(config):
-        valid = (coordinates >= 0.0) & (coordinates <= 9.0)
-        return logits.masked_fill(~valid.view(*([1] * (logits.ndim - 1)), -1), float("-inf"))
     if feature == "duration":
         valid = (coordinates >= float(config.dinr_deviation_min)) & (
             coordinates <= float(config.dinr_deviation_max)
@@ -2518,20 +2492,15 @@ def _epr_mixture_components(config):
 
 
 def _uses_binary4_pedal(config):
-    return normalize_pedal_representation(getattr(config, "pedal_representation", "start_valley")) == "binary_4"
+    return normalize_pedal_representation(getattr(config, "pedal_representation", "binary_4")) == "binary_4"
 
 
 def _attach_simple_pedal_params(config, params, raw_outputs, cursor):
-    representation = normalize_pedal_representation(getattr(config, "pedal_representation", "start_valley"))
-    if representation == "start_valley":
-        params["pedal_start_raw"] = raw_outputs[..., cursor]
-        params["pedal_valley_logits"] = raw_outputs[..., cursor + 1]
+    representation = normalize_pedal_representation(getattr(config, "pedal_representation", "binary_4"))
+    if representation == "binary_4":
+        params["pedal_binary_logits"] = raw_outputs[..., cursor : cursor + 4]
         return params
-    if representation == "start":
-        params["pedal_start_raw"] = raw_outputs[..., cursor]
-        return params
-    params["pedal_binary_logits"] = raw_outputs[..., cursor : cursor + 4]
-    return params
+    raise ValueError("Only pedal_representation=binary_4 is supported")
 
 
 def _mask_count(mask):
@@ -2596,21 +2565,6 @@ def _split_epr_mixture_params(config, raw_outputs):
             }
         if ioi_zero_logit is not None:
             params["ioi_zero_logit"] = ioi_zero_logit
-        pedal_representation = normalize_pedal_representation(getattr(config, "pedal_representation", "start_valley"))
-        pedal_distribution = str(getattr(config, "pedal_distribution", "point")).lower()
-        if pedal_representation == "start" and pedal_distribution in DLM_DISTRIBUTIONS:
-            pedal_base = raw_outputs[..., cursor : cursor + per_feature_dim].reshape(
-                *raw_outputs.shape[:-1],
-                3,
-                components,
-            )
-            params["pedal_logits"] = pedal_base[..., 0, :]
-            params["pedal_loc"] = pedal_base[..., 1, :]
-            params["pedal_log_scale"] = pedal_base[..., 2, :]
-            cursor += per_feature_dim
-            if bool(getattr(config, "dlm_pedal_zero_one_inflated", False)):
-                params["pedal_mode_logits"] = raw_outputs[..., cursor : cursor + 2]
-            return params
         return _attach_simple_pedal_params(config, params, raw_outputs, cursor)
     if distribution in SN_DISTRIBUTIONS:
         feature_dim = 3
@@ -2738,12 +2692,12 @@ def _split_epr_mixture_params(config, raw_outputs):
                 ],
                 dim=-2,
             )
-        pedal_representation = str(getattr(config, "pedal_representation", "start_valley")).lower()
+        pedal_representation = str(getattr(config, "pedal_representation", "binary_4")).lower()
         if pedal_representation == "binary_4":
             pedal_start = shared_base_dim
             params["pedal_binary_logits"] = raw_outputs[..., pedal_start : pedal_start + 4]
             return params
-        if normalize_pedal_representation(pedal_representation) == "start_valley":
+        if normalize_pedal_representation(pedal_representation) == "binary_4":
             return _attach_simple_pedal_params(config, params, raw_outputs, shared_base_dim)
         pedal_distribution = str(getattr(config, "pedal_distribution", distribution)).lower()
         pedal_feature_dim = _scalar_distribution_dim(pedal_distribution)
@@ -2792,11 +2746,11 @@ def _split_epr_mixture_params(config, raw_outputs):
                 dim=-2,
             ),
         }
-        pedal_representation = str(getattr(config, "pedal_representation", "start_valley")).lower()
+        pedal_representation = str(getattr(config, "pedal_representation", "binary_4")).lower()
         if pedal_representation == "binary_4":
             params["pedal_binary_logits"] = raw_outputs[..., cursor : cursor + 4]
             return params
-        if normalize_pedal_representation(pedal_representation) == "start_valley":
+        if normalize_pedal_representation(pedal_representation) == "binary_4":
             return _attach_simple_pedal_params(config, params, raw_outputs, cursor)
         pedal_base = raw_outputs[..., cursor : cursor + scalar_dim * 4].reshape(
             *raw_outputs.shape[:-1],
@@ -2820,7 +2774,7 @@ def _split_epr_mixture_params(config, raw_outputs):
         per_component_dim,
         components,
     )
-    pedal_representation = str(getattr(config, "pedal_representation", "start_valley")).lower()
+    pedal_representation = str(getattr(config, "pedal_representation", "binary_4")).lower()
     duration_idx = 1
     velocity_idx = 2
     params = {
@@ -2853,7 +2807,7 @@ def _split_epr_mixture_params(config, raw_outputs):
         pedal_start = shared_base_dim
         params["pedal_binary_logits"] = raw_outputs[..., pedal_start : pedal_start + 4]
         return params
-    if normalize_pedal_representation(pedal_representation) == "start_valley":
+    if normalize_pedal_representation(pedal_representation) == "binary_4":
         return _attach_simple_pedal_params(config, params, raw_outputs, shared_base_dim)
 
     pedal_start = shared_base_dim
@@ -2927,55 +2881,12 @@ def _uses_inr_epr_targets(config):
     return (
         _config_value(config, "task_type", "epr") == "epr"
         and str(_config_value(config, "epr_timing_target", "absolute")).lower()
-        in {
-            "log_deviation",
-            "log_dev",
-            "raw_log_deviation",
-            "raw_log_dev",
-            "floor_log_deviation",
-            "floor_log_dev",
-            "pure_log_deviation",
-            "pure_log_dev",
-        }
+        in {"floor_log_deviation", "floor_log_dev"}
     )
 
 
-def _uses_log_deviation_targets(config):
-    return str(_config_value(config, "epr_timing_target", "absolute")).lower() in {
-        "log_deviation",
-        "log_dev",
-        "raw_log_deviation",
-        "raw_log_dev",
-        "floor_log_deviation",
-        "floor_log_dev",
-        "pure_log_deviation",
-        "pure_log_dev",
-    }
-
-
-def _uses_raw_log_deviation_targets(config):
-    return str(_config_value(config, "epr_timing_target", "absolute")).lower() in {
-        "raw_log_deviation",
-        "raw_log_dev",
-    }
-
-
 def _uses_floor_log_deviation_targets(config):
-    return str(_config_value(config, "epr_timing_target", "absolute")).lower() in {
-        "floor_log_deviation",
-        "floor_log_dev",
-        "pure_log_deviation",
-        "pure_log_dev",
-    }
-
-
-def _uses_raw_deviation_targets(config):
-    return str(_config_value(config, "epr_timing_target", "absolute")).lower() in {
-        "raw_deviation",
-        "raw_dev",
-        "raw_seconds_deviation",
-        "raw_seconds_dev",
-    }
+    return str(_config_value(config, "epr_timing_target", "absolute")).lower() in {"floor_log_deviation", "floor_log_dev"}
 
 
 def _timing_distribution_count(config):
@@ -2990,33 +2901,6 @@ def _config_value(config, name, default):
     if isinstance(config, dict):
         return config.get(name, default)
     return getattr(config, name, default)
-
-
-def _torch_log_timing_code(time_ms, scale=50.0, max_time_ms=5000.0):
-    value = time_ms.float().clamp(0.0, float(max_time_ms))
-    scale_value = value.new_tensor(max(float(scale), 1e-12))
-    denom = torch.log1p(value.new_tensor(float(max_time_ms)) / scale_value)
-    return torch.log1p(value / scale_value) / denom
-
-
-def _torch_raw_log_timing_code(time_ms, scale=50.0, max_time_ms=5000.0):
-    value = time_ms.float().clamp(0.0, float(max_time_ms))
-    seconds = value / 1000.0
-    factor = value.new_tensor(1000.0 / max(float(scale), 1e-12))
-    return torch.log1p(factor * seconds)
-
-
-def _torch_log_timing_decode(time_norm, scale=50.0, max_time_ms=5000.0):
-    clipped = time_norm.float().clamp(0.0, 1.0)
-    scale_value = clipped.new_tensor(max(float(scale), 1e-12))
-    denom = torch.log1p(clipped.new_tensor(float(max_time_ms)) / scale_value)
-    return scale_value * torch.expm1(clipped * denom)
-
-
-def _torch_raw_log_timing_decode(log_value, scale=50.0, max_time_ms=5000.0):
-    factor = log_value.new_tensor(1000.0 / max(float(scale), 1e-12))
-    decoded = 1000.0 * torch.expm1(log_value.float()) / factor
-    return decoded.clamp(0.0, float(max_time_ms))
 
 
 def _torch_floor_log_reconstruct(score_time_ms, dev):
@@ -3037,9 +2921,9 @@ def _target7_to_raw7(score_shared_raw, target_predictions, config=None):
     score_shared_raw = score_shared_raw.float()
     target_predictions = target_predictions.float()
     pedal_representation = (
-        _config_value(config, "pedal_representation", "start_valley")
+        _config_value(config, "pedal_representation", "binary_4")
         if config is not None
-        else "start_valley"
+        else "binary_4"
     )
     pedal_dim = pedal_representation_dim(pedal_representation)
     if target_predictions.shape[-1] < 3 + pedal_dim:
@@ -3047,89 +2931,23 @@ def _target7_to_raw7(score_shared_raw, target_predictions, config=None):
 
     def pedal_raw4(start):
         pedal_values = target_predictions[..., start : start + pedal_dim].clamp(0.0, 1.0)
-        if pedal_dim in {1, 2}:
-            return pedal_values[..., 0:1].expand(*pedal_values.shape[:-1], 4) * 127.0
         return pedal_values[..., :4] * 127.0
 
-    if config is not None and _uses_absolute_epr_targets(config):
-        log_scale = float(_config_value(config, "timing_log_scale", 50.0))
-        if _uses_raw_log_absolute_targets(config) and target_predictions.shape[-1] >= 5 + pedal_dim:
-            perf_ioi_ms = target_predictions[..., 2].clamp_min(0.0) * 1000.0
-            perf_duration_ms = target_predictions[..., 3].clamp_min(0.0) * 1000.0
-            velocity = target_predictions[..., 4].clamp(0.0, 1.0) * 127.0
-            pedal = pedal_raw4(5)
-        else:
-            perf_ioi_ms = _torch_raw_log_timing_decode(target_predictions[..., 0], scale=log_scale)
-            perf_duration_ms = _torch_raw_log_timing_decode(target_predictions[..., 1], scale=log_scale)
-            velocity = target_predictions[..., 2].clamp(0.0, 1.0) * 127.0
-            pedal = pedal_raw4(3)
-        return torch.cat([perf_ioi_ms.unsqueeze(-1), perf_duration_ms.unsqueeze(-1), velocity.unsqueeze(-1), pedal], dim=-1)
-    if config is not None and not _uses_log_deviation_targets(config):
-        raise ValueError("target7 -> raw7 reconstruction expects log_deviation timing targets")
-    log_scale = float(_config_value(config, "timing_log_scale", 50.0)) if config is not None else 50.0
-    if _uses_raw_log_deviation_targets(config):
-        score_ioi_log = _torch_raw_log_timing_code(score_shared_raw[..., 0], scale=log_scale, max_time_ms=5000.0)
-        score_duration_log = _torch_raw_log_timing_code(score_shared_raw[..., 1], scale=log_scale, max_time_ms=5000.0)
-        perf_ioi_ms = _torch_raw_log_timing_decode(score_ioi_log + target_predictions[..., 0], scale=log_scale)
-        perf_duration_ms = _torch_raw_log_timing_decode(score_duration_log + target_predictions[..., 1], scale=log_scale)
-        if target_predictions.shape[-1] >= 5 + pedal_dim:
-            velocity = target_predictions[..., 4].clamp(0.0, 1.0) * 127.0
-            pedal = pedal_raw4(5)
-        else:
-            velocity = target_predictions[..., 2].clamp(0.0, 1.0) * 127.0
-            pedal = pedal_raw4(3)
-        return torch.cat([perf_ioi_ms.unsqueeze(-1), perf_duration_ms.unsqueeze(-1), velocity.unsqueeze(-1), pedal], dim=-1)
-    if _uses_floor_log_deviation_targets(config):
-        perf_ioi_ms = _torch_floor_log_reconstruct(score_shared_raw[..., 0], target_predictions[..., 0])
-        perf_duration_ms = _torch_floor_log_reconstruct(score_shared_raw[..., 1], target_predictions[..., 1])
-        if str(_config_value(config, "epr_distribution", "point")).lower() in DINR_DISTRIBUTIONS:
-            max_ms = float(_config_value(config, "dinr_absolute_max_ms", 8000.0))
-            perf_ioi_ms = perf_ioi_ms.clamp(0.0, max_ms)
-            perf_duration_ms = perf_duration_ms.clamp(0.0, max_ms)
-        velocity = target_predictions[..., 2].clamp(0.0, 1.0) * 127.0
-        pedal = pedal_raw4(3)
-        return torch.cat([perf_ioi_ms.unsqueeze(-1), perf_duration_ms.unsqueeze(-1), velocity.unsqueeze(-1), pedal], dim=-1)
-
-    target_predictions = target_predictions.clamp(0.0, 1.0)
-    score_ioi_norm = _torch_log_timing_code(score_shared_raw[..., 0], scale=log_scale, max_time_ms=5000.0)
-    score_duration_norm = _torch_log_timing_code(score_shared_raw[..., 1], scale=log_scale, max_time_ms=5000.0)
-    perf_ioi_norm = (score_ioi_norm + (target_predictions[..., 0] - 0.5)).clamp(0.0, 1.0)
-    perf_duration_norm = (score_duration_norm + (target_predictions[..., 1] - 0.5)).clamp(0.0, 1.0)
-    perf_ioi_ms = _torch_log_timing_decode(perf_ioi_norm, scale=log_scale, max_time_ms=5000.0)
-    perf_duration_ms = _torch_log_timing_decode(perf_duration_norm, scale=log_scale, max_time_ms=5000.0)
-    velocity = target_predictions[..., 2] * 127.0
+    if config is not None and not _uses_floor_log_deviation_targets(config):
+        raise ValueError("target7 -> raw7 reconstruction expects floor_log_deviation timing targets")
+    perf_ioi_ms = _torch_floor_log_reconstruct(score_shared_raw[..., 0], target_predictions[..., 0])
+    perf_duration_ms = _torch_floor_log_reconstruct(score_shared_raw[..., 1], target_predictions[..., 1])
+    if config is not None and str(_config_value(config, "epr_distribution", "point")).lower() in DINR_DISTRIBUTIONS:
+        max_ms = float(_config_value(config, "dinr_absolute_max_ms", 8000.0))
+        perf_ioi_ms = perf_ioi_ms.clamp(0.0, max_ms)
+        perf_duration_ms = perf_duration_ms.clamp(0.0, max_ms)
+    velocity = target_predictions[..., 2].clamp(0.0, 1.0) * 127.0
     pedal = pedal_raw4(3)
     return torch.cat([perf_ioi_ms.unsqueeze(-1), perf_duration_ms.unsqueeze(-1), velocity.unsqueeze(-1), pedal], dim=-1)
 
 
-def _uses_absolute_epr_targets(config):
-    return (
-        _config_value(config, "task_type", "epr") == "epr"
-        and str(_config_value(config, "epr_timing_target", "absolute")).lower()
-        in {
-            "absolute",
-            "absolute_log",
-            "log_absolute",
-            "raw_log_absolute",
-            "absolute_raw_log",
-            "floor_log_absolute",
-        }
-    )
-
-
-def _uses_raw_log_absolute_targets(config):
-    return str(_config_value(config, "epr_timing_target", "absolute")).lower() in {
-        "raw_log_absolute",
-        "absolute_raw_log",
-    }
-
-
-def _uses_floor_log_absolute_targets(config):
-    return str(_config_value(config, "epr_timing_target", "absolute")).lower() == "floor_log_absolute"
-
-
 def _uses_epr_targets(config):
-    return _uses_inr_epr_targets(config) or _uses_absolute_epr_targets(config)
+    return _uses_inr_epr_targets(config)
 
 
 def _decoder_rows_require_score_shared_raw(config):
@@ -3146,64 +2964,19 @@ def _build_epr_decoder_perf_target_rows(config, target_predictions):
 
 def _target_predictions_to_feedback7(config, target_predictions):
     target_predictions = target_predictions.float()
-    pedal_dim = pedal_representation_dim(getattr(config, "pedal_representation", "start_valley"))
-    if _uses_absolute_epr_targets(config):
-        if _uses_raw_log_absolute_targets(config) and target_predictions.shape[-1] >= 5 + pedal_dim:
-            return torch.cat(
-                [
-                    target_predictions[..., 2:4].clamp_min(0.0) * 1000.0,
-                    target_predictions[..., 4:5].clamp(0.0, 1.0),
-                    target_predictions[..., 5 : 5 + pedal_dim].clamp(0.0, 1.0),
-                ],
-                dim=-1,
-            )
-        if _uses_floor_log_absolute_targets(config):
-            max_ms = float(_config_value(config, "dinr_absolute_max_ms", 8000.0))
-            perf_ioi_ms = torch.exp(target_predictions[..., 0:1]).clamp(1.0, max_ms)
-            perf_duration_ms = torch.exp(target_predictions[..., 1:2]).clamp(1.0, max_ms)
-        else:
-            log_scale = float(_config_value(config, "timing_log_scale", 50.0))
-            perf_ioi_ms = _torch_raw_log_timing_decode(target_predictions[..., 0:1], scale=log_scale)
-            perf_duration_ms = _torch_raw_log_timing_decode(target_predictions[..., 1:2], scale=log_scale)
-        return torch.cat(
-            [
-                perf_ioi_ms,
-                perf_duration_ms,
-                target_predictions[..., 2:3].clamp(0.0, 1.0),
-                target_predictions[..., 3 : 3 + pedal_dim].clamp(0.0, 1.0),
-            ],
-            dim=-1,
-        )
-    if _uses_raw_log_deviation_targets(config) and target_predictions.shape[-1] >= 5 + pedal_dim:
-        return torch.cat(
-            [
-                target_predictions[..., 0:2],
-                target_predictions[..., 4:5].clamp(0.0, 1.0),
-                target_predictions[..., 5 : 5 + pedal_dim].clamp(0.0, 1.0),
-            ],
-            dim=-1,
-        )
+    pedal_dim = pedal_representation_dim(getattr(config, "pedal_representation", "binary_4"))
     if target_predictions.shape[-1] < 3 + pedal_dim:
         raise ValueError(f"Expected EPR target values, got shape {tuple(target_predictions.shape)}")
-    if _uses_raw_log_deviation_targets(config):
-        return torch.cat(
-            [
-                target_predictions[..., 0:2],
-                target_predictions[..., 2:3].clamp(0.0, 1.0),
-                target_predictions[..., 3 : 3 + pedal_dim].clamp(0.0, 1.0),
-            ],
-            dim=-1,
-        )
-    if _uses_floor_log_deviation_targets(config):
-        return torch.cat(
-            [
-                target_predictions[..., 0:2],
-                target_predictions[..., 2:3].clamp(0.0, 1.0),
-                target_predictions[..., 3 : 3 + pedal_dim].clamp(0.0, 1.0),
-            ],
-            dim=-1,
-        )
-    return target_predictions[..., : 3 + pedal_dim].clamp(0.0, 1.0)
+    if not _uses_floor_log_deviation_targets(config):
+        raise ValueError("Only epr_timing_target=floor_log_deviation is supported")
+    return torch.cat(
+        [
+            target_predictions[..., 0:2],
+            target_predictions[..., 2:3].clamp(0.0, 1.0),
+            target_predictions[..., 3 : 3 + pedal_dim].clamp(0.0, 1.0),
+        ],
+        dim=-1,
+    )
 
 
 def _extract_integrated_score_musical(config, score_input_continuous):
@@ -3229,68 +3002,20 @@ def _build_epr_decoder_rows(config, score_shared_raw, target_predictions, score_
         return _build_epr_decoder_perf_target_rows(config, target_predictions)
     timing_control_mode = getattr(config, "timing_control_mode", None)
     use_timing_scale_bit = getattr(config, "use_timing_scale_bit", True)
-    log_scale = getattr(config, "timing_log_scale", 50.0)
     resolve_timing_control_mode(timing_control_mode, use_timing_scale_bit)
     target7 = _target_predictions_to_feedback7(config, target_predictions)
     score_ioi = _torch_timing_control_code(
         score_shared_raw[..., 0],
         timing_control_mode=timing_control_mode,
         use_scale_bit=use_timing_scale_bit,
-        log_scale=log_scale,
     )
     score_duration = _torch_timing_control_code(
         score_shared_raw[..., 1],
         timing_control_mode=timing_control_mode,
         use_scale_bit=use_timing_scale_bit,
-        log_scale=log_scale,
     )
     score_velocity = (score_shared_raw[..., 2:3].float().clamp(0.0, 127.0) / 127.0)
-    if _uses_absolute_epr_targets(config):
-        perf_ioi = _torch_timing_control_code(
-            target7[..., 0],
-            timing_control_mode=timing_control_mode,
-            use_scale_bit=use_timing_scale_bit,
-            log_scale=log_scale,
-        )
-        duration = _torch_timing_control_code(
-            target7[..., 1],
-            timing_control_mode=timing_control_mode,
-            use_scale_bit=use_timing_scale_bit,
-            log_scale=log_scale,
-        )
-    elif _uses_raw_deviation_targets(config):
-        perf_ioi_ms = (score_shared_raw[..., 0:1].float() + target7[..., 0:1].float() * 1000.0).clamp_min(0.0)
-        duration_ms = (score_shared_raw[..., 1:2].float() + target7[..., 1:2].float() * 1000.0).clamp_min(0.0)
-        perf_ioi = _torch_timing_control_code(
-            perf_ioi_ms.squeeze(-1),
-            timing_control_mode=timing_control_mode,
-            use_scale_bit=use_timing_scale_bit,
-            log_scale=log_scale,
-        )
-        duration = _torch_timing_control_code(
-            duration_ms.squeeze(-1),
-            timing_control_mode=timing_control_mode,
-            use_scale_bit=use_timing_scale_bit,
-            log_scale=log_scale,
-        )
-    elif _uses_raw_log_deviation_targets(config):
-        score_ioi_log = _torch_raw_log_timing_code(score_shared_raw[..., 0], scale=log_scale, max_time_ms=5000.0).unsqueeze(-1)
-        score_duration_log = _torch_raw_log_timing_code(score_shared_raw[..., 1], scale=log_scale, max_time_ms=5000.0).unsqueeze(-1)
-        perf_ioi_ms = _torch_raw_log_timing_decode(score_ioi_log + target7[..., 0:1], scale=log_scale)
-        duration_ms = _torch_raw_log_timing_decode(score_duration_log + target7[..., 1:2], scale=log_scale)
-        perf_ioi = _torch_timing_control_code(
-            perf_ioi_ms.squeeze(-1),
-            timing_control_mode=timing_control_mode,
-            use_scale_bit=use_timing_scale_bit,
-            log_scale=log_scale,
-        )
-        duration = _torch_timing_control_code(
-            duration_ms.squeeze(-1),
-            timing_control_mode=timing_control_mode,
-            use_scale_bit=use_timing_scale_bit,
-            log_scale=log_scale,
-        )
-    elif _uses_floor_log_deviation_targets(config):
+    if _uses_floor_log_deviation_targets(config):
         ioi_dev = target7[..., 0:1]
         duration_dev = target7[..., 1:2]
         if str(_config_value(config, "epr_distribution", "point")).lower() in DINR_DISTRIBUTIONS:
@@ -3319,21 +3044,18 @@ def _build_epr_decoder_rows(config, score_shared_raw, target_predictions, score_
             perf_ioi_ms = perf_ioi_ms.clamp(0.0, max_ms)
             duration_ms = duration_ms.clamp(0.0, max_ms)
         perf_ioi = _torch_timing_control_code(
-            perf_ioi_ms.squeeze(-1),
-            timing_control_mode=timing_control_mode,
-            use_scale_bit=use_timing_scale_bit,
-            log_scale=log_scale,
-        )
+                perf_ioi_ms.squeeze(-1),
+                timing_control_mode=timing_control_mode,
+                use_scale_bit=use_timing_scale_bit,
+            )
         duration = _torch_timing_control_code(
-            duration_ms.squeeze(-1),
-            timing_control_mode=timing_control_mode,
-            use_scale_bit=use_timing_scale_bit,
-            log_scale=log_scale,
-        )
+                duration_ms.squeeze(-1),
+                timing_control_mode=timing_control_mode,
+                use_scale_bit=use_timing_scale_bit,
+            )
     else:
-        perf_ioi = (score_ioi[..., :1] + (target7[..., 0:1].float().clamp(0.0, 1.0) - 0.5)).clamp(0.0, 1.0)
-        duration = (score_duration[..., :1] + (target7[..., 1:2].float().clamp(0.0, 1.0) - 0.5)).clamp(0.0, 1.0)
-    pedal_dim = pedal_representation_dim(getattr(config, "pedal_representation", "start_valley"))
+        raise ValueError("Only epr_timing_target=floor_log_deviation is supported")
+    pedal_dim = pedal_representation_dim(getattr(config, "pedal_representation", "binary_4"))
     velocity = target7[..., 2:3].float().clamp(0.0, 1.0)
     pedal = target7[..., 3 : 3 + pedal_dim].float().clamp(0.0, 1.0)
     score_control = torch.cat([score_ioi, score_duration, score_velocity], dim=-1)
@@ -4832,7 +4554,7 @@ def _epr_bins_to_normalized(config, ioi_bins, duration_bins, velocity_bins, peda
     timing_norm = str(getattr(config, "timing_input_normalization", "linear_5000")).lower()
     ioi_ms = ioi_bins.to(dtype=torch.float32).clamp(0.0, float(timing_bins - 1))
     duration_ms = duration_bins.to(dtype=torch.float32).clamp(0.0, float(timing_bins - 1))
-    if timing_norm in {"linear_5000", "raw_linear_5000"}:
+    if timing_norm in {"linear_5000", "linear_5000"}:
         ioi_norm = ioi_ms.clamp(max=5000.0) / 5000.0
         duration_norm = duration_ms.clamp(max=5000.0) / 5000.0
     else:
@@ -4859,67 +4581,17 @@ def _materialize_binary4_logits(logits, sampling_strategy="mean"):
 
 
 def _materialize_pedal_params(config, params, sampling_strategy="mean"):
-    representation = normalize_pedal_representation(getattr(config, "pedal_representation", "start_valley"))
-    if representation == "start_valley":
-        start = params["pedal_start_raw"].float().clamp(0.0, 1.0)
-        valley = _materialize_binary4_logits(
-            params["pedal_valley_logits"].unsqueeze(-1),
-            sampling_strategy=sampling_strategy,
-        ).squeeze(-1)
-        return torch.stack([start, valley], dim=-1)
-    if representation == "start":
-        pedal_distribution = str(getattr(config, "pedal_distribution", "point")).lower()
-        if pedal_distribution in DLM_DISTRIBUTIONS:
-            if bool(getattr(config, "dlm_pedal_zero_one_inflated", False)):
-                start_raw = _dlm_zero_one_inflated_mean_or_sample(
-                    config,
-                    params["pedal_mode_logits"],
-                    params["pedal_logits"],
-                    params["pedal_loc"],
-                    params["pedal_log_scale"],
-                    "pedal",
-                    sampling_strategy=sampling_strategy,
-                    zero_value=0.0,
-                    one_value=127.0,
-                )
-            else:
-                start_raw = _dlm_mean_or_sample(
-                    config,
-                    params["pedal_logits"],
-                    params["pedal_loc"],
-                    params["pedal_log_scale"],
-                    "pedal",
-                    sampling_strategy=sampling_strategy,
-                )
-            return (start_raw / 127.0).clamp(0.0, 1.0).unsqueeze(-1)
-        if _is_scalar_distribution(pedal_distribution):
-            logits, a, b, c = _pedal_scalar_params(config, params, 0)
-            start = _decode_mixture_value(
-                config,
-                logits,
-                a,
-                b,
-                c,
-                sampling_strategy=sampling_strategy,
-                distribution=pedal_distribution,
-            )
-            return start.clamp(0.0, 1.0).unsqueeze(-1)
-        return params["pedal_start_raw"].float().clamp(0.0, 1.0).unsqueeze(-1)
-    return _materialize_binary4_logits(
-        params["pedal_binary_logits"],
-        sampling_strategy=sampling_strategy,
-    )
+    representation = normalize_pedal_representation(getattr(config, "pedal_representation", "binary_4"))
+    if representation == "binary_4":
+        return _materialize_binary4_logits(params["pedal_binary_logits"], sampling_strategy=sampling_strategy)
+    raise ValueError("Only pedal_representation=binary_4 is supported")
 
 
 def _materialize_pedal_raw(config, raw_pedal, sampling_strategy="mean"):
-    representation = normalize_pedal_representation(getattr(config, "pedal_representation", "start_valley"))
-    if representation == "start_valley":
-        start = raw_pedal[..., 0].float().clamp(0.0, 1.0)
-        valley = _materialize_binary4_logits(raw_pedal[..., 1:2], sampling_strategy=sampling_strategy).squeeze(-1)
-        return torch.stack([start, valley], dim=-1)
-    if representation == "start":
-        return raw_pedal[..., 0:1].float().clamp(0.0, 1.0)
-    return _materialize_binary4_logits(raw_pedal, sampling_strategy=sampling_strategy)
+    representation = normalize_pedal_representation(getattr(config, "pedal_representation", "binary_4"))
+    if representation == "binary_4":
+        return _materialize_binary4_logits(raw_pedal, sampling_strategy=sampling_strategy)
+    raise ValueError("Only pedal_representation=binary_4 is supported")
 
 
 def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean", score_shared_raw=None):
@@ -5063,51 +4735,6 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean", s
             sigma_max=sigma_max,
         ).clamp(0.0, 1.0)
         pedal = _materialize_pedal_params(config, params, sampling_strategy=sampling_strategy)
-        if _uses_raw_deviation_targets(config):
-            return torch.cat([logdev, velocity.unsqueeze(-1), pedal], dim=-1)
-        if _uses_raw_log_absolute_targets(config):
-            perf_ioi_ms = _torch_raw_log_timing_decode(logdev[..., 0], scale=float(_config_value(config, "timing_log_scale", 50.0)))
-            perf_duration_ms = _torch_raw_log_timing_decode(logdev[..., 1], scale=float(_config_value(config, "timing_log_scale", 50.0)))
-            raw_seconds = torch.stack([perf_ioi_ms / 1000.0, perf_duration_ms / 1000.0], dim=-1)
-            return torch.cat([logdev, raw_seconds, velocity.unsqueeze(-1), pedal], dim=-1)
-        if (
-            _uses_raw_log_deviation_targets(config)
-            and bool(_config_value(config, "legacy_dual_timing_head", False))
-        ):
-            if _uses_raw_timing_regression_head(config):
-                return torch.cat(
-                    [
-                        logdev,
-                        params["timing_raw_regression"],
-                        velocity.unsqueeze(-1),
-                        pedal,
-                    ],
-                    dim=-1,
-                )
-            if score_shared_raw is None:
-                return torch.cat([logdev, velocity.unsqueeze(-1), pedal], dim=-1)
-            score_shared_raw = score_shared_raw.float()
-            log_scale = float(_config_value(config, "timing_log_scale", 50.0))
-            score_ioi_log = _torch_raw_log_timing_code(
-                score_shared_raw[..., 0],
-                scale=log_scale,
-                max_time_ms=5000.0,
-            )
-            score_duration_log = _torch_raw_log_timing_code(
-                score_shared_raw[..., 1],
-                scale=log_scale,
-                max_time_ms=5000.0,
-            )
-            perf_ioi_ms = _torch_raw_log_timing_decode(score_ioi_log + logdev[..., 0], scale=log_scale)
-            perf_duration_ms = _torch_raw_log_timing_decode(score_duration_log + logdev[..., 1], scale=log_scale)
-            rawdev = torch.stack(
-                [
-                    (perf_ioi_ms - score_shared_raw[..., 0]) / 1000.0,
-                    (perf_duration_ms - score_shared_raw[..., 1]) / 1000.0,
-                ],
-                dim=-1,
-            )
-            return torch.cat([logdev, rawdev, velocity.unsqueeze(-1), pedal], dim=-1)
         return torch.cat([logdev, velocity.unsqueeze(-1), pedal], dim=-1)
 
     if distribution == "beta_mu_kappa":
@@ -5126,7 +4753,7 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean", s
         )
         pedal = _materialize_pedal_raw(
             config,
-            raw_outputs[..., -pedal_representation_dim(getattr(config, "pedal_representation", "start_valley")) :],
+            raw_outputs[..., -pedal_representation_dim(getattr(config, "pedal_representation", "binary_4")) :],
             sampling_strategy=sampling_strategy,
         )
         return torch.cat([shared, pedal], dim=-1)
@@ -5179,7 +4806,7 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean", s
     shared = raw_outputs[..., :3].clamp(0.0, 1.0)
     pedal = _materialize_pedal_raw(
         config,
-        raw_outputs[..., -pedal_representation_dim(getattr(config, "pedal_representation", "start_valley")) :],
+        raw_outputs[..., -pedal_representation_dim(getattr(config, "pedal_representation", "binary_4")) :],
         sampling_strategy=sampling_strategy,
     )
     return torch.cat([shared, pedal], dim=-1)
@@ -5212,7 +4839,7 @@ def _target_feedback_mask_to_decoder_performance_mask(config, feedback_mask):
         return None
     if decoder_note_input_schema(config) == "perf_target":
         return None
-    pedal_dim = pedal_representation_dim(getattr(config, "pedal_representation", "start_valley"))
+    pedal_dim = pedal_representation_dim(getattr(config, "pedal_representation", "binary_4"))
     performance_dim = int(
         getattr(config, "performance_control_feature_dim", getattr(config, "control_feature_dim", 3) + pedal_dim)
     )
@@ -5228,14 +4855,10 @@ def _target_feedback_mask_to_decoder_performance_mask(config, feedback_mask):
         // 2,
     )
     if timing_dim == 2:
-        legacy_dual_layout = _uses_raw_log_deviation_targets(config) and feedback_mask.shape[-1] >= 5 + pedal_dim
-        ioi_target_cols = [0, 2] if legacy_dual_layout else [0]
-        duration_target_cols = [1, 3] if legacy_dual_layout else [1]
-        velocity_col = 4 if legacy_dual_layout else 2
-        pedal_start = 5 if legacy_dual_layout else 3
-        decoder_mask[..., 0:2] = feedback_mask[..., ioi_target_cols].amax(dim=-1, keepdim=True)
-        decoder_mask[..., 2:4] = feedback_mask[..., duration_target_cols].amax(dim=-1, keepdim=True)
-        decoder_mask[..., 4:5] = feedback_mask[..., velocity_col : velocity_col + 1]
+        decoder_mask[..., 0:2] = feedback_mask[..., 0:1]
+        decoder_mask[..., 2:4] = feedback_mask[..., 1:2]
+        decoder_mask[..., 4:5] = feedback_mask[..., 2:3]
+        pedal_start = 3
         decoder_mask[..., 5 : 5 + pedal_dim] = feedback_mask[..., pedal_start : pedal_start + pedal_dim]
     else:
         decoder_mask[..., 0:1] = feedback_mask[..., 0:1]
@@ -5552,7 +5175,7 @@ def _build_prefilled_ar_note_inputs(
         if prefix_len > 0:
             if _uses_epr_targets(config):
                 if _decoder_rows_require_score_shared_raw(config) and score_shared_raw is None:
-                    raise ValueError("score_shared_raw is required for INR log_deviation AR prefix inputs")
+                    raise ValueError("score_shared_raw is required for INR floor_log_deviation AR prefix inputs")
                 decoder_input_continuous[:, 1 : prefix_len + 1] = _build_epr_decoder_rows(
                     config,
                     (
@@ -5611,7 +5234,7 @@ def _build_ar_note_continuous(
 ):
     if _uses_epr_targets(config):
         if _decoder_rows_require_score_shared_raw(config) and score_shared_raw is None:
-            raise ValueError("score_shared_raw is required for INR log_deviation AR note construction")
+            raise ValueError("score_shared_raw is required for INR floor_log_deviation AR note construction")
         if score_shared_raw is None:
             score_shared_raw = labels_continuous.new_zeros(*labels_continuous.shape[:-1], 3)
         return _build_epr_decoder_rows(
@@ -5809,48 +5432,15 @@ def _bce_logits_loss(logits, target, mask, pos_weight=None):
 
 
 def _pedal_loss_components(config, pedal_pred, pedal_target, mask, detail_components, prefix=""):
-    representation = normalize_pedal_representation(getattr(config, "pedal_representation", "start_valley"))
-    if representation == "start_valley":
-        start_pred = pedal_pred[..., 0]
-        valley_logits = pedal_pred[..., 1]
-        start_target = pedal_target[..., 0]
-        valley_target = pedal_target[..., 1]
-        loss_start = _regression_loss(
-            start_pred,
-            start_target,
-            mask,
-            getattr(config, "pedal_start_loss_type", "huber"),
-            getattr(config, "huber_delta", 0.05),
+    representation = normalize_pedal_representation(getattr(config, "pedal_representation", "binary_4"))
+    if representation == "binary_4":
+        loss = _bce_logits_loss(
+            pedal_pred,
+            pedal_target,
+            mask.unsqueeze(-1).expand_as(pedal_target),
         )
-        if bool(getattr(config, "pedal_valley_down_only", True)):
-            next_start = torch.zeros_like(start_target)
-            if start_target.shape[-1] > 1:
-                next_start[..., :-1] = start_target[..., 1:]
-            valley_mask = mask & (start_target >= 0.5) & (next_start >= 0.5)
-        else:
-            valley_mask = mask
-        pos_weight = getattr(config, "pedal_valley_pos_weight", None)
-        loss_valley = _bce_logits_loss(valley_logits, valley_target, valley_mask, pos_weight=pos_weight)
-        valley_weight = float(getattr(config, "pedal_valley_loss_weight", 1.0))
-        detail_components[f"{prefix}pedal_start"] = loss_start
-        detail_components[f"{prefix}has_valley"] = loss_valley
-        return loss_start + valley_weight * loss_valley, pedal_pred, pedal_target, ("pedal_start", "has_valley"), valley_mask
-    if representation == "start":
-        loss_start = _regression_loss(
-            pedal_pred[..., 0],
-            pedal_target[..., 0],
-            mask,
-            getattr(config, "pedal_start_loss_type", "huber"),
-            getattr(config, "huber_delta", 0.05),
-        )
-        detail_components[f"{prefix}pedal_start"] = loss_start
-        return loss_start, pedal_pred, pedal_target, ("pedal_start",), mask
-    loss = _bce_logits_loss(
-        pedal_pred,
-        pedal_target,
-        mask.unsqueeze(-1).expand_as(pedal_target),
-    )
-    return loss, pedal_pred, pedal_target, ("pedal_0", "pedal_25", "pedal_50", "pedal_75"), mask
+        return loss, pedal_pred, pedal_target, ("pedal_0", "pedal_25", "pedal_50", "pedal_75"), mask
+    raise ValueError("Only pedal_representation=binary_4 is supported")
 
 
 def _beta_nll_loss(raw_mu, raw_kappa, target, mask, eps, kappa_min):
@@ -5956,24 +5546,18 @@ def _compute_dinr_loss_components(
     logits = _split_dinr_logits(config, raw_outputs)
     ioi_logits = _dinr_support_mask(config, logits["ioi"], "ioi", score_shared_raw)
     duration_logits = _dinr_support_mask(config, logits["duration"], "duration")
-    absolute_targets = _uses_absolute_epr_targets(config)
     zero_score = score_shared_raw[..., 0].abs() <= float(getattr(config, "zero_ioi_support_eps", 1e-6))
-    if absolute_targets:
-        ioi_min = labels_continuous.new_full(zero_score.shape, 0.0)
-        ioi_max = labels_continuous.new_full(zero_score.shape, 9.0)
-        duration_min, duration_max = 0.0, 9.0
-    else:
-        ioi_min = torch.where(
-            zero_score,
-            labels_continuous.new_full((), float(config.dinr_zero_ioi_min)),
-            labels_continuous.new_full((), float(config.dinr_deviation_min)),
-        )
-        ioi_max = torch.where(
-            zero_score,
-            labels_continuous.new_full((), float(config.dinr_zero_ioi_max)),
-            labels_continuous.new_full((), float(config.dinr_deviation_max)),
-        )
-        duration_min, duration_max = float(config.dinr_deviation_min), float(config.dinr_deviation_max)
+    ioi_min = torch.where(
+        zero_score,
+        labels_continuous.new_full((), float(config.dinr_zero_ioi_min)),
+        labels_continuous.new_full((), float(config.dinr_deviation_min)),
+    )
+    ioi_max = torch.where(
+        zero_score,
+        labels_continuous.new_full((), float(config.dinr_zero_ioi_max)),
+        labels_continuous.new_full((), float(config.dinr_deviation_max)),
+    )
+    duration_min, duration_max = float(config.dinr_deviation_min), float(config.dinr_deviation_max)
     ioi_target_value = labels_continuous[..., 0]
     duration_target_value = labels_continuous[..., 1]
     ioi_mask = mask.bool() & (ioi_target_value >= ioi_min) & (ioi_target_value <= ioi_max)
@@ -6535,7 +6119,7 @@ def _compute_integrated_loss_components(
     if getattr(config, "task_type", "epr") == "removed_task":
         return _compute_removed_task_loss_components(config, continuous_pred, labels_continuous, attention_mask)
     if not _uses_epr_targets(config):
-        raise ValueError("EPR loss only supports INR log_deviation targets")
+        raise ValueError("EPR loss only supports INR floor_log_deviation targets")
 
     mask = attention_mask.bool()
     feature_mask = label_valid_mask.bool() if label_valid_mask is not None else None
@@ -6647,51 +6231,15 @@ def _compute_integrated_loss_components(
                 sigma_max,
             )
             detail_components["velocity_sn_nll"] = loss_velocity
-        pedal_representation = normalize_pedal_representation(getattr(config, "pedal_representation", "start_valley"))
+        pedal_representation = normalize_pedal_representation(getattr(config, "pedal_representation", "binary_4"))
         pedal_dim = pedal_representation_dim(pedal_representation)
-        pedal_distribution = str(getattr(config, "pedal_distribution", "point")).lower()
-        if pedal_representation == "start" and pedal_distribution in DLM_DISTRIBUTIONS:
-            if bool(getattr(config, "dlm_pedal_zero_one_inflated", False)):
-                loss_pedal = _dlm_zero_one_inflated_nll(
-                    config,
-                    params["pedal_mode_logits"],
-                    params["pedal_logits"],
-                    params["pedal_loc"],
-                    params["pedal_log_scale"],
-                    labels_continuous[..., 3] * 127.0,
-                    mask,
-                    "pedal",
-                    zero_value=0.0,
-                    one_value=127.0,
-                )
-            else:
-                loss_pedal = _dlm_nll(
-                    config,
-                    params["pedal_logits"],
-                    params["pedal_loc"],
-                    params["pedal_log_scale"],
-                    labels_continuous[..., 3] * 127.0,
-                    mask,
-                    "pedal",
-                )
-            detail_components["pedal_dlm_nll"] = loss_pedal
-            pedal_logits_for_detail = pedal_target_for_detail = pedal_detail_mask = None
-            pedal_names = ()
-        else:
-            pedal_pred_for_loss = (
-                torch.stack([params["pedal_start_raw"], params["pedal_valley_logits"]], dim=-1)
-                if pedal_representation == "start_valley"
-                else params["pedal_start_raw"].unsqueeze(-1)
-                if pedal_representation == "start"
-                else params["pedal_binary_logits"]
-            )
-            loss_pedal, pedal_logits_for_detail, pedal_target_for_detail, pedal_names, pedal_detail_mask = _pedal_loss_components(
-                config,
-                pedal_pred_for_loss,
-                labels_continuous[..., 3 : 3 + pedal_dim],
-                mask,
-                detail_components,
-            )
+        loss_pedal, pedal_logits_for_detail, pedal_target_for_detail, pedal_names, pedal_detail_mask = _pedal_loss_components(
+            config,
+            params["pedal_binary_logits"],
+            labels_continuous[..., 3 : 3 + pedal_dim],
+            mask,
+            detail_components,
+        )
         detail_components.update(
             {
                 "ioi_dlm_nll": loss_ioi,
@@ -6747,12 +6295,6 @@ def _compute_integrated_loss_components(
         params = _split_epr_mixture_params(config, continuous_pred)
         sigma_min = getattr(config, "skew_normal_sigma_min", getattr(config, "logistic_normal_sigma_min", 1e-4))
         sigma_max = getattr(config, "skew_normal_sigma_max", getattr(config, "logistic_normal_sigma_max", 1e4))
-        raw_lambda = float(getattr(config, "raw_timing_loss_lambda", 0.25))
-        legacy_dual_layout = (
-            _uses_raw_log_deviation_targets(config)
-            and bool(getattr(config, "legacy_dual_timing_head", False))
-            and labels_continuous.shape[-1] >= 9
-        )
         zero_ioi_transform = str(getattr(config, "zero_ioi_transform", None) or "").lower()
         zero_ioi_enabled = bool(getattr(config, "zero_ioi_positive_support", False)) or zero_ioi_transform in {
             "softplus",
@@ -6832,143 +6374,10 @@ def _compute_integrated_loss_components(
                 sigma_min,
                 sigma_max,
             )
-        if legacy_dual_layout and _uses_raw_timing_regression_head(config):
-            loss_ioi_raw = _regression_loss(
-                params["timing_raw_regression"][..., 0],
-                labels_continuous[..., 2],
-                mask,
-                "huber",
-                config.huber_delta,
-            )
-            loss_duration_raw = _regression_loss(
-                params["timing_raw_regression"][..., 1],
-                labels_continuous[..., 3],
-                mask,
-                "huber",
-                config.huber_delta,
-            )
-            detail_components.update(
-                {
-                    "ioi_raw_huber": loss_ioi_raw,
-                    "duration_raw_huber": loss_duration_raw,
-                    "ioi_raw_weighted": raw_lambda * loss_ioi_raw,
-                    "duration_raw_weighted": raw_lambda * loss_duration_raw,
-                }
-            )
-        elif legacy_dual_layout:
-            loss_ioi_raw = _skew_normal_nll(
-                params["timing_raw_loc"][..., 0],
-                params["timing_raw_log_scale"][..., 0],
-                params["timing_raw_alpha"][..., 0],
-                labels_continuous[..., 2],
-                mask,
-                sigma_min,
-                sigma_max,
-            )
-            loss_duration_raw = _skew_normal_nll(
-                params["timing_raw_loc"][..., 1],
-                params["timing_raw_log_scale"][..., 1],
-                params["timing_raw_alpha"][..., 1],
-                labels_continuous[..., 3],
-                mask,
-                sigma_min,
-                sigma_max,
-            )
-            detail_components.update(
-                {
-                    "ioi_raw_nll": loss_ioi_raw,
-                    "duration_raw_nll": loss_duration_raw,
-                    "ioi_raw_weighted": raw_lambda * loss_ioi_raw,
-                    "duration_raw_weighted": raw_lambda * loss_duration_raw,
-                }
-            )
-        elif _uses_raw_log_deviation_targets(config) and raw_lambda > 0.0:
-            if score_shared_raw is None:
-                raise ValueError("raw-log deviation auxiliary loss requires score_shared_raw")
-            timing_center = _skew_normal_mean_or_sample(
-                params["timing_log_loc"],
-                params["timing_log_log_scale"],
-                params["timing_log_alpha"],
-                sampling_strategy="mean",
-                sigma_min=sigma_min,
-                sigma_max=sigma_max,
-            )
-            score_shared_raw = score_shared_raw.float()
-            if zero_dual_enabled:
-                zero_timing_center = _skew_normal_mean_or_sample(
-                    params["timing_zero_log_loc"],
-                    params["timing_zero_log_log_scale"],
-                    params["timing_zero_log_alpha"],
-                    sampling_strategy="mean",
-                    sigma_min=sigma_min,
-                    sigma_max=sigma_max,
-                )
-                if zero_dual_mode == "zero_folded":
-                    zero_timing_center = torch.cat(
-                        [zero_timing_center[..., 0:1].abs(), zero_timing_center[..., 1:]],
-                        dim=-1,
-                    )
-                zero_mask = _zero_score_ioi_mask(config, score_shared_raw, attention_mask=mask)
-                timing_center = torch.where(
-                    zero_mask.to(device=timing_center.device).unsqueeze(-1),
-                    zero_timing_center,
-                    timing_center,
-                )
-            else:
-                timing_center = _apply_zero_ioi_positive_support(config, timing_center, score_shared_raw)
-            log_scale = float(_config_value(config, "timing_log_scale", 50.0))
-            score_ioi_log = _torch_raw_log_timing_code(
-                score_shared_raw[..., 0],
-                scale=log_scale,
-                max_time_ms=5000.0,
-            )
-            score_duration_log = _torch_raw_log_timing_code(
-                score_shared_raw[..., 1],
-                scale=log_scale,
-                max_time_ms=5000.0,
-            )
-            pred_ioi_ms = _torch_raw_log_timing_decode(
-                score_ioi_log + timing_center[..., 0],
-                scale=log_scale,
-            )
-            pred_duration_ms = _torch_raw_log_timing_decode(
-                score_duration_log + timing_center[..., 1],
-                scale=log_scale,
-            )
-            pred_ioi_raw_dev = (pred_ioi_ms - score_shared_raw[..., 0]) / 1000.0
-            pred_duration_raw_dev = (pred_duration_ms - score_shared_raw[..., 1]) / 1000.0
-            target_ioi_ms = _torch_raw_log_timing_decode(
-                score_ioi_log + labels_continuous[..., 0],
-                scale=log_scale,
-            )
-            target_duration_ms = _torch_raw_log_timing_decode(
-                score_duration_log + labels_continuous[..., 1],
-                scale=log_scale,
-            )
-            target_ioi_raw_dev = (target_ioi_ms - score_shared_raw[..., 0]) / 1000.0
-            target_duration_raw_dev = (target_duration_ms - score_shared_raw[..., 1]) / 1000.0
-            loss_ioi_raw = _regression_loss(
-                pred_ioi_raw_dev,
-                target_ioi_raw_dev,
-                mask,
-                "huber",
-                config.huber_delta,
-            )
-            loss_duration_raw = _regression_loss(
-                pred_duration_raw_dev,
-                target_duration_raw_dev,
-                mask,
-                "huber",
-                config.huber_delta,
-            )
-        else:
-            loss_ioi_raw = loss_ioi_log.new_zeros(())
-            loss_duration_raw = loss_duration_log.new_zeros(())
-            raw_lambda = 0.0
-        velocity_col = 4 if legacy_dual_layout or _uses_raw_log_absolute_targets(config) else 2
-        pedal_start = 5 if legacy_dual_layout or _uses_raw_log_absolute_targets(config) else 3
-        loss_ioi = loss_ioi_log + raw_lambda * loss_ioi_raw
-        loss_duration = loss_duration_log + raw_lambda * loss_duration_raw
+        velocity_col = 2
+        pedal_start = 3
+        loss_ioi = loss_ioi_log
+        loss_duration = loss_duration_log
         detail_components.update(
             {
                 "ioi_log_nll": loss_ioi_log,
@@ -6993,18 +6402,11 @@ def _compute_integrated_loss_components(
             sigma_min,
             sigma_max,
         )
-        pedal_representation = normalize_pedal_representation(getattr(config, "pedal_representation", "start_valley"))
+        pedal_representation = normalize_pedal_representation(getattr(config, "pedal_representation", "binary_4"))
         pedal_dim = pedal_representation_dim(pedal_representation)
-        pedal_pred_for_loss = (
-            torch.stack([params["pedal_start_raw"], params["pedal_valley_logits"]], dim=-1)
-            if pedal_representation == "start_valley"
-            else params["pedal_start_raw"].unsqueeze(-1)
-            if pedal_representation == "start"
-            else params["pedal_binary_logits"]
-        )
         loss_pedal, pedal_logits_for_detail, pedal_target_for_detail, pedal_names, pedal_detail_mask = _pedal_loss_components(
             config,
-            pedal_pred_for_loss,
+            params["pedal_binary_logits"],
             labels_continuous[..., pedal_start : pedal_start + pedal_dim],
             mask,
             detail_components,
@@ -7058,43 +6460,15 @@ def _compute_integrated_loss_components(
         logits, a, b, c = _shared_scalar_params(config, params, 2)
         loss_velocity = loss_one(logits, a, b, velocity_target, c)
         velocity_variance_args = (logits, a, b)
-        pedal_representation = normalize_pedal_representation(getattr(config, "pedal_representation", "start_valley"))
+        pedal_representation = normalize_pedal_representation(getattr(config, "pedal_representation", "binary_4"))
         pedal_dim = pedal_representation_dim(pedal_representation)
-        pedal_distribution = str(getattr(config, "pedal_distribution", distribution)).lower()
-        if pedal_representation == "start" and _is_scalar_distribution(pedal_distribution):
-            logits, a, b, c = _pedal_scalar_params(config, params, 0)
-            loss_pedal = _mixture_loss_value(
-                config,
-                logits,
-                a,
-                b,
-                labels_continuous[..., 3],
-                mask,
-                eps,
-                sigma_min,
-                sigma_max,
-                alpha_min,
-                c,
-                distribution=pedal_distribution,
-            )
-            detail_components["pedal_scalar_nll"] = loss_pedal
-            pedal_logits_for_detail = pedal_target_for_detail = pedal_detail_mask = None
-            pedal_names = ()
-        else:
-            pedal_pred_for_loss = (
-                torch.stack([params["pedal_start_raw"], params["pedal_valley_logits"]], dim=-1)
-                if pedal_representation == "start_valley"
-                else params["pedal_start_raw"].unsqueeze(-1)
-                if pedal_representation == "start"
-                else params["pedal_binary_logits"]
-            )
-            loss_pedal, pedal_logits_for_detail, pedal_target_for_detail, pedal_names, pedal_detail_mask = _pedal_loss_components(
-                config,
-                pedal_pred_for_loss,
-                labels_continuous[..., 3 : 3 + pedal_dim],
-                mask,
-                detail_components,
-            )
+        loss_pedal, pedal_logits_for_detail, pedal_target_for_detail, pedal_names, pedal_detail_mask = _pedal_loss_components(
+            config,
+            params["pedal_binary_logits"],
+            labels_continuous[..., 3 : 3 + pedal_dim],
+            mask,
+            detail_components,
+        )
         variance_lambda = float(getattr(config, "predictive_variance_lambda", 0.0))
         if variance_lambda > 0.0:
             timing_radius = float(getattr(config, "predictive_timing_radius", 0.05))
@@ -7171,7 +6545,7 @@ def _compute_integrated_loss_components(
             eps,
             kappa_min,
         )
-        pedal_dim = pedal_representation_dim(getattr(config, "pedal_representation", "start_valley"))
+        pedal_dim = pedal_representation_dim(getattr(config, "pedal_representation", "binary_4"))
         loss_pedal, pedal_logits_for_detail, pedal_target_for_detail, pedal_names, pedal_detail_mask = _pedal_loss_components(
             config,
             continuous_pred[..., -pedal_dim:],
@@ -7181,13 +6555,9 @@ def _compute_integrated_loss_components(
         )
     else:
         pred = continuous_pred
-        pedal_dim = pedal_representation_dim(getattr(config, "pedal_representation", "start_valley"))
-        has_raw_log = (
-            (_uses_raw_log_deviation_targets(config) or _uses_raw_log_absolute_targets(config))
-            and labels_continuous.shape[-1] >= 5 + pedal_dim
-        )
-        velocity_col = 4 if has_raw_log else 2
-        pedal_start = 5 if has_raw_log else 3
+        pedal_dim = pedal_representation_dim(getattr(config, "pedal_representation", "binary_4"))
+        velocity_col = 2
+        pedal_start = 3
         pedal_pred_start = pred.shape[-1] - pedal_dim
         loss_ioi = _regression_loss(
             pred[..., 0],
@@ -7223,7 +6593,7 @@ def _compute_integrated_loss_components(
         detail_components[name] = _bce_loss(
             pedal_logits_for_detail[..., index],
             pedal_target_for_detail[..., index],
-            pedal_detail_mask if name == "has_valley" else mask,
+            mask,
         )
     components = {
         "ioi": loss_ioi,
@@ -8135,7 +7505,7 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
         if pitch_ids is None or continuous is None:
             raise ValueError("pitch_ids and continuous are required")
         if _uses_epr_targets(self.config) and score_shared_raw is None:
-            raise ValueError("score_shared_raw is required for INR log_deviation EPR")
+            raise ValueError("score_shared_raw is required for INR floor_log_deviation EPR")
 
         if attention_mask is None:
             attention_mask = (pitch_ids != self.config.pitch_pad_id).long()

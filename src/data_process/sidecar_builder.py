@@ -96,7 +96,6 @@ def build_sidecar_for_work(
         for key in (
             "label_shared_raw",
             "label_pedal4_raw",
-            "label_pedal_start_valley_raw",
             "label_raw",
             "pedal4_raw",
         ):
@@ -190,25 +189,11 @@ def build_ready_sidecar_for_work(
                 [1] * len(score_payload.get("pitch", [])),
             )
             break
-    raw_by_source = {
-        perf.get("performance_source"): perf
-        for perf in work.get("performances", [])
-        if perf.get("performance_source") is not None
-    }
-    original_target = dataset.epr_timing_target
-    try:
-        for perf in prepared.get("performances", []):
-            deviation_labels = perf.pop("labels")
-            raw_perf = raw_by_source[perf.get("performance_source")]
-            dataset.epr_timing_target = "floor_log_absolute"
-            absolute_labels, _ = dataset._compute_performance_labels(prepared, raw_perf)
-            perf["labels_by_target"] = {
-                "floor_log_deviation": deviation_labels,
-                "floor_log_absolute": absolute_labels,
-            }
-            perf.pop("label_bins", None)
-    finally:
-        dataset.epr_timing_target = original_target
+    for perf in prepared.get("performances", []):
+        perf["labels_by_target"] = {
+            "floor_log_deviation": perf.pop("labels"),
+        }
+        perf.pop("label_bins", None)
     prepared["_cache_signature"] = dataset._build_ready_sidecar_signature()
     prepared["_source_identity"] = dataset._source_identity(path)
     prepared["performance_time_normalization"] = performance_time_normalization or "none"

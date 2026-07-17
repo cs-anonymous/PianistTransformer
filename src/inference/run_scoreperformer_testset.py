@@ -166,6 +166,7 @@ def generate_one(args, runtime, item, sample_idx, output_path):
             time_window_overflow=0.5,
             filter_kwargs={"k": 8},
             disable_tqdm=True,
+            disable_caches=True,
         )
         if messages is None or len(messages) == 0:
             current_time += args.time_window
@@ -240,6 +241,11 @@ def main():
         proc.join()
         if proc.exitcode:
             raise RuntimeError(f"worker {proc.pid} exited with {proc.exitcode}")
+    gpu_inference_seconds = {}
+    for item in per_score.values():
+        for detail in item["sample_details"]:
+            gpu = str(detail["gpu"])
+            gpu_inference_seconds[gpu] = gpu_inference_seconds.get(gpu, 0.0) + float(detail["inference_seconds"])
     manifest = {
         "model": "ScorePerformer",
         "protocol": "scoreperformer_zero_mf",
@@ -254,6 +260,7 @@ def main():
         "workers_per_gpu": args.workers_per_gpu,
         "items": [per_score[i] for i in range(len(items))],
         "total_inference_seconds": sum(sum(x["inference_seconds"]) for x in per_score.values()),
+        "gpu_inference_seconds_by_gpu": gpu_inference_seconds,
         "wall_inference_seconds": time.perf_counter() - wall_start,
     }
     (args.output_dir / "prediction_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

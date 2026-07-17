@@ -17,7 +17,6 @@ if str(ROOT_DIR) not in sys.path:
 from src.utils.inr_midi import (
     RAW_CONTINUOUS_KEYS,
     RAW_PEDAL4_KEYS,
-    RAW_PEDAL_START_VALLEY_KEYS,
     RAW_SHARED_KEYS,
     midi_to_note_features,
     sorted_piano_notes,
@@ -213,7 +212,6 @@ def build_performance_payload(row, refined_dir, score_pitch, max_time_ms, float_
         max_time_ms=max_time_ms,
         normalize=False,
         force_monotonic_starts=True,
-        include_pedal_start_valley=True,
     )
 
     if performance_features["pitch"] != score_pitch:
@@ -229,7 +227,6 @@ def build_performance_payload(row, refined_dir, score_pitch, max_time_ms, float_
         "tier_a_star": bool(optional_value(row, "tier_a_star")),
         "label_shared_raw": shared_rows_to_int(performance_features["shared"]),
         "label_pedal4_raw": value_rows_to_int(performance_features["pedal4"], 4),
-        "label_pedal_start_valley_raw": value_rows_to_int(performance_features["pedal_start_valley"], 2),
         "interpolated": interpolated,
     }
 
@@ -255,7 +252,6 @@ def build_work_meta(first_row, score_rel_path, performance_count, max_time_ms, f
         "performance_count": performance_count,
         "label_shared_raw_keys": list(RAW_SHARED_KEYS),
         "label_pedal4_raw_keys": list(RAW_PEDAL4_KEYS),
-        "label_pedal_start_valley_raw_keys": list(RAW_PEDAL_START_VALLEY_KEYS),
         "timing_unit": "ms",
         "velocity_range": [0, 127],
         "pedal_range": [0, 127],

@@ -151,17 +151,15 @@ def load_config(path: Path, checkpoint: str | None):
         config["style_source_vocab_size"] = len(config["style_source_vocab"])
     if checkpoint:
         config["resume_path"] = checkpoint
-    config.setdefault("pedal_representation", "start_valley")
-    target = str(config.get("epr_timing_target", "")).lower()
-    config["legacy_dual_timing_head"] = (
-        target in {"raw_log_deviation", "raw_log_dev", "raw_log_absolute", "absolute_raw_log"}
-        and int(config.get("output_continuous_dim", config.get("continuous_dim", 0)) or 0) == 9
-    )
+    config.setdefault("pedal_representation", "binary_4")
+    target = str(config.get("epr_timing_target", "floor_log_deviation")).lower()
+    if target not in {"floor_log_deviation", "floor_log_dev"}:
+        raise ValueError("Only epr_timing_target=floor_log_deviation is supported")
+    config["legacy_dual_timing_head"] = False
     if config.get("task_type", "epr").lower() == "epr" and "output_continuous_dim" not in config:
         config["output_continuous_dim"] = default_epr_output_dim(
             target,
-            config.get("pedal_representation", "start_valley"),
-            legacy_dual_timing_head=config.get("legacy_dual_timing_head", False),
+            config.get("pedal_representation", "binary_4"),
         )
     if config.get("task_type", "epr").lower() != "epr":
         raise ValueError("Only task_type=epr is supported")
@@ -169,7 +167,7 @@ def load_config(path: Path, checkpoint: str | None):
     config["musical_feature_dim"] = musical_feature_dim(musical_mode)
     config["mask_feature_dim"] = 2 if int(config["musical_feature_dim"]) == 0 else 3
     config["score_control_feature_dim"] = int(config.get("score_control_feature_dim", config.get("control_feature_dim", 5)))
-    pedal_dim = pedal_representation_dim(config.get("pedal_representation", "start_valley"))
+    pedal_dim = pedal_representation_dim(config.get("pedal_representation", "binary_4"))
     config["performance_control_feature_dim"] = int(
         config.get("performance_control_feature_dim", config.get("control_feature_dim", 5) + pedal_dim)
     )
@@ -529,11 +527,11 @@ def labels_for_perf(config, perf, score_shared_raw):
     labels = performance_dev_velocity_pedal4_binary_rows(
         perf,
         score_shared_raw,
-        epr_timing_target=config.get("epr_timing_target", "log_deviation"),
+        epr_timing_target=config.get("epr_timing_target", "floor_log_deviation"),
         log_scale=float(config.get("timing_log_scale", 50.0)),
         pedal_binary_threshold=float(config.get("pedal_binary_threshold", 64.0)),
         legacy_dual_timing_head=bool(config.get("legacy_dual_timing_head", False)),
-        pedal_representation=config.get("pedal_representation", "start_valley"),
+        pedal_representation=config.get("pedal_representation", "binary_4"),
     )
     if labels is None:
         raise ValueError(f"Could not build labels for {perf.get('performance_source')}")
@@ -656,7 +654,7 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
         score_note_schema=config.get("score_note_input_schema", "integrated"),
         task_type="epr",
         disable_musical_features=config.get("disable_musical_features", False),
-        pedal_control_dim=pedal_representation_dim(config.get("pedal_representation", "start_valley")),
+        pedal_control_dim=pedal_representation_dim(config.get("pedal_representation", "binary_4")),
     )
     score = loaded["score"]
     windows = build_windows(len(pitch), config["block_notes"], config["overlap_ratio"])
@@ -796,13 +794,6 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
         )
         pred_continuous_list = pred_continuous.float().cpu().tolist()
         raw_rows_list = raw_rows.tolist()
-        pedal_dim = pedal_representation_dim(config.get("pedal_representation", "start_valley"))
-        pedal_start = pred_continuous.shape[-1] - pedal_dim
-        pedal_start_valley_rows = (
-            pred_continuous.float().cpu()[:, pedal_start : pedal_start + pedal_dim].tolist()
-            if pedal_dim == 2
-            else None
-        )
         midi_obj = note_features_to_midi(
             pitch=pitch,
             continuous=raw_rows_list,
@@ -810,19 +801,10 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
             target_tempo=120,
             max_time_ms=config["max_time_ms"],
             normalized=False,
-            pedal_start_valley=pedal_start_valley_rows,
-            valley_phase=float(config.get("pedal_valley_phase", 0.5)),
-            valley_restore_phase=float(config.get("pedal_valley_restore_phase", 0.9)),
         )
         raw_path = raw_dir / f"{score_stem}__{plan['suffix']}.json"
-        if pred_continuous.shape[-1] == 9:
-            target_key = "predicted_target9"
-        else:
-            target_key = "predicted_target7"
-        if pred_continuous.shape[-1] == 9:
-            timing_representation = "target9_raw_log_dev_raw_dev_velocity_binary4"
-        else:
-            timing_representation = "target7_dev_velocity_binary4"
+        target_key = "predicted_target7"
+        timing_representation = "target7_floor_log_dev_velocity_binary4"
         raw_payload = {
             "score_source": score_source,
             "performance_source": plan.get("performance_source"),
@@ -836,7 +818,6 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
             "pitch": [int(value) for value in pitch],
             target_key: pred_continuous_list,
             "predicted_target7": pred_continuous_list if pred_continuous.shape[-1] == 7 else None,
-            "predicted_target9": pred_continuous_list if pred_continuous.shape[-1] == 9 else None,
             "reconstructed_raw7": raw_rows_list,
             "ground_truth_paths": gt_rel_paths,
             "ground_truth_eval_paths": gt_paths,

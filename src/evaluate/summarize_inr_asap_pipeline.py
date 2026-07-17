@@ -338,7 +338,7 @@ def normalize_target_ioi_dev(score_ioi_ms, perf_ioi_ms, config):
     return normalize_train_ioi_dev(
         score_ioi_ms,
         perf_ioi_ms,
-        epr_timing_target=config.get("epr_timing_target", "log_deviation"),
+        epr_timing_target=config.get("epr_timing_target", "floor_log_deviation"),
         log_scale=float(config.get("timing_log_scale", 50.0)),
     )
 
@@ -347,7 +347,7 @@ def normalize_target_duration_dev(score_duration_ms, perf_duration_ms, config):
     return normalize_train_duration_dev(
         score_duration_ms,
         perf_duration_ms,
-        epr_timing_target=config.get("epr_timing_target", "log_deviation"),
+        epr_timing_target=config.get("epr_timing_target", "floor_log_deviation"),
         log_scale=float(config.get("timing_log_scale", 50.0)),
     )
 
@@ -439,7 +439,7 @@ def extract_pred_dev_arrays(raw_output_paths, score_source_to_work_path, config)
                 work = json.load(file)
             score_raw_cache[score_source] = work["score"]["score_raw"]
         score_raw = score_raw_cache[score_source]
-        target = payload.get("predicted_target7") or payload.get("predicted_target9") or []
+        target = payload.get("predicted_target7") or []
         reconstructed_raw = payload.get("reconstructed_raw7") or []
         if len(reconstructed_raw) != len(score_raw):
             raise ValueError(
@@ -572,7 +572,7 @@ def main():
     det_manifest = load_manifest(args.deterministic_manifest)
     sampling_manifest = load_manifest(args.sampling_manifest)
     config = load_manifest(args.config)
-    timing_normalization = config.get("timing_input_normalization", "legacy_log1p")
+    timing_normalization = config.get("timing_input_normalization", "linear_5000")
     max_time_ms = float(config.get("max_time_ms", 10000.0))
     pedal_binary_support = str(config.get("pedal_representation", "")).lower() == "binary_4"
     pedal_binary_threshold = float(config.get("pedal_binary_threshold", 64.0))

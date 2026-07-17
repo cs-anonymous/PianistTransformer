@@ -145,41 +145,19 @@ cfg = json.loads(Path(src).read_text(encoding="utf-8"))
 if cfg.get("task_type", "epr").lower() != "epr":
     raise SystemExit("run_inr_epr_pipeline.sh requires task_type=epr")
 cfg["use_style_tokens"] = False
-cfg.setdefault("pedal_representation", "start_valley")
-target = str(cfg.get("epr_timing_target", "log_deviation")).lower()
-pedal_representation = str(cfg.get("pedal_representation", "start_valley")).lower()
-pedal_aliases = {
-    "binary4": "binary_4",
-    "pedal4_binary": "binary_4",
-    "start-valley": "start_valley",
-    "pedal_start_valley": "start_valley",
-    "pedal_start_has_valley": "start_valley",
-    "pedal_start": "start",
-    "start_only": "start",
-    "start_dlm": "start",
-}
+cfg.setdefault("pedal_representation", "binary_4")
+target = str(cfg.get("epr_timing_target", "floor_log_deviation")).lower()
+if target not in {"floor_log_deviation", "floor_log_dev"}:
+    raise SystemExit("Only epr_timing_target=floor_log_deviation is supported")
+pedal_representation = str(cfg.get("pedal_representation", "binary_4")).lower()
+pedal_aliases = {"binary4": "binary_4", "pedal4_binary": "binary_4"}
 pedal_representation = pedal_aliases.get(pedal_representation, pedal_representation)
 if pedal_representation == "binary_4":
     pedal_dim = 4
-elif pedal_representation == "start_valley":
-    pedal_dim = 2
-elif pedal_representation == "start":
-    pedal_dim = 1
 else:
-    raise SystemExit(f"Unsupported pedal_representation={cfg.get('pedal_representation')}")
-configured_output_dim = int(cfg.get("output_continuous_dim", cfg.get("continuous_dim", 0)) or 0)
-legacy_dual = bool(
-    cfg.get(
-        "legacy_dual_timing_head",
-        target in {"raw_log_deviation", "raw_log_dev"} and configured_output_dim >= 9,
-    )
-)
-if target in {"raw_log_absolute", "absolute_raw_log"}:
-    default_output_dim = 5 + pedal_dim
-elif target in {"raw_log_deviation", "raw_log_dev"} and legacy_dual:
-    default_output_dim = 5 + pedal_dim
-else:
-    default_output_dim = 3 + pedal_dim
+    raise SystemExit("Only pedal_representation=binary_4 is supported")
+cfg["legacy_dual_timing_head"] = False
+default_output_dim = 3 + pedal_dim
 cfg.setdefault("output_continuous_dim", default_output_dim)
 cfg["output_dir"] = output_root
 cfg["logging_dir"] = log_root

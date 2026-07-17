@@ -45,7 +45,7 @@ for path in paths:
     assert payload.get("score_input") is not None, path
     for perf in payload.get("performances", []):
         targets = set((perf.get("labels_by_target") or {}).keys())
-        assert {"floor_log_deviation", "floor_log_absolute"} <= targets, (path, perf.get("performance_source"))
+        assert "floor_log_deviation" in targets, (path, perf.get("performance_source"))
 print("VALIDATED_READY_SCORE_SPAN", len(paths), flush=True)
 PY
 

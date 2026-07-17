@@ -44,12 +44,6 @@ RAW_PEDAL2_KEYS = (
     "pedal_ctrl",
 )
 
-RAW_PEDAL_START_VALLEY_KEYS = (
-    "pedal_start",
-    "has_valley",
-)
-
-
 def sorted_piano_notes(midi_obj):
     notes = []
     for instrument in midi_obj.instruments:
@@ -78,7 +72,7 @@ def denormalize_time_ms(time_norm, max_time_ms=10000.0):
 
 def normalize_time_ms_for_inr_input(time_ms, normalization="linear_5000", max_time_ms=10000.0):
     normalization = str(normalization or "linear_5000").lower()
-    if normalization in {"linear_5000", "raw_linear_5000"}:
+    if normalization in {"linear_5000", "linear_5000"}:
         return min(max(float(time_ms), 0.0), 5000.0) / 5000.0
     raise ValueError(f"Unsupported timing normalization: {normalization}")
 
@@ -86,7 +80,7 @@ def normalize_time_ms_for_inr_input(time_ms, normalization="linear_5000", max_ti
 def denormalize_time_ms_from_inr_input(time_norm, normalization="linear_5000", max_time_ms=10000.0):
     normalization = str(normalization or "linear_5000").lower()
     clipped = min(max(float(time_norm), 0.0), 1.0)
-    if normalization in {"linear_5000", "raw_linear_5000"}:
+    if normalization in {"linear_5000", "linear_5000"}:
         return clipped * 5000.0
     raise ValueError(f"Unsupported timing normalization: {normalization}")
 
@@ -100,7 +94,7 @@ def old_continuous_row_to_raw(row, max_time_ms=10000.0):
     ]
 
 
-def raw_row_to_model_continuous(row, timing_normalization="legacy_log1p", max_time_ms=10000.0):
+def raw_row_to_model_continuous(row, timing_normalization="linear_5000", max_time_ms=10000.0):
     return [
         normalize_time_ms_for_inr_input(
             row[0],
@@ -117,7 +111,7 @@ def raw_row_to_model_continuous(row, timing_normalization="legacy_log1p", max_ti
     ]
 
 
-def raw_rows_to_model_continuous(rows, timing_normalization="legacy_log1p", max_time_ms=10000.0):
+def raw_rows_to_model_continuous(rows, timing_normalization="linear_5000", max_time_ms=10000.0):
     return [
         raw_row_to_model_continuous(
             row,
@@ -216,7 +210,6 @@ def midi_to_note_features(
     normalize=True,
     force_monotonic_starts=False,
     include_pedal2=False,
-    include_pedal_start_valley=False,
     pedal_binary_threshold=64.0,
 ):
     """Convert a MIDI object to note-level pitch and continuous features.
@@ -241,7 +234,6 @@ def midi_to_note_features(
     pitches = []
     continuous = []
     pedal2 = []
-    pedal_start_valley = []
     last_start_ms = 0.0
 
     for idx, note in enumerate(notes):
@@ -269,21 +261,6 @@ def midi_to_note_features(
             pedal_start,
             next_pedal_start,
         )
-        pedal_min = _cc_min_value_between_ms(
-            pedal_times_ms,
-            pedal_values,
-            start_ms,
-            next_start_ms,
-            pedal_start,
-            next_pedal_start,
-        )
-        threshold = float(pedal_binary_threshold)
-        has_valley = (
-            float(pedal_start) >= threshold
-            and float(next_pedal_start) >= threshold
-            and float(pedal_min) < threshold
-        )
-
         if normalize:
             ioi_value = normalize_time_ms(ioi_ms, max_time_ms=max_time_ms)
             duration_value = normalize_time_ms(duration_ms, max_time_ms=max_time_ms)
@@ -292,10 +269,6 @@ def midi_to_note_features(
             pedal2_values_out = [
                 min(max(float(pedal_start) / 127.0, 0.0), 1.0),
                 min(max(float(pedal_ctrl) / 127.0, 0.0), 1.0),
-            ]
-            pedal_start_valley_values_out = [
-                min(max(float(pedal_start) / 127.0, 0.0), 1.0),
-                1.0 if has_valley else 0.0,
             ]
         else:
             ioi_value = ioi_ms
@@ -306,11 +279,6 @@ def midi_to_note_features(
                 min(max(float(pedal_start), 0.0), 127.0),
                 min(max(float(pedal_ctrl), 0.0), 127.0),
             ]
-            pedal_start_valley_values_out = [
-                min(max(float(pedal_start), 0.0), 127.0),
-                1.0 if has_valley else 0.0,
-            ]
-
         pitches.append(int(note.pitch))
         continuous.append(
             [
@@ -321,7 +289,6 @@ def midi_to_note_features(
             ]
         )
         pedal2.append(pedal2_values_out)
-        pedal_start_valley.append(pedal_start_valley_values_out)
 
     result = {
         "pitch": pitches,
@@ -331,8 +298,6 @@ def midi_to_note_features(
     }
     if include_pedal2:
         result["pedal2"] = pedal2
-    if include_pedal_start_valley:
-        result["pedal_start_valley"] = pedal_start_valley
     return result
 
 
@@ -343,9 +308,6 @@ def note_features_to_midi(
     target_tempo=120,
     max_time_ms=10000.0,
     normalized=True,
-    pedal_start_valley=None,
-    valley_phase=0.5,
-    valley_restore_phase=0.9,
 ):
     """Build a MIDI object from pitch and predicted continuous features."""
     def _maybe_scale_midi_value(value):
@@ -362,18 +324,17 @@ def note_features_to_midi(
     duration_values = []
     velocity_values = []
     pedal_values = []
-    valley_values = []
 
     for idx, row in enumerate(continuous):
         if normalized:
             ioi_ms = denormalize_time_ms_from_inr_input(
                 row[0],
-                normalization=normalized if isinstance(normalized, str) else "legacy_log1p",
+                normalization=normalized if isinstance(normalized, str) else "linear_5000",
                 max_time_ms=max_time_ms,
             )
             duration_ms = denormalize_time_ms_from_inr_input(
                 row[1],
-                normalization=normalized if isinstance(normalized, str) else "legacy_log1p",
+                normalization=normalized if isinstance(normalized, str) else "linear_5000",
                 max_time_ms=max_time_ms,
             )
             velocity = int(round(min(max(float(row[2]), 0.0), 1.0) * 127.0))
@@ -387,11 +348,6 @@ def note_features_to_midi(
         duration_values.append(duration_ms)
         velocity_values.append(velocity)
         pedal_values.append(pedals)
-        if pedal_start_valley is not None:
-            valley_row = pedal_start_valley[idx]
-            valley_values.append(1.0 if float(valley_row[1]) >= 0.5 else 0.0)
-        else:
-            valley_values.append(0.0)
 
     for idx, pitch_value in enumerate(pitch):
         current_ms += ioi_values[idx]
@@ -409,13 +365,6 @@ def note_features_to_midi(
         ]
         for value, sample_time in zip(pedal_values[idx], sample_times):
             control_changes.append(ControlChange(64, value, int(round(sample_time))))
-        if valley_values[idx] >= 0.5 and idx + 1 < len(pedal_values):
-            valley_time = current_ms + next_ioi * min(max(float(valley_phase), 0.0), 1.0)
-            restore_time = current_ms + next_ioi * min(max(float(valley_restore_phase), 0.0), 1.0)
-            restore_value = int(round(_maybe_scale_midi_value(pedal_values[idx + 1][0])))
-            control_changes.append(ControlChange(64, 0, int(round(valley_time))))
-            control_changes.append(ControlChange(64, restore_value, int(round(restore_time))))
-
     control_changes = _deduplicate_controls(control_changes)
 
     max_tick = 0

@@ -78,17 +78,17 @@ def build_dataset(config, manifest, split):
         max_performances_per_work=None,
         max_windows_per_work=None,
         cache_size=max(1, int(config.get("node_cache_size", 8) or 8)),
-        timing_normalization=config.get("timing_input_normalization", "scaled_log_5000_s10"),
+        timing_normalization=config.get("timing_input_normalization", "linear_5000"),
         max_time_ms=config.get("max_time_ms", 10000.0),
         epr_timing_bins=config.get("epr_timing_bins", 5000),
         epr_value_bins=config.get("epr_value_bins", 128),
-        pedal_representation=config.get("pedal_representation", "start_valley"),
+        pedal_representation=config.get("pedal_representation", "binary_4"),
         musical_feature_mode=config.get(
             "musical_feature_mode",
             "musical51_full",
         ),
         disable_musical_features=config.get("disable_musical_features", False),
-        epr_timing_target=config.get("epr_timing_target", "log_deviation"),
+        epr_timing_target=config.get("epr_timing_target", "floor_log_deviation"),
         use_timing_scale_bit=config.get("use_timing_scale_bit", False),
         timing_control_mode=config.get("timing_control_mode", "dinr_floor_log"),
         timing_log_scale=config.get("timing_log_scale", 50.0),
@@ -138,11 +138,10 @@ def main():
     parser.add_argument("--input-feature-mode", default="integrated")
     parser.add_argument("--timing-input-normalization", default="linear_5000")
     parser.add_argument("--max-time-ms", type=float, default=10000.0)
-    parser.add_argument("--pedal-representation", default="start_valley")
-    parser.add_argument("--pedal-valley-pos-weight", type=float, default=None)
+    parser.add_argument("--pedal-representation", default="binary_4")
     parser.add_argument("--musical-feature-mode", default="musical51")
     parser.add_argument("--disable-musical-features", action="store_true")
-    parser.add_argument("--epr-timing-target", default="log_deviation")
+    parser.add_argument("--epr-timing-target", default="floor_log_deviation")
     parser.add_argument("--use-timing-scale-bit", type=int, default=0)
     parser.add_argument("--timing-control-mode", default="dinr_floor_log")
     parser.add_argument("--timing-log-scale", type=float, default=50.0)
@@ -184,13 +183,11 @@ def main():
         "timing_input_normalization": args.timing_input_normalization,
         "max_time_ms": args.max_time_ms,
         "pedal_representation": args.pedal_representation,
-        "pedal_valley_pos_weight": args.pedal_valley_pos_weight,
         "musical_feature_mode": args.musical_feature_mode,
         "disable_musical_features": args.disable_musical_features,
         "epr_timing_target": args.epr_timing_target,
         "use_timing_scale_bit": bool(args.use_timing_scale_bit),
         "timing_control_mode": args.timing_control_mode,
-        "timing_log_scale": args.timing_log_scale,
         "seed": args.seed,
         "node_cache_size": args.node_cache_size,
         "fixed_window_split_scheme": args.fixed_window_split_scheme,
