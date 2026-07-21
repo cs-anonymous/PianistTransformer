@@ -5,6 +5,41 @@ from pathlib import Path
 import torch
 
 
+def _validate_score_feature_payload(score_payload, path):
+    pitch = score_payload.get("pitch") or []
+    score_feature = score_payload.get("score_feature")
+    has_score_feature = score_payload.get("has_score_feature")
+    if not isinstance(score_feature, list):
+        raise ValueError(f"missing_score_feature_for_sidecar: {path}")
+    if not isinstance(has_score_feature, list):
+        raise ValueError(f"missing_has_score_feature_for_sidecar: {path}")
+    if len(score_feature) != len(pitch):
+        raise ValueError(f"score_feature_length_mismatch_for_sidecar: {path}")
+    if len(has_score_feature) != len(pitch):
+        raise ValueError(f"has_score_feature_length_mismatch_for_sidecar: {path}")
+    for idx, (row, has_feature) in enumerate(zip(score_feature, has_score_feature)):
+        if not bool(has_feature):
+            continue
+        if len(row) != 9:
+            raise ValueError(f"score_feature_width_mismatch_for_sidecar[{idx}]: {path}")
+        mo_idx = int(round(float(row[0])))
+        md_idx = int(round(float(row[1])))
+        ml_idx = int(round(float(row[2])))
+        if mo_idx < 0 or mo_idx > 144 or md_idx < 0 or md_idx > 144 or ml_idx < 0 or ml_idx > 144:
+            raise ValueError(f"score_feature_idx_out_of_range[{idx}]: {path}")
+        for value in row[3:9]:
+            if float(value) not in (0.0, 1.0):
+                raise ValueError(f"score_feature_binary_value_invalid[{idx}]: {path}")
+    matched = sum(1 for value in has_score_feature if bool(value))
+    if pitch and matched <= 0:
+        raise ValueError(f"zero_score_feature_coverage_for_sidecar: {path}")
+    total_abs = 0.0
+    for row in score_feature:
+        total_abs += sum(abs(float(value)) for value in row)
+    if pitch and total_abs <= 0.0:
+        raise ValueError(f"all_zero_score_feature_for_sidecar: {path}")
+
+
 def _normalize_performance_to_score_onset_span(score_raw, perf):
     """Scale performance IOI/duration so its first-to-last onset span matches the score."""
     score_span_ms = float(sum(float(row[0]) for row in score_raw[1:]))
@@ -76,11 +111,7 @@ def build_sidecar_for_work(
             score_payload["score_feature"] = full_score["score_feature"]
         if "has_score_feature" in full_score:
             score_payload["has_score_feature"] = full_score["has_score_feature"]
-    pitch = score_payload.get("pitch") or []
-    if "score_feature" not in score_payload:
-        score_payload["score_feature"] = [[0.0] * 9 for _ in pitch]
-    if "has_score_feature" not in score_payload:
-        score_payload["has_score_feature"] = [0] * len(pitch)
+    _validate_score_feature_payload(score_payload, path)
     # Persist raw per-performance targets inside the sidecar so training can
     # stay strictly read-only and validate the cache payload against the current
     # raw-sidecar schema.
@@ -198,6 +229,8 @@ def build_ready_sidecar_for_work(
     prepared["_source_identity"] = dataset._source_identity(path)
     prepared["performance_time_normalization"] = performance_time_normalization or "none"
     cache_path = dataset._prepared_disk_cache_path(path)
+    if cache_path is None:
+        cache_path = dataset._prepared_sidecar_paths(path)[0]
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.tmp")
     torch.save(prepared, tmp_path)

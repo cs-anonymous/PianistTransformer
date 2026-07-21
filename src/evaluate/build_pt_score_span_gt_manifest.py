@@ -17,8 +17,8 @@ def parse_args():
     parser.add_argument("--prediction-manifest", type=Path, required=True)
     parser.add_argument("--output-manifest", type=Path, required=True)
     parser.add_argument("--output-gt-dir", type=Path, required=True)
-    parser.add_argument("--processed-root", type=Path, default=Path("/home/sy/EPR/PianoCoRe/processed"))
-    parser.add_argument("--refined-root", type=Path, default=Path("/home/sy/EPR/PianoCoRe/refined"))
+    parser.add_argument("--processed-root", type=Path, default=ROOT_DIR / "data" / "ASAP_processed")
+    parser.add_argument("--refined-root", type=Path, default=ROOT_DIR / "data" / "ASAP_processed")
     parser.add_argument(
         "--eval-gt-time-normalization",
         default="score_onset_span",

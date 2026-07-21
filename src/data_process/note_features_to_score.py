@@ -139,6 +139,15 @@ def feature_flags(payload: dict[str, Any], index: int, pitch_value: int) -> tupl
     score = payload["score"]
     features = score.get("score_feature") or []
     has = score.get("has_score_feature") or []
+    keys = (payload.get("meta") or {}).get("score_feature_keys") or []
+    if keys[:9] == ["mo_idx", "md_idx", "ml_idx", "staff", "trill", "grace", "staccato", "stem_up", "stem_down"]:
+        if index < len(features) and (not has or bool(has[index])):
+            row = features[index]
+            staff = 1 if len(row) > 3 and row[3] >= 0.5 else 0
+            trill = bool(len(row) > 4 and row[4] >= 0.5)
+            grace = bool(len(row) > 5 and row[5] >= 0.5)
+            staccato = bool(len(row) > 6 and row[6] >= 0.5)
+            return staff, trill, grace, staccato
     if index < len(features) and (not has or bool(has[index])):
         row = features[index]
         staff = 1 if len(row) > 4 and row[4] >= 0.5 else 0
@@ -299,6 +308,8 @@ def events_from_score_feature(payload: dict[str, Any]) -> tuple[list[NoteEvent],
     pitches = [int(value) for value in score["pitch"]]
     features = score.get("score_feature") or []
     has = score.get("has_score_feature") or [1] * len(pitches)
+    keys = (payload.get("meta") or {}).get("score_feature_keys") or []
+    indexed_binary6 = keys[:9] == ["mo_idx", "md_idx", "ml_idx", "staff", "trill", "grace", "staccato", "stem_up", "stem_down"]
     raw_grid = (payload.get("meta") or {}).get("score_feature_unit") == "quarter_length_raw_grid_1/24"
 
     events: list[NoteEvent] = []
@@ -306,16 +317,37 @@ def events_from_score_feature(payload: dict[str, Any]) -> tuple[list[NoteEvent],
     measure = 0
     prev_offset = 0.0
     current_length = 4.0
+    measure_max_end = 0.0
     for idx, pitch_value in enumerate(pitches):
         row = features[idx] if idx < len(features) else [0.0] * 8
-        mo, md, ml = denorm_score_feature(row, raw_grid=raw_grid)
         has_feature = idx < len(has) and bool(has[idx])
-        starts_new_measure = idx > 0 and has_feature and ml > 0 and (row[3] >= 0.5 or mo <= prev_offset + 1e-6)
-        if starts_new_measure:
-            current_length = max(ml, SCORE_GRID)
-            num, den = time_signature_for_length(current_length)
-            measure_infos.append(MeasureInfo(current_length, num, den))
-            measure += 1
+        stem = None
+        if indexed_binary6:
+            mo = quantize(min(max(float(row[0]) / 24.0, 0.0), 6.0)) if len(row) > 0 else 0.0
+            md = quantize(min(max(float(row[1]) / 24.0, 0.0), 6.0)) if len(row) > 1 else SCORE_GRID
+            ml = quantize(min(max(float(row[2]) / 24.0, 0.0), 6.0)) if len(row) > 2 else 0.0
+            starts_new_measure = idx > 0 and has_feature and ml > 0.0 and mo <= SCORE_GRID / 2.0 and prev_offset > SCORE_GRID / 2.0
+            if starts_new_measure:
+                current_length = max(ml, SCORE_GRID)
+                num, den = time_signature_for_length(current_length)
+                measure_infos.append(MeasureInfo(current_length, num, den))
+                measure += 1
+                measure_max_end = 0.0
+            elif idx == 0 and has_feature and ml > 0.0:
+                current_length = max(ml, SCORE_GRID)
+            if len(row) > 7 and row[7] >= 0.5:
+                stem = "up"
+            elif len(row) > 8 and row[8] >= 0.5:
+                stem = "down"
+        else:
+            mo, md, ml = denorm_score_feature(row, raw_grid=raw_grid)
+            starts_new_measure = idx > 0 and has_feature and ml > 0 and (row[3] >= 0.5 or mo <= prev_offset + 1e-6)
+            if starts_new_measure:
+                current_length = max(ml, SCORE_GRID)
+                num, den = time_signature_for_length(current_length)
+                measure_infos.append(MeasureInfo(current_length, num, den))
+                measure += 1
+                measure_max_end = 0.0
         staff, trill, grace, staccato = feature_flags(payload, idx, pitch_value)
         if not has_feature and events:
             mo = min(events[-1].offset + SCORE_GRID, current_length - SCORE_GRID)
@@ -331,14 +363,16 @@ def events_from_score_feature(payload: dict[str, Any]) -> tuple[list[NoteEvent],
                 trill=trill,
                 grace=grace,
                 staccato=staccato,
+                stem=stem,
             )
         )
         prev_offset = mo
+        measure_max_end = max(measure_max_end, mo + max(md, SCORE_GRID))
 
     while len(measure_infos) <= measure:
         measure_events = [event for event in events if event.measure == len(measure_infos)]
-        inferred = max((event.offset + event.duration for event in measure_events), default=current_length)
-        length = max(current_length, quantize(inferred))
+        inferred = max((event.offset + event.duration for event in measure_events), default=measure_max_end or current_length)
+        length = max(current_length if indexed_binary6 else SCORE_GRID, quantize(inferred))
         num, den = time_signature_for_length(length)
         measure_infos.append(MeasureInfo(length, num, den))
     return split_cross_measure_events(events, measure_infos), measure_infos
@@ -556,6 +590,8 @@ def assign_voices_and_stems(events: list[NoteEvent]) -> None:
         }
         for event in staff_events:
             event.voice = group_voice.get(event.index, 1)
+            if event.stem:
+                continue
             if event.offset in polyphonic_offsets or event.voice > 1:
                 event.stem = "up" if event.voice == 1 else "down"
             else:
@@ -635,9 +671,9 @@ def output_path_for_json(json_path: Path, output_mode: str) -> Path:
     if output_mode == "basename":
         name = json_path.name
         if name.endswith(".node_a.json"):
-            name = name[: -len(".node_a.json")] + ".extracted.mxl"
+            name = name[: -len(".node_a.json")] + ".mxl"
         else:
-            name = name.replace(".json", ".extracted.mxl")
+            name = name.replace(".json", ".mxl")
         return json_path.with_name(name)
     if output_mode == "fixed":
         return json_path.with_name("extracted.mxl")
@@ -833,6 +869,22 @@ def write_events_mxl(
     return "direct_musicxml"
 
 
+def write_music21_mxl(
+    events: list[NoteEvent],
+    measure_infos: list[MeasureInfo],
+    key_fifths: list[int],
+    out_path: Path,
+    title: str | None,
+) -> str:
+    score = build_score(events, measure_infos, key_fifths, title=title)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = out_path.with_name(out_path.name + ".tmp.mxl")
+    tmp_path.unlink(missing_ok=True)
+    score.write("mxl", fp=str(tmp_path))
+    os.replace(tmp_path, out_path)
+    return "music21_postprocessed_mxl"
+
+
 def convert_one(task: dict[str, Any]) -> dict[str, Any]:
     started = time.time()
     json_path = Path(task["json_path"])
@@ -864,7 +916,7 @@ def convert_one(task: dict[str, Any]) -> dict[str, Any]:
         events, measure_infos = built
         key_fifths = infer_key_fifths_by_measure(events, len(measure_infos), key_complexity, change_penalty, min_key_run)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        write_mode = write_events_mxl(events, measure_infos, key_fifths, out_path, title=json_path.parent.name)
+        write_mode = write_music21_mxl(events, measure_infos, key_fifths, out_path, title=json_path.parent.name)
         result.update(
             {
                 "status": "ok",
@@ -906,10 +958,10 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--json-root", type=Path, default=Path("PianoCoRe/processed"))
-    parser.add_argument("--refined-dir", type=Path, default=Path("PianoCoRe/refined"))
-    parser.add_argument("--summary-path", type=Path, default=Path("PianoCoRe/processed/processed_extracted_mxl_summary.json"))
-    parser.add_argument("--details-path", type=Path, default=Path("PianoCoRe/processed/processed_extracted_mxl_details.jsonl"))
+    parser.add_argument("--json-root", type=Path, default=Path("data/ASAP_processed"))
+    parser.add_argument("--refined-dir", type=Path, default=Path("data/ASAP_processed"))
+    parser.add_argument("--summary-path", type=Path, default=Path("data/ASAP_processed/processed_extracted_mxl_summary.json"))
+    parser.add_argument("--details-path", type=Path, default=Path("data/ASAP_processed/processed_extracted_mxl_details.jsonl"))
     parser.add_argument("--num-proc", type=int, default=30)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
@@ -919,7 +971,7 @@ def main() -> None:
     parser.add_argument("--min-key-run-measures", type=int, default=4)
     args = parser.parse_args()
 
-    json_paths = sorted(path for path in args.json_root.rglob("*.json"))
+    json_paths = sorted(path for path in args.json_root.rglob("score_*_refined.json"))
     if args.limit is not None:
         json_paths = json_paths[: args.limit]
     tasks = [

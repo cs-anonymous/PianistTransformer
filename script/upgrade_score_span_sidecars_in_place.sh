@@ -4,8 +4,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 common_args=(
-  --metadata-path PianoCoRe/metadata.csv
-  --refined-dir PianoCoRe/processed
+  --metadata-path data/ASAP_processed/metadata.generated_json.csv
+  --refined-dir data/ASAP_processed
   --block-notes 512
   --overlap-ratio 0.125
   --min-notes 64
@@ -13,11 +13,11 @@ common_args=(
   --timing-input-normalization linear_5000
   --max-time-ms 10000
   --pedal-representation binary_4
-  --musical-feature-mode musical51_full
+  --musical-feature-mode musical4slot
   --epr-timing-target floor_log_deviation
   --timing-control-mode dinr_floor_log
   --timing-log-scale 50
-  --sidecar-tag ASAP_DINR_SCORESPAN
+  --sidecar-tag NONE
   --ready
   --performance-time-normalization score_onset_span
   --performance-dataset ASAP
@@ -32,7 +32,7 @@ import glob
 import json
 import torch
 
-paths = glob.glob("PianoCoRe/processed/**/*.ASAP_DINR_SCORESPAN.pt", recursive=True)
+paths = glob.glob("data/ASAP_processed/**/*.pt", recursive=True)
 # ASAP-only training contains 188 works and the held-out ASAP test protocol
 # contributes another 19 score works.
 assert len(paths) == 207, len(paths)
@@ -49,6 +49,6 @@ for path in paths:
 print("VALIDATED_READY_SCORE_SPAN", len(paths), flush=True)
 PY
 
-find PianoCoRe/processed -name '*.DINR_READY_ASAP.pt' -delete
-remaining="$(find PianoCoRe/processed -name '*.DINR_READY_ASAP.pt' | wc -l)"
+find data/ASAP_processed -name '*.DINR_READY_ASAP.pt' -delete
+remaining="$(find data/ASAP_processed -name '*.DINR_READY_ASAP.pt' | wc -l)"
 printf 'DINR_READY_ASAP_REMAINING %s\n' "$remaining"

@@ -354,7 +354,7 @@ def normalize_target_duration_dev(score_duration_ms, perf_duration_ms, config):
 
 def refined_root_from_config(config):
     refined_dir = (ROOT_DIR / config["refined_dir"]).resolve()
-    return refined_dir.parent / "refined"
+    return refined_dir
 
 
 def relative_refined_path(path, refined_root):

@@ -5,14 +5,13 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
 COMMON=(
-  --metadata-path PianoCoRe/metadata.csv
-  --refined-dir PianoCoRe/processed
+  --metadata-path data/ASAP_processed/metadata.generated_json.csv
+  --refined-dir data/ASAP_processed
   --split train
   --performance-dataset ASAP
   --task-type epr
   --input-feature-mode integrated
-  --musical-feature-mode none
-  --disable-musical-features
+  --musical-feature-mode musical4slot
   --timing-control-mode dinr_floor_log
   --pedal-representation binary_4
   --ready
@@ -23,7 +22,7 @@ COMMON=(
 python src/data_process/prebuild_inr_work_pt.py \
   "${COMMON[@]}" \
   --epr-timing-target floor_log_deviation \
-  --sidecar-tag DINR_READY_ASAP
+  --sidecar-tag NONE
 
 BASE_NUM_TRAIN_EPOCHS=16 \
 BASE_ASAP_ONLY=1 \

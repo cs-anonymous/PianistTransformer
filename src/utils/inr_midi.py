@@ -74,6 +74,8 @@ def normalize_time_ms_for_inr_input(time_ms, normalization="linear_5000", max_ti
     normalization = str(normalization or "linear_5000").lower()
     if normalization in {"linear_5000", "linear_5000"}:
         return min(max(float(time_ms), 0.0), 5000.0) / 5000.0
+    if normalization in {"log1p_t_over_50_5000", "scaled_log_5000_s10"}:
+        return normalize_time_ms(time_ms, max_time_ms=max_time_ms)
     raise ValueError(f"Unsupported timing normalization: {normalization}")
 
 
@@ -82,6 +84,8 @@ def denormalize_time_ms_from_inr_input(time_norm, normalization="linear_5000", m
     clipped = min(max(float(time_norm), 0.0), 1.0)
     if normalization in {"linear_5000", "linear_5000"}:
         return clipped * 5000.0
+    if normalization in {"log1p_t_over_50_5000", "scaled_log_5000_s10"}:
+        return denormalize_time_ms(clipped, max_time_ms=max_time_ms)
     raise ValueError(f"Unsupported timing normalization: {normalization}")
 
 

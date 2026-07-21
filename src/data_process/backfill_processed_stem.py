@@ -347,7 +347,7 @@ def main() -> None:
     parser.add_argument("--pianocore-dir", type=Path, default=Path("../PianoCoRe"))
     parser.add_argument("--metadata", type=Path, default=None)
     parser.add_argument("--raw-midi-zip", type=Path, default=None)
-    parser.add_argument("--json-dir", type=Path, default=Path("../PianoCoRe/processed"))
+    parser.add_argument("--json-dir", type=Path, default=Path("data/ASAP_processed"))
     parser.add_argument("--subset", choices=["a", "a_star", "all"], default="a")
     parser.add_argument("--num-proc", type=int, default=30)
     parser.add_argument("--limit-works", type=int, default=None)

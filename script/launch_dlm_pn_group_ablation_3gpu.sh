@@ -12,8 +12,8 @@ mkdir -p "${RUN_ROOT}"
 SPLIT_SUMMARY="${RUN_ROOT}/train_valid_asap3_nonasap05_v1_current_summary.json"
 if [[ ! -s "${SPLIT_SUMMARY}" ]]; then
   /home/kaititech/anaconda3/bin/python src/data_process/create_fixed_window_valid_split.py \
-    --metadata-path PianoCoRe/metadata.csv \
-    --refined-dir PianoCoRe/processed \
+    --metadata-path data/ASAP_processed/metadata.generated_json.csv \
+    --refined-dir data/ASAP_processed \
     --scheme-name train_valid_asap3_nonasap05_v1 \
     --selection-seed 42 \
     --output-summary "${SPLIT_SUMMARY}" \
@@ -37,6 +37,10 @@ cfg.update({
     "overwrite_output_dir": True,
     "resume_path": None,
     "resume_trainer_state": False,
+    "metadata_path": str(Path("data/ASAP_processed/metadata.generated_json.csv").resolve()),
+    "refined_dir": str(Path("data/ASAP_processed").resolve()),
+    "musical_feature_mode": "musical4slot",
+    "disable_musical_features": False,
     "multi_perf_group_size": 4,
     "multi_perf_min_group_size": 3,
     # Each dataset item expands to 3-4 performances in the collator; bs8 keeps
@@ -52,6 +56,7 @@ cfg.update({
     "pn_var_duration_lambda": 0.0,
     "pn_var_velocity_lambda": 0.0,
 })
+cfg.pop("prepared_sidecar_tag", None)
 if name == "B-group-mean":
     cfg["pn_mean_loss_lambda"] = 0.1
 elif name == "C-group-mean-var":

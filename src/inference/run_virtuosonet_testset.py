@@ -1,6 +1,7 @@
 import argparse
 import json
 import multiprocessing as mp
+import sys
 import time
 from pathlib import Path
 
@@ -9,11 +10,13 @@ import pandas as pd
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--metadata", type=Path, default=Path("PianoCoRe/metadata.csv"))
+    p.add_argument("--metadata", type=Path, default=Path("data/ASAP_processed/metadata.csv"))
     p.add_argument("--midi-root", type=Path, default=Path("PianoCoRe"))
+    p.add_argument("--processed-root", type=Path, default=Path("data/ASAP_processed"))
     p.add_argument("--score-source-list", type=Path, required=True)
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--generated-xml-root", type=Path, default=Path("results/external_eval_20260717/generated_musicxml"))
+    p.add_argument("--virtuoso-root", type=Path, default=Path("external/virtuosoNet"))
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--num-workers", type=int, default=1)
@@ -46,13 +49,16 @@ def collect_items(args):
         if row.empty:
             raise FileNotFoundError(f"Missing ASAP metadata row for {score_source}")
         rel = Path(score_source)
-        xml_path = args.midi_root / "raw" / rel.parent / "score.musicxml"
-        xml_source = "raw"
+        xml_path = args.processed_root / rel.parent / rel.with_suffix(".musicxml").name
+        xml_source = "processed"
+        if not xml_path.exists():
+            xml_path = args.midi_root / "raw" / rel.parent / "score.musicxml"
+            xml_source = "raw"
         if not xml_path.exists():
             xml_path = args.generated_xml_root / rel.with_suffix(".musicxml")
             xml_source = "generated_from_refined_score_midi"
         if not xml_path.exists():
-            raise FileNotFoundError(f"Missing MusicXML and generated fallback: {score_source}")
+            raise FileNotFoundError(f"Missing processed/raw/generated MusicXML fallback: {score_source}")
         gt_paths = [
             str((args.midi_root / "refined" / p).resolve())
             for p in sorted(row["refined_performance_midi_path"].dropna().unique())
@@ -68,6 +74,9 @@ def collect_items(args):
 
 
 def worker(worker_idx, args, jobs, results):
+    virtuoso_root = str(args.virtuoso_root.resolve())
+    if virtuoso_root not in sys.path:
+        sys.path.insert(0, virtuoso_root)
     import torch
     from virtuoso.inference import InferenceModel
 
@@ -130,6 +139,7 @@ def main():
     ]
     for w in workers:
         w.start()
+    wall_start = time.perf_counter()
     for i, item in enumerate(items):
         jobs.put((i, item))
     for _ in workers:
@@ -143,21 +153,28 @@ def main():
         w.join()
         if w.exitcode:
             raise RuntimeError(f"worker {w.pid} exited with {w.exitcode}")
+    wall_elapsed = time.perf_counter() - wall_start
     manifest = {
         "model": "VirtuosoNet HAN+GRU",
         "protocol": "virtuosonet_han_gru",
         "checkpoint": str(args.checkpoint.resolve()),
+        "metadata": str(args.metadata.resolve()),
+        "processed_root": str(args.processed_root.resolve()),
+        "midi_root": str(args.midi_root.resolve()),
         "score_source_list": str(args.score_source_list.resolve()),
         "split": "test",
         "gt_filter": "performance_dataset=ASAP",
         "num_samples": 2,
         "sample_initial_z": ["zero", "normal"],
         "generated_xml_root": str(args.generated_xml_root.resolve()),
+        "virtuoso_root": str(args.virtuoso_root.resolve()),
+        "device": args.device,
         "num_workers": args.num_workers,
         "items": [collected[i] for i in range(len(items))],
         "total_inference_seconds": sum(
             sum(x["inference_seconds"]) for x in collected.values()
         ),
+        "wall_inference_seconds": wall_elapsed,
     }
     (args.output_dir / "prediction_manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"

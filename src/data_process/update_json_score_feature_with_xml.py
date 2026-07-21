@@ -4,11 +4,12 @@
 The existing ``*.json`` files contain INR note objects with score pitch, score continuous
 features, and performance targets. This script adds the v2 score-side fields:
 
-    score.score_feature       [mo, md, ml, first, staff, trill, grace, staccato]
+    score.score_feature       [mo_idx, md_idx, ml_idx, staff, trill, grace, staccato, stem_up, stem_down]
     score.has_score_feature   1 if the refined score note maps to an XML note
 
-The first three score feature values are stored in raw quarter-length units on
-the 1/24 grid, not normalized to [0, 1].
+The first three score feature values are integer 1/24-quarter grid indices,
+clamped to [0, 144].  ml_idx is 0 except at measure-start notes, where it
+stores the measure length.  Annotation fields are binary.
 
 Unmapped notes are kept in the sequence with zero score_feature rows and
 has_score_feature=0.
@@ -41,7 +42,9 @@ from src.data_process import score_xml_alignment
 
 SCHEMA_VERSION = "pianocore_integrated_node_work_v2"
 JSON_SUFFIX = ".json"
-FEATURE_WIDTH = 8
+FEATURE_WIDTH = 9
+FEATURE_KEYS = ["mo_idx", "md_idx", "ml_idx", "staff", "trill", "grace", "staccato", "stem_up", "stem_down"]
+FEATURE_UNIT = "idx_1/24_clamped_0_144_and_binary"
 
 WORKER_RAW_ZIP = None
 WORKER_ARGS: argparse.Namespace | None = None
@@ -119,7 +122,7 @@ def init_worker(raw_midi_zip: str, args_dict: dict[str, Any]) -> None:
     global WORKER_RAW_ZIP, WORKER_ARGS
     warnings.filterwarnings("ignore", category=UserWarning, module="music21")
     warnings.filterwarnings("ignore", message="Could not import.*", module="music21")
-    WORKER_RAW_ZIP = score_xml_alignment.ZipResolver(Path(raw_midi_zip))
+    WORKER_RAW_ZIP = score_xml_alignment.make_resolver(Path(raw_midi_zip))
     WORKER_ARGS = argparse.Namespace(**args_dict)
 
 
@@ -168,10 +171,32 @@ def build_score_features(
         args,
     )
 
-    xml_score_features = [
-        list(structure) + list(annotation)
-        for structure, annotation in zip(xml_features["score_structure"], xml_features["score_annotation"])
-    ]
+    xml_score_features = []
+    for structure, annotation, pitch in zip(
+        xml_features["score_structure"],
+        xml_features["score_annotation"],
+        xml_features["pitch"],
+    ):
+        mo_idx = min(max(int(round(float(structure[0]) * 24.0)), 0), 144)
+        md_idx = min(max(int(round(float(structure[1]) * 24.0)), 0), 144)
+        first = 1 if float(structure[3]) >= 0.5 or len(xml_score_features) == 0 else 0
+        ml_idx = min(max(int(round(float(structure[2]) * 24.0)), 0), 144) if first else 0
+        staff = 1 if float(annotation[0]) >= 0.5 else 0
+        trill = 1 if float(annotation[1]) >= 0.5 else 0
+        grace = 1 if float(annotation[2]) >= 0.5 else 0
+        staccato = 1 if float(annotation[3]) >= 0.5 else 0
+        # Keep the canonical score feature self-contained.  Stem is inferred
+        # with the same staff/pitch rule used by MusicXML reconstruction.
+        middle_line = 71 if staff == 0 else 50
+        stem_down = 1 if int(pitch) >= middle_line else 0
+        stem_up = 1 - stem_down
+        xml_score_features.append([mo_idx, md_idx, ml_idx, staff, trill, grace, staccato, stem_up, stem_down])
+    if xml_score_features:
+        nonzero_lengths = [int(row[2]) for row in xml_score_features if int(row[2]) > 0]
+        if nonzero_lengths:
+            modal_length = Counter(nonzero_lengths).most_common(1)[0][0]
+            if xml_score_features[0][2] <= max(3, modal_length // 2):
+                xml_score_features[0][2] = modal_length
     note_count = len(refined_pitches)
     score_feature = [[0.0] * FEATURE_WIDTH for _ in range(note_count)]
     has_score_feature = [0] * note_count
@@ -191,12 +216,13 @@ def build_score_features(
         "matched": matched,
         "unmatched": note_count - matched,
         "coverage": float(matched / note_count) if note_count else 1.0,
-        "score_feature": round_rows(score_feature, args.float_precision),
+        "score_feature": score_feature,
         "has_score_feature": has_score_feature,
         "unknown_staff_count": xml_features["unknown_staff_count"],
         "trill_count": xml_features["trill_count"],
         "grace_count": xml_features["grace_count"],
         "staccato_count": xml_features["staccato_count"],
+        "stem_source": "heuristic_staff_pitch_middle_line",
     }
 
 
@@ -282,8 +308,8 @@ def update_one(task: dict[str, Any]) -> dict[str, Any]:
             meta["score_raw_keys"] = ["ioi_ms", "duration_ms", "velocity", "pedal_0", "pedal_25", "pedal_50", "pedal_75"]
         if "score_continuous" in score:
             meta["score_continuous_keys"] = ["ioi", "duration", "velocity"]
-        meta["score_feature_keys"] = ["mo", "md", "ml", "first", "staff", "trill", "grace", "staccato"]
-        meta["score_feature_unit"] = "quarter_length_raw_grid_1/24"
+        meta["score_feature_keys"] = FEATURE_KEYS
+        meta["score_feature_unit"] = FEATURE_UNIT
         meta["note_type_keys"] = ["has_score_feature", "has_pedal_feature"]
         meta["xml_to_refined_score_alignment"] = {
             "method": "midi2scoretransformer_parse_mxl + pitch_aware_monotonic_alignment",

@@ -32,7 +32,9 @@ def common(name):
             "timing_control_mode": "dinr_floor_log",
             "epr_timing_target": "floor_log_deviation",
             "slot_version": "slot8",
-            "musical_feature_mode": "musical51_full",
+            "metadata_path": str(Path("data/ASAP_processed/metadata.generated_json.csv").resolve()),
+            "refined_dir": str(Path("data/ASAP_processed").resolve()),
+            "musical_feature_mode": "musical4slot",
             "disable_musical_features": False,
             "dlm_ioi_nonzero_min": -2.0,
             "dlm_ioi_nonzero_max": 1.0,
@@ -53,6 +55,7 @@ def common(name):
             "max_train_epochs": 16.0,
         }
     )
+    cfg.pop("prepared_sidecar_tag", None)
     return cfg
 
 configs = {}
@@ -87,7 +90,7 @@ for name, cfg in configs.items():
             "shared": {
                 "timing_control_mode": "dinr_floor_log",
                 "distribution": "cinr_bounded_5pct",
-                "musical_feature_mode": "musical51_full",
+                "musical_feature_mode": "musical4slot",
                 "duration_support": [-2.0, 1.0],
                 "sampling": {"temperature": 1.0, "top_p": 0.90, "top_k": 0, "num_samples": 2},
             },

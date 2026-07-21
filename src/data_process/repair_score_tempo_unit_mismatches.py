@@ -167,10 +167,10 @@ def backup_file(path, source_root, backup_root, prefix):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--metadata", type=Path, default=Path("../PianoCoRe/metadata.csv"))
-    parser.add_argument("--raw-root", type=Path, default=Path("../PianoCoRe/raw"))
-    parser.add_argument("--refined-root", type=Path, default=Path("../PianoCoRe/refined"))
-    parser.add_argument("--processed-root", type=Path, default=Path("../PianoCoRe/processed"))
+    parser.add_argument("--metadata", type=Path, default=Path("data/ASAP_processed/metadata.generated_json.csv"))
+    parser.add_argument("--raw-root", type=Path, default=Path("data/ASAP_processed"))
+    parser.add_argument("--refined-root", type=Path, default=Path("data/ASAP_processed"))
+    parser.add_argument("--processed-root", type=Path, default=Path("data/ASAP_processed"))
     parser.add_argument("--backup-root", type=Path, required=True)
     parser.add_argument("--score-xml-path", action="append", default=None)
     args = parser.parse_args()

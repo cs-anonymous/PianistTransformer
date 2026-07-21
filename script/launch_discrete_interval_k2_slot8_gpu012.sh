@@ -25,7 +25,9 @@ common.update({
     "slot_version": "slot8",
     "slot_dim": 128,
     "slot_fusion": "mlp",
-    "musical_feature_mode": "musical51",
+    "metadata_path": str(Path("data/ASAP_processed/metadata.generated_json.csv").resolve()),
+    "refined_dir": str(Path("data/ASAP_processed").resolve()),
+    "musical_feature_mode": "musical4slot",
     "disable_musical_features": False,
     "epr_mixture_components": 2,
     "dlm_components": 2,
@@ -41,9 +43,9 @@ common.update({
     "train_performance_dataset": "ASAP",
     "eval_performance_dataset": "ASAP",
     "eval_include_all_performance_dataset": "ASAP",
-    "prepared_sidecar_tag": "ASAP_FLOORLOG_NOMUS_SCORESPAN",
     "pedal_distribution": "point",
 })
+common.pop("prepared_sidecar_tag", None)
 
 experiments = {
     "discrete_ln_k2": {

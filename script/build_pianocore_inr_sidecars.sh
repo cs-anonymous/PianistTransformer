@@ -6,8 +6,8 @@ cd "${ROOT_DIR}"
 
 export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}"
 
-PIANOCORE_DIR="${PIANOCORE_DIR:-data/pianocore}"
-PROCESSED_DIR="${PROCESSED_DIR:-../PianoCoRe/processed}"
+PIANOCORE_DIR="${PIANOCORE_DIR:-data/ASAP_processed}"
+PROCESSED_DIR="${PROCESSED_DIR:-data/ASAP_processed}"
 RAW_MIDI_ZIP="${RAW_MIDI_ZIP:-${PIANOCORE_DIR}/PianoCoRe-1.0-raw-midi.zip}"
 WORKERS="${WORKERS:-36}"
 

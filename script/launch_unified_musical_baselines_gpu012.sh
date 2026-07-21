@@ -36,17 +36,18 @@ def common(cfg, name):
             "slot_gates": False,
             "slot_share_role_encoders": True,
             "slot_decoder_mask_mode": "whole_token",
-            "musical_feature_mode": "musical51_full",
+            "metadata_path": str(Path("data/ASAP_processed/metadata.generated_json.csv").resolve()),
+            "refined_dir": str(Path("data/ASAP_processed").resolve()),
+            "musical_feature_mode": "musical4slot",
             "disable_musical_features": False,
             "timing_control_mode": "dinr_floor_log",
             "epr_timing_target": "floor_log_deviation",
             "eval_gt_time_normalization": "score_onset_span",
-            "prepared_sidecar_tag": "ASAP_DINR_SCORESPAN",
             "train_performance_dataset": "ASAP",
             "eval_performance_dataset": "ASAP",
             "eval_include_all_performance_dataset": "ASAP",
-            "num_train_epochs": 16.0,
-            "max_train_epochs": 16.0,
+            "num_train_epochs": 20.0,
+            "max_train_epochs": 20.0,
             "pedal_representation": "binary_4",
             "pedal_distribution": "point",
             "pedal_output_activation": "linear",
@@ -138,12 +139,12 @@ for name, cfg in configs.items():
             "sampling": {"temperature": 1.0, "top_p": 0.90, "top_k": 0, "num_samples": 2, "seed": 42},
             "shared": {
                 "slot_version": "slot6",
-                "musical_feature_mode": "musical51_full",
+                "musical_feature_mode": "musical4slot",
                 "timing_control_mode": "dinr_floor_log",
                 "ioi_nonzero_support": [-2.0, 1.0],
                 "duration_support": [-2.0, 1.0],
                 "pedal_representation": "binary_4",
-                "epochs": 16.0,
+                "epochs": 20.0,
             },
             "runs": manifest,
         },
@@ -178,7 +179,7 @@ env CUDA_VISIBLE_DEVICES="\${gpu}" \\
   CONFIG="\${config}" \\
   RUN_DIR_OVERRIDE="\${run_dir}" \\
   BASE_ASAP_ONLY=1 \\
-  BASE_NUM_TRAIN_EPOCHS=16 \\
+  BASE_NUM_TRAIN_EPOCHS=20 \\
   ADAPT_NUM_TRAIN_EPOCHS=0 \\
   BATCH_SIZE_PER_DEVICE=32 \\
   GLOBAL_BATCH_SIZE=64 \\

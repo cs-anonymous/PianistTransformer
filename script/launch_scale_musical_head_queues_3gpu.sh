@@ -15,8 +15,8 @@ mkdir -p "${CONFIG_DIR}"
 SPLIT_SUMMARY="${CONFIG_DIR}/train_valid_asap3_nonasap05_v1_current_summary.json"
 if [[ ! -f "${SPLIT_SUMMARY}" ]]; then
   python src/data_process/create_fixed_window_valid_split.py \
-    --metadata-path PianoCoRe/metadata.csv \
-    --refined-dir PianoCoRe/processed \
+    --metadata-path data/ASAP_processed/metadata.generated_json.csv \
+    --refined-dir data/ASAP_processed \
     --scheme-name train_valid_asap3_nonasap05_v1 \
     --selection-seed 42 \
     --output-summary "${SPLIT_SUMMARY}" \
@@ -49,6 +49,8 @@ common.update({
     "slot_gates": False,
     "slot_share_role_encoders": True,
     "slot_decoder_mask_mode": "whole_token",
+    "metadata_path": str(Path("data/ASAP_processed/metadata.generated_json.csv").resolve()),
+    "refined_dir": str(Path("data/ASAP_processed").resolve()),
     "continuous_dim": 7,
     "output_continuous_dim": 7,
     "pedal_representation": "binary_4",
@@ -84,6 +86,7 @@ common.update({
     "timing_sample_truncate_radius": 0.0,
     "dlm_timing_sample_truncate_radius": 0.0,
 })
+common.pop("prepared_sidecar_tag", None)
 
 def nomus():
     return {"slot_version": "slot5", "musical_feature_mode": "none", "disable_musical_features": True}
@@ -115,14 +118,7 @@ variants["scale-default-current"] = {**nomus(), **dlm_k1()}
 for label, frac in (("2p5", .025), ("5", .05), ("10", .10), ("20", .20)):
     variants[f"scale-{label}pct"] = {**nomus(), **dlm_k1(), **percent_scale(frac)}
 
-for name, mode in (
-    ("musical-onset", "musical51_onset_only"),
-    ("musical-annotation", "musical51_annotation_only"),
-    ("musical-onset-annotation", "musical51_onset_annotation"),
-    ("musical-duration", "musical51_duration_only"),
-    ("musical-full", "musical51_full"),
-):
-    variants[name] = {**musical(mode), **dlm_k1(), **percent_scale(.05)}
+variants["musical-compact"] = {**musical("musical4slot"), **dlm_k1(), **percent_scale(.05)}
 
 head_common = {**nomus(), **percent_scale(.05), "bounded_floorlog_support": True, "epr_distribution_eps": 1e-5}
 variants["head-dlm-k3"] = {**head_common, "epr_distribution": "dlm", "velocity_distribution": "dlm", "dlm_components": 3, "epr_mixture_components": 3}
@@ -133,7 +129,7 @@ variants["head-beta-k3"] = {**head_common, "epr_distribution": "mixture_beta", "
 
 queues = {
     "gpu0_scale": ["scale-default-current", "scale-2p5pct", "scale-5pct", "scale-10pct", "scale-20pct"],
-    "gpu1_musical": ["musical-onset", "musical-annotation", "musical-onset-annotation", "musical-duration", "musical-full"],
+    "gpu1_musical": ["musical-compact"],
     "gpu2_head": ["head-dlm-k3", "head-mln-k1", "head-mln-k3", "head-beta-k1", "head-beta-k3"],
 }
 

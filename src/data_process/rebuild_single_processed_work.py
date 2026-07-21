@@ -22,7 +22,7 @@ def main():
     parser.add_argument("--metadata-csv", required=True)
     parser.add_argument("--pianocore-dir", default="../PianoCoRe")
     parser.add_argument("--score-rel-path", required=True)
-    parser.add_argument("--output-dir", default="../PianoCoRe/processed")
+    parser.add_argument("--output-dir", default="data/ASAP_processed")
     parser.add_argument("--max-time-ms", type=float, default=10000.0)
     parser.add_argument("--float-precision", type=int, default=5)
     parser.add_argument("--overwrite", action="store_true")

@@ -26,6 +26,7 @@ from src.train.train_inr import (
     default_epr_output_dim,
     decoder_note_input_schema,
     decoder_perf_target_input_dim,
+    enforce_asap_processed_config,
     integrated_epr_input_dim,
     infer_input_feature_mode,
     musical_feature_dim,
@@ -42,11 +43,11 @@ from src.utils.inr_midi import note_features_to_midi
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run INR inference on PianoCoRe test scores.")
+    parser = argparse.ArgumentParser(description="Run INR inference on ASAP processed test scores.")
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--split", type=str, default="test")
-    parser.add_argument("--protocol", choices=["deterministic", "sampling"], default="deterministic")
+    parser.add_argument("--protocol", choices=["sampling"], default="sampling")
     parser.add_argument(
         "--sampling-strategy",
         choices=["mean", "greedy", "sample"],
@@ -139,6 +140,7 @@ def select_worker_device(device_arg, worker_idx):
 def load_config(path: Path, checkpoint: str | None):
     with open(path, "r", encoding="utf-8") as file:
         config = json.load(file)
+    enforce_asap_processed_config(config)
     config["input_feature_mode"] = infer_input_feature_mode(config)
     if config.get("use_style_tokens", False):
         composer_vocab = config.get("style_composer_vocab")
@@ -163,7 +165,7 @@ def load_config(path: Path, checkpoint: str | None):
         )
     if config.get("task_type", "epr").lower() != "epr":
         raise ValueError("Only task_type=epr is supported")
-    musical_mode = str(config.get("musical_feature_mode", "musical51_full")).lower()
+    musical_mode = str(config.get("musical_feature_mode", "musical4slot")).lower()
     config["musical_feature_dim"] = musical_feature_dim(musical_mode)
     config["mask_feature_dim"] = 2 if int(config["musical_feature_dim"]) == 0 else 3
     config["score_control_feature_dim"] = int(config.get("score_control_feature_dim", config.get("control_feature_dim", 5)))
@@ -239,7 +241,7 @@ def load_score_from_node(
     use_timing_scale_bit=False,
     timing_control_mode="dinr_floor_log",
     timing_log_scale=50.0,
-    musical_feature_mode="categorical",
+    musical_feature_mode="musical4slot",
     score_note_schema="integrated",
     task_type="epr",
     performance_source=None,
@@ -650,7 +652,7 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
         use_timing_scale_bit=config.get("use_timing_scale_bit", False),
         timing_control_mode=config.get("timing_control_mode", "dinr_floor_log"),
         timing_log_scale=config.get("timing_log_scale", 50.0),
-        musical_feature_mode=config.get("musical_feature_mode", "musical51_full"),
+        musical_feature_mode=config.get("musical_feature_mode", "musical4slot"),
         score_note_schema=config.get("score_note_input_schema", "integrated"),
         task_type="epr",
         disable_musical_features=config.get("disable_musical_features", False),
@@ -1010,6 +1012,18 @@ def filter_manifest_by_score_sources(manifest, score_sources):
     return filtered
 
 
+def sort_manifest_longest_first(manifest):
+    return sorted(
+        manifest,
+        key=lambda item: (
+            int(item.get("estimated_examples") or 0),
+            int(item.get("note_count") or 0),
+            len(item.get("windows") or []),
+        ),
+        reverse=True,
+    )
+
+
 def main():
     args = parse_args()
     random.seed(args.seed)
@@ -1058,6 +1072,7 @@ def main():
     manifest = filter_manifest_by_score_sources(manifest, load_score_source_filter(args))
     if (args.performance_dataset is not None or args.exclude_performance_dataset is not None) and args.max_works is not None:
         manifest = manifest[: args.max_works]
+    manifest = sort_manifest_longest_first(manifest)
     score_midi_dir = score_midi_dir_from_processed(config["refined_dir"])
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.num_workers > 1:

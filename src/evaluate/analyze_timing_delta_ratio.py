@@ -181,7 +181,7 @@ def plot_ecdf(df, output_path):
 
 def main():
     parser = argparse.ArgumentParser(description="Analyze timing delta and ratio target distributions.")
-    parser.add_argument("--processed-dir", type=Path, default=Path("../PianoCoRe/processed_raw"))
+    parser.add_argument("--processed-dir", type=Path, default=Path("data/ASAP_processed"))
     parser.add_argument("--output-dir", type=Path, default=Path("results/plots/timing_delta_ratio"))
     parser.add_argument("--max-files", type=int, default=None)
     parser.add_argument("--shuffle-files", action="store_true")

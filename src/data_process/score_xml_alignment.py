@@ -122,6 +122,41 @@ class ZipResolver:
         return tmp_path
 
 
+class FileResolver:
+    def __init__(self, root: Path):
+        self.root = Path(root)
+
+    def close(self):
+        return None
+
+    def resolve(self, relative_path: str) -> Path:
+        rel = Path(str(relative_path).replace("\\", "/").lstrip("/"))
+        candidates = [
+            self.root / rel,
+            self.root / "PianoCoRe" / "raw" / rel,
+            self.root / "raw" / rel,
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        raise FileNotFoundError(f"{relative_path} not found under {self.root}")
+
+    def extract_to_temp(self, relative_path: str, suffix: str) -> str:
+        source = self.resolve(relative_path)
+        fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+        os.close(fd)
+        with open(source, "rb") as src, open(tmp_path, "wb") as dst:
+            dst.write(src.read())
+        return tmp_path
+
+
+def make_resolver(path: Path):
+    path = Path(path)
+    if path.is_dir():
+        return FileResolver(path)
+    return ZipResolver(path)
+
+
 def tensor_values(streams: dict[str, Any], key: str) -> list[float]:
     value = streams[key]
     if hasattr(value, "detach"):

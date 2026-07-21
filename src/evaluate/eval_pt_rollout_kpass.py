@@ -26,8 +26,8 @@ from src.utils.midi import ids_to_midi, midi_to_ids
 def parse_args():
     parser = argparse.ArgumentParser(description="PT k-pass rollout evaluation with GT/predicted token feedback.")
     parser.add_argument("--model-path", type=Path, required=True)
-    parser.add_argument("--metadata", type=Path, default=Path("../PianoCoRe/metadata.csv"))
-    parser.add_argument("--midi-root", type=Path, default=Path("../PianoCoRe/refined"))
+    parser.add_argument("--metadata", type=Path, default=Path("data/ASAP_processed/metadata.generated_json.csv"))
+    parser.add_argument("--midi-root", type=Path, default=Path("data/ASAP_processed"))
     parser.add_argument("--split", type=str, default="test")
     parser.add_argument("--performance-dataset", type=str, default="ASAP")
     parser.add_argument("--score-source-list", type=Path, default=None)

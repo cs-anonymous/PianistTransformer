@@ -31,8 +31,8 @@ Default fixed split scheme:
 
 Important environment variables accepted by the shell entrypoint:
 
-- `PIANOCORE_DIR`: source PianoCoRe directory, default `data/pianocore`
-- `PROCESSED_DIR`: output processed root, default `../PianoCoRe/processed`
+- `PIANOCORE_DIR`: source dataset directory, default `data/ASAP_processed`
+- `PROCESSED_DIR`: output processed root, default `data/ASAP_processed`
 - `RAW_MIDI_ZIP`: raw PianoCoRe zip used for XML/MXL lookup
 - `WORKERS`: worker count shared by all stages, default `36`
 

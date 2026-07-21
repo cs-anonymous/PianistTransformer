@@ -29,9 +29,9 @@ BEAT_QUARTERS = {
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Audit MusicXML metronome/sound tempo and score MIDI tempo consistency.")
-    parser.add_argument("--metadata", type=Path, default=Path("../PianoCoRe/metadata.csv"))
-    parser.add_argument("--raw-root", type=Path, default=Path("../PianoCoRe/raw"))
-    parser.add_argument("--refined-root", type=Path, default=Path("../PianoCoRe/refined"))
+    parser.add_argument("--metadata", type=Path, default=Path("data/ASAP_processed/metadata.generated_json.csv"))
+    parser.add_argument("--raw-root", type=Path, default=Path("data/ASAP_processed"))
+    parser.add_argument("--refined-root", type=Path, default=Path("data/ASAP_processed"))
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--rel-tol", type=float, default=1e-4)
     parser.add_argument("--abs-tol", type=float, default=1e-3)

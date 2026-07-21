@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
-RUN_ROOT="results/inr_epr_pipeline/launch_rawlog_4exp_sine_cine_m12_m51_${STAMP}"
+RUN_ROOT="results/inr_epr_pipeline/launch_rawlog_sine_cine_musical4slot_${STAMP}"
 CONFIG_ROOT="${RUN_ROOT}/configs"
 mkdir -p "${RUN_ROOT}" "${CONFIG_ROOT}"
 
@@ -26,10 +26,13 @@ cfg = json.loads(Path(base_path).read_text(encoding="utf-8"))
 cfg["note_embedding_mode"] = note_mode
 cfg["musical_feature_mode"] = musical_mode
 cfg["input_continuous_dim"] = int(input_dim)
+cfg["metadata_path"] = str(Path("data/ASAP_processed/metadata.generated_json.csv").resolve())
+cfg["refined_dir"] = str(Path("data/ASAP_processed").resolve())
 cfg["decoder_note_input_schema"] = "integrated"
 cfg["score_note_input_schema"] = "integrated"
 cfg["disable_musical_features"] = False
 cfg["auto_rollout_eval_after_train"] = False
+cfg.pop("prepared_sidecar_tag", None)
 Path(output_path).write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 PY
 }
@@ -66,9 +69,7 @@ launch_one() {
   echo "${name}: pid=${pid} run_dir=${run_dir} config=${config_path} log=${log_path}" | tee -a "${RUN_ROOT}/launch.log"
 }
 
-launch_one 0 "exp1_sine_musical12_ed_tfmask50" "sine" "continuous" 29
-launch_one 1 "exp2_sine_musical51_ed_tfmask50" "sine" "musical51" 68
-launch_one 2 "exp3_cine_musical12_ed_tfmask50" "cine" "continuous" 29
-launch_one 3 "exp4_cine_musical51_ed_tfmask50" "cine" "musical51" 68
+launch_one 0 "exp1_sine_musical4slot_ed_tfmask50" "sine" "musical4slot" 22
+launch_one 1 "exp2_cine_musical4slot_ed_tfmask50" "cine" "musical4slot" 22
 
 echo "launch_root=${RUN_ROOT}"

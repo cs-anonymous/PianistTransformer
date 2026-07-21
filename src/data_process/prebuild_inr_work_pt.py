@@ -12,7 +12,10 @@ if str(ROOT_DIR) not in sys.path:
 from src.data_process.work_manifest import build_work_manifest
 from src.data_process.sidecar_builder import build_ready_sidecar_for_work, build_sidecar_for_work
 from src.train.train_inr import (
+    ASAP_METADATA_PATH,
+    ASAP_PROCESSED_DIR,
     PianoCoReNodeSFTDataset,
+    enforce_asap_processed_config,
     infer_input_feature_mode,
 )
 
@@ -85,14 +88,14 @@ def build_dataset(config, manifest, split):
         pedal_representation=config.get("pedal_representation", "binary_4"),
         musical_feature_mode=config.get(
             "musical_feature_mode",
-            "musical51_full",
+            "musical4slot",
         ),
         disable_musical_features=config.get("disable_musical_features", False),
         epr_timing_target=config.get("epr_timing_target", "floor_log_deviation"),
         use_timing_scale_bit=config.get("use_timing_scale_bit", False),
         timing_control_mode=config.get("timing_control_mode", "dinr_floor_log"),
         timing_log_scale=config.get("timing_log_scale", 50.0),
-        use_prepared_sidecar=True,
+        use_prepared_sidecar=False,
         prepared_sidecar_tag=config.get("prepared_sidecar_tag"),
     )
 
@@ -128,8 +131,8 @@ def worker(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--metadata-path", required=True)
-    parser.add_argument("--refined-dir", required=True)
+    parser.add_argument("--metadata-path", default=str(ASAP_METADATA_PATH))
+    parser.add_argument("--refined-dir", default=str(ASAP_PROCESSED_DIR))
     parser.add_argument("--split", default="train", choices=["train", "test", "valid"])
     parser.add_argument("--block-notes", type=int, default=512)
     parser.add_argument("--overlap-ratio", type=float, default=0.125)
@@ -139,7 +142,7 @@ def main():
     parser.add_argument("--timing-input-normalization", default="linear_5000")
     parser.add_argument("--max-time-ms", type=float, default=10000.0)
     parser.add_argument("--pedal-representation", default="binary_4")
-    parser.add_argument("--musical-feature-mode", default="musical51")
+    parser.add_argument("--musical-feature-mode", default="musical4slot")
     parser.add_argument("--disable-musical-features", action="store_true")
     parser.add_argument("--epr-timing-target", default="floor_log_deviation")
     parser.add_argument("--use-timing-scale-bit", type=int, default=0)
@@ -196,6 +199,7 @@ def main():
         "fixed_window_train_split_name": args.fixed_window_train_split_name,
         "fixed_window_split_summary_path": args.fixed_window_split_summary_path,
     }
+    enforce_asap_processed_config(config)
     if args.sidecar_tag is not None:
         if str(args.sidecar_tag).upper() in {"NONE", "NULL", "NO", "OFF"}:
             config.pop("prepared_sidecar_tag", None)

@@ -33,7 +33,7 @@ SCORE_NAME_MAP = {
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--metadata", type=Path, default=Path("PianoCoRe/metadata.csv"))
+    p.add_argument("--metadata", type=Path, default=Path("data/ASAP_processed/metadata.generated_json.csv"))
     p.add_argument("--midi-root", type=Path, default=Path("PianoCoRe"))
     p.add_argument("--score-source-list", type=Path, required=True)
     p.add_argument("--checkpoint", type=Path, required=True)

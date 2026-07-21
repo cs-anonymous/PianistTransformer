@@ -23,7 +23,7 @@ from src.utils.midi import midi_to_ids
 def parse_args():
     parser = argparse.ArgumentParser(description="Run PT inference on PianoCoRe test scores.")
     parser.add_argument("--model-path", type=Path, required=True)
-    parser.add_argument("--metadata", type=Path, default=Path("PianoCoRe/metadata.csv"))
+    parser.add_argument("--metadata", type=Path, default=Path("data/ASAP_processed/metadata.generated_json.csv"))
     parser.add_argument("--midi-root", type=Path, default=Path("/home/sy/EPR/PianoCoRe/refined"))
     parser.add_argument("--split", type=str, default="test")
     parser.add_argument("--output-dir", type=Path, required=True)

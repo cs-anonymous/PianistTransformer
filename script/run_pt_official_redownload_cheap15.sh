@@ -30,8 +30,8 @@ sha256sum "${MODEL_DIR}/model.safetensors" | tee "${RUN_DIR}/model.sha256"
 
 CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python src/inference/infer_pt_testset.py \
   --model-path "${MODEL_DIR}" \
-  --metadata ../PianoCoRe/metadata.csv \
-  --midi-root ../PianoCoRe/refined \
+  --metadata data/ASAP_processed/metadata.generated_json.csv \
+  --midi-root data/ASAP_processed \
   --split test \
   --performance-dataset ASAP \
   --output-dir "${RUN_DIR}/sampling" \

@@ -12,8 +12,9 @@ import pandas as pd
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--metadata", type=Path, default=Path("PianoCoRe/metadata.csv"))
+    p.add_argument("--metadata", type=Path, default=Path("data/ASAP_processed/metadata.csv"))
     p.add_argument("--midi-root", type=Path, default=Path("PianoCoRe"))
+    p.add_argument("--processed-root", type=Path, default=Path("data/ASAP_processed"))
     p.add_argument("--score-source-list", type=Path, required=True)
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--generated-xml-root", type=Path, default=Path("results/external_eval_20260717/generated_musicxml"))
@@ -53,13 +54,16 @@ def collect_items(args):
         if rows.empty:
             raise FileNotFoundError(f"Missing ASAP metadata row for {score_source}")
         rel = Path(score_source)
-        xml_path = args.midi_root / "raw" / rel.parent / "score.musicxml"
-        xml_source = "raw"
+        xml_path = args.processed_root / rel.parent / rel.with_suffix(".musicxml").name
+        xml_source = "processed"
+        if not xml_path.exists():
+            xml_path = args.midi_root / "raw" / rel.parent / "score.musicxml"
+            xml_source = "raw"
         if not xml_path.exists():
             xml_path = args.generated_xml_root / rel.with_suffix(".musicxml")
             xml_source = "generated_from_refined_score_midi"
         if not xml_path.exists():
-            raise FileNotFoundError(f"Missing MusicXML and generated fallback: {score_source}")
+            raise FileNotFoundError(f"Missing processed/raw/generated MusicXML fallback: {score_source}")
         gt_paths = [
             str((args.midi_root / "refined" / p).resolve())
             for p in sorted(rows["refined_performance_midi_path"].dropna().unique())
@@ -176,6 +180,9 @@ def main():
         "model": "DExter",
         "protocol": "dexter",
         "checkpoint": str(args.checkpoint.resolve()),
+        "metadata": str(args.metadata.resolve()),
+        "processed_root": str(args.processed_root.resolve()),
+        "midi_root": str(args.midi_root.resolve()),
         "score_source_list": str(args.score_source_list.resolve()),
         "split": "test",
         "gt_filter": "performance_dataset=ASAP",

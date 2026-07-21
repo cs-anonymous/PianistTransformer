@@ -13,7 +13,7 @@ run_shard() {
   local gpu="$1" shard="$2"
   CUDA_VISIBLE_DEVICES="${gpu}" PYTHONUNBUFFERED=1 python src/inference/infer_pt_testset.py \
     --model-path "${MODEL_DIR}" \
-    --metadata ../PianoCoRe/metadata.csv --midi-root ../PianoCoRe/refined \
+    --metadata data/ASAP_processed/metadata.generated_json.csv --midi-root data/ASAP_processed \
     --split test --performance-dataset ASAP \
     --output-dir "${RUN_DIR}/shard${shard}" --device cuda \
     --batch-size 8 --num-workers 4 --protocol sampling --num-samples 1 \

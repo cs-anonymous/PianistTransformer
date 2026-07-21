@@ -60,13 +60,13 @@ PY
 PROCESSED_RAW_DIR="$(python - "${RUN_CONFIG}" <<'PY'
 import json, sys
 cfg = json.loads(open(sys.argv[1], encoding="utf-8").read())
-print(cfg.get("processed_raw_dir", "../PianoCoRe/processed_raw"))
+print(cfg.get("processed_raw_dir", "data/ASAP_processed"))
 PY
 )"
 METADATA_PATH="$(python - "${RUN_CONFIG}" <<'PY'
 import json, sys
 cfg = json.loads(open(sys.argv[1], encoding="utf-8").read())
-print(cfg.get("metadata_path", "../PianoCoRe/metadata.csv"))
+print(cfg.get("metadata_path", "data/ASAP_processed/metadata.generated_json.csv"))
 PY
 )"
 PT_DATA_PERFORMANCE_DATASET="$(python - "${RUN_CONFIG}" <<'PY'

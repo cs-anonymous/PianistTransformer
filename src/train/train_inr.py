@@ -45,6 +45,30 @@ from src.utils.inr_midi import raw_rows_to_epr_bins, raw_rows_to_model_continuou
 
 os.environ["WANDB_PROJECT"] = "pianist-transformer"
 
+ASAP_PROCESSED_DIR = (ROOT_DIR / "data" / "ASAP_processed").resolve()
+ASAP_METADATA_PATH = ASAP_PROCESSED_DIR / "metadata.generated_json.csv"
+
+
+def resolve_project_path(path):
+    path = Path(path)
+    return path.resolve() if path.is_absolute() else (ROOT_DIR / path).resolve()
+
+
+def enforce_asap_processed_config(config):
+    config["metadata_path"] = str(resolve_project_path(config.get("metadata_path", ASAP_METADATA_PATH)))
+    config["refined_dir"] = str(resolve_project_path(config.get("refined_dir", ASAP_PROCESSED_DIR)))
+    if Path(config["refined_dir"]).resolve() != ASAP_PROCESSED_DIR:
+        raise ValueError(
+            f"INR EPR only accepts refined_dir={ASAP_PROCESSED_DIR}; got {config['refined_dir']}"
+        )
+    metadata_path = Path(config["metadata_path"]).resolve()
+    if metadata_path.parent != ASAP_PROCESSED_DIR:
+        raise ValueError(
+            f"INR EPR only accepts metadata under {ASAP_PROCESSED_DIR}; got {metadata_path}"
+        )
+    config.pop("prepared_sidecar_tag", None)
+    return config
+
 
 def release_cuda_cache():
     gc.collect()
@@ -244,7 +268,7 @@ def default_input_continuous_dim(
     input_feature_mode,
     score_feature_dim=8,
     continuous_dim=5,
-    musical_feature_mode="categorical",
+    musical_feature_mode="musical4slot",
 ):
     if input_feature_mode == "integrated":
         if task_type != "epr":
@@ -275,11 +299,26 @@ def timing_control_feature_dim(timing_control_mode="dinr_floor_log", use_timing_
     return 3
 
 
-def musical_feature_dim(musical_feature_mode="musical51_full"):
+def musical_feature_dim(musical_feature_mode="musical4slot"):
     mode = str(musical_feature_mode).lower()
-    if mode in {"musical51", "musical51_full"}:
-        return 51
-    raise ValueError("Only musical_feature_mode=musical51_full is supported")
+    if mode in {"none", "nomus", "no_musical", "disabled"}:
+        return 0
+    if mode in {
+        "musical4slot",
+        "musical4slot_full",
+        "musical4slot_idx145",
+        "musical4slot_no_onset",
+        "musical4slot_no_duration",
+        "musical4slot_no_annotation",
+        "musical4slot_no_length",
+        "musical9",
+        "asap4slot",
+        "compact4slot",
+    }:
+        return 9
+    raise ValueError(
+        f"Unsupported musical_feature_mode={musical_feature_mode}; use musical4slot for ASAP_processed 9D features"
+    )
 
 
 def score_note_input_schema(config_or_value=None):
@@ -399,7 +438,7 @@ def stable_target_columns(channels=None):
 def integrated_epr_input_dim(
     timing_control_mode="dinr_floor_log",
     use_timing_scale_bit=False,
-    musical_feature_mode="categorical",
+    musical_feature_mode="musical4slot",
     pedal_control_dim=2,
 ):
     control_dim = timing_control_feature_dim(
@@ -434,7 +473,7 @@ def default_epr_output_dim(epr_timing_target="floor_log_deviation", pedal_repres
     return 3 + pedal_dim
 
 
-def score_musical_input_dim(timing_control_mode="dinr_floor_log", use_timing_scale_bit=False, musical_feature_mode="categorical"):
+def score_musical_input_dim(timing_control_mode="dinr_floor_log", use_timing_scale_bit=False, musical_feature_mode="musical4slot"):
     control_dim = timing_control_feature_dim(
         timing_control_mode=timing_control_mode,
         use_timing_scale_bit=use_timing_scale_bit,
@@ -663,233 +702,45 @@ def _one_hot_bucket(value, edges):
     return bucket
 
 
-MUSICAL_MD_CATEGORIES = [
-    0.5,
-    0.25,
-    1.0,
-    1.0 / 3.0,
-    0.125,
-    1.0 / 6.0,
-    2.0,
-    1.5,
-    0.75,
-    3.0,
-    4.0,
-    0.0,
-    1.0 / 12.0,
-    0.375,
-    0.0625,
-    2.0 / 3.0,
-]
-
-MUSICAL_ML_CATEGORIES = [3.0, 4.0, 2.0, 1.5, 6.0, 1.0, 0.5, 0.25]
-
-MUSICAL_MO_PHASE_CATEGORIES = [
-    0.0,
-    0.5,
-    0.25,
-    2.0 / 3.0,
-    1.0 / 3.0,
-    0.75,
-    1.0 / 6.0,
-    0.125,
-    0.375,
-    0.2,
-    5.0 / 6.0,
-    0.875,
-    0.4,
-    1.0 / 7.0,
-    1.0 / 12.0,
-    0.625,
-]
-
-MUSICAL51_ABLATION_MODES = {
-    "musical51_full",
-    "musical51_onset_only",
-    "musical51_annotation_only",
-    "musical51_duration_only",
-    "musical51_onset_annotation",
-    "musical51_no_duration",
-    "musical51_no_length",
-    "musical51_no_duration_length",
-}
-
-
-def _musical51_base_mode(mode):
-    mode = str(mode).lower()
-    return "musical51" if mode in MUSICAL51_ABLATION_MODES else mode
-
-
-def _apply_musical51_ablation(row, mode):
-    mode = str(mode).lower()
-    if mode in {"musical51", "categorical", "categorical51", "musical51_full"}:
-        return row
-    if mode not in MUSICAL51_ABLATION_MODES:
-        return row
-    masked = [0.0] * 51
-    if mode == "musical51_no_duration":
-        spans = [(17, 51)]
-    elif mode == "musical51_no_length":
-        spans = [(0, 17), (27, 51)]
-    elif mode == "musical51_onset_only":
-        spans = [(27, 44)]
-    elif mode == "musical51_annotation_only":
-        spans = [(45, 51)]
-    elif mode == "musical51_duration_only":
-        spans = [(17, 27)]
-    elif mode in {"musical51_onset_annotation", "musical51_no_duration_length"}:
-        spans = [(27, 44), (45, 51)]
-    else:
-        spans = [(0, 51)]
-    for start, end in spans:
-        masked[start:end] = row[start:end]
-    return masked
-
-
-def _one_hot_exact(value, categories, tol=1e-4):
-    return [1.0 if abs(float(value) - float(category)) <= tol else 0.0 for category in categories]
-
-
-def build_score_musical_rows(score, musical_feature_mode="continuous"):
+def build_score_musical_rows(score, musical_feature_mode="musical4slot"):
     score_feature = score.get("score_feature", [])
     has_score_feature = score.get("has_score_feature", [0] * len(score.get("pitch", [])))
-    score_raw = score.get("score_raw", [])
     mode = str(musical_feature_mode).lower()
-    base_mode = _musical51_base_mode(mode)
+    musical_dim = musical_feature_dim(mode)
+    if musical_dim == 0:
+        return [[] for _ in score.get("pitch", [])]
+    if musical_dim != 9:
+        raise ValueError(
+            f"Only compact ASAP musical4slot 9D score_feature is supported, got {musical_feature_mode}"
+        )
 
     rows = []
-    measure_start = 0.0
-    current_measure_length = 4.0
-    prev_q = None
-    prev_ms_per_quarter = 500.0
-    seen_any_measure = False
-
     for idx, has_feature in enumerate(has_score_feature):
         if not bool(has_feature):
-            rows.append([0.0] * musical_feature_dim(mode))
+            rows.append([0.0] * musical_dim)
             continue
 
         feature = score_feature[idx]
-        mo = float(feature[0]) if len(feature) > 0 else 0.0
-        md = float(feature[1]) if len(feature) > 1 else 0.0
-        raw_ml = float(feature[2]) if len(feature) > 2 else 0.0
-        first = 1.0 if len(feature) > 3 and float(feature[3]) >= 0.5 else 0.0
-        hand = 1.0 if len(feature) > 4 and float(feature[4]) >= 0.5 else 0.0
-        trill = 1.0 if len(feature) > 5 and float(feature[5]) >= 0.5 else 0.0
-        grace = 1.0 if len(feature) > 6 and float(feature[6]) >= 0.5 else 0.0
-        stacc = 1.0 if len(feature) > 7 and float(feature[7]) >= 0.5 else 0.0
-        stem_code = int(round(float(feature[8]))) if len(feature) > 8 else 0
-
-        if not seen_any_measure:
-            seen_any_measure = True
-            if raw_ml > 0.0:
-                current_measure_length = raw_ml
-        elif first >= 0.5:
-            measure_start += max(current_measure_length, 0.0)
-            if raw_ml > 0.0:
-                current_measure_length = raw_ml
-        ml_eff = current_measure_length
-        ml_present = 1.0 if raw_ml > 0.0 else 0.0
-
-        q = measure_start + mo
-        mioi = 0.0 if prev_q is None else max(q - prev_q, 0.0)
-        prev_q = q
-
-        candidates = []
-        if idx < len(score_raw):
-            score_ioi_ms = float(score_raw[idx][0])
-            score_duration_ms = float(score_raw[idx][1])
-            if mioi > 1e-6:
-                candidates.append(score_ioi_ms / mioi)
-            if md > 1e-6:
-                candidates.append(score_duration_ms / md)
-        if candidates:
-            prev_ms_per_quarter = sum(candidates) / len(candidates)
-        tempo_bpm = 60000.0 / max(prev_ms_per_quarter, 1e-6)
-        tempo_norm = min(max(tempo_bpm, 0.0), 300.0) / 300.0
-
-        if base_mode == "continuous":
-            score_ioi_ms = float(score_raw[idx][0]) if idx < len(score_raw) else 0.0
-            score_ioi_is_zero = 1.0 if score_ioi_ms <= 0.0 else 0.0
-            continuous = [
-                mo,
-                score_ioi_is_zero,
-                md,
-                raw_ml,
-                tempo_norm,
-                first,
-                grace,
-                hand,
-                trill,
-                stacc,
-                1.0 if stem_code == 1 else 0.0,
-                1.0 if stem_code == 2 else 0.0,
-            ]
-            rows.append(continuous)
-            continue
-
-        if base_mode in {"musical145_onset_annotation", "onset145_annotation"}:
-            onset_idx = int(round(mo * 24.0))
-            onset_idx = min(max(onset_idx, 0), 144)
-            onset = [0.0] * 145
-            onset[onset_idx] = 1.0
-            rows.append(
-                [
-                    *onset,
-                    hand,
-                    trill,
-                    grace,
-                    stacc,
-                    1.0 if stem_code == 1 else 0.0,
-                    1.0 if stem_code == 2 else 0.0,
-                ]
+        if len(feature) < 9:
+            raise ValueError(
+                "compact musical slot expects 9 score_feature values "
+                "[mo_idx, md_idx, ml_idx, staff, trill, grace, staccato, stem_up, stem_down], "
+                f"got {len(feature)} at note {idx}"
             )
-            continue
-
-        if base_mode in {"categorical62", "musical62"}:
-            d_bins = _one_hot_bucket(md, [0.0, 1 / 16, 1 / 12, 1 / 8, 1 / 6, 1 / 4, 1 / 3, 3 / 8, 1 / 2, 2 / 3, 3 / 4, 1.0, 1.5, 2.0, 3.0])
-            i_bins = _one_hot_bucket(mioi, [0.0, 1 / 16, 1 / 12, 1 / 8, 1 / 6, 1 / 4, 1 / 3, 3 / 8, 1 / 2, 2 / 3, 3 / 4, 1.0, 1.5, 2.0, 3.0])
-            l_bins = _one_hot_bucket(raw_ml, [0.0, 1.0, 1.5, 2.0, 4.0])
-            phase = (mo / max(raw_ml, 1e-6)) % 1.0 if raw_ml > 0 else (mo / 4.0) % 1.0
-            o_phase = min(15, int(math.floor(phase * 16.0)))
-            o_scalar = mo
-
-            rows.append(
-                [
-                    *([1.0 if d_bins == k else 0.0 for k in range(16)]),
-                    *([1.0 if i_bins == k else 0.0 for k in range(16)]),
-                    *([1.0 if l_bins == k else 0.0 for k in range(6)]),
-                    *([1.0 if o_phase == k else 0.0 for k in range(16)]),
-                    o_scalar,
-                    first,
-                    grace,
-                    hand,
-                    trill,
-                    stacc,
-                    1.0 if stem_code == 1 else 0.0,
-                    1.0 if stem_code == 2 else 0.0,
-                ]
-            )
-            continue
-
-        mo_phase = (mo / max(ml_eff, 1e-6)) % 1.0 if ml_eff > 0 else 0.0
-        row = [
-            *_one_hot_exact(md, MUSICAL_MD_CATEGORIES),
-            md,
-            *_one_hot_exact(ml_eff, MUSICAL_ML_CATEGORIES),
-            ml_eff,
-            ml_present,
-            *_one_hot_exact(mo_phase, MUSICAL_MO_PHASE_CATEGORIES),
-            min(max(mo_phase, 0.0), 1.0),
-            tempo_norm,
-            hand,
-            trill,
-            grace,
-            stacc,
-            1.0 if stem_code == 1 else 0.0,
-            1.0 if stem_code == 2 else 0.0,
-        ]
-        rows.append(_apply_musical51_ablation(row, mode))
+        row = [float(value) for value in feature[:9]]
+        row[0] = float(min(max(int(round(row[0])), 0), 144))
+        row[1] = float(min(max(int(round(row[1])), 0), 144))
+        row[2] = float(min(max(int(round(row[2])), 0), 144))
+        row[3:] = [1.0 if float(value) >= 0.5 else 0.0 for value in row[3:9]]
+        if mode == "musical4slot_no_onset":
+            row[0] = 0.0
+        elif mode == "musical4slot_no_duration":
+            row[1] = 0.0
+        elif mode == "musical4slot_no_length":
+            row[2] = 0.0
+        elif mode == "musical4slot_no_annotation":
+            row[3:] = [0.0] * 6
+        rows.append(row)
     return rows
 
 
@@ -898,7 +749,7 @@ def build_epr_score_input_rows(
     use_timing_scale_bit=False,
     timing_control_mode="dinr_floor_log",
     log_scale=50.0,
-    musical_feature_mode="categorical",
+    musical_feature_mode="musical4slot",
     score_note_schema="integrated",
     disable_musical_features=False,
     pedal_control_dim=4,
@@ -1254,7 +1105,7 @@ class PianoCoReNodeSFTDataset(Dataset):
         epr_timing_bins=5000,
         epr_value_bins=128,
         pedal_representation="binary_4",
-        musical_feature_mode="categorical",
+        musical_feature_mode="musical4slot",
         score_note_schema="integrated",
         epr_timing_target="floor_log_deviation",
         disable_musical_features=False,
@@ -1588,7 +1439,7 @@ class PianoCoReNodeSFTDataset(Dataset):
     def _save_prepared_to_disk(self, path, prepared):
         cache_path = self._prepared_disk_cache_path(path)
         if cache_path is None:
-            return
+            cache_path = self._prepared_sidecar_paths(path)[0]
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.tmp")
         payload = dict(prepared)
@@ -1831,7 +1682,7 @@ class PianoCoReNodeSFTDataset(Dataset):
         if "_derived_score_musical" not in prepared:
             prepared["_derived_score_musical"] = build_score_musical_rows(
                 prepared["score"],
-                musical_feature_mode="continuous",
+                musical_feature_mode=self.musical_feature_mode,
             )
         return prepared["_derived_score_musical"]
 
@@ -2513,6 +2364,57 @@ class NodeSFTTrainer(Trainer):
         inputs.pop("pn_group_sizes", None)
         outputs = model(**inputs)
         loss = outputs.loss
+        config = self._model_config(model)
+        if (
+            self.model.training
+            and bool(getattr(config, "gradnorm", False))
+            and getattr(outputs, "logits", None) is not None
+            and inputs.get("labels_continuous") is not None
+        ):
+            # Lightweight GradNorm: estimate task gradient magnitudes on one
+            # shared backbone tensor, then rebalance the four task losses.
+            components = _compute_integrated_loss_components(
+                config,
+                outputs.logits,
+                inputs["labels_continuous"],
+                inputs["attention_mask"],
+                labels_epr_bins=inputs.get("labels_epr_bins"),
+                score_shared_raw=inputs.get("score_shared_raw"),
+                label_valid_mask=inputs.get("label_valid_mask"),
+            )
+            names = ("ioi", "duration", "velocity", "pedal")
+            shared_param = next(
+                (
+                    p
+                    for n, p in model.named_parameters()
+                    if p.requires_grad and "encoder" in n and p.ndim > 1
+                ),
+                None,
+            )
+            if shared_param is not None:
+                norms = []
+                for name in names:
+                    grad = torch.autograd.grad(
+                        components[name],
+                        shared_param,
+                        retain_graph=True,
+                        allow_unused=True,
+                    )[0]
+                    norms.append(
+                        grad.detach().float().norm().clamp_min(1e-8)
+                        if grad is not None
+                        else torch.tensor(1.0, device=shared_param.device)
+                    )
+                norms = torch.stack(norms)
+                target = norms.mean()
+                dynamic_weights = (target / norms).pow(
+                    float(getattr(config, "gradnorm_alpha", 0.5))
+                )
+                dynamic_weights = 4.0 * dynamic_weights / dynamic_weights.sum()
+                loss = sum(
+                    dynamic_weights[idx].detach() * components[name]
+                    for idx, name in enumerate(names)
+                )
         pn_components = None
         if group_index is not None:
             config = self._model_config(model)
@@ -3361,7 +3263,7 @@ def create_model(train_config):
     musical_feature_mode = str(
         train_config.get(
             "musical_feature_mode",
-            "musical51_full",
+            "musical4slot",
         )
     ).lower()
     default_score_input_dim = (
@@ -3458,6 +3360,7 @@ def create_model(train_config):
         removed_task_md_max=train_config.get("removed_task_md_max", 6.0),
         removed_task_ml_max=train_config.get("removed_task_ml_max", 6.0),
         huber_delta=train_config["huber_delta"],
+        loss_normalization=train_config.get("loss_normalization", False),
         loss_weights=train_config["loss_weights"],
         removed_task_loss_weights=train_config.get("removed_task_loss_weights"),
         decoder_input_mode=train_config["decoder_input_mode"],
@@ -3897,6 +3800,7 @@ def main():
 
     with open(args.config, "r", encoding="utf-8") as file:
         train_config = json.load(file)
+    enforce_asap_processed_config(train_config)
     seed = int(train_config.get("seed", 42))
     random.seed(seed)
     np.random.seed(seed)
@@ -3923,7 +3827,7 @@ def main():
     musical_feature_mode = str(
         train_config.get(
             "musical_feature_mode",
-            "musical51_full",
+            "musical4slot",
         )
     ).lower()
     train_config["musical_feature_mode"] = musical_feature_mode
@@ -4155,7 +4059,11 @@ def main():
     print_model_parameters(model)
 
     training_args_dict = filter_valid_args(train_config, TrainingArguments)
-    if str(train_config.get("note_embedding_mode", "")).lower() == "slot_attribute":
+    distribution = str(train_config.get("epr_distribution", "")).lower()
+    if (
+        str(train_config.get("note_embedding_mode", "")).lower() == "slot_attribute"
+        or distribution in {"dinr", "discrete_inr", "discrete"}
+    ):
         training_args_dict["save_safetensors"] = False
     if args.deepspeed:
         training_args_dict["deepspeed"] = args.deepspeed

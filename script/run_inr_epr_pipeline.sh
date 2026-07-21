@@ -8,9 +8,7 @@ cd "${ROOT_DIR}"
 
 INFER_NUM_WORKERS="${INFER_NUM_WORKERS:-8}"
 METRIC_NUM_WORKERS="${METRIC_NUM_WORKERS:-8}"
-DET_NUM_SAMPLES="${DET_NUM_SAMPLES:-1}"
 SAMPLING_NUM_SAMPLES="${SAMPLING_NUM_SAMPLES:-1}"
-DET_STRATEGY="${DET_STRATEGY:-greedy}"
 INFER_BATCH_SIZE_WINDOWS="${INFER_BATCH_SIZE_WINDOWS:-8}"
 INFER_SCORE_SOURCE_LIST="${INFER_SCORE_SOURCE_LIST:-}"
 MERGE_MODE="${MERGE_MODE:-continuation}"
@@ -70,9 +68,11 @@ EVALUATE_LOG="${RUN_DIR}/evaluate.log"
 TMP_DIR="${RUN_DIR}/_tmp"
 mkdir -p "${RUN_DIR}" "${TRAIN_ROOT}" "${TF_LOG_ROOT}" "${TMP_DIR}"
 
-MASTER_PORT="$(python -c "import socket; s=socket.socket(); s.bind(('', 0)); print(s.getsockname()[1]); s.close()")"
-DET_GPU="${GPU_LIST[0]}"
-SAMPLING_GPU="${GPU_LIST[$(( GPU_COUNT > 1 ? 1 : 0 ))]}"
+MASTER_PORT="${MASTER_PORT:-}"
+if [[ "${GPU_COUNT}" -gt 1 && -z "${MASTER_PORT}" ]]; then
+  MASTER_PORT="$(python -c "import socket; s=socket.socket(); s.bind(('', 0)); print(s.getsockname()[1]); s.close()")"
+fi
+SAMPLING_GPU="${GPU_LIST[0]}"
 
 latest_train_dir() {
   local root="$1" marker="$2"
@@ -238,7 +238,6 @@ run_infer() {
     --protocol "${protocol}" \
     --num-samples "${samples}" \
     "${score_source_args[@]}" \
-    --deterministic-strategy "${DET_STRATEGY}" \
     --output-dir "${out_dir}" 2>&1 | tee -a "${EVALUATE_LOG}"
 }
 
@@ -332,19 +331,8 @@ if (( ADAPT_NUM_TRAIN_EPOCHS > 0 )); then
   FINAL_DIR="${ADAPT_DIR}"
 fi
 
-DET_DIR="${FINAL_DIR}/deterministic"
 SAMPLING_DIR="${FINAL_DIR}/sampling"
-if [[ "${GPU_COUNT}" -gt 1 ]]; then
-  maybe_run_infer "${FINAL_CONFIG}" "${FINAL_CHECKPOINT}" deterministic "${DET_NUM_SAMPLES}" "${DET_DIR}" "${DET_GPU}" &
-  DET_PID=$!
-  maybe_run_infer "${FINAL_CONFIG}" "${FINAL_CHECKPOINT}" sampling "${SAMPLING_NUM_SAMPLES}" "${SAMPLING_DIR}" "${SAMPLING_GPU}" &
-  SAMPLING_PID=$!
-  wait "${DET_PID}"
-  wait "${SAMPLING_PID}"
-else
-  maybe_run_infer "${FINAL_CONFIG}" "${FINAL_CHECKPOINT}" deterministic "${DET_NUM_SAMPLES}" "${DET_DIR}" "${DET_GPU}"
-  maybe_run_infer "${FINAL_CONFIG}" "${FINAL_CHECKPOINT}" sampling "${SAMPLING_NUM_SAMPLES}" "${SAMPLING_DIR}" "${SAMPLING_GPU}"
-fi
+maybe_run_infer "${FINAL_CONFIG}" "${FINAL_CHECKPOINT}" sampling "${SAMPLING_NUM_SAMPLES}" "${SAMPLING_DIR}" "${SAMPLING_GPU}"
 
 if [[ "${SKIP_EXISTING_PIPELINE_OUTPUTS}" == "1" && -s "${FINAL_DIR}/summary.json" ]]; then
   echo "[$(date '+%F %T')] summarize/statistics: reuse existing ${FINAL_DIR}/summary.json" | tee -a "${EVALUATE_LOG}"
@@ -353,7 +341,7 @@ else
     "${FINAL_CONFIG}" \
     "${FINAL_CHECKPOINT}" \
     "${FINAL_OUTPUT_DIR}" \
-    "${DET_DIR}" \
+    "${SAMPLING_DIR}" \
     "${SAMPLING_DIR}" \
     "${FINAL_DIR}/summary.json" \
     "${FINAL_DIR}/asap_label_distribution.png"

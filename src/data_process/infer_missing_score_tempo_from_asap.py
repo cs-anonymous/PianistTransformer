@@ -28,10 +28,10 @@ def backup_file(path, root, backup_root, kind):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--metadata", type=Path, default=Path("../PianoCoRe/metadata.csv"))
-    parser.add_argument("--processed-root", type=Path, default=Path("../PianoCoRe/processed"))
-    parser.add_argument("--raw-root", type=Path, default=Path("../PianoCoRe/raw"))
-    parser.add_argument("--refined-root", type=Path, default=Path("../PianoCoRe/refined"))
+    parser.add_argument("--metadata", type=Path, default=Path("data/ASAP_processed/metadata.generated_json.csv"))
+    parser.add_argument("--processed-root", type=Path, default=Path("data/ASAP_processed"))
+    parser.add_argument("--raw-root", type=Path, default=Path("data/ASAP_processed"))
+    parser.add_argument("--refined-root", type=Path, default=Path("data/ASAP_processed"))
     parser.add_argument("--sidecar-tag", default="ASAP_SCORESPAN")
     parser.add_argument("--max-scale-deviation", type=float, default=0.2)
     parser.add_argument("--default-bpm", type=float, default=120.0)

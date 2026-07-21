@@ -386,9 +386,9 @@ def plot_bucket_views(df, output_dir, seed, sample_per_bucket_source):
 
 def main():
     parser = argparse.ArgumentParser(description="Plot musical/score/performance duration diagnostics.")
-    parser.add_argument("--metadata-path", type=Path, default=Path("../PianoCoRe/metadata.csv"))
-    parser.add_argument("--processed-dir", type=Path, default=Path("../PianoCoRe/processed"))
-    parser.add_argument("--det-manifest", type=Path, required=True)
+    parser.add_argument("--metadata-path", type=Path, default=ROOT_DIR / "data" / "ASAP_processed" / "metadata.generated_json.csv")
+    parser.add_argument("--processed-dir", type=Path, default=ROOT_DIR / "data" / "ASAP_processed")
+    parser.add_argument("--det-manifest", type=Path, default=None)
     parser.add_argument("--sampling-manifest", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--log-scale", type=float, default=50.0)
@@ -409,9 +409,12 @@ def main():
         args.log_max_ms,
         args.num_workers,
     )
-    det_df = collect_pred(args.det_manifest, args.processed_dir, args.log_scale, args.log_max_ms, "pred det")
+    pred_frames = []
+    if args.det_manifest is not None:
+        pred_frames.append(collect_pred(args.det_manifest, args.processed_dir, args.log_scale, args.log_max_ms, "pred det"))
     samp_df = collect_pred(args.sampling_manifest, args.processed_dir, args.log_scale, args.log_max_ms, "pred samp")
-    all_df = pd.concat([gt_df, det_df, samp_df], ignore_index=True)
+    pred_frames.append(samp_df)
+    all_df = pd.concat([gt_df, *pred_frames], ignore_index=True)
     if all_df.empty:
         raise SystemExit("No rows collected.")
 
