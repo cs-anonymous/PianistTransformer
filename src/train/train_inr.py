@@ -702,7 +702,53 @@ def _one_hot_bucket(value, edges):
     return bucket
 
 
-def build_score_musical_rows(score, musical_feature_mode="musical4slot"):
+def _random_musical4slot_row(score, idx, seed=42):
+    source = (
+        score.get("score_source")
+        or score.get("source")
+        or score.get("path")
+        or str(score.get("pitch", [])[idx] if idx < len(score.get("pitch", [])) else "")
+    )
+    digest = hashlib.sha256(f"{seed}:{source}:{idx}".encode("utf-8")).digest()
+    rng = random.Random(int.from_bytes(digest[:8], "little"))
+    staff = 1.0 if rng.random() < 0.92 else 0.0
+    stem_up = 1.0 if rng.random() < 0.19 else 0.0
+    return [
+        float(rng.randrange(0, 145)),
+        float(rng.randrange(0, 145)),
+        float(0 if rng.random() >= 0.06 else rng.randrange(1, 145)),
+        staff,
+        1.0 if rng.random() < 0.002 else 0.0,
+        1.0 if rng.random() < 0.005 else 0.0,
+        1.0 if rng.random() < 0.10 else 0.0,
+        stem_up,
+        0.0 if stem_up else 1.0,
+    ]
+
+
+def normalize_musical_feature_transform(value):
+    mode = str(value or "none").lower()
+    aliases = {
+        "": "none",
+        "off": "none",
+        "identity": "none",
+        "force_mask": "forced_mask",
+        "all_mask": "forced_mask",
+        "random": "random_value",
+        "random_values": "random_value",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in {"none", "forced_mask", "random_value"}:
+        raise ValueError(f"Unsupported musical_feature_transform={value}")
+    return mode
+
+
+def build_score_musical_rows(
+    score,
+    musical_feature_mode="musical4slot",
+    musical_feature_transform="none",
+    musical_random_seed=42,
+):
     score_feature = score.get("score_feature", [])
     has_score_feature = score.get("has_score_feature", [0] * len(score.get("pitch", [])))
     mode = str(musical_feature_mode).lower()
@@ -715,9 +761,16 @@ def build_score_musical_rows(score, musical_feature_mode="musical4slot"):
         )
 
     rows = []
+    transform = normalize_musical_feature_transform(musical_feature_transform)
     for idx, has_feature in enumerate(has_score_feature):
         if not bool(has_feature):
             rows.append([0.0] * musical_dim)
+            continue
+        if transform == "forced_mask":
+            rows.append([0.0] * musical_dim)
+            continue
+        if transform == "random_value":
+            rows.append(_random_musical4slot_row(score, idx, seed=musical_random_seed))
             continue
 
         feature = score_feature[idx]
@@ -752,13 +805,20 @@ def build_epr_score_input_rows(
     musical_feature_mode="musical4slot",
     score_note_schema="integrated",
     disable_musical_features=False,
+    musical_feature_transform="none",
+    musical_random_seed=42,
     pedal_control_dim=4,
 ):
     score_raw = score["score_raw"]
     has_score_feature = score.get("has_score_feature", [0] * len(score["pitch"]))
     musical_dim = musical_feature_dim(musical_feature_mode)
     musical_rows = (
-        build_score_musical_rows(score, musical_feature_mode=musical_feature_mode)
+        build_score_musical_rows(
+            score,
+            musical_feature_mode=musical_feature_mode,
+            musical_feature_transform=musical_feature_transform,
+            musical_random_seed=musical_random_seed,
+        )
         if musical_dim > 0
         else [[] for _ in score["pitch"]]
     )
@@ -777,7 +837,7 @@ def build_epr_score_input_rows(
         )
         if musical_dim == 0:
             m_musical = 0.0
-        elif disable_musical_features:
+        elif disable_musical_features or normalize_musical_feature_transform(musical_feature_transform) == "forced_mask":
             m_musical = 0.0
             musical = [0.0] * len(musical)
         else:
@@ -1109,6 +1169,8 @@ class PianoCoReNodeSFTDataset(Dataset):
         score_note_schema="integrated",
         epr_timing_target="floor_log_deviation",
         disable_musical_features=False,
+        musical_feature_transform="none",
+        musical_random_seed=42,
         use_timing_scale_bit=False,
         timing_control_mode="dinr_floor_log",
         timing_log_scale=50.0,
@@ -1136,6 +1198,8 @@ class PianoCoReNodeSFTDataset(Dataset):
         self.score_note_schema = score_note_input_schema(score_note_schema)
         self.epr_timing_target = str(epr_timing_target or "floor_log_deviation").lower()
         self.disable_musical_features = bool(disable_musical_features)
+        self.musical_feature_transform = normalize_musical_feature_transform(musical_feature_transform)
+        self.musical_random_seed = int(musical_random_seed)
         self.use_timing_scale_bit = bool(use_timing_scale_bit)
         self.timing_control_mode = resolve_timing_control_mode(
             timing_control_mode=timing_control_mode,
@@ -1228,6 +1292,8 @@ class PianoCoReNodeSFTDataset(Dataset):
                 "musical_feature_mode": self.musical_feature_mode,
                 "score_note_input_schema": self.score_note_schema,
                 "disable_musical_features": self.disable_musical_features,
+                "musical_feature_transform": self.musical_feature_transform,
+                "musical_random_seed": self.musical_random_seed,
                 "timing_control_mode": self.timing_control_mode,
                 "timing_log_scale": self.timing_log_scale,
                 "use_timing_scale_bit": self.use_timing_scale_bit,
@@ -1548,6 +1614,8 @@ class PianoCoReNodeSFTDataset(Dataset):
                 musical_feature_mode=self.musical_feature_mode,
                 score_note_schema=self.score_note_schema,
                 disable_musical_features=self.disable_musical_features,
+                musical_feature_transform=self.musical_feature_transform,
+                musical_random_seed=self.musical_random_seed,
                 pedal_control_dim=pedal_representation_dim(self.pedal_representation),
             )
         if eager_labels:
@@ -1674,6 +1742,8 @@ class PianoCoReNodeSFTDataset(Dataset):
                 musical_feature_mode=self.musical_feature_mode,
                 score_note_schema=self.score_note_schema,
                 disable_musical_features=self.disable_musical_features,
+                musical_feature_transform=self.musical_feature_transform,
+                musical_random_seed=self.musical_random_seed,
                 pedal_control_dim=pedal_representation_dim(self.pedal_representation),
             )
         return cache[cache_key]
@@ -1683,6 +1753,8 @@ class PianoCoReNodeSFTDataset(Dataset):
             prepared["_derived_score_musical"] = build_score_musical_rows(
                 prepared["score"],
                 musical_feature_mode=self.musical_feature_mode,
+                musical_feature_transform=self.musical_feature_transform,
+                musical_random_seed=self.musical_random_seed,
             )
         return prepared["_derived_score_musical"]
 
@@ -3380,7 +3452,10 @@ def create_model(train_config):
         slot_version=train_config.get("slot_version"),
         slot_dim=train_config.get("slot_dim"),
         slot_fusion=train_config.get("slot_fusion", "mlp"),
+        musical_slot_fusion=train_config.get("musical_slot_fusion", "sum"),
         slot_gates=train_config.get("slot_gates", False),
+        slot_gate_scope=train_config.get("slot_gate_scope", "all"),
+        slot_gate_init=train_config.get("slot_gate_init", 1.0),
         slot_share_role_encoders=slot_share_role_encoders,
         decoder_head_layout=train_config.get("decoder_head_layout", "pyramid4"),
         decoder_head_expand_ratio=train_config.get("decoder_head_expand_ratio", 2.0),
@@ -3493,6 +3568,11 @@ def create_model(train_config):
         timing_input_normalization=train_config.get("timing_input_normalization", "linear_5000"),
         musical_feature_mode=musical_feature_mode,
         musical_gate_init=train_config.get("musical_gate_init", 1.0),
+        musical_component_gates=train_config.get("musical_component_gates", False),
+        musical_component_gate_init=train_config.get("musical_component_gate_init", 1.0),
+        additive_embedding_gates=train_config.get("additive_embedding_gates", False),
+        additive_gate_init=train_config.get("additive_gate_init", 1.0),
+        additive_musical_gate_init=train_config.get("additive_musical_gate_init", 1.0),
         prior_token_keep_prob=train_config.get("prior_token_keep_prob", 1.0),
         prior_token_dropout_mode=train_config.get("prior_token_dropout_mode", "mask"),
         prior_attribute_keep_probs=train_config.get("prior_attribute_keep_probs"),
@@ -4007,6 +4087,8 @@ def main():
         score_note_schema=train_config.get("score_note_input_schema", "integrated"),
         epr_timing_target=train_config.get("epr_timing_target", "floor_log_deviation"),
         disable_musical_features=train_config.get("disable_musical_features", False),
+        musical_feature_transform=train_config.get("musical_feature_transform", "none"),
+        musical_random_seed=train_config.get("musical_random_seed", train_config.get("seed", 42)),
         use_timing_scale_bit=train_config.get("use_timing_scale_bit", False),
         timing_control_mode=train_config.get("timing_control_mode"),
         timing_log_scale=train_config.get("timing_log_scale", 50.0),
@@ -4040,6 +4122,8 @@ def main():
         score_note_schema=train_config.get("score_note_input_schema", "integrated"),
         epr_timing_target=train_config.get("epr_timing_target", "floor_log_deviation"),
         disable_musical_features=train_config.get("disable_musical_features", False),
+        musical_feature_transform=train_config.get("musical_feature_transform", "none"),
+        musical_random_seed=train_config.get("musical_random_seed", train_config.get("seed", 42)),
         use_timing_scale_bit=train_config.get("use_timing_scale_bit", False),
         timing_control_mode=train_config.get("timing_control_mode"),
         timing_log_scale=train_config.get("timing_log_scale", 50.0),

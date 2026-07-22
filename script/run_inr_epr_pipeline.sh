@@ -170,11 +170,11 @@ cfg["global_batch_size"] = int(global_bs)
 cfg.setdefault("use_prepared_sidecar", True)
 cfg["precompute_dataset_items"] = False
 cfg["precompute_eval_dataset_items"] = False
-cfg["fixed_window_split_scheme"] = cfg.get("fixed_window_split_scheme") or "train_valid_asap3_nonasap05_v1"
-cfg["fixed_window_base_split"] = cfg.get("fixed_window_base_split") or "train"
-cfg["fixed_window_train_split_name"] = cfg.get("fixed_window_train_split_name") or "train"
-cfg["fixed_window_eval_split_name"] = cfg.get("fixed_window_eval_split_name") or "valid"
-cfg["fixed_window_split_summary_path"] = cfg.get("fixed_window_split_summary_path") or "data/train_valid_asap3_nonasap05_v1_summary.json"
+cfg.setdefault("fixed_window_split_scheme", "train_valid_asap3_nonasap05_v1")
+cfg.setdefault("fixed_window_base_split", "train")
+cfg.setdefault("fixed_window_train_split_name", "train")
+cfg.setdefault("fixed_window_eval_split_name", "valid")
+cfg.setdefault("fixed_window_split_summary_path", "data/train_valid_asap3_nonasap05_v1_summary.json")
 cfg["load_best_model_at_end"] = True
 cfg["metric_for_best_model"] = "eval_loss"
 cfg["greater_is_better"] = False

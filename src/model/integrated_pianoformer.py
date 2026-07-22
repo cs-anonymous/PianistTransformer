@@ -349,9 +349,17 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         slot_version=None,
         slot_dim=None,
         slot_fusion="mlp",
+        musical_slot_fusion="sum",
         slot_gates=False,
+        slot_gate_scope="all",
+        slot_gate_init=1.0,
         slot_share_role_encoders=True,
         musical_gate_init=1.0,
+        musical_component_gates=False,
+        musical_component_gate_init=1.0,
+        additive_embedding_gates=False,
+        additive_gate_init=1.0,
+        additive_musical_gate_init=1.0,
         prior_token_keep_prob=1.0,
         prior_token_dropout_mode="mask",
         prior_attribute_keep_probs=None,
@@ -648,9 +656,17 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.slot_version = normalize_slot_version(slot_version) if str(note_embedding_mode).lower() == "slot_attribute" else None
         self.slot_dim = None if slot_dim is None else int(slot_dim)
         self.slot_fusion = str(slot_fusion).lower()
+        self.musical_slot_fusion = str(musical_slot_fusion or "sum").lower()
         self.slot_gates = bool(slot_gates)
+        self.slot_gate_scope = str(slot_gate_scope or "all").lower()
+        self.slot_gate_init = float(slot_gate_init)
         self.slot_share_role_encoders = bool(slot_share_role_encoders)
         self.musical_gate_init = float(musical_gate_init)
+        self.musical_component_gates = bool(musical_component_gates)
+        self.musical_component_gate_init = float(musical_component_gate_init)
+        self.additive_embedding_gates = bool(additive_embedding_gates)
+        self.additive_gate_init = float(additive_gate_init)
+        self.additive_musical_gate_init = float(additive_musical_gate_init)
         self.soft_ce_tau = soft_ce_tau or {
             "ioi": 10.0,
             "duration": 30.0,
@@ -808,6 +824,11 @@ def _make_mlp(input_dim, output_dim, hidden_dim, depth=2, activation="gelu"):
     return nn.Sequential(*layers)
 
 
+def _gate_logit_from_value(value, eps=1e-6):
+    value = min(max(float(value), eps), 1.0 - eps)
+    return math.log(value / (1.0 - value))
+
+
 def _make_decoder_head(
     input_dim,
     output_dim,
@@ -870,6 +891,11 @@ class IntegratedNoteEncoder(nn.Module):
         self.slot_num = slot_version_num_slots(self.slot_version) if self.slot_version is not None else 0
         self.slot_is_pt = slot_version_is_pt(self.slot_version) if self.slot_version is not None else False
         self.slot_fusion_mode = str(getattr(config, "slot_fusion", "mlp") or "mlp").lower()
+        self.musical_slot_fusion_mode = str(getattr(config, "musical_slot_fusion", "sum") or "sum").lower()
+        if self.musical_slot_fusion_mode not in {"sum", "mlp"}:
+            raise ValueError(
+                f"Unsupported musical_slot_fusion={self.musical_slot_fusion_mode}; expected sum or mlp"
+            )
         self.slot_dim = (
             int(getattr(config, "slot_dim", 0))
             if getattr(config, "slot_dim", None) is not None
@@ -977,6 +1003,9 @@ class IntegratedNoteEncoder(nn.Module):
         self.slot_musical_fusion = None
         self.slot_fusion = None
         self.slot_gate_logits = None
+        self.slot_gate_mask = None
+        self.slot_musical_component_gate_logits = None
+        self.additive_embedding_gate_logits = None
         self.slot_timing_dim = max(1, (self.score_control_dim - 1) // 2) if self.mode == "slot_attribute" else 0
         self.dinr_enabled = (
             self.mode == "slot_attribute"
@@ -1053,6 +1082,12 @@ class IntegratedNoteEncoder(nn.Module):
                 self.embedding_depth,
                 self.activation,
             )
+            if bool(getattr(config, "additive_embedding_gates", False)):
+                gate_logit = _gate_logit_from_value(getattr(config, "additive_gate_init", 1.0))
+                musical_logit = _gate_logit_from_value(getattr(config, "additive_musical_gate_init", 1.0))
+                self.additive_embedding_gate_logits = nn.Parameter(torch.full((5,), gate_logit))
+                with torch.no_grad():
+                    self.additive_embedding_gate_logits[3] = musical_logit
         elif self.mode == "cine":
             flat_dim = (
                 self.pitch_factor_dim
@@ -1153,6 +1188,14 @@ class IntegratedNoteEncoder(nn.Module):
                     self.slot_musical_length_embedding = nn.Embedding(147, self.slot_dim)
                 if self.musical_dim == 9:
                     self.slot_musical_compact_norm = nn.LayerNorm(self.slot_dim)
+                    if self.musical_slot_fusion_mode == "mlp":
+                        self.slot_musical_fusion = _make_mlp(
+                            self.slot_dim * 4,
+                            self.slot_dim,
+                            self.slot_dim * 2,
+                            self.embedding_depth,
+                            self.activation,
+                        )
             self.slot_null_embeddings = nn.Parameter(torch.zeros(self.slot_num, self.slot_dim))
             self.slot_mask_embeddings = nn.Parameter(torch.zeros(self.slot_num, self.slot_dim))
             self.slot_pad_embeddings = nn.Parameter(torch.zeros(self.slot_num, self.slot_dim))
@@ -1175,14 +1218,29 @@ class IntegratedNoteEncoder(nn.Module):
                     "slot_attribute sum fusion requires slot_dim == hidden_size, got "
                     f"{self.slot_dim} != {config.hidden_size}"
                 )
+            if bool(getattr(config, "musical_component_gates", False)) and self.musical_dim == 9:
+                component_gate_init = _gate_logit_from_value(
+                    getattr(config, "musical_component_gate_init", 1.0)
+                )
+                self.slot_musical_component_gate_logits = nn.Parameter(
+                    torch.full((4,), component_gate_init)
+                )
             if bool(getattr(config, "slot_gates", False)):
-                self.slot_gate_logits = nn.Parameter(torch.ones(self.slot_num))
-                if self.slot_version == "slot12":
-                    musical_gate_init = float(getattr(config, "musical_gate_init", 1.0))
-                    musical_gate_init = min(max(musical_gate_init, 1e-4), 1.0 - 1e-4)
-                    musical_logit = math.log(musical_gate_init / (1.0 - musical_gate_init))
+                gate_init = _gate_logit_from_value(getattr(config, "slot_gate_init", 1.0))
+                self.slot_gate_logits = nn.Parameter(torch.full((self.slot_num,), gate_init))
+                scope = str(getattr(config, "slot_gate_scope", "all") or "all").lower()
+                if scope not in {"all", "musical_only"}:
+                    raise ValueError(f"Unsupported slot_gate_scope={scope}; expected all or musical_only")
+                if self.slot_version in {"slot6", "slot7", "slot9", "slot12"} and self.musical_dim > 0:
+                    musical_base = 5 if self.slot_is_pt else 8
+                    musical_logit = _gate_logit_from_value(getattr(config, "musical_gate_init", 1.0))
                     with torch.no_grad():
-                        self.slot_gate_logits[8:] = musical_logit
+                        self.slot_gate_logits[musical_base:] = musical_logit
+                    if scope == "musical_only":
+                        self.slot_gate_mask = torch.zeros(self.slot_num, dtype=torch.bool)
+                        self.slot_gate_mask[musical_base:] = True
+                elif scope == "musical_only":
+                    self.slot_gate_mask = torch.zeros(self.slot_num, dtype=torch.bool)
         self.norm = nn.LayerNorm(config.hidden_size)
 
     def _pitch_factors(self, pitch_ids):
@@ -1360,6 +1418,8 @@ class IntegratedNoteEncoder(nn.Module):
     def _slot_apply_gate(self, slot_index, embedding):
         if self.slot_gate_logits is None:
             return embedding
+        if self.slot_gate_mask is not None and not bool(self.slot_gate_mask[slot_index].item()):
+            return embedding
         gate = torch.sigmoid(self.slot_gate_logits[slot_index]).to(dtype=embedding.dtype, device=embedding.device)
         return embedding * gate
 
@@ -1413,18 +1473,40 @@ class IntegratedNoteEncoder(nn.Module):
         ml_has_value = ml_idx > 0
         ml_ids = torch.where(ml_has_value, ml_idx, ml_idx.new_full(ml_idx.shape, no_value_id))
         ml_ids = torch.where(active, ml_ids, ml_idx.new_full(ml_idx.shape, pad_id))
+        onset_embedding = self.slot_musical_onset_embedding(mo_ids).to(dtype=annotation.dtype)
+        duration_embedding = self.slot_musical_duration_embedding(md_ids).to(dtype=annotation.dtype)
+        length_embedding = self.slot_musical_length_embedding(ml_ids).to(dtype=annotation.dtype)
         annotation_embedding = self._slot_encode(
             self.slot_musical_binary_projection,
             annotation,
             mask,
             slot_index,
         )
-        musical_slot = (
-            self.slot_musical_onset_embedding(mo_ids).to(dtype=annotation.dtype)
-            + self.slot_musical_duration_embedding(md_ids).to(dtype=annotation.dtype)
-            + self.slot_musical_length_embedding(ml_ids).to(dtype=annotation.dtype)
-            + annotation_embedding
-        )
+        if self.slot_musical_component_gate_logits is not None:
+            component_gates = torch.sigmoid(
+                self.slot_musical_component_gate_logits.to(
+                    dtype=annotation_embedding.dtype,
+                    device=annotation_embedding.device,
+                )
+            )
+            onset_embedding = onset_embedding * component_gates[0]
+            duration_embedding = duration_embedding * component_gates[1]
+            length_embedding = length_embedding * component_gates[2]
+            annotation_embedding = annotation_embedding * component_gates[3]
+        if self.slot_musical_fusion is not None and self.musical_slot_fusion_mode == "mlp":
+            musical_slot = self.slot_musical_fusion(
+                torch.cat(
+                    [
+                        onset_embedding,
+                        duration_embedding,
+                        length_embedding,
+                        annotation_embedding,
+                    ],
+                    dim=-1,
+                )
+            )
+        else:
+            musical_slot = onset_embedding + duration_embedding + length_embedding + annotation_embedding
         if self.slot_musical_compact_norm is not None:
             musical_slot = self.slot_musical_compact_norm(musical_slot)
         return musical_slot
@@ -1691,6 +1773,18 @@ class IntegratedNoteEncoder(nn.Module):
             if self.musical_projection is not None:
                 musical_embeds = self.musical_projection(musical) * masks[..., 2:3]
             mask_embeds = self.mask_projection(masks)
+            if self.additive_embedding_gate_logits is not None:
+                additive_gates = torch.sigmoid(
+                    self.additive_embedding_gate_logits.to(
+                        dtype=pitch_embeds.dtype,
+                        device=pitch_embeds.device,
+                    )
+                )
+                pitch_embeds = pitch_embeds * additive_gates[0]
+                score_control_embeds = score_control_embeds * additive_gates[1]
+                performance_control_embeds = performance_control_embeds * additive_gates[2]
+                musical_embeds = musical_embeds * additive_gates[3]
+                mask_embeds = mask_embeds * additive_gates[4]
             embeddings = (
                 pitch_embeds
                 + score_control_embeds
@@ -5156,6 +5250,8 @@ def _share_slot_attribute_encoders(score_encoder, decoder_encoder):
     decoder_encoder.slot_pad_embeddings = score_encoder.slot_pad_embeddings
     decoder_encoder.slot_zero_score_ioi_embedding = score_encoder.slot_zero_score_ioi_embedding
     decoder_encoder.slot_gate_logits = score_encoder.slot_gate_logits
+    decoder_encoder.slot_gate_mask = score_encoder.slot_gate_mask
+    decoder_encoder.slot_musical_component_gate_logits = score_encoder.slot_musical_component_gate_logits
     decoder_encoder.slot_fusion = score_encoder.slot_fusion
     decoder_encoder.dinr_timing_table = score_encoder.dinr_timing_table
     decoder_encoder.dinr_velocity_table = score_encoder.dinr_velocity_table

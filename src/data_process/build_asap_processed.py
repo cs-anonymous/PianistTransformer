@@ -118,11 +118,6 @@ def validate_json_one(path: Path, min_coverage: float) -> dict[str, Any]:
                 raise ValueError(f"score_feature_binary_value_invalid[{idx}]: {path}")
     matched = sum(1 for value in has_score_feature if bool(value))
     coverage = matched / len(pitch) if pitch else 1.0
-    total_abs = float(np.abs(np.asarray(score_feature, dtype=float)).sum()) if score_feature else 0.0
-    if pitch and matched <= 0:
-        raise ValueError(f"zero_score_feature_coverage: {path}")
-    if pitch and total_abs <= 0.0:
-        raise ValueError(f"all_zero_score_feature: {path}")
     if coverage < min_coverage:
         raise ValueError(f"low_score_feature_coverage={coverage:.6f}: {path}")
     align = (payload.get("meta") or {}).get("xml_to_refined_score_alignment") or {}
@@ -148,6 +143,8 @@ def validate_json_tree(json_root: Path, min_coverage: float) -> dict[str, Any]:
         "matched": matched,
         "coverage": matched / notes if notes else 1.0,
         "min_coverage": min((item["coverage"] for item in details), default=1.0),
+        "zero_coverage_works": sum(1 for item in details if item["coverage"] <= 0.0),
+        "low_coverage_works": sum(1 for item in details if item["coverage"] < min_coverage),
         "details": details,
     }
 
@@ -248,10 +245,7 @@ def validate_sidecar_one(path: Path, tag: str | None = None) -> dict[str, Any]:
             raise ValueError(f"bad_sidecar_score_feature_idx[{idx}]: {sidecar}")
         if any(float(value) not in (0.0, 1.0) for value in row[3:9]):
             raise ValueError(f"bad_sidecar_score_feature_binary[{idx}]: {sidecar}")
-    total_abs = float(np.abs(np.asarray(score_feature, dtype=float)).sum()) if score_feature else 0.0
     matched = sum(1 for value in has_score_feature if bool(value))
-    if pitch and (matched <= 0 or total_abs <= 0.0):
-        raise ValueError(f"empty_sidecar_score_feature: {sidecar}")
     return {
         "path": str(path),
         "sidecar": str(sidecar),
@@ -272,6 +266,7 @@ def validate_sidecars(json_root: Path, tag: str | None = None) -> dict[str, Any]
         "matched": matched,
         "coverage": matched / notes if notes else 1.0,
         "min_coverage": min((item["coverage"] for item in details), default=1.0),
+        "zero_coverage_works": sum(1 for item in details if item["coverage"] <= 0.0),
         "details": details,
     }
 
@@ -300,7 +295,7 @@ def main() -> None:
     parser.add_argument("--raw-root", type=Path, default=Path("data/ASAP_processed"))
     parser.add_argument("--workers", type=int, default=32)
     parser.add_argument("--sidecar-tag", default=DEFAULT_TAG)
-    parser.add_argument("--min-score-feature-coverage", type=float, default=0.95)
+    parser.add_argument("--min-score-feature-coverage", type=float, default=0.0)
     parser.add_argument("--performance-time-normalization", choices=["none", "score_onset_span"], default="none")
     parser.add_argument("--limit-works", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")

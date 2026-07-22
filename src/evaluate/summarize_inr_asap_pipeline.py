@@ -357,12 +357,26 @@ def refined_root_from_config(config):
     return refined_dir
 
 
-def relative_refined_path(path, refined_root):
+def gt_source_path_candidates(path, refined_root):
     resolved = Path(path).resolve()
+    candidates = {resolved.as_posix()}
+    for root in (
+        refined_root,
+        ROOT_DIR / "data" / "refined",
+        ROOT_DIR / "PianoCoRe" / "refined",
+        ROOT_DIR / "PianoCoRe" / "processed",
+    ):
+        root = Path(root).resolve()
+        try:
+            candidates.add(resolved.relative_to(root).as_posix())
+        except ValueError:
+            pass
     try:
-        return resolved.relative_to(refined_root).as_posix()
+        refined_idx = resolved.parts.index("refined")
+        candidates.add(Path(*resolved.parts[refined_idx + 1 :]).as_posix())
     except ValueError:
-        return resolved.as_posix()
+        pass
+    return candidates
 
 
 def score_source_to_work_path_from_manifest(manifest, config):
@@ -377,10 +391,10 @@ def selected_gt_sources_from_manifest(manifest, config):
     selected = {}
     for item in manifest["items"]:
         source_paths = item.get("original_ground_truth_paths") or item.get("ground_truth_paths", [])
-        selected[item["score_source"]] = {
-            relative_refined_path(path, refined_root)
-            for path in source_paths
-        }
+        candidates = set()
+        for path in source_paths:
+            candidates.update(gt_source_path_candidates(path, refined_root))
+        selected[item["score_source"]] = candidates
     return selected
 
 

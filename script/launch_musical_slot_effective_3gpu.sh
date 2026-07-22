@@ -35,6 +35,11 @@ common = {
     "slot_version": "slot6",
     "slot_dim": 128,
     "slot_fusion": "mlp",
+    "musical_slot_fusion": "sum",
+    "slot_gates": True,
+    "musical_component_gates": True,
+    "musical_component_gate_init": 1.0,
+    "musical_gate_init": 0.0,
     "encoder_layers_num": 8,
     "decoder_layers_num": 4,
     "loss_normalization": True,
@@ -49,11 +54,11 @@ common = {
     "sampling_top_k": 0,
     "dlm_sampling_top_k": 0,
     "dinr_sampling_top_k": 0,
-    "fixed_window_split_scheme": "train_valid_asap3_nonasap05_v1",
+    "fixed_window_split_scheme": "train_valid_asap3_rebuilt_mask_v1",
     "fixed_window_base_split": "train",
     "fixed_window_train_split_name": "train",
     "fixed_window_eval_split_name": "valid",
-    "fixed_window_split_summary_path": "data/train_valid_asap3_nonasap05_v1_summary.json",
+    "fixed_window_split_summary_path": "data/train_valid_asap3_rebuilt_mask_v1_summary.json",
 }
 
 def clean(cfg):
@@ -154,16 +159,6 @@ def add(queue, name, cfg):
 # Queue 1: CINR.
 for name, overrides in [
     ("default_dlm_k1_bounded5", {}),
-    ("absolute_timing_0_9", {
-        "epr_timing_target": "absolute_log",
-        "timing_input_normalization": "log1p_t_over_50_5000",
-        "dlm_ioi_nonzero_min": 0.0,
-        "dlm_ioi_nonzero_max": 9.0,
-        "dlm_ioi_zero_min": 0.0,
-        "dlm_ioi_zero_max": 9.0,
-        "dlm_duration_min": 0.0,
-        "dlm_duration_max": 9.0,
-    }),
     ("bounded_2p5pct", bounded_scales(0.025)),
     ("bounded_5pct", bounded_scales(0.05)),
     ("bounded_10pct", bounded_scales(0.10)),
@@ -182,16 +177,6 @@ for name, overrides in [
 # Queue 2: DINR.
 for name, overrides in [
     ("default_no_coord", {}),
-    ("absolute_timing_0_9_256bin", {
-        "epr_timing_target": "absolute_log",
-        "dinr_output_timing_bins": 256,
-        "dinr_output_zero_bin": 0,
-        "dinr_output_timing_step": 9.0 / 255.0,
-        "dinr_deviation_min": 0.0,
-        "dinr_deviation_max": 9.0,
-        "dinr_zero_ioi_min": 0.0,
-        "dinr_zero_ioi_max": 9.0,
-    }),
     ("coord_none", {"dinr_input_numerical_coordinates": False, "dinr_input_velocity_numerical_coordinates": False, "dinr_output_deviation_numerical_coordinates": False, "dinr_velocity_numerical_coordinates": False}),
     ("coord_input_only", {"dinr_input_numerical_coordinates": True, "dinr_input_velocity_numerical_coordinates": True, "dinr_output_deviation_numerical_coordinates": False, "dinr_velocity_numerical_coordinates": False}),
     ("coord_timing_dev_only", {"dinr_input_numerical_coordinates": False, "dinr_input_velocity_numerical_coordinates": False, "dinr_output_deviation_numerical_coordinates": True, "dinr_velocity_numerical_coordinates": False}),
@@ -230,7 +215,8 @@ for name, overrides in [
     "configs": configs,
     "notes": [
         "Queue runner continues after individual experiment failures.",
-        "absolute_timing_* configs are written as requested; current train/model may reject non-floor_log_deviation until absolute EPR support is restored.",
+        "absolute_timing_* configs are omitted because current train/infer/model code rejects non-floor_log_deviation EPR targets.",
+        "Baseline is full_musical_gated_zero_init plus component-wise musical gates: 20ep, loss_normalization=true, musical_slot_fusion=sum, musical_gate_init=0.0.",
         "musical ablations use compact 9D ASAP_processed schema, not musical51.",
     ],
 }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -286,12 +272,18 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
 fi
 
 : > "${RUN_ROOT}/queue_status.tsv"
-setsid bash "${RUN_ROOT}/run_queue.sh" 0 cinr "${RUN_ROOT}" "${ROOT_DIR}" > "${RUN_ROOT}/cinr.queue.log" 2>&1 < /dev/null &
-echo "$!" > "${RUN_ROOT}/cinr.pid"
-setsid bash "${RUN_ROOT}/run_queue.sh" 1 dinr "${RUN_ROOT}" "${ROOT_DIR}" > "${RUN_ROOT}/dinr.queue.log" 2>&1 < /dev/null &
-echo "$!" > "${RUN_ROOT}/dinr.pid"
-setsid bash "${RUN_ROOT}/run_queue.sh" 2 extra "${RUN_ROOT}" "${ROOT_DIR}" > "${RUN_ROOT}/extra.queue.log" 2>&1 < /dev/null &
-echo "$!" > "${RUN_ROOT}/extra.pid"
+tmux new-session -d -s "musical_slot_cinr_${STAMP}" \
+  "bash '${RUN_ROOT}/run_queue.sh' 0 cinr '${RUN_ROOT}' '${ROOT_DIR}' > '${RUN_ROOT}/cinr.queue.log' 2>&1"
+tmux new-session -d -s "musical_slot_dinr_${STAMP}" \
+  "bash '${RUN_ROOT}/run_queue.sh' 1 dinr '${RUN_ROOT}' '${ROOT_DIR}' > '${RUN_ROOT}/dinr.queue.log' 2>&1"
+tmux new-session -d -s "musical_slot_extra_${STAMP}" \
+  "bash '${RUN_ROOT}/run_queue.sh' 2 extra '${RUN_ROOT}' '${ROOT_DIR}' > '${RUN_ROOT}/extra.queue.log' 2>&1"
+
+{
+  echo "musical_slot_cinr_${STAMP}"
+  echo "musical_slot_dinr_${STAMP}"
+  echo "musical_slot_extra_${STAMP}"
+} > "${RUN_ROOT}/tmux_sessions.txt"
 
 echo "RUN_ROOT=${RUN_ROOT}"
-echo "PIDS cinr=$(cat "${RUN_ROOT}/cinr.pid") dinr=$(cat "${RUN_ROOT}/dinr.pid") extra=$(cat "${RUN_ROOT}/extra.pid")"
+echo "TMUX_SESSIONS=$(tr '\n' ' ' < "${RUN_ROOT}/tmux_sessions.txt")"

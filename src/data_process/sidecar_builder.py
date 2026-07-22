@@ -31,13 +31,6 @@ def _validate_score_feature_payload(score_payload, path):
             if float(value) not in (0.0, 1.0):
                 raise ValueError(f"score_feature_binary_value_invalid[{idx}]: {path}")
     matched = sum(1 for value in has_score_feature if bool(value))
-    if pitch and matched <= 0:
-        raise ValueError(f"zero_score_feature_coverage_for_sidecar: {path}")
-    total_abs = 0.0
-    for row in score_feature:
-        total_abs += sum(abs(float(value)) for value in row)
-    if pitch and total_abs <= 0.0:
-        raise ValueError(f"all_zero_score_feature_for_sidecar: {path}")
 
 
 def _normalize_performance_to_score_onset_span(score_raw, perf):
