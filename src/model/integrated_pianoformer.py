@@ -103,6 +103,20 @@ def musical_feature_dim(musical_feature_mode="musical4slot"):
     if mode in {"none", "nomus", "no_musical", "disabled"}:
         return 0
     if mode in {
+        "musical51",
+        "musical51_full",
+        "musical51_onset_only",
+        "musical51_annotation_only",
+        "musical51_duration_only",
+        "musical51_onset_annotation",
+        "musical51_no_onset",
+        "musical51_no_duration",
+        "musical51_no_annotation",
+        "musical51_no_length",
+        "musical51_no_duration_length",
+    }:
+        return 51
+    if mode in {
         "musical4slot",
         "musical4slot_full",
         "musical4slot_idx145",
@@ -115,9 +129,7 @@ def musical_feature_dim(musical_feature_mode="musical4slot"):
         "compact4slot",
     }:
         return 9
-    raise ValueError(
-        f"Unsupported musical_feature_mode={musical_feature_mode}; use musical4slot for ASAP_processed 9D features"
-    )
+    raise ValueError(f"Unsupported musical_feature_mode={musical_feature_mode}")
 
 
 def normalize_slot_version(slot_version=None):
@@ -1115,10 +1127,10 @@ class IntegratedNoteEncoder(nn.Module):
                 raise ValueError(
                     f"slot_attribute expects performance_control_dim={expected_perf_dim}, got {self.performance_control_dim}"
                 )
-            if self.slot_version in {"slot6", "slot9", "slot12"} and self.musical_dim not in {0, 9}:
+            if self.slot_version in {"slot6", "slot9", "slot12"} and self.musical_dim not in {0, 9, 51}:
                 raise ValueError(
-                    f"{self.slot_version} expects musical_feature_dim in {{0, 9}}, got {self.musical_dim}. "
-                    "Use musical_feature_mode='musical4slot' or disable musical features."
+                    f"{self.slot_version} expects musical_feature_dim in {{0, 9, 51}}, got {self.musical_dim}. "
+                    "Use musical_feature_mode='musical4slot'/'musical51_full' or disable musical features."
                 )
             if self.slot_version == "slot7" and self.musical_dim != 0:
                 raise ValueError(
@@ -1174,7 +1186,7 @@ class IntegratedNoteEncoder(nn.Module):
                 self.activation,
             )
             if self.slot_version in {"slot6", "slot7", "slot9", "slot12"}:
-                onset_embeddings = 147
+                onset_embeddings = 18 if self.musical_dim == 51 else 147
                 self.slot_musical_onset_embedding = nn.Embedding(onset_embeddings, self.slot_dim)
                 self.slot_musical_binary_projection = _make_mlp(
                     6,
@@ -1184,8 +1196,24 @@ class IntegratedNoteEncoder(nn.Module):
                     self.activation,
                 )
                 if self.slot_version != "slot7":
-                    self.slot_musical_duration_embedding = nn.Embedding(147, self.slot_dim)
-                    self.slot_musical_length_embedding = nn.Embedding(147, self.slot_dim)
+                    self.slot_musical_duration_embedding = nn.Embedding(
+                        18 if self.musical_dim == 51 else 147,
+                        self.slot_dim,
+                    )
+                    self.slot_musical_length_embedding = nn.Embedding(
+                        10 if self.musical_dim == 51 else 147,
+                        self.slot_dim,
+                    )
+                    if self.musical_dim == 51:
+                        self.slot_musical_onset_scalar_projection = _make_mlp(
+                            1, self.slot_dim, self.slot_dim, self.embedding_depth, self.activation
+                        )
+                        self.slot_musical_duration_scalar_projection = _make_mlp(
+                            1, self.slot_dim, self.slot_dim, self.embedding_depth, self.activation
+                        )
+                        self.slot_musical_length_scalar_projection = _make_mlp(
+                            2, self.slot_dim, self.slot_dim, self.embedding_depth, self.activation
+                        )
                 if self.musical_dim == 9:
                     self.slot_musical_compact_norm = nn.LayerNorm(self.slot_dim)
                     if self.musical_slot_fusion_mode == "mlp":
@@ -1196,6 +1224,14 @@ class IntegratedNoteEncoder(nn.Module):
                             self.embedding_depth,
                             self.activation,
                         )
+                elif self.musical_dim == 51 and self.slot_version == "slot6":
+                    self.slot_musical_fusion = _make_mlp(
+                        self.slot_dim * 4,
+                        self.slot_dim,
+                        self.slot_dim * 2,
+                        self.embedding_depth,
+                        self.activation,
+                    )
             self.slot_null_embeddings = nn.Parameter(torch.zeros(self.slot_num, self.slot_dim))
             self.slot_mask_embeddings = nn.Parameter(torch.zeros(self.slot_num, self.slot_dim))
             self.slot_pad_embeddings = nn.Parameter(torch.zeros(self.slot_num, self.slot_dim))
@@ -1446,6 +1482,15 @@ class IntegratedNoteEncoder(nn.Module):
         musical_binary = musical[..., 145:151]
         return musical_onset, musical_binary
 
+    def _split_slot_musical51(self, musical):
+        if musical.shape[-1] < 51:
+            raise ValueError(f"slot6 expects musical51-compatible rows, got dim={musical.shape[-1]}")
+        musical_duration = musical[..., 0:17]
+        musical_length = musical[..., 17:27]
+        musical_onset = musical[..., 27:44]
+        musical_binary = musical[..., 45:51]
+        return musical_onset, musical_duration, musical_length, musical_binary
+
     def _split_slot_musical4slot(self, musical):
         if musical.shape[-1] < 9:
             raise ValueError(
@@ -1680,10 +1725,70 @@ class IntegratedNoteEncoder(nn.Module):
                 if self.slot_fusion is None:
                     return fused
                 return self.slot_fusion(fused)
-            if self.musical_dim > 0:
-                raise ValueError(
-                    f"{self.slot_version} only supports musical_feature_dim=9 for ASAP_processed musical slots"
+            if self.musical_dim == 51:
+                musical_onset, musical_duration, musical_length, musical_binary = self._split_slot_musical51(musical)
+                musical_onset_embedding = self._categorical_slot_embedding(
+                    self.slot_musical_onset_embedding,
+                    musical_onset[..., :16],
+                    musical_onset[..., 16:17],
+                    self.slot_musical_onset_scalar_projection,
+                    musical_base,
+                    m_musical,
                 )
+                musical_duration_embedding = self._categorical_slot_embedding(
+                    self.slot_musical_duration_embedding,
+                    musical_duration[..., :16],
+                    musical_duration[..., 16:17],
+                    self.slot_musical_duration_scalar_projection,
+                    musical_base if self.slot_version == "slot6" else musical_base + 1,
+                    m_musical,
+                )
+                musical_length_embedding = self._musical_length_slot_embedding(
+                    musical_length[..., :8],
+                    musical_length[..., 8:9],
+                    musical_length[..., 9:10],
+                    musical_base if self.slot_version == "slot6" else musical_base + 2,
+                    m_musical,
+                )
+                musical_binary_embedding = self._slot_encode(
+                    self.slot_musical_binary_projection,
+                    musical_binary,
+                    m_musical,
+                    musical_base if self.slot_version == "slot6" else musical_base + 3,
+                )
+                if self.slot_version == "slot6":
+                    if is_decoder:
+                        musical_slot = self._slot_mask_embedding(musical_base, pitch_embeds).expand_as(pitch_embeds)
+                    else:
+                        musical_slot = self.slot_musical_fusion(
+                            torch.cat(
+                                [
+                                    musical_onset_embedding,
+                                    musical_duration_embedding,
+                                    musical_length_embedding,
+                                    musical_binary_embedding,
+                                ],
+                                dim=-1,
+                            )
+                        )
+                    slot_embeddings.append(self._slot_apply_gate(musical_base, musical_slot))
+                else:
+                    slot_embeddings.extend(
+                        [
+                            self._slot_apply_gate(musical_base, musical_onset_embedding),
+                            self._slot_apply_gate(musical_base + 1, musical_duration_embedding),
+                            self._slot_apply_gate(musical_base + 2, musical_length_embedding),
+                            self._slot_apply_gate(musical_base + 3, musical_binary_embedding),
+                        ]
+                    )
+                fused = torch.cat(slot_embeddings, dim=-1)
+                if self.slot_fusion_mode == "sum":
+                    return torch.stack(slot_embeddings, dim=0).sum(dim=0)
+                if self.slot_fusion is None:
+                    return fused
+                return self.slot_fusion(fused)
+            if self.musical_dim > 0:
+                raise ValueError(f"Unsupported musical_feature_dim={self.musical_dim}")
             musical_slot = self._slot_mask_embedding(musical_base, pitch_embeds).expand_as(pitch_embeds)
             if self.slot_version == "slot6":
                 slot_embeddings.append(self._slot_apply_gate(musical_base, musical_slot))

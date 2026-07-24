@@ -183,6 +183,8 @@ cfg["early_stopping_threshold"] = float(cfg.get("early_stopping_threshold", 0.00
 cfg.setdefault("eval_dataloader_persistent_workers", False)
 cfg.setdefault("eval_dataloader_num_workers", cfg.get("dataloader_num_workers", 0))
 cfg.setdefault("eval_dataloader_prefetch_factor", cfg.get("dataloader_prefetch_factor", 2))
+musical_mode = str(cfg.get("musical_feature_mode", "") or "").lower()
+auto_sidecar_tag = "ASAP_MUSICAL51" if musical_mode.startswith("musical51") or musical_mode in {"categorical", "categorical51"} else "ASAP"
 for key in (
     "eval_every_steps",
     "eval_every_epochs",
@@ -204,7 +206,13 @@ if asap_only == "1":
     cfg["train_performance_dataset"] = "ASAP"
     cfg["eval_performance_dataset"] = "ASAP"
     cfg["eval_split"] = "valid"
-    cfg["prepared_sidecar_tag"] = adapt_sidecar_tag or cfg.get("prepared_sidecar_tag") or "ASAP"
+    existing_sidecar_tag = cfg.get("prepared_sidecar_tag")
+    if adapt_sidecar_tag:
+        cfg["prepared_sidecar_tag"] = adapt_sidecar_tag
+    elif existing_sidecar_tag and existing_sidecar_tag != "ASAP":
+        cfg["prepared_sidecar_tag"] = existing_sidecar_tag
+    else:
+        cfg["prepared_sidecar_tag"] = auto_sidecar_tag
 else:
     cfg.pop("train_performance_dataset", None)
     cfg.pop("eval_performance_dataset", None)

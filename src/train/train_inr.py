@@ -47,6 +47,18 @@ os.environ["WANDB_PROJECT"] = "pianist-transformer"
 
 ASAP_PROCESSED_DIR = (ROOT_DIR / "data" / "ASAP_processed").resolve()
 ASAP_METADATA_PATH = ASAP_PROCESSED_DIR / "metadata.generated_json.csv"
+ASAP_MUSICAL51_SIDECAR_TAG = "ASAP_MUSICAL51"
+
+
+def _uses_musical51_sidecar(config):
+    mode = str(config.get("musical_feature_mode", "") or "").lower()
+    return mode.startswith("musical51") or mode in {"categorical", "categorical51"}
+
+
+def apply_default_asap_sidecar_tag(config):
+    if _uses_musical51_sidecar(config) and str(config.get("prepared_sidecar_tag") or "ASAP") == "ASAP":
+        config["prepared_sidecar_tag"] = ASAP_MUSICAL51_SIDECAR_TAG
+    return config
 
 
 def resolve_project_path(path):
@@ -55,6 +67,8 @@ def resolve_project_path(path):
 
 
 def enforce_asap_processed_config(config):
+    if not bool(config.get("enforce_asap_processed_config", False)):
+        return config
     config["metadata_path"] = str(resolve_project_path(config.get("metadata_path", ASAP_METADATA_PATH)))
     config["refined_dir"] = str(resolve_project_path(config.get("refined_dir", ASAP_PROCESSED_DIR)))
     if Path(config["refined_dir"]).resolve() != ASAP_PROCESSED_DIR:
@@ -66,7 +80,7 @@ def enforce_asap_processed_config(config):
         raise ValueError(
             f"INR EPR only accepts metadata under {ASAP_PROCESSED_DIR}; got {metadata_path}"
         )
-    config.pop("prepared_sidecar_tag", None)
+    apply_default_asap_sidecar_tag(config)
     return config
 
 
@@ -304,6 +318,20 @@ def musical_feature_dim(musical_feature_mode="musical4slot"):
     if mode in {"none", "nomus", "no_musical", "disabled"}:
         return 0
     if mode in {
+        "musical51",
+        "musical51_full",
+        "musical51_onset_only",
+        "musical51_annotation_only",
+        "musical51_duration_only",
+        "musical51_onset_annotation",
+        "musical51_no_onset",
+        "musical51_no_duration",
+        "musical51_no_annotation",
+        "musical51_no_length",
+        "musical51_no_duration_length",
+    }:
+        return 51
+    if mode in {
         "musical4slot",
         "musical4slot_full",
         "musical4slot_idx145",
@@ -316,9 +344,7 @@ def musical_feature_dim(musical_feature_mode="musical4slot"):
         "compact4slot",
     }:
         return 9
-    raise ValueError(
-        f"Unsupported musical_feature_mode={musical_feature_mode}; use musical4slot for ASAP_processed 9D features"
-    )
+    raise ValueError(f"Unsupported musical_feature_mode={musical_feature_mode}")
 
 
 def score_note_input_schema(config_or_value=None):
@@ -702,6 +728,97 @@ def _one_hot_bucket(value, edges):
     return bucket
 
 
+MUSICAL_MD_CATEGORIES = [
+    0.0,
+    1.0 / 16.0,
+    1.0 / 12.0,
+    1.0 / 8.0,
+    1.0 / 6.0,
+    1.0 / 4.0,
+    1.0 / 3.0,
+    3.0 / 8.0,
+    1.0 / 2.0,
+    2.0 / 3.0,
+    3.0 / 4.0,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+]
+MUSICAL_ML_CATEGORIES = [0.0, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0]
+MUSICAL_MO_PHASE_CATEGORIES = [
+    0.0,
+    1.0 / 16.0,
+    1.0 / 12.0,
+    1.0 / 8.0,
+    1.0 / 6.0,
+    1.0 / 4.0,
+    1.0 / 3.0,
+    3.0 / 8.0,
+    1.0 / 2.0,
+    5.0 / 8.0,
+    2.0 / 3.0,
+    3.0 / 4.0,
+    5.0 / 6.0,
+    7.0 / 8.0,
+    11.0 / 12.0,
+    0.625,
+]
+
+MUSICAL51_ABLATION_MODES = {
+    "musical51_full",
+    "musical51_onset_only",
+    "musical51_annotation_only",
+    "musical51_duration_only",
+    "musical51_onset_annotation",
+    "musical51_no_onset",
+    "musical51_no_duration",
+    "musical51_no_annotation",
+    "musical51_no_length",
+    "musical51_no_duration_length",
+}
+
+
+def _musical51_base_mode(mode):
+    mode = str(mode).lower()
+    return "musical51" if mode in MUSICAL51_ABLATION_MODES else mode
+
+
+def _apply_musical51_ablation(row, mode):
+    mode = str(mode).lower()
+    if mode in {"musical51", "categorical", "categorical51", "musical51_full"}:
+        return row
+    if mode not in MUSICAL51_ABLATION_MODES:
+        return row
+    masked = [0.0] * 51
+    if mode == "musical51_no_duration":
+        spans = [(17, 51)]
+    elif mode == "musical51_no_onset":
+        spans = [(0, 27), (44, 51)]
+    elif mode == "musical51_no_annotation":
+        spans = [(0, 45)]
+    elif mode == "musical51_no_length":
+        spans = [(0, 17), (27, 51)]
+    elif mode == "musical51_onset_only":
+        spans = [(27, 44)]
+    elif mode == "musical51_annotation_only":
+        spans = [(45, 51)]
+    elif mode == "musical51_duration_only":
+        spans = [(17, 27)]
+    elif mode in {"musical51_onset_annotation", "musical51_no_duration_length"}:
+        spans = [(27, 44), (45, 51)]
+    else:
+        spans = [(0, 51)]
+    for start, end in spans:
+        masked[start:end] = row[start:end]
+    return masked
+
+
+def _one_hot_exact(value, categories, tol=1e-4):
+    return [1.0 if abs(float(value) - float(category)) <= tol else 0.0 for category in categories]
+
+
 def _random_musical4slot_row(score, idx, seed=42):
     source = (
         score.get("score_source")
@@ -755,13 +872,86 @@ def build_score_musical_rows(
     musical_dim = musical_feature_dim(mode)
     if musical_dim == 0:
         return [[] for _ in score.get("pitch", [])]
-    if musical_dim != 9:
-        raise ValueError(
-            f"Only compact ASAP musical4slot 9D score_feature is supported, got {musical_feature_mode}"
-        )
+    base_mode = _musical51_base_mode(mode)
 
     rows = []
     transform = normalize_musical_feature_transform(musical_feature_transform)
+    if musical_dim == 51:
+        measure_start = 0.0
+        current_measure_length = 4.0
+        prev_q = None
+        prev_ms_per_quarter = 500.0
+        seen_any_measure = False
+
+        for idx, has_feature in enumerate(has_score_feature):
+            if not bool(has_feature) or transform == "forced_mask":
+                rows.append([0.0] * musical_dim)
+                continue
+            if transform == "random_value":
+                raise ValueError("random_value musical_feature_transform only supports musical4slot")
+
+            feature = score_feature[idx]
+            mo = float(feature[0]) if len(feature) > 0 else 0.0
+            md = float(feature[1]) if len(feature) > 1 else 0.0
+            raw_ml = float(feature[2]) if len(feature) > 2 else 0.0
+            first = 1.0 if len(feature) > 3 and float(feature[3]) >= 0.5 else 0.0
+            hand = 1.0 if len(feature) > 4 and float(feature[4]) >= 0.5 else 0.0
+            trill = 1.0 if len(feature) > 5 and float(feature[5]) >= 0.5 else 0.0
+            grace = 1.0 if len(feature) > 6 and float(feature[6]) >= 0.5 else 0.0
+            stacc = 1.0 if len(feature) > 7 and float(feature[7]) >= 0.5 else 0.0
+            stem_code = int(round(float(feature[8]))) if len(feature) > 8 else 0
+
+            if not seen_any_measure:
+                seen_any_measure = True
+                if raw_ml > 0.0:
+                    current_measure_length = raw_ml
+            elif first >= 0.5:
+                measure_start += max(current_measure_length, 0.0)
+                if raw_ml > 0.0:
+                    current_measure_length = raw_ml
+            ml_eff = current_measure_length
+            ml_present = 1.0 if raw_ml > 0.0 else 0.0
+
+            q = measure_start + mo
+            mioi = 0.0 if prev_q is None else max(q - prev_q, 0.0)
+            prev_q = q
+
+            candidates = []
+            if idx < len(score.get("score_raw", [])):
+                score_ioi_ms = float(score["score_raw"][idx][0])
+                score_duration_ms = float(score["score_raw"][idx][1])
+                if mioi > 1e-6:
+                    candidates.append(score_ioi_ms / mioi)
+                if md > 1e-6:
+                    candidates.append(score_duration_ms / md)
+            if candidates:
+                prev_ms_per_quarter = sum(candidates) / len(candidates)
+            tempo_bpm = 60000.0 / max(prev_ms_per_quarter, 1e-6)
+            tempo_norm = min(max(tempo_bpm, 0.0), 300.0) / 300.0
+
+            mo_phase = (mo / max(ml_eff, 1e-6)) % 1.0 if ml_eff > 0 else 0.0
+            row = [
+                *_one_hot_exact(md, MUSICAL_MD_CATEGORIES),
+                md,
+                *_one_hot_exact(ml_eff, MUSICAL_ML_CATEGORIES),
+                ml_eff,
+                ml_present,
+                *_one_hot_exact(mo_phase, MUSICAL_MO_PHASE_CATEGORIES),
+                min(max(mo_phase, 0.0), 1.0),
+                tempo_norm,
+                hand,
+                trill,
+                grace,
+                stacc,
+                1.0 if stem_code == 1 else 0.0,
+                1.0 if stem_code == 2 else 0.0,
+            ]
+            rows.append(_apply_musical51_ablation(row, mode))
+        return rows
+
+    if musical_dim != 9:
+        raise ValueError(f"Unsupported musical_feature_mode={musical_feature_mode}")
+
     for idx, has_feature in enumerate(has_score_feature):
         if not bool(has_feature):
             rows.append([0.0] * musical_dim)
@@ -2431,6 +2621,117 @@ class NodeSFTTrainer(Trainer):
                 flush=True,
             )
 
+    def _accumulate_eval_loss_components(self, inputs, outputs):
+        if self.model.training:
+            return
+        labels = inputs.get("labels_continuous")
+        attention_mask = inputs.get("attention_mask")
+        if labels is None or attention_mask is None or getattr(outputs, "logits", None) is None:
+            return
+        try:
+            components = _compute_integrated_loss_components(
+                self._model_config(self.model),
+                outputs.logits,
+                labels,
+                attention_mask,
+                labels_epr_bins=inputs.get("labels_epr_bins"),
+                score_shared_raw=inputs.get("score_shared_raw"),
+                label_valid_mask=inputs.get("label_valid_mask"),
+            )
+            values = {}
+            for name, value in components.items():
+                if torch.is_tensor(value):
+                    values[name] = float(value.detach().float().cpu().item())
+            weights = getattr(self._model_config(self.model), "loss_weights", {}) or {}
+            weighted_total = 0.0
+            for name in ("ioi", "duration", "velocity", "pedal"):
+                if name not in values:
+                    continue
+                contribution = float(weights.get(name, 1.0)) * values[name]
+                values[f"weighted_{name}"] = contribution
+                weighted_total += contribution
+            for name in ("predictive_variance", "dlm_tail", "dlm_target_tail", "dlm_raw_ms_crps"):
+                if name in values:
+                    weighted_total += values[name]
+            values["components_total"] = weighted_total
+
+            batch_weight = float(attention_mask.detach().sum().float().cpu().item())
+            if batch_weight <= 0.0:
+                return
+            accumulator = getattr(self, "_eval_loss_component_sums", None)
+            if accumulator is None:
+                accumulator = {}
+                self._eval_loss_component_sums = accumulator
+            for name, value in values.items():
+                accumulator[name] = accumulator.get(name, 0.0) + float(value) * batch_weight
+            self._eval_loss_component_weight = float(
+                getattr(self, "_eval_loss_component_weight", 0.0) or 0.0
+            ) + batch_weight
+        except Exception as exc:  # noqa: BLE001
+            if self.is_world_process_zero():
+                print(
+                    json.dumps(
+                        {
+                            "step": int(getattr(self.state, "global_step", 0) or 0),
+                            "event": "eval_loss_components_failed",
+                            "reason": str(exc),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+
+    def _reset_eval_loss_components(self):
+        self._eval_loss_component_sums = {}
+        self._eval_loss_component_weight = 0.0
+
+    def _inject_eval_loss_components(self, metrics):
+        sums = getattr(self, "_eval_loss_component_sums", {}) or {}
+        weight = float(getattr(self, "_eval_loss_component_weight", 0.0) or 0.0)
+        if not sums or weight <= 0.0:
+            return metrics
+
+        names = sorted(sums)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            device = (
+                torch.device("cuda", torch.cuda.current_device())
+                if torch.cuda.is_available()
+                else torch.device("cpu")
+            )
+            values = torch.tensor(
+                [float(sums[name]) for name in names] + [weight],
+                dtype=torch.float64,
+                device=device,
+            )
+            torch.distributed.all_reduce(values, op=torch.distributed.ReduceOp.SUM)
+            reduced = values.detach().cpu().tolist()
+            sums = {name: float(reduced[idx]) for idx, name in enumerate(names)}
+            weight = float(reduced[-1])
+
+        if metrics is None:
+            metrics = {}
+        if weight > 0.0:
+            for name in names:
+                metrics[f"eval_loss_{name}"] = float(sums[name]) / weight
+        return metrics
+
+    def _update_last_eval_log_history(self, metrics):
+        if not metrics or not hasattr(self.state, "log_history"):
+            return
+        eval_component_keys = [key for key in metrics if key.startswith("eval_loss_")]
+        if not eval_component_keys:
+            return
+        current_step = int(getattr(self.state, "global_step", 0) or 0)
+        for record in reversed(self.state.log_history):
+            if "eval_loss" not in record:
+                continue
+            if int(record.get("step", current_step) or current_step) != current_step:
+                continue
+            for key in eval_component_keys:
+                record[key] = metrics[key]
+            return
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         group_index = inputs.pop("pn_group_index", None)
         inputs.pop("pn_group_sizes", None)
@@ -2515,6 +2816,7 @@ class NodeSFTTrainer(Trainer):
                     accumulator[name] = accumulator.get(name, 0.0) + float(value.detach().cpu())
                 # _accumulate_train_loss_components below increments the shared count.
         self._accumulate_train_loss_components(inputs, outputs)
+        self._accumulate_eval_loss_components(inputs, outputs)
         return (loss, outputs) if return_outputs else loss
 
     def log(self, logs, *args, **kwargs):
@@ -2807,6 +3109,7 @@ class NodeSFTTrainer(Trainer):
                 flush=True,
             )
         self._clear_eval_dataloader_cache()
+        self._reset_eval_loss_components()
         try:
             try:
                 metrics = super().evaluate(*args, **kwargs)
@@ -2843,6 +3146,7 @@ class NodeSFTTrainer(Trainer):
             self.eval_dataloader_persistent_workers = False
             self.eval_dataloader_prefetch_factor = None
             self._clear_eval_dataloader_cache()
+            self._reset_eval_loss_components()
             try:
                 metrics = super().evaluate(*args, **kwargs)
             finally:
@@ -2851,6 +3155,8 @@ class NodeSFTTrainer(Trainer):
                 self.eval_dataloader_prefetch_factor = original_prefetch_factor
                 self._clear_eval_dataloader_cache()
 
+        metrics = self._inject_eval_loss_components(metrics)
+        self._update_last_eval_log_history(metrics)
         metrics = self._inject_rollout_eval_metrics(metrics)
         if self._dagger_enabled() and bool(getattr(self, "dagger_refresh_on_eval", True)):
             self.refresh_dagger_prefix_cache(reason="eval")

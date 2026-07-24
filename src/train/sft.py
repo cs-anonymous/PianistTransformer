@@ -352,7 +352,8 @@ if __name__ == "__main__":
     else:
         model = PianoT5Gemma.from_pretrained(
             train_config["pretrained_model"],
-            torch_dtype=torch.bfloat16
+            torch_dtype=torch.bfloat16,
+            attn_implementation=train_config.get("attn_implementation", "eager"),
         )
         print(f"Loaded pretrained model from {train_config['pretrained_model']}")
 

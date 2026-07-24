@@ -11,9 +11,12 @@ def _normalized_work_path(path):
 
 def _processed_relative_path(path):
     parts = Path(path).parts
-    try:
-        processed_index = parts.index("processed")
-    except ValueError:
+    processed_index = None
+    for idx, part in enumerate(parts):
+        if part == "processed" or part.endswith("_processed"):
+            processed_index = idx
+            break
+    if processed_index is None:
         return None
     return "/".join(parts[processed_index + 1 :])
 

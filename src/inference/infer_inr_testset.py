@@ -702,7 +702,13 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
         raise ValueError("--oracle-gt-prefix-mode requires --merge-mode continuation")
     perf_style_stats_mode = str(config.get("perf_style_stats_mode", "prefix") or "prefix").lower()
     requires_gt_window_style = bool(config.get("use_style_tokens", False)) and perf_style_stats_mode == "window"
+    task_sample_idx = work.get("_inference_sample_idx")
     if args.oracle_gt_prefix_mode == "none" and not requires_gt_window_style:
+        sample_indices = (
+            [int(task_sample_idx)]
+            if task_sample_idx is not None
+            else range(args.num_samples)
+        )
         inference_plans = [
             {
                 "sample_idx": sample_idx,
@@ -712,7 +718,7 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
                 "oracle_targets": None,
                 "suffix": f"sample_{sample_idx:03d}",
             }
-            for sample_idx in range(args.num_samples)
+            for sample_idx in sample_indices
         ]
     else:
         inference_plans = []
@@ -848,6 +854,7 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
         "note_count": len(pitch),
         "num_windows": len(windows),
         "oracle_gt_prefix_mode": args.oracle_gt_prefix_mode,
+        "sample_indices": [int(plan["sample_idx"]) for plan in inference_plans],
     }
 
 
@@ -878,6 +885,27 @@ def worker_loop(worker_idx, args, config, score_midi_dir, job_queue, result_queu
 
 
 def run_dynamic_pool(args, config, manifest, score_midi_dir):
+    split_sampling_tasks = (
+        args.num_samples > 1
+        and args.oracle_gt_prefix_mode == "none"
+        and not bool(config.get("use_style_tokens", False))
+    )
+    jobs = []
+    if split_sampling_tasks:
+        for score_idx, work in enumerate(manifest):
+            for sample_idx in range(args.num_samples):
+                task_work = dict(work)
+                task_work["_inference_sample_idx"] = sample_idx
+                jobs.append(((score_idx, sample_idx), task_work))
+        print(
+            f"Expanded inference into {len(jobs)} independent tasks "
+            f"({len(manifest)} scores x {args.num_samples} samples), "
+            "ordered by descending score note count.",
+            flush=True,
+        )
+    else:
+        jobs = [(job_idx, work) for job_idx, work in enumerate(manifest)]
+
     ctx = mp.get_context("spawn")
     job_queue = ctx.Queue()
     result_queue = ctx.Queue()
@@ -887,14 +915,14 @@ def run_dynamic_pool(args, config, manifest, score_midi_dir):
     ]
     for worker in workers:
         worker.start()
-    for job_idx, work in enumerate(manifest):
+    for job_idx, work in jobs:
         job_queue.put((job_idx, work))
     for _ in workers:
         job_queue.put(None)
 
     items_by_idx = {}
-    with tqdm(total=len(manifest), desc=f"INR inference pool ({args.protocol})") as progress:
-        for _ in range(len(manifest)):
+    with tqdm(total=len(jobs), desc=f"INR inference pool ({args.protocol})") as progress:
+        for _ in range(len(jobs)):
             job_idx, item, error = result_queue.get()
             if error is not None:
                 for worker in workers:
@@ -908,7 +936,25 @@ def run_dynamic_pool(args, config, manifest, score_midi_dir):
         if worker.exitcode != 0:
             raise RuntimeError(f"Worker {worker.pid} exited with code {worker.exitcode}")
 
-    return [items_by_idx[idx] for idx in range(len(manifest))]
+    if not split_sampling_tasks:
+        return [items_by_idx[idx] for idx in range(len(manifest))]
+
+    merged_items = []
+    for score_idx in range(len(manifest)):
+        sample_items = [
+            items_by_idx[(score_idx, sample_idx)]
+            for sample_idx in range(args.num_samples)
+        ]
+        merged = dict(sample_items[0])
+        merged["prediction_paths"] = [
+            item["prediction_paths"][0] for item in sample_items
+        ]
+        merged["raw_output_paths"] = [
+            item["raw_output_paths"][0] for item in sample_items
+        ]
+        merged["sample_indices"] = list(range(args.num_samples))
+        merged_items.append(merged)
+    return merged_items
 
 
 def run_single_process(args, config, manifest, score_midi_dir):
