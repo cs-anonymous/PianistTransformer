@@ -246,6 +246,10 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         decoder_head_layout="pyramid4",
         decoder_head_expand_ratio=2.0,
         decoder_head_shrink_ratio=0.5,
+        output_task_embedding_mode="none",
+        output_task_adapter_depth=2,
+        output_task_adapter_width_multiplier=0.5,
+        decoder_task_token_mode="note",
         gpt_layers_num=None,
         bert_layers_num=None,
         max_position_embeddings=4096,
@@ -323,6 +327,9 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         pn_var_ioi_nonzero_lambda=0.0,
         pn_var_duration_lambda=0.0,
         pn_var_velocity_lambda=0.0,
+        pn_velocity_w1_lambda=0.0,
+        pp_velocity_w1_lambda=0.0,
+        velocity_w1_normalizer=127.0,
         pn_variance_shrinkage_tau=4.0,
         pn_variance_epsilon=1e-4,
         raw_timing_loss_lambda=0.5,
@@ -482,6 +489,10 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.decoder_head_layout = str(decoder_head_layout).lower()
         self.decoder_head_expand_ratio = float(decoder_head_expand_ratio)
         self.decoder_head_shrink_ratio = float(decoder_head_shrink_ratio)
+        self.output_task_embedding_mode = str(output_task_embedding_mode or "none").lower()
+        self.output_task_adapter_depth = int(output_task_adapter_depth)
+        self.output_task_adapter_width_multiplier = float(output_task_adapter_width_multiplier)
+        self.decoder_task_token_mode = str(decoder_task_token_mode or "note").lower()
         self.gpt_layers_num = gpt_layers_num
         self.bert_layers_num = bert_layers_num
         self.max_position_embeddings = max_position_embeddings
@@ -599,6 +610,9 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.pn_var_ioi_nonzero_lambda = float(pn_var_ioi_nonzero_lambda)
         self.pn_var_duration_lambda = float(pn_var_duration_lambda)
         self.pn_var_velocity_lambda = float(pn_var_velocity_lambda)
+        self.pn_velocity_w1_lambda = float(pn_velocity_w1_lambda)
+        self.pp_velocity_w1_lambda = float(pp_velocity_w1_lambda)
+        self.velocity_w1_normalizer = float(velocity_w1_normalizer)
         self.pn_variance_shrinkage_tau = float(pn_variance_shrinkage_tau)
         self.pn_variance_epsilon = float(pn_variance_epsilon)
         self.raw_timing_loss_lambda = raw_timing_loss_lambda
@@ -873,6 +887,19 @@ def _make_decoder_head(
     )
 
 
+def _make_zero_residual_adapter(dim, hidden_dim, depth=2, activation="gelu"):
+    adapter = _make_mlp(dim, dim, hidden_dim, depth=depth, activation=activation)
+    last_linear = next(
+        (module for module in reversed(list(adapter.modules())) if isinstance(module, nn.Linear)),
+        None,
+    )
+    if last_linear is not None:
+        nn.init.zeros_(last_linear.weight)
+        if last_linear.bias is not None:
+            nn.init.zeros_(last_linear.bias)
+    return adapter
+
+
 class IntegratedNoteEncoder(nn.Module):
     def __init__(self, config, continuous_dim=None, role="score"):
         super().__init__()
@@ -934,7 +961,12 @@ class IntegratedNoteEncoder(nn.Module):
         )
         self.decoder_target_mask_dim = 3
         shared_dinr_encoder = str(getattr(config, "epr_distribution", "point")).lower() in DINR_DISTRIBUTIONS
-        if (self.role == "decoder" or shared_dinr_encoder) and self.schema == "integrated":
+        shared_decoder_role = (
+            self.role == "score"
+            and str(getattr(config, "note_embedding_mode", "")).lower() == "slot_attribute"
+            and bool(getattr(config, "slot_share_role_encoders", True))
+        )
+        if (self.role == "decoder" or shared_decoder_role or shared_dinr_encoder) and self.schema == "integrated":
             self.performance_missing_embeddings = nn.Parameter(
                 torch.zeros(self.performance_control_dim, config.hidden_size)
             )
@@ -2277,6 +2309,40 @@ class IntegratedContinuousDecoder(nn.Module):
         self.shared_slice = self.score_slice = self.perf_slice = slice(None)
         shared_dim = score_dim = perf_dim = full_dim
         shared_pack_mode = "concat"
+        self.output_task_embedding_mode = str(
+            getattr(config, "output_task_embedding_mode", "none") or "none"
+        ).lower()
+        if self.output_task_embedding_mode in {"off", "false", "0"}:
+            self.output_task_embedding_mode = "none"
+        if self.output_task_embedding_mode not in {"none", "timing_expression", "two", "4", "four"}:
+            raise ValueError(
+                "output_task_embedding_mode must be none, timing_expression/two, or four/4; "
+                f"got {self.output_task_embedding_mode}"
+            )
+        adapter_hidden_dim = max(
+            1,
+            int(
+                round(
+                    full_dim
+                    * float(getattr(config, "output_task_adapter_width_multiplier", 0.5))
+                )
+            ),
+        )
+        adapter_depth = int(getattr(config, "output_task_adapter_depth", 2))
+        self.output_task_adapters = nn.ModuleDict()
+        if self.output_task_embedding_mode in {"timing_expression", "two"}:
+            adapter_names = ("timing", "expression")
+        elif self.output_task_embedding_mode in {"4", "four"}:
+            adapter_names = ("ioi", "duration", "velocity", "pedal")
+        else:
+            adapter_names = ()
+        for adapter_name in adapter_names:
+            self.output_task_adapters[adapter_name] = _make_zero_residual_adapter(
+                full_dim,
+                adapter_hidden_dim,
+                depth=adapter_depth,
+                activation=activation,
+            )
         if (
             getattr(config, "task_type", "epr") == "epr"
             and self.epr_distribution in DINR_DISTRIBUTIONS
@@ -2521,12 +2587,27 @@ class IntegratedContinuousDecoder(nn.Module):
         )
         return shared_hidden + condition
 
+    def _task_hidden(self, hidden_states, task):
+        if self.output_task_embedding_mode == "none":
+            return hidden_states
+        if self.output_task_embedding_mode in {"timing_expression", "two"}:
+            key = "timing" if task in {"ioi", "duration"} else "expression"
+        else:
+            key = task
+        if key not in self.output_task_adapters:
+            return hidden_states
+        return hidden_states + self.output_task_adapters[key](hidden_states)
+
     def _shared_outputs(self, hidden_states, score_shared_raw=None):
         shared_hidden = hidden_states[..., self.shared_slice]
         if not self.split_shared_heads:
             return self.shared_head(shared_hidden)
 
-        timing_hidden = self._timing_conditioned_hidden(shared_hidden, score_shared_raw)
+        timing_hidden = self._task_hidden(shared_hidden, "ioi")
+        duration_hidden = self._task_hidden(shared_hidden, "duration")
+        velocity_hidden = self._task_hidden(shared_hidden, "velocity")
+        timing_hidden = self._timing_conditioned_hidden(timing_hidden, score_shared_raw)
+        duration_hidden = self._timing_conditioned_hidden(duration_hidden, score_shared_raw)
         if self.epr_distribution in DINR_DISTRIBUTIONS and self.ioi_head.alternate_value_table is not None:
             if score_shared_raw is None:
                 raise ValueError("Separated DINR IOI routing requires score_shared_raw")
@@ -2537,11 +2618,11 @@ class IntegratedContinuousDecoder(nn.Module):
         else:
             ioi = self.ioi_head(timing_hidden)
         duration = (
-            self.duration_head(timing_hidden)
+            self.duration_head(duration_hidden)
             if self.duration_head is not None
-            else shared_hidden.new_empty(*shared_hidden.shape[:-1], 0)
+            else duration_hidden.new_empty(*duration_hidden.shape[:-1], 0)
         )
-        velocity = self.velocity_head(shared_hidden)
+        velocity = self.velocity_head(velocity_hidden)
         if self.shared_pack_mode == "beta_mu_kappa":
             return torch.cat(
                 [
@@ -2563,7 +2644,8 @@ class IntegratedContinuousDecoder(nn.Module):
     def forward(self, hidden_states, score_shared_raw=None):
         if _uses_epr_targets(self.config):
             shared = self._shared_outputs(hidden_states, score_shared_raw=score_shared_raw)
-            pedal = self.pedal_head(hidden_states[..., self.perf_slice])
+            pedal_hidden = self._task_hidden(hidden_states[..., self.perf_slice], "pedal")
+            pedal = self.pedal_head(pedal_hidden)
             if self.epr_distribution in {
                 "beta_mu_kappa",
                 "lan",
@@ -2593,7 +2675,8 @@ class IntegratedContinuousDecoder(nn.Module):
             return self.generic_head(hidden_states[..., self.score_slice])
 
         shared = self._shared_outputs(hidden_states, score_shared_raw=score_shared_raw)
-        pedal = self.pedal_head(hidden_states[..., self.perf_slice])
+        pedal_hidden = self._task_hidden(hidden_states[..., self.perf_slice], "pedal")
+        pedal = self.pedal_head(pedal_hidden)
         if self.epr_distribution in {
             "beta_mu_kappa",
             "categorical",
@@ -3184,6 +3267,68 @@ def _target7_to_raw7(score_shared_raw, target_predictions, config=None):
 
 def _uses_epr_targets(config):
     return _uses_inr_epr_targets(config)
+
+
+def _uses_timing_expression_decoder_tokens(config):
+    mode = str(getattr(config, "decoder_task_token_mode", "note") or "note").lower()
+    return mode in {"timing_expression_2n", "te2n", "2n_timing_expression", "2n"}
+
+
+def _epr_timing_raw_end(config):
+    distribution = str(getattr(config, "epr_distribution", "point")).lower()
+    if distribution in DLM_DISTRIBUTIONS:
+        components = int(getattr(config, "dlm_components", getattr(config, "epr_mixture_components", 8)))
+        per_feature_dim = components * 3
+        return per_feature_dim + (1 if bool(getattr(config, "dlm_ioi_zero_inflated", False)) else 0) + per_feature_dim
+    if distribution in DINR_DISTRIBUTIONS:
+        return int(config.dinr_output_timing_bins) * 2
+    if distribution in {"categorical", "hard_categorical", "soft_categorical"}:
+        return int(config.epr_timing_bins) * 2
+    if distribution == "beta_mu_kappa":
+        return 2
+    if _is_scalar_distribution(distribution):
+        components = _scalar_distribution_components(config, distribution)
+        per_feature_dim = components * _scalar_distribution_dim(distribution)
+        if distribution in SN_DISTRIBUTIONS:
+            dual_timing = str(
+                getattr(config, "zero_ioi_dual_distribution_mode", "none") or "none"
+            ).lower() not in {"none", "off", "false", "0"}
+            base_timing_count = _timing_distribution_count(config)
+            ioi_timing_count = base_timing_count + (1 if dual_timing else 0)
+            duration_timing_count = base_timing_count + (
+                1 if dual_timing and bool(getattr(config, "zero_ioi_dual_duration", True)) else 0
+            )
+            return (
+                per_feature_dim * ioi_timing_count
+                + (1 if _uses_raw_timing_regression_head(config) else 0)
+                + per_feature_dim * duration_timing_count
+                + (1 if _uses_raw_timing_regression_head(config) else 0)
+            )
+        return per_feature_dim * 2
+    return 2
+
+
+def _merge_timing_expression_raw_outputs(config, raw_outputs):
+    if raw_outputs.shape[1] % 2 != 0:
+        raise ValueError(f"2N decoder outputs require an even sequence length, got {raw_outputs.shape[1]}")
+    timing_raw = raw_outputs[:, 0::2, :]
+    expression_raw = raw_outputs[:, 1::2, :]
+    timing_end = _epr_timing_raw_end(config)
+    if timing_end <= 0 or timing_end >= raw_outputs.shape[-1]:
+        raise ValueError(
+            f"Invalid timing raw split {timing_end} for raw output dim {raw_outputs.shape[-1]}"
+        )
+    return torch.cat([timing_raw[..., :timing_end], expression_raw[..., timing_end:]], dim=-1)
+
+
+def _timing_expression_task_ids(attention_mask):
+    batch_size, seq_len = attention_mask.shape
+    task = torch.arange(seq_len * 2, device=attention_mask.device, dtype=torch.long) % 2
+    return task.unsqueeze(0).expand(batch_size, -1)
+
+
+def _expand_note_sequence_2n(values):
+    return values.repeat_interleave(2, dim=1)
 
 
 def _decoder_rows_require_score_shared_raw(config):
@@ -7618,6 +7763,11 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
         self.model = IntegratedPianoT5GemmaModel(config)
         self.continuous_decoder = IntegratedContinuousDecoder(config)
         _share_dinr_value_tables(self.note_encoder, self.decoder_note_encoder, self.continuous_decoder)
+        self.decoder_target_task_embeddings = (
+            nn.Embedding(2, config.hidden_size)
+            if _uses_timing_expression_decoder_tokens(config)
+            else None
+        )
         self.post_init()
 
     @property
@@ -7634,6 +7784,112 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
         source_model = PianoT5Gemma.from_pretrained(pretrained_model_path, torch_dtype=torch_dtype)
         incompatible = self.load_state_dict(source_model.state_dict(), strict=False)
         return incompatible
+
+    def _add_decoder_target_task_embeddings(self, hidden_states, start_position=0):
+        if self.decoder_target_task_embeddings is None:
+            return hidden_states
+        task_ids = torch.arange(
+            int(start_position),
+            int(start_position) + hidden_states.shape[1],
+            device=hidden_states.device,
+            dtype=torch.long,
+        ) % 2
+        task_embeds = self.decoder_target_task_embeddings(task_ids).to(dtype=hidden_states.dtype)
+        return hidden_states + task_embeds.unsqueeze(0)
+
+    def _timing_expression_target_rows(
+        self,
+        pitch_ids,
+        labels_continuous,
+        score_shared_raw,
+        continuous,
+        attention_mask,
+    ):
+        full_rows = _build_ar_note_continuous(
+            self.config,
+            labels_continuous,
+            score_shared_raw=score_shared_raw,
+            score_input_continuous=continuous,
+            task_type=self.config.task_type,
+        )
+        batch_size, seq_len, decoder_dim = full_rows.shape
+        target_rows = full_rows.new_zeros(batch_size, seq_len * 2, decoder_dim)
+        timing_rows = full_rows.clone()
+        target_rows[:, 0::2] = timing_rows
+        target_rows[:, 1::2] = full_rows
+
+        perf_dim = int(
+            getattr(
+                self.config,
+                "performance_control_feature_dim",
+                getattr(self.config, "control_feature_dim", 5)
+                + pedal_representation_dim(getattr(self.config, "pedal_representation", "binary_4")),
+            )
+        )
+        target_missing = full_rows.new_zeros(batch_size, seq_len * 2, perf_dim)
+        timing_dim = max(
+            1,
+            (
+                int(getattr(self.config, "score_control_feature_dim", getattr(self.config, "control_feature_dim", 5)))
+                - 1
+            )
+            // 2,
+        )
+        expr_start = min(timing_dim * 2, perf_dim)
+        target_missing[:, 0::2, expr_start:] = 1.0
+
+        target_pitch_ids = pitch_ids.repeat_interleave(2, dim=1)
+        target_attention_mask = attention_mask.repeat_interleave(2, dim=1)
+        decoder_input_continuous = full_rows.new_zeros(batch_size, seq_len * 2, decoder_dim)
+        decoder_missing_mask = full_rows.new_zeros(batch_size, seq_len * 2, perf_dim)
+        decoder_pitch_ids = pitch_ids.new_full((batch_size, seq_len * 2), int(self.config.pitch_pad_id))
+        special_note_ids = attention_mask.new_full((batch_size, seq_len * 2), -1)
+        if seq_len > 0:
+            special_note_ids[:, 0] = int(self.config.special_note_ids.get("bos", 2))
+        if seq_len * 2 > 1:
+            decoder_input_continuous[:, 1:] = target_rows[:, :-1]
+            decoder_missing_mask[:, 1:] = target_missing[:, :-1]
+            decoder_pitch_ids[:, 1:] = target_pitch_ids[:, :-1]
+        decoder_pitch_ids = torch.where(
+            target_attention_mask.bool(),
+            decoder_pitch_ids,
+            decoder_pitch_ids.new_full(decoder_pitch_ids.shape, int(self.config.pitch_pad_id)),
+        )
+        return decoder_pitch_ids, decoder_input_continuous, special_note_ids, decoder_missing_mask, target_attention_mask
+
+    def _make_timing_expression_decoder_row(
+        self,
+        prediction,
+        score_shared_raw,
+        score_input_continuous,
+        expression_missing=False,
+    ):
+        row = _build_epr_decoder_rows(
+            self.config,
+            score_shared_raw,
+            prediction,
+            score_input_continuous=score_input_continuous,
+        )
+        perf_dim = int(
+            getattr(
+                self.config,
+                "performance_control_feature_dim",
+                getattr(self.config, "control_feature_dim", 5)
+                + pedal_representation_dim(getattr(self.config, "pedal_representation", "binary_4")),
+            )
+        )
+        missing = row.new_zeros(*row.shape[:-1], perf_dim)
+        if expression_missing:
+            timing_dim = max(
+                1,
+                (
+                    int(getattr(self.config, "score_control_feature_dim", getattr(self.config, "control_feature_dim", 5)))
+                    - 1
+                )
+                // 2,
+            )
+            missing[..., min(timing_dim * 2, perf_dim) :] = 1.0
+        return row, missing
 
     def _build_decoder_inputs(
         self,
@@ -7653,6 +7909,30 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
         if decoder_mode == "ar":
             if labels_continuous is None:
                 return None, None
+            if _uses_timing_expression_decoder_tokens(self.config):
+                if self.config.task_type != "epr" or not _uses_epr_targets(self.config):
+                    raise ValueError("2N timing/expression decoder tokens are only supported for INR EPR targets")
+                (
+                    decoder_pitch_ids,
+                    decoder_input_continuous,
+                    special_note_ids,
+                    decoder_missing_mask,
+                    target_attention_mask,
+                ) = self._timing_expression_target_rows(
+                    pitch_ids,
+                    labels_continuous,
+                    score_shared_raw,
+                    continuous,
+                    attention_mask,
+                )
+                decoder_inputs_embeds = self.decoder_note_encoder(
+                    decoder_pitch_ids,
+                    decoder_input_continuous,
+                    special_note_ids=special_note_ids,
+                    performance_missing_mask=decoder_missing_mask,
+                    role="decoder",
+                )
+                return decoder_inputs_embeds, target_attention_mask
             feedback_continuous = decoder_feedback_continuous if decoder_feedback_continuous is not None else labels_continuous
             decoder_target_continuous = _build_ar_note_continuous(
                 self.config,
@@ -7787,6 +8067,34 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
                     skip_first_token=True,
                 )
         if decoder_inputs_embeds is None:
+            if _uses_timing_expression_decoder_tokens(self.config):
+                continuous_pred = self._autoregressive_rollout_timing_expression(
+                    pitch_ids=pitch_ids,
+                    continuous=continuous,
+                    score_shared_raw=score_shared_raw,
+                    attention_mask=attention_mask,
+                    score_context_embeds=score_context_embeds,
+                    context_attention_mask=context_attention_mask,
+                    sampling_strategy=continuous_sampling_strategy,
+                    position_ids=position_ids,
+                    encoder_outputs=encoder_outputs,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    **style_kwargs,
+                )
+                loss = None
+                if labels_continuous is not None:
+                    loss_mask = label_mask if (self.config.task_type == "removed_task" and label_mask is not None) else attention_mask
+                    loss = _compute_integrated_loss(
+                        self.config,
+                        continuous_pred,
+                        labels_continuous,
+                        loss_mask,
+                        labels_epr_bins=labels_epr_bins,
+                        score_shared_raw=score_shared_raw,
+                        label_valid_mask=label_valid_mask,
+                    )
+                return Seq2SeqLMOutput(loss=loss, logits=continuous_pred)
             continuous_pred = self._autoregressive_rollout(
                 pitch_ids=pitch_ids,
                 continuous=continuous,
@@ -7847,7 +8155,15 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
             decoder_outputs.last_hidden_state,
             **style_kwargs,
         )
-        continuous_pred = self.continuous_decoder(decoder_hidden, score_shared_raw=score_shared_raw)
+        decoder_hidden = self._add_decoder_target_task_embeddings(decoder_hidden)
+        decoder_score_shared_raw = (
+            _expand_note_sequence_2n(score_shared_raw)
+            if _uses_timing_expression_decoder_tokens(self.config)
+            else score_shared_raw
+        )
+        continuous_pred = self.continuous_decoder(decoder_hidden, score_shared_raw=decoder_score_shared_raw)
+        if _uses_timing_expression_decoder_tokens(self.config):
+            continuous_pred = _merge_timing_expression_raw_outputs(self.config, continuous_pred)
         continuous_pred = self._apply_zero_ioi_residual(continuous_pred, score_shared_raw)
         if labels_continuous is None:
             if self.config.task_type == "epr":
@@ -7914,6 +8230,21 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
             attention_mask = (pitch_ids != self.config.pitch_pad_id).long()
         decoder_mode = self.config.decoder_input_mode.lower()
         if decoder_mode == "ar":
+            if _uses_timing_expression_decoder_tokens(self.config):
+                if prefix_predictions is not None:
+                    raise ValueError("Prefix continuation is not implemented for 2N timing/expression decoder tokens")
+                return self._autoregressive_rollout_timing_expression(
+                    pitch_ids=pitch_ids,
+                    continuous=continuous,
+                    score_shared_raw=score_shared_raw,
+                    attention_mask=attention_mask,
+                    sampling_strategy=sampling_strategy,
+                    style_creator_ids=style_creator_ids,
+                    style_source_ids=style_source_ids,
+                    style_score_stats=style_score_stats,
+                    style_perf_stats=style_perf_stats,
+                    style_perf_is_pad=style_perf_is_pad,
+                )
             return self._autoregressive_rollout(
                 pitch_ids=pitch_ids,
                 continuous=continuous,
@@ -7940,6 +8271,158 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
             continuous_sampling_strategy=sampling_strategy,
         )
         return outputs.logits
+
+    def _autoregressive_rollout_timing_expression(
+        self,
+        pitch_ids,
+        continuous,
+        score_shared_raw,
+        attention_mask,
+        score_context_embeds=None,
+        context_attention_mask=None,
+        sampling_strategy="mean",
+        style_creator_ids=None,
+        style_source_ids=None,
+        style_score_stats=None,
+        style_perf_stats=None,
+        style_perf_is_pad=None,
+        position_ids=None,
+        encoder_outputs=None,
+        past_key_values=None,
+        use_cache=None,
+        **kwargs,
+    ):
+        del kwargs, use_cache
+        batch_size, seq_len = pitch_ids.shape
+        style_kwargs = {
+            "style_creator_ids": style_creator_ids,
+            "style_source_ids": style_source_ids,
+            "style_score_stats": style_score_stats,
+            "style_perf_stats": style_perf_stats,
+            "style_perf_is_pad": style_perf_is_pad,
+        }
+        if score_context_embeds is None or context_attention_mask is None:
+            score_note_embeds = self.note_encoder(pitch_ids, continuous)
+            score_note_embeds = self._apply_style_to_note_embeds(score_note_embeds, **style_kwargs)
+            score_context_embeds, context_attention_mask, _ = self._prepend_style_tokens(
+                score_note_embeds,
+                attention_mask,
+                **style_kwargs,
+            )
+        if encoder_outputs is None:
+            encoder_outputs = self.model.encoder(
+                attention_mask=context_attention_mask,
+                position_ids=position_ids,
+                inputs_embeds=score_context_embeds,
+            )
+
+        decoder_dim = int(getattr(self.config, "decoder_input_continuous_dim", getattr(self.config, "input_continuous_dim")))
+        perf_dim = int(
+            getattr(
+                self.config,
+                "performance_control_feature_dim",
+                getattr(self.config, "control_feature_dim", 5)
+                + pedal_representation_dim(getattr(self.config, "pedal_representation", "binary_4")),
+            )
+        )
+        cached_past_key_values = past_key_values
+        next_input_row = continuous.new_zeros(batch_size, 1, decoder_dim)
+        next_missing = continuous.new_zeros(batch_size, 1, perf_dim)
+        predictions = []
+        current_timing = None
+
+        full_decoder_attention_mask = attention_mask.repeat_interleave(2, dim=1)
+        for token_index in range(seq_len * 2):
+            note_index = token_index // 2
+            if token_index == 0:
+                decoder_pitch = pitch_ids.new_full((batch_size, 1), int(self.config.pitch_pad_id))
+                special_note_ids = attention_mask.new_full(
+                    (batch_size, 1),
+                    int(self.config.special_note_ids.get("bos", 2)),
+                )
+            else:
+                input_note_index = (token_index - 1) // 2
+                decoder_pitch = pitch_ids[:, input_note_index : input_note_index + 1]
+                special_note_ids = attention_mask.new_full((batch_size, 1), -1)
+
+            decoder_inputs_embeds = self.decoder_note_encoder(
+                decoder_pitch,
+                next_input_row,
+                special_note_ids=special_note_ids,
+                performance_missing_mask=next_missing,
+                role="decoder",
+            )
+            decoder_inputs_embeds = self._apply_style_to_decoder_inputs(
+                decoder_inputs_embeds,
+                **style_kwargs,
+            )
+            decoder_kwargs = {}
+            if token_index > 0:
+                decoder_kwargs["cache_position"] = torch.tensor(
+                    [token_index],
+                    device=pitch_ids.device,
+                    dtype=torch.long,
+                )
+            decoder_outputs = self.model(
+                attention_mask=context_attention_mask,
+                position_ids=position_ids,
+                decoder_attention_mask=full_decoder_attention_mask[:, : token_index + 1],
+                encoder_outputs=encoder_outputs,
+                decoder_inputs_embeds=decoder_inputs_embeds,
+                use_cache=True,
+                past_key_values=cached_past_key_values,
+                **decoder_kwargs,
+            )
+            cached_past_key_values = decoder_outputs.past_key_values
+            decoder_hidden = self._apply_style_to_decoder_hidden(
+                decoder_outputs.last_hidden_state,
+                **style_kwargs,
+            )
+            decoder_hidden = self._add_decoder_target_task_embeddings(
+                decoder_hidden,
+                start_position=token_index,
+            )
+            step_raw = self.continuous_decoder(
+                decoder_hidden[:, -1:, :],
+                score_shared_raw=score_shared_raw[:, note_index : note_index + 1],
+            )
+            step_raw = self._apply_zero_ioi_residual(
+                step_raw,
+                score_shared_raw[:, note_index : note_index + 1],
+            )
+            step_pred = _materialize_epr_prediction(
+                self.config,
+                step_raw,
+                sampling_strategy=sampling_strategy,
+                score_shared_raw=score_shared_raw[:, note_index : note_index + 1],
+            )
+
+            if token_index % 2 == 0:
+                current_timing = step_pred[..., :2]
+                timing_row_pred = step_pred.clone()
+                timing_row_pred[..., 2:] = 0.0
+                next_input_row, next_missing = self._make_timing_expression_decoder_row(
+                    timing_row_pred,
+                    score_shared_raw[:, note_index : note_index + 1],
+                    continuous[:, note_index : note_index + 1],
+                    expression_missing=True,
+                )
+            else:
+                if current_timing is None:
+                    raise RuntimeError("Expression token reached before timing token")
+                full_pred = torch.cat([current_timing, step_pred[..., 2:]], dim=-1)
+                predictions.append(full_pred)
+                next_input_row, next_missing = self._make_timing_expression_decoder_row(
+                    full_pred,
+                    score_shared_raw[:, note_index : note_index + 1],
+                    continuous[:, note_index : note_index + 1],
+                    expression_missing=False,
+                )
+                current_timing = None
+
+        if predictions:
+            return torch.cat(predictions, dim=1)
+        return continuous.new_zeros((batch_size, 0, self.config.output_continuous_dim))
 
     def _autoregressive_rollout(
         self,

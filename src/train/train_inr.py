@@ -2163,6 +2163,97 @@ def _pn_group_calibration_loss(config, logits, labels, score_shared_raw, attenti
     return result
 
 
+def _histogram_from_values(values, centers):
+    if values.numel() == 0:
+        return centers.new_zeros((centers.numel(),))
+    if centers.numel() == 1:
+        return centers.new_ones((1,))
+    edges = 0.5 * (centers[:-1] + centers[1:])
+    indices = torch.bucketize(values.detach().float().contiguous(), edges).clamp(0, centers.numel() - 1)
+    hist = centers.new_zeros((centers.numel(),))
+    hist.scatter_add_(0, indices, torch.ones_like(values, dtype=hist.dtype, device=hist.device))
+    return hist / hist.sum().clamp_min(1.0)
+
+
+def _batched_histogram_from_values(values, centers):
+    if values.numel() == 0:
+        return values.new_zeros((*values.shape[:-1], centers.numel()))
+    if centers.numel() == 1:
+        return values.new_ones((*values.shape[:-1], 1))
+    edges = 0.5 * (centers[:-1] + centers[1:])
+    indices = torch.bucketize(values.detach().float().contiguous(), edges).clamp(0, centers.numel() - 1)
+    hist = values.new_zeros((*values.shape[:-1], centers.numel()), dtype=centers.dtype)
+    hist.scatter_add_(
+        -1,
+        indices,
+        torch.ones_like(values, dtype=hist.dtype, device=hist.device),
+    )
+    return hist / hist.sum(dim=-1, keepdim=True).clamp_min(1.0)
+
+
+def _cdf_w1_from_pmfs(pred_pmf, target_pmf, centers):
+    if centers.numel() <= 1:
+        return pred_pmf.sum() * 0.0
+    widths = centers[1:] - centers[:-1]
+    cdf_delta = pred_pmf.cumsum(dim=-1) - target_pmf.cumsum(dim=-1)
+    return (cdf_delta[..., :-1].abs() * widths).sum(dim=-1)
+
+
+def _pn_pp_velocity_w1_loss(config, logits, labels, score_shared_raw, attention_mask, group_index, *, compute_pn=True, compute_pp=True):
+    """Velocity W1 surrogate aligned with PN/PP distribution metrics."""
+    params = _split_epr_mixture_params(config, logits)
+    valid = attention_mask.bool()
+    log_probs = _dlm_log_bin_probs(
+        config,
+        params["velocity_logits"],
+        params["velocity_loc"],
+        params["velocity_log_scale"],
+        "velocity",
+    )
+    probs = log_probs.exp()
+    centers = _dlm_bin_centers(config, "velocity", log_probs)
+    while centers.ndim > 1:
+        centers = centers[0]
+    centers = centers.float()
+    velocity_targets = (labels[..., 2].float() * 127.0).clamp(
+        float(getattr(config, "dlm_velocity_min", -0.5)),
+        float(getattr(config, "dlm_velocity_max", 127.5)),
+    )
+    normalizer = max(float(getattr(config, "velocity_w1_normalizer", 127.0)), 1e-6)
+    zero = logits.sum() * 0.0
+    pn_terms = []
+    pp_terms = []
+
+    for group_id in torch.unique(group_index, sorted=True):
+        rows = group_index == group_id
+        if int(rows.sum().item()) < 2:
+            continue
+        group_valid = valid[rows]
+        group_probs = probs[rows]
+        group_targets = velocity_targets[rows]
+
+        if compute_pp and group_valid.any():
+            pooled_valid = group_valid
+            pred_pmf = group_probs[pooled_valid].mean(dim=0)
+            target_pmf = _histogram_from_values(group_targets[pooled_valid], centers)
+            pp_terms.append(_cdf_w1_from_pmfs(pred_pmf, target_pmf, centers) / normalizer)
+
+        if compute_pn:
+            aligned_valid = group_valid.all(dim=0)
+            if aligned_valid.any():
+                pred_pmfs = group_probs[:, aligned_valid, :].mean(dim=0)
+                target_pmfs = _batched_histogram_from_values(
+                    group_targets[:, aligned_valid].transpose(0, 1),
+                    centers,
+                )
+                pn_terms.append(_cdf_w1_from_pmfs(pred_pmfs, target_pmfs, centers).mean() / normalizer)
+
+    return {
+        "pn_velocity_w1": torch.stack(pn_terms).mean() if pn_terms else zero,
+        "pp_velocity_w1": torch.stack(pp_terms).mean() if pp_terms else zero,
+    }
+
+
 class NodeSFTTrainer(Trainer):
     def _model_config(self, model):
         return model.module.config if hasattr(model, "module") else model.config
@@ -2791,21 +2882,49 @@ class NodeSFTTrainer(Trainer):
         pn_components = None
         if group_index is not None:
             config = self._model_config(model)
-            pn_components = _pn_group_calibration_loss(
-                config,
-                outputs.logits,
-                inputs["labels_continuous"],
-                inputs["score_shared_raw"],
-                inputs["attention_mask"],
-                group_index,
-            )
             weights = {
                 "pn_mean": float(getattr(config, "pn_mean_loss_lambda", 0.0)),
                 "pn_var_ioi_zero": float(getattr(config, "pn_var_ioi_zero_lambda", 0.0)),
                 "pn_var_ioi_nonzero": float(getattr(config, "pn_var_ioi_nonzero_lambda", 0.0)),
                 "pn_var_duration": float(getattr(config, "pn_var_duration_lambda", 0.0)),
                 "pn_var_velocity": float(getattr(config, "pn_var_velocity_lambda", 0.0)),
+                "pn_velocity_w1": float(getattr(config, "pn_velocity_w1_lambda", 0.0)),
+                "pp_velocity_w1": float(getattr(config, "pp_velocity_w1_lambda", 0.0)),
             }
+            pn_components = {}
+            if any(
+                weights[name] != 0.0
+                for name in (
+                    "pn_mean",
+                    "pn_var_ioi_zero",
+                    "pn_var_ioi_nonzero",
+                    "pn_var_duration",
+                    "pn_var_velocity",
+                )
+            ):
+                pn_components.update(
+                    _pn_group_calibration_loss(
+                        config,
+                        outputs.logits,
+                        inputs["labels_continuous"],
+                        inputs["score_shared_raw"],
+                        inputs["attention_mask"],
+                        group_index,
+                    )
+                )
+            if weights["pn_velocity_w1"] != 0.0 or weights["pp_velocity_w1"] != 0.0:
+                pn_components.update(
+                    _pn_pp_velocity_w1_loss(
+                        config,
+                        outputs.logits,
+                        inputs["labels_continuous"],
+                        inputs["score_shared_raw"],
+                        inputs["attention_mask"],
+                        group_index,
+                        compute_pn=weights["pn_velocity_w1"] != 0.0,
+                        compute_pp=weights["pp_velocity_w1"] != 0.0,
+                    )
+                )
             loss = loss + sum(weights[name] * value for name, value in pn_components.items())
             if self.model.training and self.is_world_process_zero():
                 accumulator = getattr(self, "_train_loss_component_sums", None)
@@ -3766,6 +3885,10 @@ def create_model(train_config):
         decoder_head_layout=train_config.get("decoder_head_layout", "pyramid4"),
         decoder_head_expand_ratio=train_config.get("decoder_head_expand_ratio", 2.0),
         decoder_head_shrink_ratio=train_config.get("decoder_head_shrink_ratio", 0.5),
+        output_task_embedding_mode=train_config.get("output_task_embedding_mode", "none"),
+        output_task_adapter_depth=train_config.get("output_task_adapter_depth", 2),
+        output_task_adapter_width_multiplier=train_config.get("output_task_adapter_width_multiplier", 0.5),
+        decoder_task_token_mode=train_config.get("decoder_task_token_mode", "note"),
         epr_distribution=train_config.get("epr_distribution", "point"),
         pedal_distribution=train_config.get("pedal_distribution"),
         epr_mixture_components=train_config.get("epr_mixture_components", 1),
@@ -3831,6 +3954,9 @@ def create_model(train_config):
         pn_var_ioi_nonzero_lambda=train_config.get("pn_var_ioi_nonzero_lambda", 0.0),
         pn_var_duration_lambda=train_config.get("pn_var_duration_lambda", 0.0),
         pn_var_velocity_lambda=train_config.get("pn_var_velocity_lambda", 0.0),
+        pn_velocity_w1_lambda=train_config.get("pn_velocity_w1_lambda", 0.0),
+        pp_velocity_w1_lambda=train_config.get("pp_velocity_w1_lambda", 0.0),
+        velocity_w1_normalizer=train_config.get("velocity_w1_normalizer", 127.0),
         pn_variance_shrinkage_tau=train_config.get("pn_variance_shrinkage_tau", 4.0),
         pn_variance_epsilon=train_config.get("pn_variance_epsilon", 1e-4),
         raw_timing_loss_lambda=train_config.get("raw_timing_loss_lambda", 0.5),
