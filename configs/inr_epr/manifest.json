@@ -1,0 +1,72 @@
+{
+  "run_root": "results",
+  "queues": {
+    "cinr": [
+      "default_dlm_k1_bounded5",
+      "bounded_2p5pct",
+      "bounded_10pct",
+      "unbounded",
+      "dist_dlm_k3",
+      "dist_ln_k1",
+      "dist_ln_k3",
+      "dist_beta_k1",
+      "dist_beta_k3"
+    ],
+    "dinr": [
+      "default_no_coord",
+      "coord_input_only",
+      "coord_timing_dev_only",
+      "coord_velocity_only",
+      "coord_all",
+      "rep_sine",
+      "rep_slot_direct",
+      "rep_slot_sum",
+      "rep_slot256_mlp"
+    ],
+    "extra": [
+      "rep_sine",
+      "rep_slot_direct",
+      "rep_slot_sum",
+      "rep_slot256_mlp",
+      "musical_no_duration",
+      "musical_no_onset",
+      "musical_no_annotation",
+      "musical_no_length"
+    ]
+  },
+  "configs": {
+    "cinr/default_dlm_k1_bounded5": "configs/cinr__default_dlm_k1_bounded5.json",
+    "cinr/bounded_2p5pct": "configs/cinr__bounded_2p5pct.json",
+    "cinr/bounded_10pct": "configs/cinr__bounded_10pct.json",
+    "cinr/unbounded": "configs/cinr__unbounded.json",
+    "cinr/dist_dlm_k3": "configs/cinr__dist_dlm_k3.json",
+    "cinr/dist_ln_k1": "configs/cinr__dist_ln_k1.json",
+    "cinr/dist_ln_k3": "configs/cinr__dist_ln_k3.json",
+    "cinr/dist_beta_k1": "configs/cinr__dist_beta_k1.json",
+    "cinr/dist_beta_k3": "configs/cinr__dist_beta_k3.json",
+    "dinr/default_no_coord": "configs/dinr__default_no_coord.json",
+    "dinr/coord_input_only": "configs/dinr__coord_input_only.json",
+    "dinr/coord_timing_dev_only": "configs/dinr__coord_timing_dev_only.json",
+    "dinr/coord_velocity_only": "configs/dinr__coord_velocity_only.json",
+    "dinr/coord_all": "configs/dinr__coord_all.json",
+    "dinr/rep_sine": "configs/dinr__rep_sine.json",
+    "dinr/rep_slot_direct": "configs/dinr__rep_slot_direct.json",
+    "dinr/rep_slot_sum": "configs/dinr__rep_slot_sum.json",
+    "dinr/rep_slot256_mlp": "configs/dinr__rep_slot256_mlp.json",
+    "extra/rep_sine": "configs/extra__rep_sine.json",
+    "extra/rep_slot_direct": "configs/extra__rep_slot_direct.json",
+    "extra/rep_slot_sum": "configs/extra__rep_slot_sum.json",
+    "extra/rep_slot256_mlp": "configs/extra__rep_slot256_mlp.json",
+    "extra/musical_no_duration": "configs/extra__musical_no_duration.json",
+    "extra/musical_no_onset": "configs/extra__musical_no_onset.json",
+    "extra/musical_no_annotation": "configs/extra__musical_no_annotation.json",
+    "extra/musical_no_length": "configs/extra__musical_no_length.json"
+  },
+  "notes": [
+    "Canonical base: ASAP_processed musical51 CINR bounded no-lossnorm 16ep.",
+    "Reference experiment structural deltas are applied to the canonical base.",
+    "Global content dedup ignores only output_dir/logging_dir/run_name.",
+    "Sampling: 3 independent tasks per score, 19 x 3 tasks, 8 inference workers, longest scores first."
+  ],
+  "metadata_path": "data/ASAP_processed/metadata.generated_json.csv"
+}

@@ -3,17 +3,11 @@ __pycache__
 .ipynb_checkpoints
 models
 temp
-testset-norm
 tools
 data
 logs
 results
-MIDI2ScoreTransformer
-.tools
-PianoCoRe
 INSPIRE*
 backup
 tmp
-external
 .humanize
-submission

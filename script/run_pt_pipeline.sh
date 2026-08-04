@@ -102,7 +102,7 @@ if [[ ! -s "${DATA_FILE}" ]]; then
   {
     echo "[$(date '+%F %T')] data: missing PT jsonl ${DATA_FILE}"
     echo "run_pt_pipeline.sh no longer auto-generates PT jsonl from INR JSON."
-    echo "Please prepare config.data_paths in advance, or use the legacy PT/CPT preprocessors under src/data_process/legacy_pt_cpt if you still need the tokenizer-style PT pipeline."
+    echo "Please prepare config.data_paths in advance, or use the archived PT/CPT preprocessors under backup/repo_cleanup_20260804/src/data_process/legacy_pt_cpt if you still need the tokenizer-style PT pipeline."
   } | tee -a "${EVALUATE_LOG}"
   exit 1
 fi

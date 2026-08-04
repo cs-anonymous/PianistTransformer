@@ -1,352 +1,292 @@
-# Pianist Transformer: Towards Expressive Piano Performance Rendering via Scalable Self-Supervised Pre-training
+# INSPIRE: Integrated Note-based Score-to-Performance Interpretation and Rendering
 
-[![Paper](https://img.shields.io/badge/Paper-Arxiv-red)](https://arxiv.org/abs/2512.02652) [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0) [![Project Page](https://img.shields.io/badge/Project-Page-blue)](https://yhj137.github.io/pianist-transformer-demo/)
+This repository contains the implementation materials for **INSPIRE: Integrated
+Note-based Score-to-Performance Interpretation and Rendering for Expressive
+Piano Performance**.
 
-English | [中文](/docs/README_zh.md)
+INSPIRE studies **expressive piano performance rendering (EPR)**: given a
+symbolic piano score, the system generates a human-like performance by
+predicting note-level timing, duration, velocity, and sustain-pedal behavior.
+The central implementation idea is **Integrated Note Representation (INR)**.
+Instead of expanding every note into multiple autoregressive MIDI tokens, INR
+represents each aligned score note as one Transformer timestep with typed
+internal slots.
 
-This is the official implementation for the paper **"Pianist Transformer: Towards Expressive Piano Performance Rendering via Scalable Self-Supervised Pre-Training"**.
-
-Our work demonstrates that by pre-training on billions of tokens of unlabeled MIDI data, a model can learn a profound understanding of musical structures. This knowledge can then be transferred to the downstream task of expressive performance generation, producing piano performances that are statistically indistinguishable from those of human pianists in subjective listening tests.
+The repository has been reorganized around the cleaned submission flow. Older
+exploratory configs, launchers, diagnostics, logs, temporary files, and generated
+results from the cleanup are archived under `backup/repo_cleanup_20260804/`.
+The original Pianist Transformer (PT) code path is still kept for comparison and
+reuse.
 
 ## Key Features
 
-- **Unified Data Representation**: Eliminates the distinction between score MIDI and performance MIDI, allowing massive amounts of unlabeled performance data to be directly used for pre-training.
-- **Efficient Asymmetric Architecture**: Employs an asymmetric structure with a 10-layer Encoder and a 2-layer Decoder, combined with encoder sequence compression, to achieve a `2.1x` inference speedup while maintaining powerful modeling capabilities. Enables efficient inference on CPUs.
-- **Scalable Training Paradigm**: A two-stage "pre-train, fine-tune" workflow that effectively overcomes the bottleneck of scarce supervised data.
-- **Human-Level Generation Quality**: Pianist Transformer achieves State-Of-The-Art (SOTA) results in both objective and subjective evaluations, and is statistically indistinguishable from human pianists in subjective blind listening tests.
-- **Editable Performance MIDI Output**: Beyond generating expressive piano performances, Pianist Transformer also supports an editable workflow for real-world music production. With our proposed Expressive Tempo Mapping algorithm, the model output can be converted into a DAW-friendly MIDI file, where expressive timing variations are represented as a dynamic tempo curve while preserving performance details such as velocity, articulation, and pedal control. This makes the rendered result not only expressive, but also directly usable for further arranging and production.
+- **Note-level sequence modeling**: one aligned note corresponds to one
+  Transformer timestep, reducing sequence length and autoregressive decoding
+  cost compared with token-block MIDI decoders.
+- **Typed note slots**: pitch, IOI, duration, velocity, pedal, and musical score
+  descriptors are encoded with separate slot encoders before fusion.
+- **CINR and DINR variants**: continuous INR predicts calibrated distributions
+  for numerical controls; discrete INR uses typed value tables with optional
+  numerical-coordinate augmentation.
+- **Score-relative timing targets**: performance IOI and duration are modeled as
+  log-scale deviations from score timing, which stabilizes long-tailed timing
+  behavior.
+- **Efficient sidecar loading**: prebuilt per-work `.pt` sidecars avoid repeated
+  JSON parsing during training and inference.
+- **Distributional evaluation**: generated MIDI is evaluated using PN/PP
+  Wasserstein metrics over IOI, duration, velocity, and pedal.
 
-## Video Demos
-We provide two demo videos on Bilibili to showcase real-world use cases of Pianist Transformer:
+## Repository Layout
 
-- **AI-rendered Piano Accompaniment + Human Violin Melody Performance**: In this demo, Pianist Transformer was used to generate an expressive and editable piano accompaniment MIDI. After slight post-editing, a human performer used a MIDI keyboard and a MIDI breath controller to perform a violin-style melody in real-time duet with the rendered accompaniment. This example demonstrates how Pianist Transformer can support flexible and interactive human-AI music performance workflows. (The DAW footage shown in the video was recorded separately afterwards for presentation purposes, and does not reflect the actual computer screen during the live performance.) [Watch on Bilibili](https://www.bilibili.com/video/BV1Qy2jBJEdS/?share_source=copy_web&vd_source=170ea94eca2d273dffbe75cdc4aac193)
+| Path | Description |
+| --- | --- |
+| `src/` | Model, preprocessing, inference, and evaluation code. |
+| `src/model/integrated_pianoformer.py` | INR/CINR/DINR model implementation and output heads. |
+| `src/train/train_inr.py` | Main INR training entry point. |
+| `src/inference/infer_inr_testset.py` | Autoregressive INR inference over a test score list. |
+| `src/evaluate/evaluate_inr_saved_midis.py` | PN/PP Wasserstein evaluation for saved MIDI predictions. |
+| `src/evaluate/summarize_inr_asap_pipeline.py` | Mainline ASAP rollout summary and distribution plots. |
+| `src/evaluate/plot_floorlog_timing_stats.py` | Paper figure helper for floor-log timing/deviation statistics. |
+| `src/evaluate/plot_sampling_matrix_humanrel.py` | Paper figure helper for sampling-sensitivity human-relative metrics. |
+| `src/data_process/` | Dataset construction, MusicXML feature projection, fixed-window split, and sidecar builders. |
+| `script/run_inr_epr_pipeline.sh` | Main train -> infer -> summarize pipeline used by the INR queue. |
+| `script/build_pianocore_inr_sidecars.sh` | Main preprocessing and sidecar construction script. |
+| `script/run_example_inference_eval.sh` | Minimal inference + evaluation command template for an existing checkpoint. |
+| `script/run_pt_pipeline.sh` | Original Pianist Transformer pipeline entry point. |
+| `configs/inr_epr/` | Mainline INR/EPR configs from the submission queue. |
+| `configs/pt_*.json`, `configs/pretrain_*.json`, `configs/sft_*.json` | Retained PT/pretraining/SFT configs. |
+| `data/ASAP_processed/` | Compact ASAP train/test subset with refined MIDI, alignments, metadata, and sidecars. |
+| `submission/` | Original submission package and media supplement. |
+| `backup/repo_cleanup_20260804/` | Files moved out during repository cleanup. |
 
-- **Composer User Showcase**: In this demo, a composer user used Pianist Transformer to render the score MIDI of an original piano piece and produce a demo performance. This example shows how the system can help composers quickly transform a raw score into an expressive piano performance for presentation and sharing. [Watch on Bilibili](https://www.bilibili.com/video/BV1ZUrABrEZj/?share_source=copy_web&vd_source=170ea94eca2d273dffbe75cdc4aac193)
+## Method Summary
 
+INSPIRE assumes note-aligned score and performance sequences. A score note
+contains pitch, score IOI, score duration, score velocity, and musical
+descriptors derived from MusicXML. A performance note contains the same pitch
+plus realized IOI, duration, velocity, and four sustain-pedal snapshots.
 
-## Environment Dependencies
-This project has been tested under the following environment configurations. We highly recommend using `conda` or `venv` to create an isolated virtual environment to avoid conflicts with existing packages on your system.
+INR uses six outer slots:
 
-### Software Requirements
--   **Python**: `3.11`
--   **PyTorch**: `2.7.1`
--   **Transformers**: `4.54.0`
--   **CUDA**: `11.8` or higher
+| Slot | Contents |
+| --- | --- |
+| Pitch | MIDI pitch category. |
+| IOI | Score or performance inter-onset interval. |
+| Duration | Score or performance note duration. |
+| Velocity | Score or performance MIDI velocity. |
+| Pedal | Four binary pedal states sampled at note-relative positions. |
+| Musical | MusicXML-derived measure onset, measure duration, note length, and annotation flags. |
 
-Our core dependencies include `PyTorch`, `Transformers`, `Accelerate`, and `miditoolkit`. For a complete list of dependencies, please see the `requirements.txt` file in the root directory.
+The musical slot follows a compact score descriptor layout:
 
-### Hardware Requirements
--   **Inference**: A standard CPU is sufficient, though a GPU will accelerate the process.
--   **Training**: To efficiently reproduce our training process, we recommend using **4 x NVIDIA GeForce RTX 4090** GPUs or equivalent.
+| Feature | Meaning |
+| --- | --- |
+| `mo_q` | Measure onset position normalized by 24 quarter-length units. |
+| `md_q` | Measure duration normalized by 24 quarter-length units. |
+| `ml_q` | Local note length normalized by 24 quarter-length units. |
+| `first` | Whether the note starts a local musical group. |
+| `hand` | Hand/staff indicator. |
+| `trill` | Trill flag. |
+| `grace` | Grace-note flag. |
+| `staccato` | Staccato flag. |
+| `stem_code` | Encoded stem direction. |
 
-## Access Our Models
+Each slot is projected to a typed vector. The vectors are fused into a
+768-dimensional note embedding. The encoder processes score-note embeddings
+bidirectionally; the decoder uses shifted performance-note embeddings with
+causal self-attention and cross-attention to the score encoder states.
 
-You can directly obtain our model checkpoints from **HuggingFace** and **ModelScope**.  
-We provide two types of models: **pre-trained models** and **fine-tuned models (ready for inference)**.
+## CINR and DINR
 
-| Model | HuggingFace | ModelScope | Parameters |
-|-------|-------------|------------|------------|
-| pianist-transformer-base | [Link](https://huggingface.co/yhj137/pianist-transformer-base) | [Link](https://www.modelscope.cn/models/yhj137/pianist-transformer-base/) | 135M |
-| pianist-transformer-rendering | [Link](https://huggingface.co/yhj137/pianist-transformer-rendering) | [Link](https://www.modelscope.cn/models/yhj137/pianist-transformer-rendering/) | 135M |
+**CINR** encodes numerical controls continuously and predicts distribution
+parameters for IOI, duration, and velocity. The mainline bounded CINR variants
+use discretized logistic output heads. Timing targets are score-relative log
+deviations:
 
-## Quick Start
-Follow the steps below to set up the environment and generate your first expressive piano performance with Pianist Transformer in under 5 minutes.
-
-### 1. Clone the Repository
-First, clone this repository to your local machine:
-```bash
-git clone https://github.com/yhj137/PianistTransformer.git
-cd PianistTransformer
-```
-### 2. Set Up the Environment
-We highly recommend using `conda` to create an isolated virtual environment for this project.
-
-```bash
-# 1. Create and activate the conda environment
-conda create -n pianist-transformer python=3.11
-conda activate pianist-transformer
-
-# 2. Install PyTorch
-# The installation command for PyTorch may vary depending on your OS and CUDA version.
-# Here are some examples for common configurations:
-
-# For Linux/Windows (NVIDIA GPU with CUDA 12.8):
-# pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
-
-# For Linux/Windows (NVIDIA GPU with CUDA 11.8):
-# pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu118
-
-# For macOS or CPU-only:
-pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1
-
-# 3. Install other dependencies
-pip install -r requirements.txt
-```
-
-### 3. Download the Model Weights
-We have uploaded the fine-tuned model to the HuggingFace and ModelScope for easy access.
-
-```bash
-# from the HuggingFace
-python -m src.utils.download_model --source huggingface
-
-# or from ModelScope (for Chinese Users)
-# python -m src.utils.download_model --source modelscope
-```
-
-*Note: The model file is approximately 270 MB. After downloading, please ensure the file `generation_config.json`, `config.json`, `model.safetensors` is located in the `models/sft/` directory.*
-
-### 4. Run the Inference Script
-
-You're all set! We provide a convenient inference script that will automatically process an example score.
-
-```bash
-python src/inference/inference.py
+```text
+delta_ioi = log(max(performance_ioi, 1 ms)) - log(max(score_ioi, 1 ms))
+delta_duration = log(max(performance_duration, 1 ms)) - log(max(score_duration, 1 ms))
 ```
 
-After the rendering is complete, you will find the generated MIDI file `0.mid` in the `data/midis/testset/inference` directory. You can load it into your favorite DAW with a piano plugin for playback and editing.
+The bounded variants restrict timing support during loss and sampling to reduce
+the effect of long-tail alignment artifacts.
 
-## Training from Scratch
-This section is for researchers and developers who wish to reproduce our full training pipeline or train the Pianist Transformer on a custom dataset.
+**DINR** represents timing and velocity as typed categorical values. It
+optionally augments learned value-table entries with numerical coordinates so
+neighboring values can share ordinal structure. DINR uses categorical heads for
+IOI, duration, and velocity, and binary heads for pedal.
 
-To help you verify and understand the entire process, **we have included a minimal, ready-to-use dataset within this repository**. Simply follow the steps below to execute the scripts for the full pipeline, from data processing to final model fine-tuning.
+## Dataset Construction
 
-### 1. Data Preprocessing
+The preprocessing pipeline builds training-ready aligned note data from
+score-performance pairs:
 
-For the active INR research pipeline, preprocess PianoCoRe into training-ready
-JSON and sidecars with:
+1. Normalize score and performance MIDI into refined note sequences.
+2. Align performance notes to score notes.
+3. Project MusicXML score annotations onto refined score MIDI.
+4. Build fixed 512-note training/evaluation windows.
+5. Prebuild per-work sidecars for fast loading.
+
+To regenerate processed INR sidecars from PianoCoRe/ASAP-style data:
 
 ```bash
 bash script/build_pianocore_inr_sidecars.sh
 ```
 
-This pipeline generates paired work JSON, projects XML score features, writes
-the shared fixed valid split, and prebuilds both base `.pt` and ASAP `.ASAP.pt`
-sidecars so training stays read-only.
+The included compact ASAP subset is intended for code execution and data-format
+demonstration. Full training data and trained checkpoints are not included.
 
-### 2. Self-Supervised Pre-training
+## Environment
 
-In this stage, the model undergoes large-scale pre-training on the processed unlabeled data to learn general musical structures and knowledge.
+The packaged INR runs and supplement preparation used the following local
+environment:
+
+| Item | Value |
+| --- | --- |
+| Operating system | Linux 6.17.0-35-generic, x86_64, glibc 2.39 |
+| GPU | 3 NVIDIA GeForce RTX 3090 GPUs, 24GB each |
+| NVIDIA driver | 595.71.05 |
+| Python | 3.13.9 |
+| PyTorch | 2.12.0+cu130 |
+| CUDA runtime | 13.0 |
+| cuDNN | 9.2 |
+
+Install dependencies with:
+
+```bash
+pip install -r requirements.txt
+```
+
+GPU execution is recommended for INR inference and required for practical
+training. CPU execution is sufficient for reading the repository contents and
+running lightweight smoke checks.
+
+## Smoke Check
+
+```bash
+python -c "from pathlib import Path; import pandas as pd; df=pd.read_csv('data/ASAP_processed/metadata.generated_json.csv'); print('rows', len(df)); print(df.groupby('split').size().to_dict()); print('works', df.groupby('split')['refined_score_midi_path'].nunique().to_dict()); print('sidecars', len(list(Path('data/ASAP_processed').rglob('*.ASAP_MUSICAL51.pt'))))"
+```
+
+Expected output for the compact subset:
+
+```text
+rows 193
+{'test': 82, 'train': 111}
+works {'test': 19, 'train': 31}
+sidecars 50
+```
+
+## Running Inference
+
+This repository does not include trained INR checkpoints. Given a trained
+checkpoint, run:
+
+```bash
+CONFIG=configs/inr_epr/cinr__default_dlm_k1_bounded5.json \
+CHECKPOINT=/path/to/checkpoint-best \
+OUT_DIR=results/example_inference \
+bash script/run_example_inference_eval.sh
+```
+
+The script runs:
+
+```bash
+python src/inference/infer_inr_testset.py
+python src/evaluate/evaluate_inr_saved_midis.py
+```
+
+and writes generated MIDI plus PN/PP Wasserstein metrics under `OUT_DIR`.
+
+## Training Pipeline
+
+The mainline INR/EPR configs point to the included metadata and sidecars:
+
+```text
+metadata_path = data/ASAP_processed/metadata.generated_json.csv
+refined_dir = data/ASAP_processed
+prepared_sidecar_tag = ASAP_MUSICAL51
+```
+
+For a short training smoke run on the included subset:
+
+```bash
+CONFIG=configs/inr_epr/cinr__default_dlm_k1_bounded5.json \
+CUDA_VISIBLE_DEVICES=0 \
+GLOBAL_BATCH_SIZE=32 \
+BASE_NUM_TRAIN_EPOCHS=1 \
+ADAPT_NUM_TRAIN_EPOCHS=0 \
+bash script/run_inr_epr_pipeline.sh
+```
+
+The main full training/inference/summarization pipeline is:
+
+```bash
+CONFIG=configs/inr_epr/cinr__default_dlm_k1_bounded5.json \
+CUDA_VISIBLE_DEVICES=0,1,2 \
+GLOBAL_BATCH_SIZE=96 \
+bash script/run_inr_epr_pipeline.sh
+```
+
+## Mainline Configurations
+
+The current mainline INR/EPR queue lives in:
+
+```text
+configs/inr_epr/
+```
+
+The queue contains CINR variants, DINR variants, and representation/feature
+ablations. The canonical baseline is:
+
+```text
+configs/inr_epr/cinr__default_dlm_k1_bounded5.json
+```
+
+The compact result table from the submission package is available at:
+
+```text
+submission/Code/results/mainline_rollout_metrics_26_configs.csv
+```
+
+## Evaluation Metrics
+
+The code evaluates generated MIDI as distributions, because EPR is one-to-many:
+the same score can have many plausible human performances.
+
+- **PP Wasserstein** compares piece-level predicted and human distributions
+  after pooling note values within each piece.
+- **PN Wasserstein** compares generated and human values per aligned score note,
+  then averages over notes and pieces.
+- Metrics are reported for IOI, duration, velocity, and pedal.
+
+Lower Wasserstein distance is better. Human-relative aggregates used in the
+paper normalize these distances by leave-one-out human variation.
+
+## Original Pianist Transformer Path
+
+The original PT implementation is retained for comparison and compatibility:
 
 ```bash
 python src/train/pretrain.py
-```
-⚠️ **Note**: Even with the minimal dataset, pre-training can be time-consuming. Training logs and model checkpoints will be saved to the `models/pretrain/` directory by default.
-
-### 3. Supervised Fine-tuning
-
-Finally, we take the pre-trained model and fine-tune it on paired (score-performance) data to teach the model how to generate expressive performances.
-
-```bash
 python src/train/sft.py --config configs/sft_config_pianocore.json
-```
-After fine-tuning is complete, the final model, ready for inference, will be saved in the `models/sft/` directory.
-
-### Using Your Own Data
-
-If you wish to train the model on your own dataset, please organize your files according to the example data structure found in the `data/` directory.
-
-You can modify `script/build_pianocore_inr_sidecars.sh` or the Python stages in
-`src/data_process/` to adapt the INR pipeline to your own dataset layout.
-
-## INSPIRE / INR Research Track
-
-In addition to the original Pianist Transformer pipeline, this repository also contains an active research direction for:
-
-`INSPIRE = Integrated Note-based Score Performance Interpretation, Reconstruction and Expression`
-
-Its core representation is:
-
-`INR = Integrated Note Representation`
-
-INR moves from the original token-level note block representation to a note-level structured object representation. In the current repository, some implementation class names and scripts still use legacy `Integrated*` naming for compatibility, but the research terminology is now `INSPIRE / INR`.
-
-### INR Task Split
-
-INR treats symbolic-performance modeling as two related but different tasks:
-
-- `EPR (Expressive Performance Rendering)`: `score -> performance`
-- `CSR (Canonical Score Reconstruction)`: `performance -> score`
-
-These two tasks are intentionally **not** trained with the exact same loss philosophy:
-
-- `EPR` is closer to one-to-many conditional expressive realization, so the loss should be tolerant to multiple plausible outputs.
-- `CSR` is closer to many-to-one canonical reconstruction, so the loss should enforce stricter score-grid and notation recovery.
-
-### Recommended Loss Design
-
-#### EPR Loss
-
-Recommended heads:
-
-- `timing_head -> [ioi, dur]`
-- `velocity_head -> [vel]`
-- `pedal_head -> [pedal_1..4]`
-
-Recommended default losses:
-
-- `ioi`, `dur`: `Laplace NLL`
-- `velocity`: continuous regression, default `Huber`
-- `pedal`: continuous regression, default `Huber`
-
-Recommended form:
-
-```python
-loss_ioi = laplace_nll(ioi_mu, ioi_log_b, ioi_target)
-loss_dur = laplace_nll(dur_mu, dur_log_b, dur_target)
-loss_vel = huber(vel_pred, vel_target)
-loss_pedal = huber(pedal_raw_pred, pedal_target)
-
-loss_epr = (
-    1.0 * loss_ioi
-  + 1.0 * loss_dur
-  + 1.0 * loss_vel
-  + 0.75 * loss_pedal
-)
+python src/inference/inference.py
 ```
 
-Why these choices:
+Related configs remain at the top level of `configs/`, and the PT shell pipeline
+is kept as:
 
-- `ioi` and `dur` are the timing targets most affected by one-to-many expressive variation, so they use `Laplace NLL`.
-- `velocity` is a simpler continuous target and can stay as direct regression.
-- `pedal` is also treated as a continuous control signal, with no binary/logit objective by default.
-- The final EPR objective is intentionally simple: `ioi + dur + velocity + 0.75 * pedal`.
-
-Important implementation note for pedal:
-
-- The primary INR recommendation is **not** `sigmoid + BCE`.
-- Use a **linear regression head** for pedal during training.
-- Clamp to `[0, 1]` only at inference/export time.
-
-```python
-pedal_raw_pred = pedal_head(hidden_states)
-loss_pedal = huber(pedal_raw_pred, pedal_target)
-pedal_out = pedal_raw_pred.clamp(0.0, 1.0)
-```
-
-An auxiliary binary pedal-state head can still be added later if clearer on/off boundaries are needed, but it is **not** the default loss.
-
-#### CSR Loss
-
-Recommended heads:
-
-- `score_position_head -> [mo, md]`
-- `measure_structure_head -> [ml, first]`
-- `score_annotation_head -> [staff, trill, grace, staccato]`
-
-Recommended default losses:
-
-- `mo`, `md`, `ml`: `ordinal classification` on the canonical score grid
-- `first`, `staff`, `trill`, `grace`, `staccato`: `BCEWithLogitsLoss`
-
-This is important: `mo/md/ml` should not be treated as the final-form continuous regression targets in CSR. Although a `Huber` baseline is easy to prototype, the preferred INSPIRE/INR design is ordinal/grid-aware prediction because these variables lie on a fixed discrete score lattice.
-
-Current score-grid definitions in this repository are:
-
-- `mo`: range `[0, 6]`, step `1/24`
-- `md`: range `[0, 4]`, step `1/24`
-- `ml`: range `[0, 6]`, step `1/24`
-
-That means:
-
-- `mo` has `145` bins
-- `md` has `97` bins
-- `ml` has `145` bins
-
-Recommended form:
-
-```python
-score_mask = attention_mask * has_score_feature
-ml_mask = score_mask * first_target
-
-loss_mo = 1.0 * ordinal_ce(mo_logits, mo_bin_target, score_mask)
-loss_md = 1.0 * ordinal_ce(md_logits, md_bin_target, score_mask)
-loss_first = 1.0 * bce_with_logits(first_logit, first_target, score_mask)
-
-loss_ml = 1.0 * ordinal_ce(ml_logits, ml_bin_target, ml_mask)
-
-loss_staff = 0.5 * bce_with_logits(staff_logit, staff_target, score_mask)
-loss_trill = 0.40 * bce_with_logits(trill_logit, trill_target, score_mask)
-loss_grace = 0.40 * bce_with_logits(grace_logit, grace_target, score_mask)
-loss_staccato = 0.30 * bce_with_logits(staccato_logit, staccato_target, score_mask)
-
-loss_csr = (
-    loss_mo
-  + loss_md
-  + loss_first
-  + loss_ml
-  + loss_staff
-  + loss_trill
-  + loss_grace
-  + loss_staccato
-)
-```
-
-Why these choices:
-
-- `mo`, `md`, and `first` define the core canonical score structure, so they carry the highest weight.
-- `ml` is meaningful mainly at measure starts, so it is masked by `first`; because `ml_mask` is much sparser than the other masks, its coefficient should stay at `1.0` rather than be reduced.
-- `staff` is an important structural label and is stronger than a light auxiliary tag, so `0.5` is a better default than a very small weight.
-- `trill`, `grace`, and `staccato` are sparse but musically meaningful notation labels, so they should not be left unweighted, but they also should not dominate the main score-grid reconstruction targets.
-
-### Practical Summary
-
-- `EPR`: tolerant continuous regression, with pedal modeled first as a continuous control signal.
-- `CSR`: stricter canonical reconstruction, with `mo/md/ml` modeled on discrete ordinal score grids.
-- `Huber` remains a good baseline loss for continuous targets, but it is not the preferred final-form loss for `mo/md/ml` in CSR.
-
-For the more detailed experiment design and ongoing INR backbone comparison notes, see [docs/integrated_note_representation_experiment.md](/home/kaititech/EPR/PianistTransformer/docs/integrated_note_representation_experiment.md).
-
-## Graphical User Interface (GUI)
-To make our tool accessible to everyone, especially users who are not familiar with the command line, we have developed a simple and intuitive Graphical User Interface (GUI) based on PyQt and Pygame. You can easily use the Pianist Transformer without writing any code.
-
-### How to Launch
-
-First, ensure you have installed all dependencies, including `PyQt5` and `pygame`. Then, run the following command:
 ```bash
-python -m src.gui.ui
+bash script/run_pt_pipeline.sh
 ```
-The GUI window will launch automatically.
 
-### Interface and Features
+## Cleanup Archive
 
-<p align="center">
-  <img src="assets/gui.png" width="800"/>
-  <br>
-</p>
+The cleanup archive is:
 
-Our GUI is divided into three main sections: **Control & Parameters**, **Status Display**, and **Result Actions**.
-
-**Workflow:**
-
-1.  **Load Score (`Load MIDI`)**: Click the `Load MIDI` button on the right side of the interface to select the score MIDI file you want to render.
-
-2.  **Adjust Generation Parameters**:
-    *   **`Temperature`**: Controls the randomness of the generated output. A higher value leads to a more "improvisational" feel, while a lower value makes the result more stable and deterministic.
-    *   **`Top-p`**: A more advanced sampling strategy that controls the diversity of the output. It is generally recommended to keep the default value.
-    *   **`Max Tempo`**: Controls the maximum tempo value when saving the edited rendered MIDI. Any tempo exceeding this value will be clipped.
-
-3.  **Start Rendering**:
-    Once the parameters are set, click `Render` or `Render Again` to start the process. The circular progress bar in the center (`Rendering...`) will show the real-time progress. You can click `Cancel` at any time to terminate the current task.
-
-4.  **Preview and Compare**:
-    After rendering is complete, you can use the player at the top to preview the audio. You can switch between the `Original Score` and different rendered versions (`V1` - `V5`) at any time to visually compare the results.
-
-5.  **Save the Results**:
-    We offer two practical save options:
-    *   **`Save Rendered MIDI`**: Saves a standard performance MIDI file, which records the absolute timing of notes with millisecond precision.
-    *   **`Save Editable Rendered MIDI`**: **(Recommended)** Saves a DAW-friendly MIDI file. This option utilizes the "Expressive Tempo Mapping" technique proposed in our paper, converting all velocity and timing deviations into a dynamic tempo track. This means you can import the file into any professional music software (e.g., Logic Pro, Cubase, FL Studio), and it will automatically align to the beat grid while preserving all the expressive nuances, making it convenient for further editing and composition.
-
-## Citation
-If you find our work, code, or models helpful in your research, we would be grateful if you could cite our paper:
-
-```bibtex
-@misc{you2025pianisttransformerexpressivepiano,
-      title={Pianist Transformer: Towards Expressive Piano Performance Rendering via Scalable Self-Supervised Pre-Training}, 
-      author={Hong-Jie You and Jie-Jing Shao and Xiao-Wen Yang and Lin-Han Jia and Lan-Zhe Guo and Yu-Feng Li},
-      year={2025},
-      eprint={2512.02652},
-      archivePrefix={arXiv},
-      primaryClass={cs.SD}
-}
+```text
+backup/repo_cleanup_20260804/
 ```
+
+It contains older exploratory configs, previous launch scripts, diagnostics,
+plotting helpers, logs, temporary files, and generated results. Core INR and PT
+implementation files were kept in place.

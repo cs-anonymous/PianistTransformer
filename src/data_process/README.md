@@ -153,5 +153,6 @@ Recommended usage:
 
 ## Legacy
 
-`legacy_pt_cpt/` contains old PT/CPT preprocessing scripts and is not part of
-the active INR pipeline.
+Old PT/CPT preprocessing scripts were moved to
+`backup/repo_cleanup_20260804/src/data_process/legacy_pt_cpt/`. They are not
+part of the active INR pipeline.
