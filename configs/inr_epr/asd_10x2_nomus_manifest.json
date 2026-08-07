@@ -1,0 +1,15 @@
+{
+  "baseline": [
+    "configs/inr_epr/cinr__default_dlm_k1_bounded5_10x2_nomus.json",
+    "configs/inr_epr/dinr__default_no_coord_10x2_nomus.json"
+  ],
+  "asd_lanes": [
+    "configs/inr_epr/cinr__asd_full4_default_dlm_k1_bounded5_10x2_nomus_seed42.json",
+    "configs/inr_epr/cinr__asd_full4_default_dlm_k1_bounded5_10x2_nomus_seed43.json",
+    "configs/inr_epr/cinr__asd_full4_default_dlm_k1_bounded5_10x2_nomus_seed44.json",
+    "configs/inr_epr/dinr__asd_full4_default_no_coord_10x2_nomus_seed42.json",
+    "configs/inr_epr/dinr__asd_full4_default_no_coord_10x2_nomus_seed43.json",
+    "configs/inr_epr/dinr__asd_full4_default_no_coord_10x2_nomus_seed44.json"
+  ],
+  "prepared_sidecar_tag": "ASAP_MUSICAL51"
+}

@@ -59,6 +59,14 @@ reuse.
 | `submission/` | Original submission package and media supplement. |
 | `backup/repo_cleanup_20260804/` | Files moved out during repository cleanup. |
 
+Design notes:
+
+- `docs/attribute_specific_decoder_inr.md`: new ASD-INR direction with CINR
+  and DINR experiment plans.
+- `docs/representation_metrics.md`: PN/PP Wasserstein interpretation and
+  comparison protocol.
+- `docs/inr_slot0710.md`: slot-attribute INR representation design.
+
 ## Method Summary
 
 INSPIRE assumes note-aligned score and performance sequences. A score note

@@ -88,7 +88,7 @@ def compute_manifest_metrics(
     manifest,
     max_gt_per_score=None,
     num_workers=1,
-    pedal_binary_support=False,
+    pedal_support="raw",
     pedal_binary_threshold=64.0,
 ):
     items = manifest["items"]
@@ -100,7 +100,7 @@ def compute_manifest_metrics(
                     pool.imap(
                         score_level_metrics_worker,
                         (
-                            (item, max_gt_per_score, pedal_binary_support, pedal_binary_threshold)
+                            (item, max_gt_per_score, pedal_support, pedal_binary_threshold)
                             for item in items
                         ),
                         chunksize=1,
@@ -114,7 +114,7 @@ def compute_manifest_metrics(
             score_level_metrics(
                 item,
                 max_gt_per_score=max_gt_per_score,
-                pedal_binary_support=pedal_binary_support,
+                pedal_support=pedal_support,
                 pedal_binary_threshold=pedal_binary_threshold,
             )
             for item in tqdm(items, total=len(items), desc=f"{manifest['protocol']} score metrics")
@@ -588,21 +588,21 @@ def main():
     config = load_manifest(args.config)
     timing_normalization = config.get("timing_input_normalization", "linear_5000")
     max_time_ms = float(config.get("max_time_ms", 10000.0))
-    pedal_binary_support = str(config.get("pedal_representation", "")).lower() == "binary_4"
+    pedal_support = "soft" if str(config.get("pedal_representation", "")).lower() == "binary_4" else "raw"
     pedal_binary_threshold = float(config.get("pedal_binary_threshold", 64.0))
 
     det_metrics = compute_manifest_metrics(
         det_manifest,
         max_gt_per_score=args.max_gt_per_score,
         num_workers=args.num_workers,
-        pedal_binary_support=pedal_binary_support,
+        pedal_support=pedal_support,
         pedal_binary_threshold=pedal_binary_threshold,
     )
     sampling_metrics = compute_manifest_metrics(
         sampling_manifest,
         max_gt_per_score=args.max_gt_per_score,
         num_workers=args.num_workers,
-        pedal_binary_support=pedal_binary_support,
+        pedal_support=pedal_support,
         pedal_binary_threshold=pedal_binary_threshold,
     )
     plot_summary = plot_distributions(
@@ -634,6 +634,8 @@ def main():
             "performance_dataset": det_manifest.get("performance_dataset"),
             "exclude_performance_dataset": det_manifest.get("exclude_performance_dataset"),
             "timing_normalization": timing_normalization,
+            "pedal_metric_support": "soft_0_1" if pedal_support == "soft" else "raw_0_127",
+            "pedal_binary_threshold": pedal_binary_threshold if pedal_support == "binary" else None,
             **plot_summary,
             **dev_plot_summary,
         },

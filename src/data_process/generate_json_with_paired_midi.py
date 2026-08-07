@@ -18,7 +18,11 @@ from src.utils.inr_midi import (
     RAW_CONTINUOUS_KEYS,
     RAW_PEDAL4_KEYS,
     RAW_SHARED_KEYS,
+    _cc_value_at_ms,
+    _tick_to_ms_mapping,
+    _time_at_tick_ms,
     midi_to_note_features,
+    sorted_pedal_controls,
     sorted_piano_notes,
 )
 
@@ -56,13 +60,18 @@ OPTIONAL_COLUMNS = [
 
 
 def find_refined_dir(pianocore_dir):
+    pianocore_dir = Path(pianocore_dir)
     candidates = [
-        Path(pianocore_dir) / "refined",
-        Path(pianocore_dir) / "PianoCoRe" / "refined",
-        Path(pianocore_dir) / "PianoCoRe-1.0" / "refined",
+        pianocore_dir,
+        pianocore_dir / "refined",
+        pianocore_dir / "PianoCoRe" / "refined",
+        pianocore_dir / "PianoCoRe-1.0" / "refined",
     ]
     for candidate in candidates:
-        if candidate.exists():
+        if candidate.exists() and (
+            (candidate / "metadata.csv").exists()
+            or any(candidate.rglob("score_ASAP_refined.mid"))
+        ):
             return candidate
     raise FileNotFoundError(
         "Could not find PianoCoRe refined directory. Checked: "
@@ -189,7 +198,46 @@ def aligned_performance_notes(performance_midi, alignment_path, note_count):
     return performance_notes, interpolated_int
 
 
-def build_performance_payload(row, refined_dir, score_pitch, max_time_ms, float_precision):
+def score_onset_group_starts(score_raw):
+    starts = []
+    for idx, row in enumerate(score_raw):
+        if idx == 0 or float(row[0]) > 0.0:
+            starts.append(idx)
+    return starts
+
+
+def group_onset_pedal4_rows(performance_midi, performance_notes, score_raw):
+    tick_to_ms = _tick_to_ms_mapping(performance_midi)
+    pedal_controls = sorted_pedal_controls(performance_midi)
+    pedal_times_ms = [_time_at_tick_ms(tick_to_ms, cc.time) for cc in pedal_controls]
+    pedal_values = [cc.value for cc in pedal_controls]
+    starts_ms = sorted(_time_at_tick_ms(tick_to_ms, note.start) for note in performance_notes)
+    group_starts = score_onset_group_starts(score_raw)
+    group_start_set = set(group_starts)
+    rows = [[0.0, 0.0, 0.0, 0.0] for _ in performance_notes]
+    last_group_row = [0.0, 0.0, 0.0, 0.0]
+    for group_idx, start_idx in enumerate(group_starts):
+        start_ms = starts_ms[start_idx]
+        if group_idx + 1 < len(group_starts):
+            next_start_ms = starts_ms[group_starts[group_idx + 1]]
+        else:
+            next_start_ms = start_ms + 4990.0
+        span_ms = max(next_start_ms - start_ms, 0.0)
+        last_group_row = [
+            _cc_value_at_ms(pedal_times_ms, pedal_values, start_ms),
+            _cc_value_at_ms(pedal_times_ms, pedal_values, start_ms + span_ms * 0.25),
+            _cc_value_at_ms(pedal_times_ms, pedal_values, start_ms + span_ms * 0.50),
+            _cc_value_at_ms(pedal_times_ms, pedal_values, start_ms + span_ms * 0.75),
+        ]
+        rows[start_idx] = last_group_row
+        next_idx = group_starts[group_idx + 1] if group_idx + 1 < len(group_starts) else len(rows)
+        for note_idx in range(start_idx + 1, next_idx):
+            if note_idx not in group_start_set:
+                rows[note_idx] = last_group_row
+    return rows
+
+
+def build_performance_payload(row, refined_dir, score_pitch, score_raw, max_time_ms, float_precision, pedal4_group_onset=False):
     performance_rel_path = row["refined_performance_midi_path"]
     alignment_rel_path = row["refined_alignment_path"]
     performance_path = refined_dir / performance_rel_path
@@ -213,6 +261,9 @@ def build_performance_payload(row, refined_dir, score_pitch, max_time_ms, float_
         normalize=False,
         force_monotonic_starts=True,
     )
+    pedal4_rows = performance_features["pedal4"]
+    if pedal4_group_onset:
+        pedal4_rows = group_onset_pedal4_rows(performance_midi, performance_notes, score_raw)
 
     if performance_features["pitch"] != score_pitch:
         raise ValueError("pitch_mismatch")
@@ -226,7 +277,7 @@ def build_performance_payload(row, refined_dir, score_pitch, max_time_ms, float_
         "split": optional_value(row, "split"),
         "tier_a_star": bool(optional_value(row, "tier_a_star")),
         "label_shared_raw": shared_rows_to_int(performance_features["shared"]),
-        "label_pedal4_raw": value_rows_to_int(performance_features["pedal4"], 4),
+        "label_pedal4_raw": value_rows_to_int(pedal4_rows, 4),
         "interpolated": interpolated,
     }
 
@@ -283,6 +334,7 @@ def write_work_json(task):
     max_time_ms = task["max_time_ms"]
     float_precision = task["float_precision"]
     overwrite = task["overwrite"]
+    pedal4_group_onset = bool(task.get("pedal4_group_onset", False))
 
     output_path = output_path_for_score(refined_dir, output_dir, score_rel_path)
     if output_path.exists() and not overwrite:
@@ -310,6 +362,10 @@ def write_work_json(task):
             max_time_ms,
             float_precision,
         )
+        if pedal4_group_onset:
+            meta["label_pedal4_method"] = "score_onset_group_anchor_shared"
+            meta["label_pedal4_anchor"] = "first_note_in_score_onset_group_lowest_pitch_under_score_sort"
+            meta["label_pedal4_span"] = "anchor_onset_to_next_score_onset_group_anchor"
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         success_performances = 0
@@ -332,8 +388,10 @@ def write_work_json(task):
                         row,
                         refined_dir,
                         score_payload["pitch"],
+                        score_payload["score_raw"],
                         max_time_ms,
                         float_precision,
+                        pedal4_group_onset=pedal4_group_onset,
                     )
                     if not first_performance:
                         file.write(",")
@@ -407,6 +465,7 @@ def make_work_tasks(df, refined_dir, output_dir, args):
                 "max_time_ms": args.max_time_ms,
                 "float_precision": args.float_precision,
                 "overwrite": args.overwrite,
+                "pedal4_group_onset": args.pedal4_group_onset,
             }
         )
 
@@ -440,6 +499,11 @@ def main():
     parser.add_argument("--limit-works", type=int, default=None)
     parser.add_argument("--limit-performances-per-work", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--pedal4-group-onset",
+        action="store_true",
+        help="Sample pedal4 once per score onset group and copy it to score_ioi==0 continuation notes.",
+    )
     args = parser.parse_args()
 
     pianocore_dir = Path(args.pianocore_dir)

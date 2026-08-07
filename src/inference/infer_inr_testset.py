@@ -50,14 +50,14 @@ def parse_args():
     parser.add_argument("--protocol", choices=["sampling"], default="sampling")
     parser.add_argument(
         "--sampling-strategy",
-        choices=["mean", "greedy", "sample"],
+        choices=["mean", "greedy", "sample", "soft", "prob", "hard"],
         default=None,
         help="Override output materialization.",
     )
     parser.add_argument(
         "--deterministic-strategy",
-        choices=["greedy", "mean"],
-        default="greedy",
+        choices=["greedy", "mean", "soft", "prob", "hard"],
+        default="soft",
         help="How deterministic inference materializes probabilistic outputs.",
     )
     parser.add_argument("--num-samples", type=int, default=1)
@@ -109,7 +109,7 @@ def resolve_sampling_strategy(args):
     if args.sampling_strategy is not None:
         return str(args.sampling_strategy).lower()
     if args.protocol == "sampling":
-        return "sample"
+        return "soft"
     return str(args.deterministic_strategy).lower()
 
 
@@ -812,7 +812,7 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
         )
         raw_path = raw_dir / f"{score_stem}__{plan['suffix']}.json"
         target_key = "predicted_target7"
-        timing_representation = "target7_floor_log_dev_velocity_binary4"
+        timing_representation = "target7_floor_log_dev_velocity_soft4"
         raw_payload = {
             "score_source": score_source,
             "performance_source": plan.get("performance_source"),

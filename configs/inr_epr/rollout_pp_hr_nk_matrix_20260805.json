@@ -1,0 +1,49 @@
+{
+  "description": "Singleton rollout PN/PP human-normalized W1 objective comparison",
+  "shared": {
+    "rollout_hr_enabled": true,
+    "rollout_hr_replace_nll": false,
+    "rollout_hr_lambda": 0.1,
+    "rollout_hr_normalizer": "test_human",
+    "pp_ioi_w1_normalizer": 7.952391192015138,
+    "pp_duration_w1_normalizer": 25.9246360560533,
+    "pp_velocity_w1_normalizer": 3.057647553002258,
+    "pp_pedal_w1_normalizer": 0.07682493502888045,
+    "rollout_hr_sampling_strategy": "sample",
+    "rollout_hr_batch_fraction": 0.1,
+    "rollout_hr_k": 8,
+    "rollout_hr_eval_k": 16,
+    "rollout_hr_eval_num_examples": 40,
+    "rollout_hr_eval_num_samples": 1,
+    "rollout_hr_eval_seed": 42,
+    "rollout_eval_enabled": true,
+    "rollout_eval_k": 16,
+    "rollout_eval_weight": 0.0,
+    "rollout_eval_materialize_strategy": "sample",
+    "rollout_eval_feedback_strategy": "sample",
+    "evaluation_strategy": "epoch",
+    "save_strategy": "epoch",
+    "load_best_model_at_end": true,
+    "metric_for_best_model": "eval_rollout_k16_avg_hr",
+    "greater_is_better": false,
+    "early_stopping_patience": 3,
+    "early_stopping_threshold": 0.0,
+    "per_device_train_batch_size": 32,
+    "per_device_eval_batch_size": 32,
+    "gradient_accumulation_steps": 2,
+    "global_batch_size": 64,
+    "num_train_epochs": 16.0,
+    "max_train_epochs": 16.0
+  },
+  "lanes": {
+    "gpu0": [
+      {"label": "singleton_pn_n10_k8", "rollout_hr_mode": "pn"}
+    ],
+    "gpu1": [
+      {"label": "singleton_pp_n10_k8", "rollout_hr_mode": "pp"}
+    ],
+    "gpu2": [
+      {"label": "singleton_pnpp_n10_k8", "rollout_hr_mode": "pn_pp"}
+    ]
+  }
+}

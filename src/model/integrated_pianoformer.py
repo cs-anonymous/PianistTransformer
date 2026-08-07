@@ -1,3 +1,4 @@
+import copy
 import math
 from typing import Optional, Union
 
@@ -250,6 +251,10 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         output_task_adapter_depth=2,
         output_task_adapter_width_multiplier=0.5,
         decoder_task_token_mode="note",
+        decoder_arch="single",
+        asd_attributes=None,
+        asd_shared_decoder_layers=1,
+        asd_attribute_decoder_layers=1,
         gpt_layers_num=None,
         bert_layers_num=None,
         max_position_embeddings=4096,
@@ -428,6 +433,7 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         zero_timing_head_condition=False,
         zero_ioi_dual_distribution_mode="none",
         zero_ioi_dual_duration=True,
+        mask_zero_score_ioi_pedal_loss=True,
         piano_pitch_min=21,
         pedal_representation="binary_4",
         use_style_tokens=False,
@@ -511,6 +517,30 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.output_task_adapter_depth = int(output_task_adapter_depth)
         self.output_task_adapter_width_multiplier = float(output_task_adapter_width_multiplier)
         self.decoder_task_token_mode = str(decoder_task_token_mode or "note").lower()
+        self.decoder_arch = str(decoder_arch or "single").lower()
+        if self.decoder_arch in {"default", "none", "off"}:
+            self.decoder_arch = "single"
+        if self.decoder_arch not in {"single", "asd_full4", "asd_group2", "asd_pedal_solo", "asd_shared2_upper2"}:
+            raise ValueError(
+                "decoder_arch must be single, asd_full4, asd_group2, asd_pedal_solo, "
+                f"or asd_shared2_upper2, got {self.decoder_arch}"
+            )
+        asd_attributes = asd_attributes or ["ioi", "duration", "velocity", "pedal"]
+        if isinstance(asd_attributes, str):
+            asd_attributes = [part.strip() for part in asd_attributes.split(",") if part.strip()]
+        self.asd_attributes = tuple(str(attr).lower() for attr in asd_attributes)
+        if self.decoder_arch in {"asd_full4", "asd_group2", "asd_pedal_solo", "asd_shared2_upper2"} and self.asd_attributes != (
+            "ioi",
+            "duration",
+            "velocity",
+            "pedal",
+        ):
+            raise ValueError(
+                "decoder_arch=asd_full4/asd_group2/asd_pedal_solo/asd_shared2_upper2 currently expects "
+                "asd_attributes=[ioi,duration,velocity,pedal]"
+            )
+        self.asd_shared_decoder_layers = int(asd_shared_decoder_layers)
+        self.asd_attribute_decoder_layers = int(asd_attribute_decoder_layers)
         self.gpt_layers_num = gpt_layers_num
         self.bert_layers_num = bert_layers_num
         self.max_position_embeddings = max_position_embeddings
@@ -822,6 +852,7 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
                 f"got {self.zero_ioi_dual_distribution_mode}"
             )
         self.zero_ioi_dual_duration = bool(zero_ioi_dual_duration)
+        self.mask_zero_score_ioi_pedal_loss = bool(mask_zero_score_ioi_pedal_loss)
         self.piano_pitch_min = int(piano_pitch_min)
         if bool(use_style_tokens):
             raise ValueError("use_style_tokens is disabled for the simplified EPR/removed_task pipelines")
@@ -2784,6 +2815,61 @@ def _split_dinr_logits(config, raw_outputs):
         "velocity": raw_outputs[..., duration_end:velocity_end],
         "pedal": pedal,
     }
+
+
+def _epr_attribute_raw_slices(config):
+    distribution = str(getattr(config, "epr_distribution", "point")).lower()
+    pedal_dim = pedal_representation_dim(getattr(config, "pedal_representation", "binary_4"))
+    if distribution in DINR_DISTRIBUTIONS:
+        timing_bins = int(config.dinr_output_timing_bins)
+        ioi_end = timing_bins
+        duration_end = ioi_end + timing_bins
+        velocity_end = duration_end + 128
+        pedal_end = velocity_end + pedal_dim
+        return {
+            "ioi": slice(0, ioi_end),
+            "duration": slice(ioi_end, duration_end),
+            "velocity": slice(duration_end, velocity_end),
+            "pedal": slice(velocity_end, pedal_end),
+        }
+    if distribution in DLM_DISTRIBUTIONS:
+        components = int(getattr(config, "dlm_components", getattr(config, "epr_mixture_components", 8)))
+        per_feature_dim = components * 3
+        ioi_dim = per_feature_dim + (1 if bool(getattr(config, "dlm_ioi_zero_inflated", False)) else 0)
+        duration_dim = per_feature_dim
+        velocity_distribution = str(getattr(config, "velocity_distribution", "skew_normal")).lower()
+        velocity_dim = per_feature_dim if velocity_distribution in DLM_DISTRIBUTIONS else 3
+        ioi_end = ioi_dim
+        duration_end = ioi_end + duration_dim
+        velocity_end = duration_end + velocity_dim
+        pedal_end = velocity_end + pedal_dim
+        return {
+            "ioi": slice(0, ioi_end),
+            "duration": slice(ioi_end, duration_end),
+            "velocity": slice(duration_end, velocity_end),
+            "pedal": slice(velocity_end, pedal_end),
+        }
+    if distribution in {"point", "mse", "huber"}:
+        return {
+            "ioi": slice(0, 1),
+            "duration": slice(1, 2),
+            "velocity": slice(2, 3),
+            "pedal": slice(3, 3 + pedal_dim),
+        }
+    raise ValueError(f"decoder_arch=asd_full4 does not yet support epr_distribution={distribution}")
+
+
+def _merge_asd_attribute_raw_outputs(config, raw_by_attribute):
+    slices = _epr_attribute_raw_slices(config)
+    return torch.cat(
+        [
+            raw_by_attribute["ioi"][..., slices["ioi"]],
+            raw_by_attribute["duration"][..., slices["duration"]],
+            raw_by_attribute["velocity"][..., slices["velocity"]],
+            raw_by_attribute["pedal"][..., slices["pedal"]],
+        ],
+        dim=-1,
+    )
 
 
 def _dinr_coordinates(config, reference, vocabulary="deviation"):
@@ -4990,11 +5076,11 @@ def _epr_bins_to_normalized(config, ioi_bins, duration_bins, velocity_bins, peda
 def _materialize_binary4_logits(logits, sampling_strategy="mean"):
     probs = torch.sigmoid(logits.float())
     mode_name = str(sampling_strategy).lower()
-    if mode_name in {"soft", "prob", "probs", "probability", "probabilities"}:
-        return probs
     if mode_name in {"sample", "sampling", "stochastic"}:
         return torch.bernoulli(probs)
-    return (probs >= 0.5).to(dtype=probs.dtype)
+    if mode_name in {"hard", "threshold", "argmax", "greedy"}:
+        return (probs >= 0.5).to(dtype=probs.dtype)
+    return probs
 
 
 def _materialize_pedal_params(config, params, sampling_strategy="mean"):
@@ -5863,6 +5949,16 @@ def _pedal_loss_components(config, pedal_pred, pedal_target, mask, detail_compon
     raise ValueError("Only pedal_representation=binary_4 is supported")
 
 
+def _pedal_loss_mask(config, base_mask, score_shared_raw=None):
+    pedal_mask = base_mask.bool()
+    if not bool(getattr(config, "mask_zero_score_ioi_pedal_loss", True)):
+        return pedal_mask
+    if score_shared_raw is None:
+        return pedal_mask
+    zero_mask = _zero_score_ioi_mask(config, score_shared_raw, attention_mask=pedal_mask)
+    return pedal_mask & ~zero_mask
+
+
 def _beta_nll_loss(raw_mu, raw_kappa, target, mask, eps, kappa_min):
     target = target.float().clamp(eps, 1.0 - eps)
     _, _, alpha, beta = _beta_params(raw_mu.float(), raw_kappa.float(), eps=eps, kappa_min=kappa_min)
@@ -5990,6 +6086,7 @@ def _compute_dinr_loss_components(
         duration_mask &= label_valid_mask[..., 1].bool()
         if label_valid_mask.shape[-1] > 2:
             velocity_mask &= label_valid_mask[..., 2].bool()
+    pedal_mask = _pedal_loss_mask(config, mask, score_shared_raw=score_shared_raw)
     separated_vocabulary = str(getattr(config, "dinr_vocabulary_mode", "unified")).lower() == "separated"
     ioi_target = _dinr_quantize(config, ioi_target_value)
     if separated_vocabulary:
@@ -6015,8 +6112,14 @@ def _compute_dinr_loss_components(
     if pedal_dim == 4 and logits["pedal"].shape[-1] == 2:
         pedal_losses = []
         for idx in range(4):
-            target = (labels_continuous[..., 3 + idx] >= 0.5).long()
-            pedal_losses.append(_hard_categorical_loss(logits["pedal"][..., idx, :], target, mask))
+            target = labels_continuous[..., 3 + idx].float().clamp(0.0, 1.0)
+            binary_logit = logits["pedal"][..., idx, 1] - logits["pedal"][..., idx, 0]
+            values = F.binary_cross_entropy_with_logits(
+                binary_logit.float(),
+                target,
+                reduction="none",
+            )
+            pedal_losses.append(_masked_mean(values, pedal_mask))
         losses["pedal"] = torch.stack(pedal_losses).mean()
     else:
         losses["pedal"] = F.binary_cross_entropy_with_logits(
@@ -6024,7 +6127,7 @@ def _compute_dinr_loss_components(
             labels_continuous[..., 3 : 3 + pedal_dim].float(),
             reduction="none",
         ).mean(dim=-1)
-        losses["pedal"] = _masked_mean(losses["pedal"], mask)
+        losses["pedal"] = _masked_mean(losses["pedal"], pedal_mask)
     return losses
 
 
@@ -6541,6 +6644,7 @@ def _compute_integrated_loss_components(
     feature_mask = label_valid_mask.bool() if label_valid_mask is not None else None
     distribution = getattr(config, "epr_distribution", "point").lower()
     detail_components = {}
+    pedal_mask = _pedal_loss_mask(config, mask, score_shared_raw=score_shared_raw)
     if distribution in DINR_DISTRIBUTIONS:
         if score_shared_raw is None:
             raise ValueError("DINR loss requires score_shared_raw")
@@ -6653,7 +6757,7 @@ def _compute_integrated_loss_components(
             config,
             params["pedal_binary_logits"],
             labels_continuous[..., 3 : 3 + pedal_dim],
-            mask,
+            pedal_mask,
             detail_components,
         )
         detail_components.update(
@@ -6815,7 +6919,7 @@ def _compute_integrated_loss_components(
             config,
             params["pedal_binary_logits"],
             labels_continuous[..., pedal_start : pedal_start + pedal_dim],
-            mask,
+            pedal_mask,
             detail_components,
         )
     elif _is_scalar_distribution(distribution):
@@ -6873,7 +6977,7 @@ def _compute_integrated_loss_components(
             config,
             params["pedal_binary_logits"],
             labels_continuous[..., 3 : 3 + pedal_dim],
-            mask,
+            pedal_mask,
             detail_components,
         )
         variance_lambda = float(getattr(config, "predictive_variance_lambda", 0.0))
@@ -6957,7 +7061,7 @@ def _compute_integrated_loss_components(
             config,
             continuous_pred[..., -pedal_dim:],
             labels_continuous[..., 3 : 3 + pedal_dim],
-            mask,
+            pedal_mask,
             detail_components,
         )
     else:
@@ -6991,7 +7095,7 @@ def _compute_integrated_loss_components(
             config,
             pred[..., pedal_pred_start : pedal_pred_start + pedal_dim],
             labels_continuous[..., pedal_start : pedal_start + pedal_dim],
-            mask,
+            pedal_mask,
             detail_components,
         )
     for index, name in enumerate(pedal_names):
@@ -7000,7 +7104,7 @@ def _compute_integrated_loss_components(
         detail_components[name] = _bce_loss(
             pedal_logits_for_detail[..., index],
             pedal_target_for_detail[..., index],
-            mask,
+            pedal_detail_mask,
         )
     components = {
         "ioi": loss_ioi,
@@ -7797,6 +7901,69 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
             _share_slot_attribute_encoders(self.note_encoder, self.decoder_note_encoder)
         self.style_token_encoder = IntegratedStyleTokenEncoder(config) if config.use_style_tokens else None
         self.model = IntegratedPianoT5GemmaModel(config)
+        self.asd_decoders = None
+        self.asd_group_decoders = None
+        self.asd_shared_decoder = None
+        self.asd_upper_decoders = None
+        self.asd_shared_decoder_layers = int(getattr(config, "asd_shared_decoder_layers", 1))
+        self.asd_attribute_decoder_layers = int(getattr(config, "asd_attribute_decoder_layers", 1))
+        if getattr(config, "decoder_arch", "single") == "asd_full4":
+            if str(getattr(config, "decoder_input_mode", "score")).lower() != "ar":
+                raise ValueError("decoder_arch=asd_full4 currently supports decoder_input_mode='ar' only")
+            if _uses_timing_expression_decoder_tokens(config):
+                raise ValueError("decoder_arch=asd_full4 is not compatible with 2N timing/expression decoder tokens")
+            self.asd_decoders = nn.ModuleDict(
+                {
+                    "ioi": self.model.decoder,
+                    "duration": T5GemmaDecoder(config.decoder),
+                    "velocity": T5GemmaDecoder(config.decoder),
+                    "pedal": T5GemmaDecoder(config.decoder),
+                }
+            )
+        elif getattr(config, "decoder_arch", "single") == "asd_group2":
+            if str(getattr(config, "decoder_input_mode", "score")).lower() != "ar":
+                raise ValueError("decoder_arch=asd_group2 currently supports decoder_input_mode='ar' only")
+            if _uses_timing_expression_decoder_tokens(config):
+                raise ValueError("decoder_arch=asd_group2 is not compatible with 2N timing/expression decoder tokens")
+            self.asd_group_decoders = nn.ModuleDict(
+                {
+                    "timing": self.model.decoder,
+                    "expression": T5GemmaDecoder(config.decoder),
+                }
+            )
+        elif getattr(config, "decoder_arch", "single") == "asd_pedal_solo":
+            if str(getattr(config, "decoder_input_mode", "score")).lower() != "ar":
+                raise ValueError("decoder_arch=asd_pedal_solo currently supports decoder_input_mode='ar' only")
+            if _uses_timing_expression_decoder_tokens(config):
+                raise ValueError("decoder_arch=asd_pedal_solo is not compatible with 2N timing/expression decoder tokens")
+            self.asd_group_decoders = nn.ModuleDict(
+                {
+                    "main": self.model.decoder,
+                    "pedal": T5GemmaDecoder(config.decoder),
+                }
+            )
+        elif getattr(config, "decoder_arch", "single") == "asd_shared2_upper2":
+            if str(getattr(config, "decoder_input_mode", "score")).lower() != "ar":
+                raise ValueError("decoder_arch=asd_shared2_upper2 currently supports decoder_input_mode='ar' only")
+            if _uses_timing_expression_decoder_tokens(config):
+                raise ValueError(
+                    "decoder_arch=asd_shared2_upper2 is not compatible with 2N timing/expression decoder tokens"
+                )
+            if self.asd_shared_decoder_layers < 1 or self.asd_attribute_decoder_layers < 1:
+                raise ValueError("asd_shared_decoder_layers and asd_attribute_decoder_layers must be >= 1")
+            shared_decoder_config = copy.deepcopy(config.decoder)
+            shared_decoder_config.num_hidden_layers = self.asd_shared_decoder_layers
+            upper_decoder_config = copy.deepcopy(config.decoder)
+            upper_decoder_config.num_hidden_layers = self.asd_attribute_decoder_layers
+            self.asd_shared_decoder = T5GemmaDecoder(shared_decoder_config)
+            self.asd_upper_decoders = nn.ModuleDict(
+                {
+                    "ioi": T5GemmaDecoder(upper_decoder_config),
+                    "duration": T5GemmaDecoder(upper_decoder_config),
+                    "velocity": T5GemmaDecoder(upper_decoder_config),
+                    "pedal": T5GemmaDecoder(upper_decoder_config),
+                }
+            )
         self.continuous_decoder = IntegratedContinuousDecoder(config)
         _share_dinr_value_tables(self.note_encoder, self.decoder_note_encoder, self.continuous_decoder)
         self.decoder_target_task_embeddings = (
@@ -7814,6 +7981,12 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
         return self.model.encoder
 
     def get_decoder(self):
+        if self.asd_decoders is not None:
+            return self.asd_decoders
+        if self.asd_group_decoders is not None:
+            return self.asd_group_decoders
+        if self.asd_shared_decoder is not None:
+            return self.asd_shared_decoder
         return self.model.decoder
 
     def load_pianoformer_backbone(self, pretrained_model_path, torch_dtype=None):
@@ -8008,6 +8181,183 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
             return decoder_inputs_embeds, attention_mask
         raise ValueError(f"Unsupported decoder_input_mode: {self.config.decoder_input_mode}")
 
+    def _uses_asd_full4(self):
+        return self.asd_decoders is not None
+
+    def _uses_asd_group2(self):
+        return self.asd_group_decoders is not None
+
+    def _uses_asd_shared(self):
+        return self.asd_shared_decoder is not None and self.asd_upper_decoders is not None
+
+    def _assign_group_raw_outputs(self, raw_by_attribute, group_name, raw):
+        if group_name == "timing":
+            raw_by_attribute["ioi"] = raw
+            raw_by_attribute["duration"] = raw
+        elif group_name == "expression":
+            raw_by_attribute["velocity"] = raw
+            raw_by_attribute["pedal"] = raw
+        elif group_name == "main":
+            raw_by_attribute["ioi"] = raw
+            raw_by_attribute["duration"] = raw
+            raw_by_attribute["velocity"] = raw
+        elif group_name == "pedal":
+            raw_by_attribute["pedal"] = raw
+        else:
+            raise ValueError(f"Unknown ASD group: {group_name}")
+
+    def _run_asd_decoders(
+        self,
+        context_attention_mask,
+        position_ids,
+        decoder_attention_mask,
+        decoder_position_ids,
+        encoder_outputs,
+        score_context_embeds,
+        decoder_inputs_embeds,
+        score_shared_raw=None,
+        style_kwargs=None,
+        use_cache=None,
+        cache_position=None,
+        **kwargs,
+    ):
+        style_kwargs = style_kwargs or {}
+        if encoder_outputs is None:
+            encoder_outputs = self.model.encoder(
+                attention_mask=context_attention_mask,
+                position_ids=position_ids,
+                inputs_embeds=score_context_embeds,
+                **kwargs,
+            )
+        raw_by_attribute = {}
+        first_outputs = None
+        for attr, decoder in self.asd_decoders.items():
+            decoder_outputs = decoder(
+                attention_mask=decoder_attention_mask,
+                position_ids=decoder_position_ids,
+                inputs_embeds=decoder_inputs_embeds,
+                past_key_values=None,
+                encoder_hidden_states=encoder_outputs.last_hidden_state,
+                encoder_attention_mask=context_attention_mask,
+                use_cache=False if use_cache is None else use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
+            if first_outputs is None:
+                first_outputs = decoder_outputs
+            hidden = self._apply_style_to_decoder_hidden(decoder_outputs.last_hidden_state, **style_kwargs)
+            hidden = self._add_decoder_target_task_embeddings(hidden)
+            raw_by_attribute[attr] = self.continuous_decoder(hidden, score_shared_raw=score_shared_raw)
+        return raw_by_attribute, first_outputs, encoder_outputs
+
+    def _run_asd_group_decoders(
+        self,
+        context_attention_mask,
+        position_ids,
+        decoder_attention_mask,
+        decoder_position_ids,
+        encoder_outputs,
+        score_context_embeds,
+        decoder_inputs_embeds,
+        score_shared_raw=None,
+        style_kwargs=None,
+        use_cache=None,
+        cache_position=None,
+        **kwargs,
+    ):
+        style_kwargs = style_kwargs or {}
+        if encoder_outputs is None:
+            encoder_outputs = self.model.encoder(
+                attention_mask=context_attention_mask,
+                position_ids=position_ids,
+                inputs_embeds=score_context_embeds,
+                **kwargs,
+            )
+        raw_by_attribute = {}
+        first_outputs = None
+        for group_name, decoder in self.asd_group_decoders.items():
+            decoder_outputs = decoder(
+                attention_mask=decoder_attention_mask,
+                position_ids=decoder_position_ids,
+                inputs_embeds=decoder_inputs_embeds,
+                past_key_values=None,
+                encoder_hidden_states=encoder_outputs.last_hidden_state,
+                encoder_attention_mask=context_attention_mask,
+                use_cache=False if use_cache is None else use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
+            if first_outputs is None:
+                first_outputs = decoder_outputs
+            hidden = self._apply_style_to_decoder_hidden(decoder_outputs.last_hidden_state, **style_kwargs)
+            hidden = self._add_decoder_target_task_embeddings(hidden)
+            raw = self.continuous_decoder(hidden, score_shared_raw=score_shared_raw)
+            self._assign_group_raw_outputs(raw_by_attribute, group_name, raw)
+        return raw_by_attribute, first_outputs, encoder_outputs
+
+    def _run_asd_shared_decoders(
+        self,
+        context_attention_mask,
+        position_ids,
+        decoder_attention_mask,
+        decoder_position_ids,
+        encoder_outputs,
+        score_context_embeds,
+        decoder_inputs_embeds,
+        score_shared_raw=None,
+        style_kwargs=None,
+        use_cache=None,
+        cache_position=None,
+        **kwargs,
+    ):
+        style_kwargs = style_kwargs or {}
+        if encoder_outputs is None:
+            encoder_outputs = self.model.encoder(
+                attention_mask=context_attention_mask,
+                position_ids=position_ids,
+                inputs_embeds=score_context_embeds,
+                **kwargs,
+            )
+        shared_outputs = self.asd_shared_decoder(
+            attention_mask=decoder_attention_mask,
+            position_ids=decoder_position_ids,
+            inputs_embeds=decoder_inputs_embeds,
+            past_key_values=None,
+            encoder_hidden_states=encoder_outputs.last_hidden_state,
+            encoder_attention_mask=context_attention_mask,
+            use_cache=False if use_cache is None else use_cache,
+            cache_position=cache_position,
+            **kwargs,
+        )
+        shared_hidden = self._apply_style_to_decoder_hidden(shared_outputs.last_hidden_state, **style_kwargs)
+        shared_hidden = self._add_decoder_target_task_embeddings(shared_hidden)
+        raw_by_attribute = {}
+        first_outputs = None
+        for attr, upper_decoder in self.asd_upper_decoders.items():
+            upper_outputs = upper_decoder(
+                attention_mask=decoder_attention_mask,
+                position_ids=decoder_position_ids,
+                inputs_embeds=shared_hidden,
+                past_key_values=None,
+                encoder_hidden_states=encoder_outputs.last_hidden_state,
+                encoder_attention_mask=context_attention_mask,
+                use_cache=False if use_cache is None else use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
+            if first_outputs is None:
+                first_outputs = upper_outputs
+            upper_hidden = self._apply_style_to_decoder_hidden(upper_outputs.last_hidden_state, **style_kwargs)
+            upper_hidden = self._add_decoder_target_task_embeddings(upper_hidden)
+            raw_by_attribute[attr] = self.continuous_decoder(upper_hidden, score_shared_raw=score_shared_raw)
+        return raw_by_attribute, first_outputs, encoder_outputs
+
+    def _asd_continuous_decoder(self, hidden_by_attribute, score_shared_raw=None):
+        raw_by_attribute = {}
+        for attr, hidden in hidden_by_attribute.items():
+            raw_by_attribute[attr] = self.continuous_decoder(hidden, score_shared_raw=score_shared_raw)
+        return _merge_asd_attribute_raw_outputs(self.config, raw_by_attribute)
+
     def forward(
         self,
         pitch_ids: Optional[torch.LongTensor] = None,
@@ -8173,33 +8523,82 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
         if decoder_attention_mask is None:
             decoder_attention_mask = decoder_input_mask
 
-        decoder_outputs = self.model(
-            attention_mask=context_attention_mask,
-            position_ids=position_ids,
-            decoder_attention_mask=decoder_attention_mask,
-            decoder_position_ids=decoder_position_ids,
-            encoder_outputs=encoder_outputs,
-            past_key_values=past_key_values,
-            inputs_embeds=score_context_embeds,
-            decoder_inputs_embeds=decoder_inputs_embeds,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            **kwargs,
-        )
-
-        decoder_hidden = self._apply_style_to_decoder_hidden(
-            decoder_outputs.last_hidden_state,
-            **style_kwargs,
-        )
-        decoder_hidden = self._add_decoder_target_task_embeddings(decoder_hidden)
         decoder_score_shared_raw = (
             _expand_note_sequence_2n(score_shared_raw)
             if _uses_timing_expression_decoder_tokens(self.config)
             else score_shared_raw
         )
-        continuous_pred = self.continuous_decoder(decoder_hidden, score_shared_raw=decoder_score_shared_raw)
-        if _uses_timing_expression_decoder_tokens(self.config):
-            continuous_pred = _merge_timing_expression_raw_outputs(self.config, continuous_pred)
+        if self._uses_asd_full4():
+            raw_by_attribute, decoder_outputs, asd_encoder_outputs = self._run_asd_decoders(
+                context_attention_mask=context_attention_mask,
+                position_ids=position_ids,
+                decoder_attention_mask=decoder_attention_mask,
+                decoder_position_ids=decoder_position_ids,
+                encoder_outputs=encoder_outputs,
+                score_context_embeds=score_context_embeds,
+                decoder_inputs_embeds=decoder_inputs_embeds,
+                score_shared_raw=decoder_score_shared_raw,
+                style_kwargs=style_kwargs,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
+            continuous_pred = _merge_asd_attribute_raw_outputs(self.config, raw_by_attribute)
+        elif self._uses_asd_group2():
+            raw_by_attribute, decoder_outputs, asd_encoder_outputs = self._run_asd_group_decoders(
+                context_attention_mask=context_attention_mask,
+                position_ids=position_ids,
+                decoder_attention_mask=decoder_attention_mask,
+                decoder_position_ids=decoder_position_ids,
+                encoder_outputs=encoder_outputs,
+                score_context_embeds=score_context_embeds,
+                decoder_inputs_embeds=decoder_inputs_embeds,
+                score_shared_raw=decoder_score_shared_raw,
+                style_kwargs=style_kwargs,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
+            continuous_pred = _merge_asd_attribute_raw_outputs(self.config, raw_by_attribute)
+        elif self._uses_asd_shared():
+            raw_by_attribute, decoder_outputs, asd_encoder_outputs = self._run_asd_shared_decoders(
+                context_attention_mask=context_attention_mask,
+                position_ids=position_ids,
+                decoder_attention_mask=decoder_attention_mask,
+                decoder_position_ids=decoder_position_ids,
+                encoder_outputs=encoder_outputs,
+                score_context_embeds=score_context_embeds,
+                decoder_inputs_embeds=decoder_inputs_embeds,
+                score_shared_raw=decoder_score_shared_raw,
+                style_kwargs=style_kwargs,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
+            continuous_pred = _merge_asd_attribute_raw_outputs(self.config, raw_by_attribute)
+        else:
+            decoder_outputs = self.model(
+                attention_mask=context_attention_mask,
+                position_ids=position_ids,
+                decoder_attention_mask=decoder_attention_mask,
+                decoder_position_ids=decoder_position_ids,
+                encoder_outputs=encoder_outputs,
+                past_key_values=past_key_values,
+                inputs_embeds=score_context_embeds,
+                decoder_inputs_embeds=decoder_inputs_embeds,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
+            decoder_hidden = self._apply_style_to_decoder_hidden(
+                decoder_outputs.last_hidden_state,
+                **style_kwargs,
+            )
+            decoder_hidden = self._add_decoder_target_task_embeddings(decoder_hidden)
+            continuous_pred = self.continuous_decoder(decoder_hidden, score_shared_raw=decoder_score_shared_raw)
+            if _uses_timing_expression_decoder_tokens(self.config):
+                continuous_pred = _merge_timing_expression_raw_outputs(self.config, continuous_pred)
         continuous_pred = self._apply_zero_ioi_residual(continuous_pred, score_shared_raw)
         if labels_continuous is None:
             if self.config.task_type == "epr":
@@ -8240,12 +8639,32 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
             loss=loss,
             logits=continuous_pred,
             past_key_values=decoder_outputs.past_key_values,
-            decoder_hidden_states=decoder_outputs.decoder_hidden_states,
-            decoder_attentions=decoder_outputs.decoder_attentions,
+            decoder_hidden_states=getattr(
+                decoder_outputs,
+                "decoder_hidden_states",
+                getattr(decoder_outputs, "hidden_states", None),
+            ),
+            decoder_attentions=getattr(
+                decoder_outputs,
+                "decoder_attentions",
+                getattr(decoder_outputs, "attentions", None),
+            ),
             cross_attentions=decoder_outputs.cross_attentions,
-            encoder_last_hidden_state=decoder_outputs.encoder_last_hidden_state,
-            encoder_hidden_states=decoder_outputs.encoder_hidden_states,
-            encoder_attentions=decoder_outputs.encoder_attentions,
+            encoder_last_hidden_state=(
+                asd_encoder_outputs.last_hidden_state
+                if (self._uses_asd_full4() or self._uses_asd_group2() or self._uses_asd_shared())
+                else decoder_outputs.encoder_last_hidden_state
+            ),
+            encoder_hidden_states=(
+                asd_encoder_outputs.hidden_states
+                if (self._uses_asd_full4() or self._uses_asd_group2() or self._uses_asd_shared())
+                else decoder_outputs.encoder_hidden_states
+            ),
+            encoder_attentions=(
+                asd_encoder_outputs.attentions
+                if (self._uses_asd_full4() or self._uses_asd_group2() or self._uses_asd_shared())
+                else decoder_outputs.encoder_attentions
+            ),
         )
 
     def predict_performance_continuous(
@@ -8520,6 +8939,110 @@ class IntegratedPianoT5Gemma(IntegratedStyleTokenMixin, T5GemmaPreTrainedModel, 
         predictions = []
         if prefix_predictions is not None and prefix_len > 0:
             predictions.extend(prefix_predictions[:, idx : idx + 1] for idx in range(prefix_len))
+
+        if self._uses_asd_full4() or self._uses_asd_group2() or self._uses_asd_shared():
+            for step in range(prefix_len, seq_len):
+                prefix_width = step + 1
+                decoder_inputs_embeds = self.decoder_note_encoder(
+                    decoder_pitch_ids[:, :prefix_width],
+                    decoder_input_continuous[:, :prefix_width],
+                    special_note_ids=special_note_ids[:, :prefix_width],
+                    role="decoder",
+                )
+                decoder_inputs_embeds = self._apply_style_to_decoder_inputs(
+                    decoder_inputs_embeds,
+                    **style_kwargs,
+                )
+                raw_by_attribute = {}
+                if self._uses_asd_full4():
+                    for attr, decoder in self.asd_decoders.items():
+                        decoder_outputs = decoder(
+                            attention_mask=attention_mask[:, :prefix_width],
+                            inputs_embeds=decoder_inputs_embeds,
+                            encoder_hidden_states=encoder_outputs.last_hidden_state,
+                            encoder_attention_mask=context_attention_mask,
+                            use_cache=False,
+                        )
+                        decoder_hidden = self._apply_style_to_decoder_hidden(
+                            decoder_outputs.last_hidden_state,
+                            **style_kwargs,
+                        )
+                        step_hidden = decoder_hidden[:, -1:, :]
+                        raw_by_attribute[attr] = self.continuous_decoder(
+                            step_hidden,
+                            score_shared_raw=score_shared_raw[:, step : step + 1],
+                        )
+                elif self._uses_asd_group2():
+                    for group_name, decoder in self.asd_group_decoders.items():
+                        decoder_outputs = decoder(
+                            attention_mask=attention_mask[:, :prefix_width],
+                            inputs_embeds=decoder_inputs_embeds,
+                            encoder_hidden_states=encoder_outputs.last_hidden_state,
+                            encoder_attention_mask=context_attention_mask,
+                            use_cache=False,
+                        )
+                        decoder_hidden = self._apply_style_to_decoder_hidden(
+                            decoder_outputs.last_hidden_state,
+                            **style_kwargs,
+                        )
+                        step_hidden = decoder_hidden[:, -1:, :]
+                        raw = self.continuous_decoder(
+                            step_hidden,
+                            score_shared_raw=score_shared_raw[:, step : step + 1],
+                        )
+                        self._assign_group_raw_outputs(raw_by_attribute, group_name, raw)
+                else:
+                    shared_outputs = self.asd_shared_decoder(
+                        attention_mask=attention_mask[:, :prefix_width],
+                        inputs_embeds=decoder_inputs_embeds,
+                        encoder_hidden_states=encoder_outputs.last_hidden_state,
+                        encoder_attention_mask=context_attention_mask,
+                        use_cache=False,
+                    )
+                    shared_hidden = self._apply_style_to_decoder_hidden(
+                        shared_outputs.last_hidden_state,
+                        **style_kwargs,
+                    )
+                    for attr, decoder in self.asd_upper_decoders.items():
+                        upper_outputs = decoder(
+                            attention_mask=attention_mask[:, :prefix_width],
+                            inputs_embeds=shared_hidden,
+                            encoder_hidden_states=encoder_outputs.last_hidden_state,
+                            encoder_attention_mask=context_attention_mask,
+                            use_cache=False,
+                        )
+                        upper_hidden = self._apply_style_to_decoder_hidden(
+                            upper_outputs.last_hidden_state,
+                            **style_kwargs,
+                        )
+                        step_hidden = upper_hidden[:, -1:, :]
+                        raw_by_attribute[attr] = self.continuous_decoder(
+                            step_hidden,
+                            score_shared_raw=score_shared_raw[:, step : step + 1],
+                        )
+                step_raw = _merge_asd_attribute_raw_outputs(self.config, raw_by_attribute)
+                step_raw = self._apply_zero_ioi_residual(step_raw, score_shared_raw[:, step : step + 1])
+                if self.config.task_type == "removed_task":
+                    step_pred = _materialize_removed_task_prediction(self.config, step_raw)
+                else:
+                    step_pred = _materialize_epr_prediction(
+                        self.config,
+                        step_raw,
+                        sampling_strategy=sampling_strategy,
+                        score_shared_raw=score_shared_raw[:, step : step + 1],
+                    )
+                predictions.append(step_pred)
+
+                if step + 1 < seq_len:
+                    decoder_input_continuous[:, step + 1] = _build_epr_decoder_rows(
+                        self.config,
+                        score_shared_raw[:, step : step + 1],
+                        step_pred,
+                        score_input_continuous=continuous[:, step : step + 1],
+                    )[:, 0]
+
+            output = torch.cat(predictions, dim=1) if predictions else continuous.new_zeros((batch_size, 0, self.config.output_continuous_dim))
+            return output
 
         # Use KV cache for efficient autoregressive decoding
         # Step 0: process first token with full prefix

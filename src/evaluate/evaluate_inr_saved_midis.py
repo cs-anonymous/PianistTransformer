@@ -36,9 +36,9 @@ def parse_args():
     parser.add_argument("--score-source-list", type=Path, default=None)
     parser.add_argument(
         "--pedal-support",
-        choices=["auto", "raw", "binary"],
+        choices=["auto", "raw", "soft", "binary"],
         default="auto",
-        help="Pedal metric support. Binary thresholds MIDI CC64 values into {0,1}.",
+        help="Pedal metric support. Soft compares MIDI CC64 values on [0,1]. Binary keeps the legacy thresholded metric.",
     )
     parser.add_argument("--pedal-binary-threshold", type=float, default=64.0)
     return parser.parse_args()
@@ -96,21 +96,50 @@ def binary_pedal_arrays(note_arrays, threshold=64.0):
     }
 
 
-def raw_or_thresholded_pred_pedal_arrays(prediction_path, raw_output_path=None, threshold=64.0):
+def soft_pedal_arrays(note_arrays):
+    return {
+        key: np.clip(np.asarray(note_arrays[key], dtype=np.float64), 0.0, 127.0) / 127.0
+        for key in ("pedal_0", "pedal_25", "pedal_50", "pedal_75")
+    }
+
+
+def raw_or_soft_pred_pedal_arrays(prediction_path, raw_output_path=None):
     if raw_output_path is not None:
         try:
             return cached_raw_output_pedal_arrays(str(Path(raw_output_path).resolve()))
         except Exception:
             pass
+    return soft_pedal_arrays(cached_note_arrays(str(Path(prediction_path).resolve())))
+
+
+def raw_or_thresholded_pred_pedal_arrays(prediction_path, raw_output_path=None, threshold=64.0):
+    if raw_output_path is not None:
+        try:
+            raw_arrays = cached_raw_output_pedal_arrays(str(Path(raw_output_path).resolve()))
+            return {
+                key: (np.asarray(value, dtype=np.float64) >= (float(threshold) / 127.0)).astype(np.float64)
+                for key, value in raw_arrays.items()
+            }
+        except Exception:
+            pass
     return binary_pedal_arrays(cached_note_arrays(str(Path(prediction_path).resolve())), threshold=threshold)
 
 
-def pp_wass_metrics(prediction_paths, gt_paths, raw_output_paths=None, pedal_binary_support=False, pedal_binary_threshold=64.0):
+def pp_wass_metrics(prediction_paths, gt_paths, raw_output_paths=None, pedal_support="raw", pedal_binary_threshold=64.0):
     pred_arrays = [cached_note_arrays(path) for path in prediction_paths]
     gt_arrays = [cached_note_arrays(path) for path in gt_paths]
     pred_pedal_arrays = None
     gt_pedal_arrays = None
-    if pedal_binary_support:
+    if pedal_support == "soft":
+        pred_pedal_arrays = [
+            raw_or_soft_pred_pedal_arrays(
+                prediction_paths[idx],
+                raw_output_path=raw_output_paths[idx] if raw_output_paths is not None and idx < len(raw_output_paths) else None,
+            )
+            for idx in range(len(prediction_paths))
+        ]
+        gt_pedal_arrays = [soft_pedal_arrays(item) for item in gt_arrays]
+    elif pedal_support == "binary":
         pred_pedal_arrays = [
             raw_or_thresholded_pred_pedal_arrays(
                 prediction_paths[idx],
@@ -135,8 +164,8 @@ def pp_wass_metrics(prediction_paths, gt_paths, raw_output_paths=None, pedal_bin
         gt_pool = np.concatenate([log_timing_values(item[feature_name]) for item in gt_source]) if gt_source else np.asarray([], dtype=np.float64)
         output[f"{metric_name}_wass"] = feature_wasserstein(pred_pool, gt_pool)
 
-    pedal_pred_source = pred_pedal_arrays if pedal_binary_support else pred_arrays
-    pedal_gt_source = gt_pedal_arrays if pedal_binary_support else gt_arrays
+    pedal_pred_source = pred_pedal_arrays if pedal_support in {"soft", "binary"} else pred_arrays
+    pedal_gt_source = gt_pedal_arrays if pedal_support in {"soft", "binary"} else gt_arrays
     output["pedal_wass"] = finite_mean(
         [
             feature_wasserstein(
@@ -149,13 +178,22 @@ def pp_wass_metrics(prediction_paths, gt_paths, raw_output_paths=None, pedal_bin
     return output
 
 
-def pn_wass_metrics(prediction_paths, gt_paths, raw_output_paths=None, pedal_binary_support=False, pedal_binary_threshold=64.0):
+def pn_wass_metrics(prediction_paths, gt_paths, raw_output_paths=None, pedal_support="raw", pedal_binary_threshold=64.0):
     pred_arrays = [cached_note_arrays(path) for path in prediction_paths]
     gt_arrays = [cached_note_arrays(path) for path in gt_paths]
     all_arrays = pred_arrays + gt_arrays
     pred_pedal_arrays = None
     gt_pedal_arrays = None
-    if pedal_binary_support:
+    if pedal_support == "soft":
+        pred_pedal_arrays = [
+            raw_or_soft_pred_pedal_arrays(
+                prediction_paths[idx],
+                raw_output_path=raw_output_paths[idx] if raw_output_paths is not None and idx < len(raw_output_paths) else None,
+            )
+            for idx in range(len(prediction_paths))
+        ]
+        gt_pedal_arrays = [soft_pedal_arrays(item) for item in gt_arrays]
+    elif pedal_support == "binary":
         pred_pedal_arrays = [
             raw_or_thresholded_pred_pedal_arrays(
                 prediction_paths[idx],
@@ -194,9 +232,9 @@ def pn_wass_metrics(prediction_paths, gt_paths, raw_output_paths=None, pedal_bin
         ]
         output[f"{metric_name}_wass"] = finite_mean(note_wass)
 
-    pedal_pred_source = pred_pedal_arrays if pedal_binary_support else pred_arrays
-    pedal_gt_source = gt_pedal_arrays if pedal_binary_support else gt_arrays
-    pedal_all_source = (pred_pedal_arrays + gt_pedal_arrays) if pedal_binary_support else all_arrays
+    pedal_pred_source = pred_pedal_arrays if pedal_support in {"soft", "binary"} else pred_arrays
+    pedal_gt_source = gt_pedal_arrays if pedal_support in {"soft", "binary"} else gt_arrays
+    pedal_all_source = (pred_pedal_arrays + gt_pedal_arrays) if pedal_support in {"soft", "binary"} else all_arrays
     output["pedal_wass"] = finite_mean(
         [
             finite_mean(
@@ -214,7 +252,7 @@ def pn_wass_metrics(prediction_paths, gt_paths, raw_output_paths=None, pedal_bin
     return output
 
 
-def score_level_metrics(item, max_gt_per_score=None, pedal_binary_support=False, pedal_binary_threshold=64.0):
+def score_level_metrics(item, max_gt_per_score=None, pedal_support="raw", pedal_binary_threshold=64.0):
     prediction_paths = item["prediction_paths"]
     raw_output_paths = item.get("raw_output_paths")
     gt_paths = item["ground_truth_paths"]
@@ -225,14 +263,14 @@ def score_level_metrics(item, max_gt_per_score=None, pedal_binary_support=False,
         prediction_paths,
         gt_paths,
         raw_output_paths=raw_output_paths,
-        pedal_binary_support=pedal_binary_support,
+        pedal_support=pedal_support,
         pedal_binary_threshold=pedal_binary_threshold,
     )
     pp_wass = pp_wass_metrics(
         prediction_paths,
         gt_paths,
         raw_output_paths=raw_output_paths,
-        pedal_binary_support=pedal_binary_support,
+        pedal_support=pedal_support,
         pedal_binary_threshold=pedal_binary_threshold,
     )
 
@@ -246,11 +284,11 @@ def score_level_metrics(item, max_gt_per_score=None, pedal_binary_support=False,
 
 
 def score_level_metrics_worker(args):
-    item, max_gt_per_score, pedal_binary_support, pedal_binary_threshold = args
+    item, max_gt_per_score, pedal_support, pedal_binary_threshold = args
     return score_level_metrics(
         item,
         max_gt_per_score=max_gt_per_score,
-        pedal_binary_support=pedal_binary_support,
+        pedal_support=pedal_support,
         pedal_binary_threshold=pedal_binary_threshold,
     )
 
@@ -307,7 +345,7 @@ def load_manifest_and_config(manifest_path, score_source_list=None):
     return manifest, config
 
 
-def evaluate_manifest(manifest, max_gt_per_score=None, num_workers=10, pedal_binary_support=False, pedal_binary_threshold=64.0):
+def evaluate_manifest(manifest, max_gt_per_score=None, num_workers=10, pedal_support="raw", pedal_binary_threshold=64.0):
     if num_workers and num_workers > 1:
         ctx = get_context("spawn")
         with ctx.Pool(processes=num_workers) as pool:
@@ -315,7 +353,7 @@ def evaluate_manifest(manifest, max_gt_per_score=None, num_workers=10, pedal_bin
                 pool.imap(
                     score_level_metrics_worker,
                     (
-                        (item, max_gt_per_score, pedal_binary_support, pedal_binary_threshold)
+                        (item, max_gt_per_score, pedal_support, pedal_binary_threshold)
                         for item in manifest["items"]
                     ),
                     chunksize=1,
@@ -326,7 +364,7 @@ def evaluate_manifest(manifest, max_gt_per_score=None, num_workers=10, pedal_bin
             score_level_metrics(
                 item,
                 max_gt_per_score=max_gt_per_score,
-                pedal_binary_support=pedal_binary_support,
+                pedal_support=pedal_support,
                 pedal_binary_threshold=pedal_binary_threshold,
             )
             for item in manifest["items"]
@@ -342,9 +380,9 @@ def main():
     score_source_list = load_score_source_filter(args.score_source_list)
     manifest, config = load_manifest_and_config(args.prediction_manifest, score_source_list=score_source_list)
     if args.pedal_support == "auto":
-        pedal_binary_support = str(config.get("pedal_representation", "")).lower() == "binary_4"
+        pedal_support = "soft" if str(config.get("pedal_representation", "")).lower() == "binary_4" else "raw"
     else:
-        pedal_binary_support = args.pedal_support == "binary"
+        pedal_support = args.pedal_support
     pedal_binary_threshold = (
         args.pedal_binary_threshold
         if args.pedal_support != "auto"
@@ -354,7 +392,7 @@ def main():
         manifest,
         max_gt_per_score=args.max_gt_per_score,
         num_workers=args.num_workers,
-        pedal_binary_support=pedal_binary_support,
+        pedal_support=pedal_support,
         pedal_binary_threshold=pedal_binary_threshold,
     )
     score_rows = evaluation["score_rows"]
@@ -364,8 +402,8 @@ def main():
         "protocol": manifest["protocol"],
         "num_samples": manifest["num_samples"],
         "num_scores": len(score_rows),
-        "pedal_metric_support": "binary_0_1" if pedal_binary_support else "raw_0_127",
-        "pedal_binary_threshold": pedal_binary_threshold if pedal_binary_support else None,
+        "pedal_metric_support": "soft_0_1" if pedal_support == "soft" else "binary_0_1" if pedal_support == "binary" else "raw_0_127",
+        "pedal_binary_threshold": pedal_binary_threshold if pedal_support == "binary" else None,
         "aggregate": {
             "pn_wass": aggregate_score_metrics(score_rows, "pn_wass"),
             "pp_wass": aggregate_score_metrics(score_rows, "pp_wass"),

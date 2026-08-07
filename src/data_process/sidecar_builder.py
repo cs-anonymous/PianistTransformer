@@ -5,6 +5,13 @@ from pathlib import Path
 import torch
 
 
+def _saved_sidecar_path(dataset, path):
+    cache_path = dataset._prepared_disk_cache_path(path)
+    if cache_path is not None:
+        return Path(cache_path)
+    return Path(dataset._prepared_sidecar_paths(path)[0])
+
+
 def _validate_score_feature_payload(score_payload, path):
     pitch = score_payload.get("pitch") or []
     score_feature = score_payload.get("score_feature")
@@ -146,7 +153,7 @@ def build_sidecar_for_work(
         prepared["meta"] = dict(work["meta"])
     prepared["performance_time_normalization"] = performance_time_normalization or "none"
     dataset._save_prepared_to_disk(path, prepared)
-    return dataset._prepared_disk_cache_path(path)
+    return _saved_sidecar_path(dataset, path)
 
 
 def build_ready_sidecar_for_work(
@@ -221,9 +228,7 @@ def build_ready_sidecar_for_work(
     prepared["_cache_signature"] = dataset._build_ready_sidecar_signature()
     prepared["_source_identity"] = dataset._source_identity(path)
     prepared["performance_time_normalization"] = performance_time_normalization or "none"
-    cache_path = dataset._prepared_disk_cache_path(path)
-    if cache_path is None:
-        cache_path = dataset._prepared_sidecar_paths(path)[0]
+    cache_path = _saved_sidecar_path(dataset, path)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.tmp")
     torch.save(prepared, tmp_path)

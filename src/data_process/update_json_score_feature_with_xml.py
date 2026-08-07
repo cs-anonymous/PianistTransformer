@@ -51,13 +51,18 @@ WORKER_ARGS: argparse.Namespace | None = None
 
 
 def find_refined_dir(pianocore_dir: Path) -> Path:
+    pianocore_dir = Path(pianocore_dir)
     candidates = [
+        pianocore_dir,
         pianocore_dir / "PianoCoRe" / "refined",
         pianocore_dir / "PianoCoRe-1.0" / "refined",
         pianocore_dir / "refined",
     ]
     for candidate in candidates:
-        if candidate.exists():
+        if candidate.exists() and (
+            (candidate / "metadata.csv").exists()
+            or any(candidate.rglob("score_ASAP_refined.mid"))
+        ):
             return candidate
     raise FileNotFoundError("Could not find PianoCoRe refined directory")
 

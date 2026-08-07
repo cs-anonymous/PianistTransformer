@@ -13,7 +13,7 @@ def _processed_relative_path(path):
     parts = Path(path).parts
     processed_index = None
     for idx, part in enumerate(parts):
-        if part == "processed" or part.endswith("_processed"):
+        if part == "processed" or part.endswith("_processed") or "_processed_" in part:
             processed_index = idx
             break
     if processed_index is None:

@@ -17,6 +17,8 @@ BASE_NUM_TRAIN_EPOCHS="${BASE_NUM_TRAIN_EPOCHS:-8}"
 ADAPT_NUM_TRAIN_EPOCHS="${ADAPT_NUM_TRAIN_EPOCHS:-16}"
 ADAPT_PREPARED_SIDECAR_TAG="${ADAPT_PREPARED_SIDECAR_TAG:-}"
 BASE_PREPARED_SIDECAR_TAG="${BASE_PREPARED_SIDECAR_TAG:-}"
+FIXED_WINDOW_SPLIT_SUMMARY_PATH_OVERRIDE="${FIXED_WINDOW_SPLIT_SUMMARY_PATH_OVERRIDE:-}"
+FIXED_WINDOW_SPLIT_SCHEME_OVERRIDE="${FIXED_WINDOW_SPLIT_SCHEME_OVERRIDE:-}"
 BASE_ASAP_ONLY="${BASE_ASAP_ONLY:-0}"
 SKIP_BASE_TRAIN="${SKIP_BASE_TRAIN:-0}"
 BASE_CHECKPOINT_OVERRIDE="${BASE_CHECKPOINT_OVERRIDE:-}"
@@ -135,12 +137,12 @@ run_train() {
 write_train_config() {
   local src="$1" dst="$2" output_root="$3" log_root="$4" epochs="$5" resume_path="$6" asap_only="$7"
   python - "$src" "$dst" "$output_root" "$log_root" "$epochs" "$resume_path" "$asap_only" \
-    "$BATCH_SIZE_PER_DEVICE" "$GRADIENT_ACCUMULATION_STEPS" "$GLOBAL_BATCH_SIZE" "${ADAPT_PREPARED_SIDECAR_TAG}" "${BASE_PREPARED_SIDECAR_TAG}" <<'PY'
+    "$BATCH_SIZE_PER_DEVICE" "$GRADIENT_ACCUMULATION_STEPS" "$GLOBAL_BATCH_SIZE" "${ADAPT_PREPARED_SIDECAR_TAG}" "${BASE_PREPARED_SIDECAR_TAG}" "${FIXED_WINDOW_SPLIT_SUMMARY_PATH_OVERRIDE}" "${FIXED_WINDOW_SPLIT_SCHEME_OVERRIDE}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-src, dst, output_root, log_root, epochs, resume_path, asap_only, per_device_bs, grad_accum, global_bs, adapt_sidecar_tag, base_sidecar_tag = sys.argv[1:13]
+src, dst, output_root, log_root, epochs, resume_path, asap_only, per_device_bs, grad_accum, global_bs, adapt_sidecar_tag, base_sidecar_tag, split_summary_override, split_scheme_override = sys.argv[1:15]
 cfg = json.loads(Path(src).read_text(encoding="utf-8"))
 if cfg.get("task_type", "epr").lower() != "epr":
     raise SystemExit("run_inr_epr_pipeline.sh requires task_type=epr")
@@ -175,6 +177,10 @@ cfg.setdefault("fixed_window_base_split", "train")
 cfg.setdefault("fixed_window_train_split_name", "train")
 cfg.setdefault("fixed_window_eval_split_name", "valid")
 cfg.setdefault("fixed_window_split_summary_path", "data/train_valid_asap3_nonasap05_v1_summary.json")
+if split_summary_override:
+    cfg["fixed_window_split_summary_path"] = split_summary_override
+if split_scheme_override:
+    cfg["fixed_window_split_scheme"] = split_scheme_override
 cfg["load_best_model_at_end"] = True
 cfg["metric_for_best_model"] = "eval_loss"
 cfg["greater_is_better"] = False

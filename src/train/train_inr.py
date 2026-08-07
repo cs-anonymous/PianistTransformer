@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from torch.utils.data.sampler import SequentialSampler
 from tqdm.auto import tqdm
 from transformers import EarlyStoppingCallback, Trainer, TrainingArguments
+from transformers.modeling_outputs import BaseModelOutput
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in os.sys.path:
@@ -36,6 +37,7 @@ from src.model.integrated_pianoformer import (
     _dlm_log_bin_probs,
     _materialize_epr_prediction,
     _split_epr_mixture_params,
+    _target7_to_raw7,
     _torch_floor_log_reconstruct,
     _zero_score_ioi_mask,
 )
@@ -561,9 +563,8 @@ def _compose_label_raw_rows(perf, pedal_representation="binary_4", pedal_binary_
             return None
     if len(shared_rows) != len(pedal_rows):
         raise ValueError(f"label_shared_raw/label_pedal4_raw length mismatch: {len(shared_rows)} vs {len(pedal_rows)}")
-    threshold = float(pedal_binary_threshold)
     return [
-        list(shared[:3]) + [127.0 if float(value) >= threshold else 0.0 for value in list(pedal[:4])]
+        list(shared[:3]) + [min(max(float(value), 0.0), 127.0) for value in list(pedal[:4])]
         for shared, pedal in zip(shared_rows, pedal_rows)
     ]
 
@@ -662,7 +663,6 @@ def performance_dev_velocity_pedal4_binary_rows(
             f"label_shared_raw/label_pedal4_raw length mismatch: {len(shared_rows)} vs {len(pedal_rows)}"
         )
 
-    threshold = float(pedal_binary_threshold)
     rows = []
     for index, (score_row, perf_row, pedal_row) in enumerate(zip(score_shared_raw, shared_rows, pedal_rows)):
         log_ioi = normalize_ioi_dev(
@@ -678,7 +678,7 @@ def performance_dev_velocity_pedal4_binary_rows(
             log_scale=log_scale,
         )
         velocity = min(max(float(perf_row[2]), 0.0), 127.0) / 127.0
-        pedal = [1.0 if float(value) >= threshold else 0.0 for value in pedal_row[:4]]
+        pedal = [min(max(float(value), 0.0), 127.0) / 127.0 for value in pedal_row[:4]]
         rows.append([log_ioi, log_duration, velocity, *pedal])
     return rows
 
@@ -1265,7 +1265,6 @@ def build_removed_task_performance_input_rows(
             f"label_shared_raw/label_pedal4_raw length mismatch: {len(shared_rows)} vs {len(pedal_rows)}"
         )
 
-    threshold = float(pedal_binary_threshold)
     rows = []
     for raw_shared, pedal in zip(shared_rows, pedal_rows):
         score_control = [0.0] * timing_control_feature_dim(
@@ -1280,7 +1279,7 @@ def build_removed_task_performance_input_rows(
                 log_scale=log_scale,
             )
             + [
-                *[1.0 if float(value) >= threshold else 0.0 for value in pedal[:4]],
+                *[min(max(float(value), 0.0), 127.0) / 127.0 for value in pedal[:4]],
             ]
         )
         masks = [0.0, 1.0, 0.0]
@@ -1302,6 +1301,14 @@ def distributed_info():
 
 
 def configure_eval_schedule(train_config, train_examples):
+    if bool(train_config.get("rollout_hr_enabled", False)):
+        train_config["eval_strategy"] = "epoch"
+        train_config["save_strategy"] = "epoch"
+        train_config["load_best_model_at_end"] = True
+        eval_k = int(train_config.get("rollout_hr_eval_k", 16) or 16)
+        train_config["metric_for_best_model"] = f"eval_rollout_k{eval_k}_avg_hr"
+        train_config["greater_is_better"] = False
+        return
     asap_only = str(train_config.get("train_performance_dataset", "")).strip().upper() == "ASAP"
     if asap_only:
         world_size = int(os.environ.get("WORLD_SIZE", "1") or 1)
@@ -1317,9 +1324,63 @@ def configure_eval_schedule(train_config, train_examples):
     train_config["save_strategy"] = "steps"
     train_config["eval_steps"] = eval_steps
     train_config["save_steps"] = eval_steps
+    if train_config.get("force_eval_steps") is not None:
+        train_config["eval_steps"] = int(train_config["force_eval_steps"])
+    if train_config.get("force_save_steps") is not None:
+        train_config["save_steps"] = int(train_config["force_save_steps"])
     train_config.setdefault("load_best_model_at_end", True)
     train_config.setdefault("metric_for_best_model", "eval_loss")
     train_config.setdefault("greater_is_better", False)
+
+
+def split_manifest_windows_for_eval(manifest, fraction, seed):
+    """Split deterministic windows from the train manifest into an eval manifest."""
+    fraction = float(fraction)
+    if fraction <= 0.0 or not manifest:
+        return manifest, []
+
+    candidates = []
+    total_examples = sum(int(item.get("estimated_examples", 0)) for item in manifest)
+    target_examples = max(1, int(round(total_examples * fraction)))
+    for item_index, item in enumerate(manifest):
+        sources = list(item.get("selected_performance_sources") or [])
+        weight = max(1, len(sources))
+        for window_index, window in enumerate(item.get("windows") or []):
+            key = f"{seed}:{item.get('path', item_index)}:{window[0]}:{window[1]}"
+            stable_key = hashlib.sha256(key.encode("utf-8")).hexdigest()
+            candidates.append((stable_key, item_index, window_index, weight))
+
+    selected = set()
+    selected_examples = 0
+    for _, item_index, window_index, weight in sorted(candidates):
+        item_windows = manifest[item_index].get("windows") or []
+        if len(item_windows) <= 1:
+            continue
+        selected.add((item_index, window_index))
+        selected_examples += weight
+        if selected_examples >= target_examples:
+            break
+
+    if not selected:
+        return manifest, []
+
+    train_manifest = []
+    eval_manifest = []
+    for item_index, item in enumerate(manifest):
+        windows = list(item.get("windows") or [])
+        eval_windows = [window for window_index, window in enumerate(windows) if (item_index, window_index) in selected]
+        train_windows = [window for window_index, window in enumerate(windows) if (item_index, window_index) not in selected]
+        if train_windows:
+            train_item = dict(item)
+            train_item["windows"] = train_windows
+            train_item["estimated_examples"] = len(train_windows) * max(1, len(item.get("selected_performance_sources") or []))
+            train_manifest.append(train_item)
+        if eval_windows:
+            eval_item = dict(item)
+            eval_item["windows"] = eval_windows
+            eval_item["estimated_examples"] = len(eval_windows) * max(1, len(item.get("selected_performance_sources") or []))
+            eval_manifest.append(eval_item)
+    return train_manifest, eval_manifest
 
 
 def build_style_vocabs(metadata_path):
@@ -2313,8 +2374,6 @@ def _pn_pp_metric_w1_loss(config, logits, labels, score_shared_raw, attention_ma
 
     for group_id in torch.unique(group_index, sorted=True):
         rows = group_index == group_id
-        if int(rows.sum().item()) < 2:
-            continue
         group_valid = valid[rows]
         for feature in features:
             group_probs = pred[feature][0][rows]
@@ -2369,9 +2428,156 @@ def _pn_pp_metric_w1_loss(config, logits, labels, score_shared_raw, attention_ma
     return output
 
 
+def _pp_pedal_w1_loss(config, logits, labels, attention_mask, group_index):
+    """Per-window binary-pedal W1, normalized to the test human baseline."""
+    params = _split_epr_mixture_params(config, logits)
+    if "pedal_binary_logits" not in params or labels.shape[-1] < 7:
+        return logits.sum() * 0.0
+    probabilities = params["pedal_binary_logits"].float().sigmoid()
+    targets = labels[..., 3:7].float().clamp(0.0, 1.0)
+    valid = attention_mask.bool()
+    terms = []
+    for group_id in torch.unique(group_index, sorted=True):
+        rows = group_index == group_id
+        group_valid = valid[rows]
+        if not group_valid.any():
+            continue
+        pred_mean = probabilities[rows][group_valid].reshape(-1, 4).mean(dim=0)
+        target_mean = targets[rows][group_valid].reshape(-1, 4).mean(dim=0)
+        terms.append((pred_mean - target_mean).abs().mean())
+    if not terms:
+        return logits.sum() * 0.0
+    normalizer = max(float(getattr(config, "pp_pedal_w1_normalizer", 0.07682493502888045)), 1e-6)
+    return torch.stack(terms).mean() / normalizer
+
+
 class NodeSFTTrainer(Trainer):
     def _model_config(self, model):
         return model.module.config if hasattr(model, "module") else model.config
+
+    def _rollout_hr_training_loss(self, model, inputs):
+        if not bool(getattr(self, "rollout_hr_enabled", False)) or not model.training:
+            return None, {}
+        fraction = min(max(float(getattr(self, "rollout_hr_batch_fraction", 0.0)), 0.0), 1.0)
+        rollout_k = max(0, int(getattr(self, "rollout_hr_k", 0)))
+        labels = inputs.get("labels_continuous")
+        if fraction <= 0.0 or rollout_k <= 0 or labels is None or labels.shape[0] == 0:
+            return None, {}
+
+        batch_size = int(labels.shape[0])
+        selected_count = max(1, int(math.ceil(batch_size * fraction)))
+        counter = int(getattr(self, "_rollout_hr_batch_counter", 0))
+        self._rollout_hr_batch_counter = counter + 1
+        rank = int(torch.distributed.get_rank()) if torch.distributed.is_available() and torch.distributed.is_initialized() else 0
+        generator = torch.Generator(device=labels.device)
+        generator.manual_seed(
+            int(getattr(self, "rollout_hr_seed", 42))
+            + 1000003 * int(self.state.global_step)
+            + 1009 * counter
+            + rank
+        )
+        selected = torch.randperm(batch_size, generator=generator, device=labels.device)[:selected_count]
+
+        def take(name):
+            value = inputs.get(name)
+            return value.index_select(0, selected) if torch.is_tensor(value) and value.shape[0] == batch_size else value
+
+        batch = {
+            name: take(name)
+            for name in (
+                "pitch_ids",
+                "continuous",
+                "score_shared_raw",
+                "labels_continuous",
+                "labels_epr_bins",
+                "label_mask",
+                "label_valid_mask",
+                "attention_mask",
+                "style_creator_id",
+                "style_source_id",
+                "style_score_stats",
+                "style_perf_stats",
+                "style_perf_is_pad",
+            )
+            if inputs.get(name) is not None
+        }
+        feedback = None
+        cached_encoder_outputs = None
+        sampling_strategy = str(getattr(self, "rollout_hr_sampling_strategy", "sample"))
+        with torch.no_grad(), self.autocast_smart_context_manager():
+            for pass_idx in range(rollout_k):
+                rollout_outputs = model(
+                    **batch,
+                    decoder_feedback_continuous=feedback,
+                    encoder_outputs=cached_encoder_outputs,
+                    continuous_sampling_strategy=sampling_strategy,
+                )
+                # Score-side inputs do not change across rollout passes. Cache
+                # the first no-grad encoder result instead of recomputing the
+                # paper baseline's 8-layer encoder k times. The final pass below
+                # deliberately recomputes it with gradients so the HR loss still
+                # trains the encoder.
+                if pass_idx == 0 and rollout_k > 1:
+                    cached_encoder_outputs = BaseModelOutput(
+                        last_hidden_state=rollout_outputs.encoder_last_hidden_state.detach(),
+                        hidden_states=None,
+                        attentions=None,
+                    )
+                feedback = _materialize_epr_prediction(
+                    self._model_config(model),
+                    rollout_outputs.logits,
+                    sampling_strategy=sampling_strategy,
+                    score_shared_raw=batch["score_shared_raw"],
+                ).detach()
+
+        # The final pass must rebuild the encoder with gradients. Drop the
+        # detached rollout cache first so bs32/n50 does not hold two encoder
+        # activation sets at once.
+        del cached_encoder_outputs
+        del rollout_outputs
+        final_outputs = model(
+            **batch,
+            decoder_feedback_continuous=feedback,
+            continuous_sampling_strategy=sampling_strategy,
+        )
+        group_index = torch.arange(selected_count, device=labels.device, dtype=torch.long)
+        objective_mode = str(getattr(self, "rollout_hr_mode", "pp")).lower()
+        if objective_mode not in {"pn", "pp", "pn_pp"}:
+            raise ValueError(f"Unsupported rollout_hr_mode={objective_mode!r}")
+        use_pn = objective_mode in {"pn", "pn_pp"}
+        use_pp = objective_mode in {"pp", "pn_pp"}
+        components = _pn_pp_metric_w1_loss(
+            self._model_config(model),
+            final_outputs.logits,
+            batch["labels_continuous"],
+            batch["score_shared_raw"],
+            batch["attention_mask"],
+            group_index,
+            compute_pn=("ioi", "duration", "velocity") if use_pn else (),
+            compute_pp=("ioi", "duration", "velocity") if use_pp else (),
+        )
+        zero = final_outputs.logits.sum() * 0.0
+        components["pp_pedal_w1"] = (
+            _pp_pedal_w1_loss(
+                self._model_config(model),
+                final_outputs.logits,
+                batch["labels_continuous"],
+                batch["attention_mask"],
+                group_index,
+            )
+            if use_pp
+            else zero
+        )
+        pn_metric = torch.stack(
+            [components["pn_ioi_w1"], components["pn_duration_w1"], components["pn_velocity_w1"]]
+        ).mean()
+        pp_metric = torch.stack(
+            [components["pp_ioi_w1"], components["pp_duration_w1"], components["pp_velocity_w1"], components["pp_pedal_w1"]]
+        ).mean()
+        components["pn_hr"] = pn_metric
+        components["pp_hr"] = pp_metric
+        metric = pn_metric + pp_metric if objective_mode == "pn_pp" else (pn_metric if use_pn else pp_metric)
+        return metric, components
 
     def _dagger_enabled(self):
         return bool(getattr(self, "dagger_prefix_training", False))
@@ -2941,8 +3147,43 @@ class NodeSFTTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         group_index = inputs.pop("pn_group_index", None)
         inputs.pop("pn_group_sizes", None)
+        replace_nll = (
+            self.model.training
+            and bool(getattr(self, "rollout_hr_enabled", False))
+            and bool(getattr(self, "rollout_hr_replace_nll", False))
+        )
+        if replace_nll:
+            rollout_hr_loss, rollout_hr_components = self._rollout_hr_training_loss(model, inputs)
+            if rollout_hr_loss is None:
+                raise RuntimeError("rollout_hr_replace_nll is enabled but rollout HR loss was not computed")
+            accumulator = getattr(self, "_train_loss_component_sums", None)
+            if accumulator is None:
+                accumulator = {}
+                self._train_loss_component_sums = accumulator
+            accumulator["rollout_hr_objective"] = accumulator.get("rollout_hr_objective", 0.0) + float(
+                rollout_hr_loss.detach().cpu()
+            )
+            for name, value in rollout_hr_components.items():
+                key = f"rollout_{name}"
+                accumulator[key] = accumulator.get(key, 0.0) + float(value.detach().cpu())
+            return (rollout_hr_loss, None) if return_outputs else rollout_hr_loss
+
         outputs = model(**inputs)
         loss = outputs.loss
+        rollout_hr_loss, rollout_hr_components = self._rollout_hr_training_loss(model, inputs)
+        if rollout_hr_loss is not None:
+            loss = loss + float(getattr(self, "rollout_hr_lambda", 0.0)) * rollout_hr_loss
+            if self.model.training:
+                accumulator = getattr(self, "_train_loss_component_sums", None)
+                if accumulator is None:
+                    accumulator = {}
+                    self._train_loss_component_sums = accumulator
+                accumulator["rollout_hr_objective"] = accumulator.get("rollout_hr_objective", 0.0) + float(
+                    rollout_hr_loss.detach().cpu()
+                )
+                for name, value in rollout_hr_components.items():
+                    key = f"rollout_{name}"
+                    accumulator[key] = accumulator.get(key, 0.0) + float(value.detach().cpu())
         config = self._model_config(model)
         if (
             self.model.training
@@ -3234,8 +3475,87 @@ class NodeSFTTrainer(Trainer):
                 flush=True,
             )
 
+    def _sync_epoch_checkpoint_aliases(self):
+        if not self.is_world_process_zero():
+            return
+        target_epochs = getattr(self, "save_epoch_aliases", None)
+        if not target_epochs:
+            return
+        current_epoch = getattr(getattr(self, "state", None), "epoch", None)
+        global_step = int(getattr(getattr(self, "state", None), "global_step", 0) or 0)
+        if current_epoch is None or global_step <= 0:
+            return
+        current_epoch = float(current_epoch)
+        source = Path(self.args.output_dir) / f"checkpoint-{global_step}"
+        if not source.exists() or not source.is_dir():
+            return
+        tolerance = float(getattr(self, "save_epoch_alias_tolerance", 1e-3) or 1e-3)
+        output_dir = Path(self.args.output_dir)
+        for target_epoch in target_epochs:
+            target_epoch = float(target_epoch)
+            if abs(current_epoch - target_epoch) > tolerance:
+                continue
+            epoch_label = ("%g" % target_epoch).replace(".", "p")
+            alias = output_dir / f"epoch-{epoch_label}"
+            if alias.exists():
+                continue
+            tmp_dir = output_dir / f".epoch-{epoch_label}.tmp-{os.getpid()}"
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            try:
+                shutil.copytree(source, tmp_dir)
+                (tmp_dir / ".epoch_source").write_text(
+                    json.dumps(
+                        {
+                            "source": str(source),
+                            "epoch": current_epoch,
+                            "target_epoch": target_epoch,
+                            "step": global_step,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                tmp_dir.rename(alias)
+                print(
+                    json.dumps(
+                        {
+                            "step": global_step,
+                            "event": "checkpoint_epoch_alias_synced",
+                            "epoch": current_epoch,
+                            "target_epoch": target_epoch,
+                            "source": str(source),
+                            "alias": str(alias),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            except Exception as exc:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                print(
+                    json.dumps(
+                        {
+                            "step": global_step,
+                            "event": "checkpoint_epoch_alias_sync_failed",
+                            "epoch": current_epoch,
+                            "target_epoch": target_epoch,
+                            "source": str(source),
+                            "alias": str(alias),
+                            "reason": str(exc),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+
     def _save_checkpoint(self, model, trial):
         super()._save_checkpoint(model, trial)
+        self._sync_epoch_checkpoint_aliases()
         self._sync_checkpoint_best_alias()
 
     def _rollout_eval_enabled(self):
@@ -3257,16 +3577,41 @@ class NodeSFTTrainer(Trainer):
         loader = self.get_eval_dataloader()
         was_training = self.model.training
         self.model.eval()
+        cpu_rng_state = torch.random.get_rng_state()
+        cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+        eval_seed = int(getattr(self, "rollout_hr_eval_seed", 42))
+        torch.manual_seed(eval_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(eval_seed)
         total_loss = 0.0
         total_weight = 0.0
+        total_pp_hr = 0.0
+        total_pn_hr = 0.0
+        total_examples = 0.0
+        max_examples = max(1, int(getattr(self, "rollout_hr_eval_num_examples", 40)))
+        config = self._model_config(self.model)
+        normalizers = {
+            "ioi": max(float(getattr(config, "pp_ioi_w1_normalizer", 7.952391192015138)), 1e-6),
+            "duration": max(float(getattr(config, "pp_duration_w1_normalizer", 25.9246360560533)), 1e-6),
+            "velocity": max(float(getattr(config, "pp_velocity_w1_normalizer", 3.057647553002258)), 1e-6),
+            "pedal": max(float(getattr(config, "pp_pedal_w1_normalizer", 0.07682493502888045)), 1e-6),
+        }
+        pn_normalizers = {
+            "ioi": max(float(getattr(config, "pn_ioi_w1_normalizer", 22.772456164440005)), 1e-6),
+            "duration": max(float(getattr(config, "pn_duration_w1_normalizer", 75.08565114668764)), 1e-6),
+            "velocity": max(float(getattr(config, "pn_velocity_w1_normalizer", 10.580359191566208)), 1e-6),
+        }
         try:
             for batch in loader:
+                if total_examples >= max_examples:
+                    break
                 batch = self._prepare_inputs(batch)
                 attention_mask = batch["attention_mask"]
                 batch_weight = float(attention_mask.detach().sum().float().cpu().item())
                 labels = batch["labels_continuous"]
                 feedback = None
                 step_loss = None
+                final_pred = None
                 with torch.no_grad(), self.autocast_smart_context_manager():
                     for pass_idx in range(rollout_k + 1):
                         outputs = self.model(
@@ -3281,28 +3626,74 @@ class NodeSFTTrainer(Trainer):
                             continuous_sampling_strategy=str(getattr(self, "rollout_eval_materialize_strategy", "sample")),
                         )
                         step_loss = outputs.loss
+                        final_pred = self._materialize_rollout_feedback(
+                            outputs.logits,
+                            score_shared_raw=batch["score_shared_raw"],
+                        )
                         if pass_idx < rollout_k:
-                            pred = self._materialize_rollout_feedback(
-                                outputs.logits,
-                                score_shared_raw=batch["score_shared_raw"],
-                            )
-                            feedback = pred.detach()
+                            feedback = final_pred.detach()
                 if step_loss is not None and batch_weight > 0.0:
                     total_loss += float(step_loss.detach().float().cpu().item()) * batch_weight
                     total_weight += batch_weight
+                    pred_raw = _target7_to_raw7(
+                        batch["score_shared_raw"], final_pred, config=config
+                    ).detach().float()
+                    gt_raw = _target7_to_raw7(
+                        batch["score_shared_raw"], labels, config=config
+                    ).detach().float()
+                    remaining = max_examples - int(total_examples)
+                    for row_idx in range(min(int(labels.shape[0]), remaining)):
+                        row_valid = attention_mask[row_idx].bool()
+                        if not row_valid.any():
+                            continue
+                        feature_terms = []
+                        pn_feature_terms = []
+                        for column, name in ((0, "ioi"), (1, "duration"), (2, "velocity")):
+                            pred_values = pred_raw[row_idx, row_valid, column].sort().values
+                            gt_values = gt_raw[row_idx, row_valid, column].sort().values
+                            feature_terms.append((pred_values - gt_values).abs().mean() / normalizers[name])
+                            pn_feature_terms.append(
+                                (pred_raw[row_idx, row_valid, column] - gt_raw[row_idx, row_valid, column])
+                                .abs()
+                                .mean()
+                                / pn_normalizers[name]
+                            )
+                        pred_pedal = (pred_raw[row_idx, row_valid, 3:7] >= 64.0).float()
+                        gt_pedal = (gt_raw[row_idx, row_valid, 3:7] >= 64.0).float()
+                        pedal_w1 = (pred_pedal.mean(dim=0) - gt_pedal.mean(dim=0)).abs().mean()
+                        feature_terms.append(pedal_w1 / normalizers["pedal"])
+                        total_pp_hr += float(torch.stack(feature_terms).mean().cpu())
+                        total_pn_hr += float(torch.stack(pn_feature_terms).mean().cpu())
+                        total_examples += 1.0
         finally:
+            torch.random.set_rng_state(cpu_rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state(cuda_rng_state)
             if was_training:
                 self.model.train()
 
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
-            values = torch.tensor([total_loss, total_weight], dtype=torch.float64, device=device)
+            values = torch.tensor(
+                [total_loss, total_weight, total_pp_hr, total_pn_hr, total_examples], dtype=torch.float64, device=device
+            )
             torch.distributed.all_reduce(values, op=torch.distributed.ReduceOp.SUM)
             total_loss = float(values[0].item())
             total_weight = float(values[1].item())
+            total_pp_hr = float(values[2].item())
+            total_pn_hr = float(values[3].item())
+            total_examples = float(values[4].item())
         if total_weight <= 0.0:
             return None
-        return total_loss / total_weight
+        pp_hr = total_pp_hr / max(total_examples, 1.0)
+        pn_hr = total_pn_hr / max(total_examples, 1.0)
+        return {
+            "loss": total_loss / total_weight,
+            "pp_hr": pp_hr,
+            "pn_hr": pn_hr,
+            "avg_hr": 0.5 * (pp_hr + pn_hr),
+            "examples": total_examples,
+        }
 
     def _inject_rollout_eval_metrics(self, metrics):
         if not self._rollout_eval_enabled():
@@ -3320,13 +3711,18 @@ class NodeSFTTrainer(Trainer):
                 ),
                 flush=True,
             )
-        rollout_loss = self._rollout_eval_loss_for_k(rollout_k)
-        if rollout_loss is None:
+        rollout_result = self._rollout_eval_loss_for_k(rollout_k)
+        if rollout_result is None:
             return metrics
+        rollout_loss = float(rollout_result["loss"])
         tf_loss = float(metrics.get("eval_loss", 0.0))
         weight = float(getattr(self, "rollout_eval_weight", 1.0))
         combined = tf_loss + weight * float(rollout_loss)
         metrics[f"eval_rollout_k{rollout_k}_loss"] = float(rollout_loss)
+        metrics[f"eval_rollout_k{rollout_k}_pp_hr"] = float(rollout_result["pp_hr"])
+        metrics[f"eval_rollout_k{rollout_k}_pn_hr"] = float(rollout_result["pn_hr"])
+        metrics[f"eval_rollout_k{rollout_k}_avg_hr"] = float(rollout_result["avg_hr"])
+        metrics[f"eval_rollout_k{rollout_k}_hr_examples"] = float(rollout_result["examples"])
         metrics["eval_tf_loss"] = tf_loss
         metrics["eval_loss"] = float(combined)
         if self.is_world_process_zero():
@@ -3344,6 +3740,11 @@ class NodeSFTTrainer(Trainer):
                 flush=True,
             )
         return metrics
+
+    def evaluation_loop(self, *args, **kwargs):
+        output = super().evaluation_loop(*args, **kwargs)
+        metrics = self._inject_rollout_eval_metrics(dict(output.metrics or {}))
+        return output._replace(metrics=metrics)
 
     def evaluate(self, *args, **kwargs):
         eval_started = time.time()
@@ -3405,7 +3806,6 @@ class NodeSFTTrainer(Trainer):
 
         metrics = self._inject_eval_loss_components(metrics)
         self._update_last_eval_log_history(metrics)
-        metrics = self._inject_rollout_eval_metrics(metrics)
         if self._dagger_enabled() and bool(getattr(self, "dagger_refresh_on_eval", True)):
             self.refresh_dagger_prefix_cache(reason="eval")
         if not self.is_world_process_zero():
@@ -4018,6 +4418,10 @@ def create_model(train_config):
         output_task_adapter_depth=train_config.get("output_task_adapter_depth", 2),
         output_task_adapter_width_multiplier=train_config.get("output_task_adapter_width_multiplier", 0.5),
         decoder_task_token_mode=train_config.get("decoder_task_token_mode", "note"),
+        decoder_arch=train_config.get("decoder_arch", "single"),
+        asd_attributes=train_config.get("asd_attributes"),
+        asd_shared_decoder_layers=train_config.get("asd_shared_decoder_layers", 1),
+        asd_attribute_decoder_layers=train_config.get("asd_attribute_decoder_layers", 1),
         epr_distribution=train_config.get("epr_distribution", "point"),
         pedal_distribution=train_config.get("pedal_distribution"),
         epr_mixture_components=train_config.get("epr_mixture_components", 1),
@@ -4098,6 +4502,7 @@ def create_model(train_config):
         pp_duration_w1_normalizer=train_config.get("pp_duration_w1_normalizer", 20.449834140491266),
         pn_velocity_w1_normalizer=train_config.get("pn_velocity_w1_normalizer", 10.580359191566208),
         pp_velocity_w1_normalizer=train_config.get("pp_velocity_w1_normalizer", 3.070947106636113),
+        pp_pedal_w1_normalizer=train_config.get("pp_pedal_w1_normalizer", 0.07682493502888045),
         ioi_w1_bins=train_config.get("ioi_w1_bins", 256),
         duration_w1_bins=train_config.get("duration_w1_bins", 256),
         ioi_w1_min=train_config.get("ioi_w1_min", 0.0),
@@ -4635,6 +5040,16 @@ def main():
             prepared_sidecar_tag=train_config.get("prepared_sidecar_tag"),
         )
 
+    eval_from_train_fraction = train_config.get("eval_from_train_fraction")
+    if eval_from_train_fraction is not None and not fixed_window_split_scheme:
+        train_manifest, eval_manifest = split_manifest_windows_for_eval(
+            train_manifest,
+            fraction=eval_from_train_fraction,
+            seed=train_config.get("seed", 42),
+        )
+        train_dataset_split = "train"
+        eval_dataset_split = "train"
+
     max_train_epochs = float(train_config.get("max_train_epochs", 8.0))
     train_config["num_train_epochs"] = min(float(train_config.get("num_train_epochs", 1.0)), max_train_epochs)
     if "adapt_num_train_epochs" in train_config:
@@ -4811,6 +5226,18 @@ def main():
     trainer.rollout_eval_weight = float(train_config.get("rollout_eval_weight", 1.0))
     trainer.rollout_eval_materialize_strategy = train_config.get("rollout_eval_materialize_strategy", "sample")
     trainer.rollout_eval_feedback_strategy = train_config.get("rollout_eval_feedback_strategy", "sample")
+    trainer.rollout_hr_enabled = bool(train_config.get("rollout_hr_enabled", False))
+    trainer.rollout_hr_replace_nll = bool(train_config.get("rollout_hr_replace_nll", False))
+    trainer.rollout_hr_mode = str(train_config.get("rollout_hr_mode", "pp"))
+    trainer.rollout_hr_lambda = float(train_config.get("rollout_hr_lambda", 0.0))
+    trainer.rollout_hr_batch_fraction = float(train_config.get("rollout_hr_batch_fraction", 0.0))
+    trainer.rollout_hr_k = int(train_config.get("rollout_hr_k", 0) or 0)
+    trainer.rollout_hr_seed = int(train_config.get("rollout_hr_seed", train_config.get("seed", 42)))
+    trainer.rollout_hr_sampling_strategy = train_config.get("rollout_hr_sampling_strategy", "sample")
+    trainer.rollout_hr_eval_num_examples = int(train_config.get("rollout_hr_eval_num_examples", 40) or 40)
+    trainer.rollout_hr_eval_seed = int(train_config.get("rollout_hr_eval_seed", train_config.get("seed", 42)))
+    trainer.save_epoch_aliases = train_config.get("save_epoch_aliases")
+    trainer.save_epoch_alias_tolerance = train_config.get("save_epoch_alias_tolerance", 1e-3)
     trainer.loss_component_logging_steps = train_config.get(
         "loss_component_logging_steps",
         train_config.get("logging_steps", 0),
