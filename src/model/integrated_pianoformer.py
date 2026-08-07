@@ -428,6 +428,7 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         zero_timing_head_condition=False,
         zero_ioi_dual_distribution_mode="none",
         zero_ioi_dual_duration=True,
+        mask_zero_score_ioi_pedal_loss=False,
         piano_pitch_min=21,
         pedal_representation="binary_4",
         use_style_tokens=False,
@@ -822,6 +823,7 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
                 f"got {self.zero_ioi_dual_distribution_mode}"
             )
         self.zero_ioi_dual_duration = bool(zero_ioi_dual_duration)
+        self.mask_zero_score_ioi_pedal_loss = bool(mask_zero_score_ioi_pedal_loss)
         self.piano_pitch_min = int(piano_pitch_min)
         if bool(use_style_tokens):
             raise ValueError("use_style_tokens is disabled for the simplified EPR/removed_task pipelines")
@@ -5863,6 +5865,16 @@ def _pedal_loss_components(config, pedal_pred, pedal_target, mask, detail_compon
     raise ValueError("Only pedal_representation=binary_4 is supported")
 
 
+def _pedal_loss_mask(config, base_mask, score_shared_raw=None):
+    pedal_mask = base_mask.bool()
+    if not bool(getattr(config, "mask_zero_score_ioi_pedal_loss", False)):
+        return pedal_mask
+    if score_shared_raw is None:
+        return pedal_mask
+    zero_mask = _zero_score_ioi_mask(config, score_shared_raw, attention_mask=pedal_mask)
+    return pedal_mask & ~zero_mask
+
+
 def _beta_nll_loss(raw_mu, raw_kappa, target, mask, eps, kappa_min):
     target = target.float().clamp(eps, 1.0 - eps)
     _, _, alpha, beta = _beta_params(raw_mu.float(), raw_kappa.float(), eps=eps, kappa_min=kappa_min)
@@ -5990,6 +6002,7 @@ def _compute_dinr_loss_components(
         duration_mask &= label_valid_mask[..., 1].bool()
         if label_valid_mask.shape[-1] > 2:
             velocity_mask &= label_valid_mask[..., 2].bool()
+    pedal_mask = _pedal_loss_mask(config, mask, score_shared_raw=score_shared_raw)
     separated_vocabulary = str(getattr(config, "dinr_vocabulary_mode", "unified")).lower() == "separated"
     ioi_target = _dinr_quantize(config, ioi_target_value)
     if separated_vocabulary:
@@ -6016,7 +6029,7 @@ def _compute_dinr_loss_components(
         pedal_losses = []
         for idx in range(4):
             target = (labels_continuous[..., 3 + idx] >= 0.5).long()
-            pedal_losses.append(_hard_categorical_loss(logits["pedal"][..., idx, :], target, mask))
+            pedal_losses.append(_hard_categorical_loss(logits["pedal"][..., idx, :], target, pedal_mask))
         losses["pedal"] = torch.stack(pedal_losses).mean()
     else:
         losses["pedal"] = F.binary_cross_entropy_with_logits(
@@ -6024,7 +6037,7 @@ def _compute_dinr_loss_components(
             labels_continuous[..., 3 : 3 + pedal_dim].float(),
             reduction="none",
         ).mean(dim=-1)
-        losses["pedal"] = _masked_mean(losses["pedal"], mask)
+        losses["pedal"] = _masked_mean(losses["pedal"], pedal_mask)
     return losses
 
 
@@ -6541,6 +6554,7 @@ def _compute_integrated_loss_components(
     feature_mask = label_valid_mask.bool() if label_valid_mask is not None else None
     distribution = getattr(config, "epr_distribution", "point").lower()
     detail_components = {}
+    pedal_mask = _pedal_loss_mask(config, mask, score_shared_raw=score_shared_raw)
     if distribution in DINR_DISTRIBUTIONS:
         if score_shared_raw is None:
             raise ValueError("DINR loss requires score_shared_raw")
@@ -6653,7 +6667,7 @@ def _compute_integrated_loss_components(
             config,
             params["pedal_binary_logits"],
             labels_continuous[..., 3 : 3 + pedal_dim],
-            mask,
+            pedal_mask,
             detail_components,
         )
         detail_components.update(
@@ -6815,7 +6829,7 @@ def _compute_integrated_loss_components(
             config,
             params["pedal_binary_logits"],
             labels_continuous[..., pedal_start : pedal_start + pedal_dim],
-            mask,
+            pedal_mask,
             detail_components,
         )
     elif _is_scalar_distribution(distribution):
@@ -6873,7 +6887,7 @@ def _compute_integrated_loss_components(
             config,
             params["pedal_binary_logits"],
             labels_continuous[..., 3 : 3 + pedal_dim],
-            mask,
+            pedal_mask,
             detail_components,
         )
         variance_lambda = float(getattr(config, "predictive_variance_lambda", 0.0))
@@ -6957,7 +6971,7 @@ def _compute_integrated_loss_components(
             config,
             continuous_pred[..., -pedal_dim:],
             labels_continuous[..., 3 : 3 + pedal_dim],
-            mask,
+            pedal_mask,
             detail_components,
         )
     else:
@@ -6991,7 +7005,7 @@ def _compute_integrated_loss_components(
             config,
             pred[..., pedal_pred_start : pedal_pred_start + pedal_dim],
             labels_continuous[..., pedal_start : pedal_start + pedal_dim],
-            mask,
+            pedal_mask,
             detail_components,
         )
     for index, name in enumerate(pedal_names):
@@ -7000,7 +7014,7 @@ def _compute_integrated_loss_components(
         detail_components[name] = _bce_loss(
             pedal_logits_for_detail[..., index],
             pedal_target_for_detail[..., index],
-            mask,
+            pedal_detail_mask,
         )
     components = {
         "ioi": loss_ioi,

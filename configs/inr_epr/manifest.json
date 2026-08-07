@@ -32,6 +32,9 @@
       "musical_no_onset",
       "musical_no_annotation",
       "musical_no_length"
+    ],
+    "baseline0807": [
+      "pedal_group_mask"
     ]
   },
   "configs": {
@@ -60,13 +63,15 @@
     "extra/musical_no_duration": "configs/extra__musical_no_duration.json",
     "extra/musical_no_onset": "configs/extra__musical_no_onset.json",
     "extra/musical_no_annotation": "configs/extra__musical_no_annotation.json",
-    "extra/musical_no_length": "configs/extra__musical_no_length.json"
+    "extra/musical_no_length": "configs/extra__musical_no_length.json",
+    "baseline0807/pedal_group_mask": "configs/inr_epr/baseline0807_pedal_group_mask.json"
   },
   "notes": [
     "Canonical base: ASAP_processed musical51 CINR bounded no-lossnorm 16ep.",
     "Reference experiment structural deltas are applied to the canonical base.",
     "Global content dedup ignores only output_dir/logging_dir/run_name.",
-    "Sampling: 3 independent tasks per score, 19 x 3 tasks, 8 inference workers, longest scores first."
+    "Sampling: 3 independent tasks per score, 19 x 3 tasks, 8 inference workers, longest scores first.",
+    "Baseline0807: ASAP_processed_pedal_group with binary_4 pedal and zero-score-IOI pedal loss mask."
   ],
   "metadata_path": "data/ASAP_processed/metadata.generated_json.csv"
 }

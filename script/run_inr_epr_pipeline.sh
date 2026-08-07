@@ -144,6 +144,11 @@ src, dst, output_root, log_root, epochs, resume_path, asap_only, per_device_bs, 
 cfg = json.loads(Path(src).read_text(encoding="utf-8"))
 if cfg.get("task_type", "epr").lower() != "epr":
     raise SystemExit("run_inr_epr_pipeline.sh requires task_type=epr")
+declared_train_dataset = str(cfg.get("train_performance_dataset", "") or "").strip().upper()
+declared_eval_dataset = str(cfg.get("eval_performance_dataset", "") or "").strip().upper()
+declares_asap_only = declared_train_dataset == "ASAP" or declared_eval_dataset == "ASAP"
+if declares_asap_only:
+    asap_only = "1"
 cfg["use_style_tokens"] = False
 cfg.setdefault("pedal_representation", "binary_4")
 target = str(cfg.get("epr_timing_target", "floor_log_deviation")).lower()

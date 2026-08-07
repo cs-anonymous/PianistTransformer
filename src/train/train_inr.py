@@ -1310,6 +1310,11 @@ def configure_eval_schedule(train_config, train_examples):
         global_batch_size = per_device * grad_accum * world_size
         steps_per_epoch = max(1, math.ceil(int(train_examples) / max(global_batch_size, 1)))
         eval_steps = steps_per_epoch
+        if eval_steps >= int(train_config.get("eval_steps_failfast_threshold", 500) or 500):
+            raise ValueError(
+                "ASAP-only training resolved to an unexpectedly large eval_steps="
+                f"{eval_steps}. Check train_performance_dataset, batch size, and split configuration."
+            )
     else:
         eval_steps = 1000
 
@@ -4183,6 +4188,7 @@ def create_model(train_config):
         zero_timing_head_condition=train_config.get("zero_timing_head_condition", False),
         zero_ioi_dual_distribution_mode=train_config.get("zero_ioi_dual_distribution_mode", "none"),
         zero_ioi_dual_duration=train_config.get("zero_ioi_dual_duration", True),
+        mask_zero_score_ioi_pedal_loss=train_config.get("mask_zero_score_ioi_pedal_loss", False),
         piano_pitch_min=train_config.get("piano_pitch_min", 21),
         pedal_representation=train_config.get("pedal_representation", "binary_4"),
         use_style_tokens=train_config.get("use_style_tokens", False),
