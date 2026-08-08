@@ -33,8 +33,8 @@ def parse_args():
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--split", default="valid")
     parser.add_argument("--performance-dataset", default="ASAP")
-    parser.add_argument("--m-values", default="32,64")
-    parser.add_argument("--rollout-ks", default="8,16,32")
+    parser.add_argument("--m-values", default=None)
+    parser.add_argument("--rollout-ks", default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch-size-windows", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -97,12 +97,12 @@ def choose_distinct_work_windows(manifest, m, seed):
     return out
 
 
-def make_dataset(config, manifest, split):
+def make_dataset(config, manifest, dataset_split):
     group_size = int(config.get("validation_multi_perf_group_size", 1024) or 1024)
     min_group = int(config.get("validation_multi_perf_min_group_size", 2) or 2)
     return PianoCoReNodeSFTDataset(
         manifest,
-        split=split,
+        split=dataset_split,
         task_type=config.get("task_type", "epr"),
         input_feature_mode=config.get("input_feature_mode", "integrated"),
         shuffle=False,
@@ -184,8 +184,8 @@ def evaluate_k(model, model_config, loader, device, rollout_k, materialize_strat
                 batch["score_shared_raw"],
                 attention_mask,
                 group_index,
-                compute_pn=("ioi", "duration", "velocity"),
-                compute_pp=("ioi", "duration", "velocity"),
+                compute_pn=("ioi", "duration", "velocity", "pedal"),
+                compute_pp=("ioi", "duration", "velocity", "pedal"),
             )
             weight = float(len(torch.unique(group_index).detach().cpu()))
             total_weight += weight
@@ -196,26 +196,40 @@ def evaluate_k(model, model_config, loader, device, rollout_k, materialize_strat
     averaged = {key: value / total_weight for key, value in totals.items()}
     raw = {}
     for prefix, human in (("pn", HUMAN_PN), ("pp", HUMAN_PP)):
-        rel_terms = []
-        for feature in ("ioi", "duration", "velocity"):
+        rel_terms3 = []
+        rel_terms4 = []
+        for feature in ("ioi", "duration", "velocity", "pedal"):
             key = f"{prefix}_{feature}_w1"
             raw_key = f"{prefix}_{feature}_w1_raw"
             raw_value = averaged[key] * _normalizer(model_config, prefix, feature)
             raw[raw_key] = raw_value
-            rel_terms.append(raw_value / human[f"{feature}_wass"])
-        raw[f"{prefix}_hr"] = sum(rel_terms) / len(rel_terms)
+            rel_value = raw_value / human[f"{feature}_wass"]
+            rel_terms4.append(rel_value)
+            if feature != "pedal":
+                rel_terms3.append(rel_value)
+        raw[f"{prefix}_hr3"] = sum(rel_terms3) / len(rel_terms3)
+        raw[f"{prefix}_hr"] = sum(rel_terms4) / len(rel_terms4)
     return {**averaged, **raw}
 
 
 def main():
     args = parse_args()
-    m_values = parse_int_list(args.m_values)
-    rollout_ks = parse_int_list(args.rollout_ks)
     device = torch.device(args.device if torch.cuda.is_available() or not str(args.device).startswith("cuda") else "cpu")
     config = load_config(args.config, args.checkpoint)
+    m_values = parse_int_list(
+        args.m_values
+        if args.m_values is not None
+        else config.get("validation_window_m", 64)
+    )
+    rollout_ks = parse_int_list(
+        args.rollout_ks
+        if args.rollout_ks is not None
+        else config.get("validation_rollout_k", 16)
+    )
     fixed_scheme = config.get("fixed_window_split_scheme")
     manifest_split = config.get("fixed_window_base_split", "train") if fixed_scheme else args.split
     window_split_name = config.get("fixed_window_eval_split_name", args.split) if fixed_scheme else None
+    dataset_split = manifest_split if fixed_scheme else args.split
     manifest = build_work_manifest(
         metadata_path=config["metadata_path"],
         refined_dir=config["refined_dir"],
@@ -231,7 +245,12 @@ def main():
         window_split_name=window_split_name,
         window_split_summary_path=config.get("fixed_window_split_summary_path"),
     )
-    available_works = len([item for item in manifest if item.get("windows")])
+    eligible_manifest = [
+        item
+        for item in manifest
+        if item.get("windows") and int(item.get("estimated_performances", 0) or 0) >= 2
+    ]
+    available_works = len(eligible_manifest)
     model = load_model(config, device)
     model_config = model.module.config if hasattr(model, "module") else model.config
 
@@ -240,7 +259,9 @@ def main():
         "split": args.split,
         "performance_dataset": args.performance_dataset,
         "available_distinct_works": available_works,
-        "feature_set": ["ioi", "duration", "velocity"],
+        "feature_set": ["ioi", "duration", "velocity", "pedal"],
+        "hr_feature_set": ["ioi", "duration", "velocity", "pedal"],
+        "hr3_feature_set": ["ioi", "duration", "velocity"],
         "m": {},
     }
     errors = {}
@@ -255,7 +276,16 @@ def main():
                 raise ValueError(message)
             continue
         selected = choose_distinct_work_windows(manifest, m=m, seed=args.seed + m)
-        dataset = make_dataset(config, selected, split=args.split)
+        selected_windows = [
+            {
+                "work_path": str(item["path"]),
+                "score_source": str(item.get("score_source", item["path"])),
+                "window": list(item["windows"][0]),
+                "estimated_performances": int(item.get("estimated_performances", 0) or 0),
+            }
+            for item in selected
+        ]
+        dataset = make_dataset(config, selected, dataset_split=dataset_split)
         collator = NodeSFTDataCollator(
             pitch_pad_id=config["pitch_pad_id"],
             task_type=config.get("task_type", "epr"),
@@ -275,9 +305,9 @@ def main():
             num_workers=int(args.num_workers),
             collate_fn=collator,
         )
-        results["m"][str(m)] = {}
+        results["m"][str(m)] = {"selected_windows": selected_windows, "metrics": {}}
         for k in rollout_ks:
-            results["m"][str(m)][str(k)] = evaluate_k(
+            results["m"][str(m)]["metrics"][str(k)] = evaluate_k(
                 model,
                 model_config,
                 loader,

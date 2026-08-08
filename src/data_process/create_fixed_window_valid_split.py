@@ -96,7 +96,47 @@ def _augment_non_asap(entries, selected, target_examples):
     return selected
 
 
-def build_fixed_scheme(manifest, asap_ratio, non_asap_ratio, selection_seed):
+def _augment_min_asap_works(entries, selected, min_works, min_performances):
+    if int(min_works) <= 0:
+        return selected
+    current = sum(
+        1
+        for entry in selected.values()
+        if int(entry.get("target_examples", 0)) >= int(min_performances)
+    )
+    if current >= int(min_works):
+        return selected
+
+    ordered = sorted(
+        [
+            entry
+            for entry in entries
+            if entry["path"] not in selected
+            and int(entry.get("target_examples", 0)) >= int(min_performances)
+        ],
+        key=lambda entry: (entry["random_key"], entry["score_source"]),
+    )
+    for entry in ordered:
+        if current >= int(min_works):
+            break
+        selected[entry["path"]] = entry
+        current += 1
+    if current < int(min_works):
+        raise ValueError(
+            f"Cannot select {min_works} ASAP validation works with at least "
+            f"{min_performances} performances; only {current} are available"
+        )
+    return selected
+
+
+def build_fixed_scheme(
+    manifest,
+    asap_ratio,
+    non_asap_ratio,
+    selection_seed,
+    min_asap_valid_works=0,
+    min_asap_performances=2,
+):
     asap_total_examples = 0
     non_asap_total_examples = 0
     for item in manifest:
@@ -115,6 +155,12 @@ def build_fixed_scheme(manifest, asap_ratio, non_asap_ratio, selection_seed):
 
     selected = _select_primary_asap(asap_entries, asap_target)
     selected = _augment_non_asap(non_asap_entries, selected, non_asap_target)
+    selected = _augment_min_asap_works(
+        asap_entries,
+        selected,
+        min_asap_valid_works,
+        min_asap_performances,
+    )
 
     by_path = {}
     summary_rows = []
@@ -183,6 +229,8 @@ def build_fixed_scheme(manifest, asap_ratio, non_asap_ratio, selection_seed):
             },
             "valid_examples": int(total_eval_examples),
             "selected_works": int(sum(1 for row in summary_rows if row["selected"])),
+            "min_asap_valid_works": int(min_asap_valid_works),
+            "min_asap_performances": int(min_asap_performances),
         },
         "assignments_by_path": by_path,
         "work_summaries": summary_rows,
@@ -235,6 +283,8 @@ def main():
     parser.add_argument("--asap-ratio", type=float, default=0.03)
     parser.add_argument("--non-asap-ratio", type=float, default=0.005)
     parser.add_argument("--selection-seed", type=int, default=42)
+    parser.add_argument("--min-asap-valid-works", type=int, default=0)
+    parser.add_argument("--min-asap-performances", type=int, default=2)
     parser.add_argument("--output-summary", default=None)
     parser.add_argument("--skip-sidecars", action="store_true")
     parser.add_argument("--workers", type=int, default=36)
@@ -257,6 +307,8 @@ def main():
         asap_ratio=args.asap_ratio,
         non_asap_ratio=args.non_asap_ratio,
         selection_seed=args.selection_seed,
+        min_asap_valid_works=args.min_asap_valid_works,
+        min_asap_performances=args.min_asap_performances,
     )
     scheme_payload = dict(built["scheme"])
 

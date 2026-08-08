@@ -1322,6 +1322,10 @@ def configure_eval_schedule(train_config, train_examples):
     train_config["save_strategy"] = "steps"
     train_config["eval_steps"] = eval_steps
     train_config["save_steps"] = eval_steps
+    if train_config.get("force_eval_steps") is not None:
+        train_config["eval_steps"] = int(train_config["force_eval_steps"])
+    if train_config.get("force_save_steps") is not None:
+        train_config["save_steps"] = int(train_config["force_save_steps"])
     train_config.setdefault("load_best_model_at_end", True)
     train_config.setdefault("metric_for_best_model", "eval_loss")
     train_config.setdefault("greater_is_better", False)
@@ -2256,9 +2260,11 @@ def _normalizer(config, prefix, feature):
         ("pn", "ioi"): 22.772456164440005,
         ("pn", "duration"): 75.08565114668764,
         ("pn", "velocity"): 10.580359191566208,
+        ("pn", "pedal"): 1.0,
         ("pp", "ioi"): 5.030337670706154,
         ("pp", "duration"): 20.449834140491266,
         ("pp", "velocity"): 3.070947106636113,
+        ("pp", "pedal"): 1.0,
     }
     value = getattr(
         config,
@@ -2311,10 +2317,14 @@ def _pn_pp_metric_w1_loss(config, logits, labels, score_shared_raw, attention_ma
     }
     centers = {feature: _fixed_metric_centers(config, feature, logits) for feature in features}
     zero = logits.sum() * 0.0
-    pn_terms = {feature: [] for feature in features}
-    pp_terms = {feature: [] for feature in features}
+    all_features = (*features, "pedal")
+    pn_terms = {feature: [] for feature in all_features}
+    pp_terms = {feature: [] for feature in all_features}
     compute_pn = set(compute_pn)
     compute_pp = set(compute_pp)
+    pedal_logits = params.get("pedal_binary_logits")
+    pedal_probs = torch.sigmoid(pedal_logits.float()) if pedal_logits is not None else None
+    pedal_targets = labels[..., 3:7].float().clamp(0.0, 1.0) if labels.shape[-1] >= 7 else None
 
     for group_id in torch.unique(group_index, sorted=True):
         rows = group_index == group_id
@@ -2367,8 +2377,27 @@ def _pn_pp_metric_w1_loss(config, logits, labels, score_shared_raw, attention_ma
                         / _normalizer(config, "pn", feature)
                     )
 
+        if pedal_probs is not None and pedal_targets is not None:
+            group_pedal_probs = pedal_probs[rows]
+            group_pedal_targets = pedal_targets[rows]
+            if "pedal" in compute_pp and group_valid.any():
+                valid_expanded = group_valid.unsqueeze(-1).expand_as(group_pedal_probs)
+                pred_mean = group_pedal_probs[valid_expanded].mean()
+                target_mean = group_pedal_targets[valid_expanded].mean()
+                pp_terms["pedal"].append(
+                    (pred_mean - target_mean).abs() / _normalizer(config, "pp", "pedal")
+                )
+            if "pedal" in compute_pn:
+                aligned_valid = group_valid.all(dim=0)
+                if aligned_valid.any():
+                    pred_mean = group_pedal_probs[:, aligned_valid, :].mean(dim=0)
+                    target_mean = group_pedal_targets[:, aligned_valid, :].mean(dim=0)
+                    pn_terms["pedal"].append(
+                        (pred_mean - target_mean).abs().mean() / _normalizer(config, "pn", "pedal")
+                    )
+
     output = {}
-    for feature in features:
+    for feature in all_features:
         output[f"pn_{feature}_w1"] = torch.stack(pn_terms[feature]).mean() if pn_terms[feature] else zero
         output[f"pp_{feature}_w1"] = torch.stack(pp_terms[feature]).mean() if pp_terms[feature] else zero
     return output
@@ -3239,8 +3268,84 @@ class NodeSFTTrainer(Trainer):
                 flush=True,
             )
 
+    def _sync_epoch_checkpoint_aliases(self):
+        if not self.is_world_process_zero():
+            return
+        target_epochs = getattr(self, "save_epoch_aliases", None)
+        if not target_epochs:
+            return
+        current_epoch = getattr(getattr(self, "state", None), "epoch", None)
+        global_step = int(getattr(getattr(self, "state", None), "global_step", 0) or 0)
+        if current_epoch is None or global_step <= 0:
+            return
+        source = Path(self.args.output_dir) / f"checkpoint-{global_step}"
+        if not source.exists() or not source.is_dir():
+            return
+        output_dir = Path(self.args.output_dir)
+        rounded_epoch = int(math.floor(float(current_epoch) + 0.5))
+        target_epochs = {int(float(epoch)) for epoch in target_epochs}
+        if rounded_epoch not in target_epochs:
+            return
+        for target_epoch in (rounded_epoch,):
+            label = ("%g" % target_epoch).replace(".", "p")
+            alias = output_dir / f"epoch-{label}"
+            if alias.exists():
+                continue
+            tmp_dir = output_dir / f".epoch-{label}.tmp-{os.getpid()}"
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            try:
+                shutil.copytree(source, tmp_dir)
+                (tmp_dir / ".epoch_source").write_text(
+                    json.dumps(
+                        {
+                            "source": str(source),
+                            "epoch": float(current_epoch),
+                            "target_epoch": int(target_epoch),
+                            "step": global_step,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                tmp_dir.rename(alias)
+                print(
+                    json.dumps(
+                        {
+                            "step": global_step,
+                            "event": "checkpoint_epoch_alias_synced",
+                            "epoch": float(current_epoch),
+                            "target_epoch": target_epoch,
+                            "alias": str(alias),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            except Exception as exc:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                print(
+                    json.dumps(
+                        {
+                            "step": global_step,
+                            "event": "checkpoint_epoch_alias_sync_failed",
+                            "epoch": float(current_epoch),
+                            "target_epoch": target_epoch,
+                            "alias": str(alias),
+                            "reason": str(exc),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+
     def _save_checkpoint(self, model, trial):
         super()._save_checkpoint(model, trial)
+        self._sync_epoch_checkpoint_aliases()
         self._sync_checkpoint_best_alias()
 
     def _rollout_eval_enabled(self):
@@ -4817,6 +4922,8 @@ def main():
     trainer.rollout_eval_weight = float(train_config.get("rollout_eval_weight", 1.0))
     trainer.rollout_eval_materialize_strategy = train_config.get("rollout_eval_materialize_strategy", "sample")
     trainer.rollout_eval_feedback_strategy = train_config.get("rollout_eval_feedback_strategy", "sample")
+    trainer.save_epoch_aliases = train_config.get("save_epoch_aliases")
+    trainer.save_epoch_alias_tolerance = train_config.get("save_epoch_alias_tolerance", 1e-3)
     trainer.loss_component_logging_steps = train_config.get(
         "loss_component_logging_steps",
         train_config.get("logging_steps", 0),

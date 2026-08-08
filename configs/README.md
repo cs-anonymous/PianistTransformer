@@ -10,8 +10,13 @@ configs/inr_epr/cinr__default_dlm_k1_bounded5.json
 The August 7 baseline with ASAP pedal-group data and pedal loss masking is:
 
 ```text
-configs/inr_epr/baseline0807_pedal_group_mask.json
+configs/inr_epr/baseline0807.json
 ```
+
+It keeps binary pedal targets, uses ASAP pedal-group data with pedal loss masking,
+sets bs=32/gbs=96 for single-GPU training, and keeps all 12 epoch checkpoints.
+The fixed validation split contains at least 64 distinct ASAP works with at least
+two performances each, so validation can sample m=64 without repeating a work.
 
 Pianist Transformer and original training configs remain at the top level:
 

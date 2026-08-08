@@ -34,7 +34,7 @@
       "musical_no_length"
     ],
     "baseline0807": [
-      "pedal_group_mask"
+      "baseline"
     ]
   },
   "configs": {
@@ -64,7 +64,7 @@
     "extra/musical_no_onset": "configs/extra__musical_no_onset.json",
     "extra/musical_no_annotation": "configs/extra__musical_no_annotation.json",
     "extra/musical_no_length": "configs/extra__musical_no_length.json",
-    "baseline0807/pedal_group_mask": "configs/inr_epr/baseline0807_pedal_group_mask.json"
+    "baseline0807/baseline": "configs/inr_epr/baseline0807.json"
   },
   "notes": [
     "Canonical base: ASAP_processed musical51 CINR bounded no-lossnorm 16ep.",

@@ -1,0 +1,2799 @@
+{
+  "scheme_name": "train_valid_asap3_nonasap05_m64_v1",
+  "scheme": {
+    "scheme_type": "fixed_window_train_valid_v1",
+    "base_split": "train",
+    "train_split_name": "train",
+    "valid_split_name": "valid",
+    "selection_seed": 42,
+    "targets": {
+      "ASAP": {
+        "ratio": 0.03,
+        "total_examples": 6885,
+        "valid_examples": 207
+      },
+      "non-ASAP": {
+        "ratio": 0.005,
+        "total_examples": 0,
+        "valid_examples": 0
+      }
+    },
+    "valid_examples": 207,
+    "selected_works": 109,
+    "min_asap_valid_works": 64,
+    "min_asap_performances": 2
+  },
+  "work_summaries": [
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/Italian_Concerto,_BWV_971/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/Italian_Concerto,_BWV_971/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        448,
+        960
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.11_in_F_major,_BWV_856:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.11_in_F_major,_BWV_856:_Fugue/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        242,
+        754
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.11_in_F_major,_BWV_856:_Prelude/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.11_in_F_major,_BWV_856:_Prelude/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.12_in_F_minor,_BWV_857:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.12_in_F_minor,_BWV_857:_Fugue/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 6,
+      "performance_dataset_counts": {
+        "ASAP": 6
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.12_in_F_minor,_BWV_857:_Prelude/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.12_in_F_minor,_BWV_857:_Prelude/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 6,
+      "performance_dataset_counts": {
+        "ASAP": 6
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.13_in_F_sharp_major,_BWV_858:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.13_in_F_sharp_major,_BWV_858:_Fugue/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        395,
+        907
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.13_in_F_sharp_major,_BWV_858:_Prelude/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.13_in_F_sharp_major,_BWV_858:_Prelude/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.15_in_G_major,_BWV_860:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.15_in_G_major,_BWV_860:_Fugue/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 6,
+      "performance_dataset_counts": {
+        "ASAP": 6
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.15_in_G_major,_BWV_860:_Prelude/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.15_in_G_major,_BWV_860:_Prelude/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 6,
+      "performance_dataset_counts": {
+        "ASAP": 6
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.17_in_A_flat_major,_BWV_862:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.17_in_A_flat_major,_BWV_862:_Fugue/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.17_in_A_flat_major,_BWV_862:_Prelude/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.17_in_A_flat_major,_BWV_862:_Prelude/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        169,
+        681
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.18_in_G_sharp_minor,_BWV_863:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.18_in_G_sharp_minor,_BWV_863:_Fugue/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.18_in_G_sharp_minor,_BWV_863:_Prelude/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.18_in_G_sharp_minor,_BWV_863:_Prelude/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        56,
+        568
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.19_in_A_major,_BWV_864:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.19_in_A_major,_BWV_864:_Fugue/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.19_in_A_major,_BWV_864:_Prelude/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.19_in_A_major,_BWV_864:_Prelude/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        97,
+        609
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.1_in_C_major,_BWV_846:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.1_in_C_major,_BWV_846:_Fugue/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        229,
+        741
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.1_in_C_major,_BWV_846:_Prelude/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.1_in_C_major,_BWV_846:_Prelude/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.20_in_A_minor,_BWV_865:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.20_in_A_minor,_BWV_865:_Fugue/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.20_in_A_minor,_BWV_865:_Prelude/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.20_in_A_minor,_BWV_865:_Prelude/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        96,
+        608
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.21_in_B_flat_major,_BWV_866:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.21_in_B_flat_major,_BWV_866:_Fugue/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.21_in_B_flat_major,_BWV_866:_Prelude/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.21_in_B_flat_major,_BWV_866:_Prelude/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        120,
+        632
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.22_in_B_flat_minor,_BWV_867:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.22_in_B_flat_minor,_BWV_867:_Fugue/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        233,
+        745
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.22_in_B_flat_minor,_BWV_867:_Prelude/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.22_in_B_flat_minor,_BWV_867:_Prelude/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.23_in_B_major,_BWV_868:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.23_in_B_major,_BWV_868:_Fugue/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.23_in_B_major,_BWV_868:_Prelude/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.23_in_B_major,_BWV_868:_Prelude/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.3_in_C_sharp_major,_BWV_848:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.3_in_C_sharp_major,_BWV_848:_Fugue/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 9,
+      "performance_dataset_counts": {
+        "ASAP": 9
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.3_in_C_sharp_major,_BWV_848:_Prelude/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.3_in_C_sharp_major,_BWV_848:_Prelude/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 9,
+      "performance_dataset_counts": {
+        "ASAP": 9
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.9_in_E_major,_BWV_854:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.9_in_E_major,_BWV_854:_Fugue/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 5,
+      "performance_dataset_counts": {
+        "ASAP": 5
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.9_in_E_major,_BWV_854:_Prelude/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.9_in_E_major,_BWV_854:_Prelude/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 5,
+      "performance_dataset_counts": {
+        "ASAP": 5
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.11_in_F_major,_BWV_880:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.11_in_F_major,_BWV_880:_Fugue/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        461,
+        973
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.11_in_F_major,_BWV_880:_Prelude/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.11_in_F_major,_BWV_880:_Prelude/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.14_in_F_sharp_minor,_BWV_883:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.14_in_F_sharp_minor,_BWV_883:_Fugue/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 6,
+      "performance_dataset_counts": {
+        "ASAP": 6
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.14_in_F_sharp_minor,_BWV_883:_Prelude/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.14_in_F_sharp_minor,_BWV_883:_Prelude/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.15_in_G_major,_BWV_884:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.15_in_G_major,_BWV_884:_Fugue/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.16_in_G_minor,_BWV_885:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.16_in_G_minor,_BWV_885:_Fugue/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 6,
+      "performance_dataset_counts": {
+        "ASAP": 6
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.16_in_G_minor,_BWV_885:_Prelude/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.16_in_G_minor,_BWV_885:_Prelude/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 6,
+      "performance_dataset_counts": {
+        "ASAP": 6
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.18_in_G_sharp_minor,_BWV_887:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.18_in_G_sharp_minor,_BWV_887:_Fugue/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.19_in_A_major,_BWV_888:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.19_in_A_major,_BWV_888:_Fugue/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        242,
+        754
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.19_in_A_major,_BWV_888:_Prelude/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.19_in_A_major,_BWV_888:_Prelude/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        173,
+        685
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.1_in_C_major,_BWV_870:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.1_in_C_major,_BWV_870:_Fugue/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.1_in_C_major,_BWV_870:_Prelude/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.1_in_C_major,_BWV_870:_Prelude/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.20_in_A_minor,_BWV_889:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.20_in_A_minor,_BWV_889:_Fugue/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 6,
+      "performance_dataset_counts": {
+        "ASAP": 6
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.22_in_B_flat_minor,_BWV_891:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.22_in_B_flat_minor,_BWV_891:_Fugue/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        448,
+        960
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.22_in_B_flat_minor,_BWV_891:_Prelude/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.22_in_B_flat_minor,_BWV_891:_Prelude/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        670,
+        1182
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.23_in_B_major,_BWV_892:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.23_in_B_major,_BWV_892:_Fugue/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.23_in_B_major,_BWV_892:_Prelude/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.23_in_B_major,_BWV_892:_Prelude/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        448,
+        960
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.24_in_B_minor,_BWV_893:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.24_in_B_minor,_BWV_893:_Fugue/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        448,
+        960
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.24_in_B_minor,_BWV_893:_Prelude/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.24_in_B_minor,_BWV_893:_Prelude/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.4_in_C_sharp_minor,_BWV_873:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.4_in_C_sharp_minor,_BWV_873:_Fugue/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.4_in_C_sharp_minor,_BWV_873:_Prelude/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.4_in_C_sharp_minor,_BWV_873:_Prelude/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        896,
+        1408
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.5_in_D_major,_BWV_874:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.5_in_D_major,_BWV_874:_Fugue/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        353,
+        865
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.6_in_D_minor,_BWV_875:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.6_in_D_minor,_BWV_875:_Fugue/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        277,
+        789
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.6_in_D_minor,_BWV_875:_Prelude/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.6_in_D_minor,_BWV_875:_Prelude/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.7_in_E_flat_major,_BWV_876:_Fugue/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.7_in_E_flat_major,_BWV_876:_Fugue/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        189,
+        701
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.7_in_E_flat_major,_BWV_876:_Prelude/score_ASAP_refined.json",
+      "score_source": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_II,_BWV_870-893/No.7_in_E_flat_major,_BWV_876:_Prelude/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        400,
+        912
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Balakirev,_Mily/Islamey,_Op.18/score_ASAP_refined.json",
+      "score_source": "Balakirev,_Mily/Islamey,_Op.18/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 10,
+      "performance_dataset_counts": {
+        "ASAP": 10
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.10_in_G_major,_Op.14_No.2/1._Allegro/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.10_in_G_major,_Op.14_No.2/1._Allegro/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        2077,
+        2589
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.11_in_B_flat_major,_Op.22/1._Allegro_con_brio/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.11_in_B_flat_major,_Op.22/1._Allegro_con_brio/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 7,
+      "performance_dataset_counts": {
+        "ASAP": 7
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.11_in_B_flat_major,_Op.22/2._Adagio_con_molto_espressione/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.11_in_B_flat_major,_Op.22/2._Adagio_con_molto_espressione/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        896,
+        1408
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.11_in_B_flat_major,_Op.22/3._Menuetto/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.11_in_B_flat_major,_Op.22/3._Menuetto/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        448,
+        960
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.13_in_E_flat_major,_Op.27_No.1_(\"Quasi_una_fantasia\")/4._Allegro_vivace_-_Tempo_I_-_Presto/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.13_in_E_flat_major,_Op.27_No.1_(\"Quasi_una_fantasia\")/4._Allegro_vivace_-_Tempo_I_-_Presto/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        448,
+        960
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.14_in_C_sharp_minor,_Op.27_No.2_(\"Moonlight\")/3._Presto_agitato/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.14_in_C_sharp_minor,_Op.27_No.2_(\"Moonlight\")/3._Presto_agitato/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.15_in_D_major,_Op.28_(\"Pastoral\")/1._Allegro/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.15_in_D_major,_Op.28_(\"Pastoral\")/1._Allegro/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        2240,
+        2752
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.15_in_D_major,_Op.28_(\"Pastoral\")/4._Rondo._Allegro_ma_non_troppo/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.15_in_D_major,_Op.28_(\"Pastoral\")/4._Rondo._Allegro_ma_non_troppo/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.16_in_G_major,_Op.31_No.1/1._Allegro_vivace/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.16_in_G_major,_Op.31_No.1/1._Allegro_vivace/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 8,
+      "performance_dataset_counts": {
+        "ASAP": 8
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.16_in_G_major,_Op.31_No.1/2._Adagio_grazioso/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.16_in_G_major,_Op.31_No.1/2._Adagio_grazioso/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        2240,
+        2752
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.17_in_D_minor,_Op.31_No.2_(\"The_Tempest\")/1._Largo_-_Allegro/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.17_in_D_minor,_Op.31_No.2_(\"The_Tempest\")/1._Largo_-_Allegro/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 4,
+      "performance_dataset_counts": {
+        "ASAP": 4
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.17_in_D_minor,_Op.31_No.2_(\"The_Tempest\")/2._Adagio/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.17_in_D_minor,_Op.31_No.2_(\"The_Tempest\")/2._Adagio/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.17_in_D_minor,_Op.31_No.2_(\"The_Tempest\")/3._Allegretto/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.17_in_D_minor,_Op.31_No.2_(\"The_Tempest\")/3._Allegretto/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        1792,
+        2304
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.18_in_E_flat_major,_Op.31_No.3_(\"The_Hunt\")/1._Allegro/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.18_in_E_flat_major,_Op.31_No.3_(\"The_Hunt\")/1._Allegro/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 9,
+      "performance_dataset_counts": {
+        "ASAP": 9
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.18_in_E_flat_major,_Op.31_No.3_(\"The_Hunt\")/2._Scherzo._Allegretto_vivace/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.18_in_E_flat_major,_Op.31_No.3_(\"The_Hunt\")/2._Scherzo._Allegretto_vivace/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.18_in_E_flat_major,_Op.31_No.3_(\"The_Hunt\")/3._Menuetto._Moderato_e_grazioso/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.18_in_E_flat_major,_Op.31_No.3_(\"The_Hunt\")/3._Menuetto._Moderato_e_grazioso/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.18_in_E_flat_major,_Op.31_No.3_(\"The_Hunt\")/4._Presto_con_fuoco/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.18_in_E_flat_major,_Op.31_No.3_(\"The_Hunt\")/4._Presto_con_fuoco/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        2914,
+        3426
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.21_in_C_major,_Op.53,_(\"Waldstein\")/1._Allegro_con_brio/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.21_in_C_major,_Op.53,_(\"Waldstein\")/1._Allegro_con_brio/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 27,
+      "performance_dataset_counts": {
+        "ASAP": 27
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.21_in_C_major,_Op.53,_(\"Waldstein\")/2._Introduzione:_Adagio_molto/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.21_in_C_major,_Op.53,_(\"Waldstein\")/2._Introduzione:_Adagio_molto/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.21_in_C_major,_Op.53,_(\"Waldstein\")/3._Rondo:_Allegretto_moderato/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.21_in_C_major,_Op.53,_(\"Waldstein\")/3._Rondo:_Allegretto_moderato/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        896,
+        1408
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.22_in_F_major,_Op.54/1._In_tempo_d'un_minuetto/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.22_in_F_major,_Op.54/1._In_tempo_d'un_minuetto/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.23_in_F_minor,_Op.57_(\"Appassionata\")/1._Allegro_assai/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.23_in_F_minor,_Op.57_(\"Appassionata\")/1._Allegro_assai/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 17,
+      "performance_dataset_counts": {
+        "ASAP": 17
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.26_in_E_flat_major,_Op.81a_(\"Les_adieux\")/1._Das_Lebewohl_(Adagio_-_Allegro)/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.26_in_E_flat_major,_Op.81a_(\"Les_adieux\")/1._Das_Lebewohl_(Adagio_-_Allegro)/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 11,
+      "performance_dataset_counts": {
+        "ASAP": 11
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.26_in_E_flat_major,_Op.81a_(\"Les_adieux\")/2._Abwesendheit_(Andante_espressivo)/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.26_in_E_flat_major,_Op.81a_(\"Les_adieux\")/2._Abwesendheit_(Andante_espressivo)/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 5,
+      "performance_dataset_counts": {
+        "ASAP": 5
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.26_in_E_flat_major,_Op.81a_(\"Les_adieux\")/3._Das_Wiedersehn_(Vivacissimamente)/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.26_in_E_flat_major,_Op.81a_(\"Les_adieux\")/3._Das_Wiedersehn_(Vivacissimamente)/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        2240,
+        2752
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.29_in_B_flat_major,_Op.106_(\"Hammerklavier\")/2._Scherzo._Assai_vivace/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.29_in_B_flat_major,_Op.106_(\"Hammerklavier\")/2._Scherzo._Assai_vivace/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        448,
+        960
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.29_in_B_flat_major,_Op.106_(\"Hammerklavier\")/3._Adagio_sostenuto,_appassionato_e_con_molto_sentimento/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.29_in_B_flat_major,_Op.106_(\"Hammerklavier\")/3._Adagio_sostenuto,_appassionato_e_con_molto_sentimento/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        1344,
+        1856
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.29_in_B_flat_major,_Op.106_(\"Hammerklavier\")/4._Largo_-_Allegro_risoluto/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.29_in_B_flat_major,_Op.106_(\"Hammerklavier\")/4._Largo_-_Allegro_risoluto/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        6272,
+        6784
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.2_in_A_major,_Op.2_No.2/1._Allegro_vivace/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.2_in_A_major,_Op.2_No.2/1._Allegro_vivace/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.30_in_E_major,_Op.109/1._Vivace_ma_non_troppo,_sempre_legato_-_Adagio_espressivo/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.30_in_E_major,_Op.109/1._Vivace_ma_non_troppo,_sempre_legato_-_Adagio_espressivo/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 8,
+      "performance_dataset_counts": {
+        "ASAP": 8
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.31_in_A_flat_major,_Op.110/1._Moderato_cantabile_molto_espressivo/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.31_in_A_flat_major,_Op.110/1._Moderato_cantabile_molto_espressivo/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 21,
+      "performance_dataset_counts": {
+        "ASAP": 21
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.31_in_A_flat_major,_Op.110/2._Allegro_molto/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.31_in_A_flat_major,_Op.110/2._Allegro_molto/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 7,
+      "performance_dataset_counts": {
+        "ASAP": 7
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.31_in_A_flat_major,_Op.110/3._Adagio_ma_non_troppo_-_4._Allegro_ma_non_troppo/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.31_in_A_flat_major,_Op.110/3._Adagio_ma_non_troppo_-_4._Allegro_ma_non_troppo/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 11,
+      "performance_dataset_counts": {
+        "ASAP": 11
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.3_in_C_major,_Op.2_No.3/2._Adagio/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.3_in_C_major,_Op.2_No.3/2._Adagio/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.4_in_E_flat_major,_Op.7_(\"Grand\")/1._Allegro_molto_e_con_brio/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.4_in_E_flat_major,_Op.7_(\"Grand\")/1._Allegro_molto_e_con_brio/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 9,
+      "performance_dataset_counts": {
+        "ASAP": 9
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.5_in_C_minor,_Op.10_No.1_(\"Little_Pathétique\")/1._Allegro_molto_e_con_brio/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.5_in_C_minor,_Op.10_No.1_(\"Little_Pathétique\")/1._Allegro_molto_e_con_brio/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        1344,
+        1856
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.7_in_D_major,_Op.10_No.3/1._Presto/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.7_in_D_major,_Op.10_No.3/1._Presto/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 7,
+      "performance_dataset_counts": {
+        "ASAP": 7
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.7_in_D_major,_Op.10_No.3/2._Largo_e_mesto/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.7_in_D_major,_Op.10_No.3/2._Largo_e_mesto/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        896,
+        1408
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.7_in_D_major,_Op.10_No.3/3._Menuetto._Allegro/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.7_in_D_major,_Op.10_No.3/3._Menuetto._Allegro/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        896,
+        1408
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.7_in_D_major,_Op.10_No.3/4._Rondo._Allegro/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.7_in_D_major,_Op.10_No.3/4._Rondo._Allegro/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        448,
+        960
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.8_in_C_minor,_Op.13_(\"Pathétique\")/2._Adagio_cantabile/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.8_in_C_minor,_Op.13_(\"Pathétique\")/2._Adagio_cantabile/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        1126,
+        1638
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.8_in_C_minor,_Op.13_(\"Pathétique\")/3._Rondo._Allegro/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.8_in_C_minor,_Op.13_(\"Pathétique\")/3._Rondo._Allegro/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        448,
+        960
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.9_in_E_major,_Op.14,_No.1/1._Allegro/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.9_in_E_major,_Op.14,_No.1/1._Allegro/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        2128,
+        2640
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Beethoven,_Ludwig_van/Piano_Sonata_No.9_in_E_major,_Op.14,_No.1/3._Rondo._Allegro_comodo/score_ASAP_refined.json",
+      "score_source": "Beethoven,_Ludwig_van/Piano_Sonata_No.9_in_E_major,_Op.14,_No.1/3._Rondo._Allegro_comodo/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        896,
+        1408
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Brahms,_Johannes/6_Piano_Pieces,_Op.118/2._Intermezzo_in_A_major/score_ASAP_refined.json",
+      "score_source": "Brahms,_Johannes/6_Piano_Pieces,_Op.118/2._Intermezzo_in_A_major/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        1161,
+        1673
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/12_Études,_Op.10/No.10_in_A_flat_major/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/12_Études,_Op.10/No.10_in_A_flat_major/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        448,
+        960
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/12_Études,_Op.10/No.12_in_C_minor_\"Revolutionary\"/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/12_Études,_Op.10/No.12_in_C_minor_\"Revolutionary\"/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 13,
+      "performance_dataset_counts": {
+        "ASAP": 13
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/12_Études,_Op.10/No.1_in_C_major_\"Waterfall\"/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/12_Études,_Op.10/No.1_in_C_major_\"Waterfall\"/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 25,
+      "performance_dataset_counts": {
+        "ASAP": 25
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/12_Études,_Op.10/No.2_in_A_minor_\"Chromatique\"/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/12_Études,_Op.10/No.2_in_A_minor_\"Chromatique\"/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 11,
+      "performance_dataset_counts": {
+        "ASAP": 11
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/12_Études,_Op.10/No.3_in_E_major_\"Tristesse\"/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/12_Études,_Op.10/No.3_in_E_major_\"Tristesse\"/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        896,
+        1408
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/12_Études,_Op.10/No.4_in_C_sharp_minor/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/12_Études,_Op.10/No.4_in_C_sharp_minor/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 22,
+      "performance_dataset_counts": {
+        "ASAP": 22
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/12_Études,_Op.10/No.5_in_G_flat_major_\"Black_Keys\"/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/12_Études,_Op.10/No.5_in_G_flat_major_\"Black_Keys\"/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 10,
+      "performance_dataset_counts": {
+        "ASAP": 10
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/12_Études,_Op.10/No.7_in_C_major/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/12_Études,_Op.10/No.7_in_C_major/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/12_Études,_Op.10/No.8_in_F_major/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/12_Études,_Op.10/No.8_in_F_major/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 28,
+      "performance_dataset_counts": {
+        "ASAP": 28
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/12_Études,_Op.25/No.10_in_B_minor/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/12_Études,_Op.25/No.10_in_B_minor/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 12,
+      "performance_dataset_counts": {
+        "ASAP": 12
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/12_Études,_Op.25/No.11_in_A_minor_\"Winter_Wind\"/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/12_Études,_Op.25/No.11_in_A_minor_\"Winter_Wind\"/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 24,
+      "performance_dataset_counts": {
+        "ASAP": 24
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/12_Études,_Op.25/No.12_in_C_minor/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/12_Études,_Op.25/No.12_in_C_minor/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 9,
+      "performance_dataset_counts": {
+        "ASAP": 9
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/12_Études,_Op.25/No.1_in_A_flat_major_\"Harp_Study\"/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/12_Études,_Op.25/No.1_in_A_flat_major_\"Harp_Study\"/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 5,
+      "performance_dataset_counts": {
+        "ASAP": 5
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/12_Études,_Op.25/No.2_in_F_minor/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/12_Études,_Op.25/No.2_in_F_minor/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/12_Études,_Op.25/No.4_in_A_minor/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/12_Études,_Op.25/No.4_in_A_minor/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        448,
+        960
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/12_Études,_Op.25/No.5_in_E_minor/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/12_Études,_Op.25/No.5_in_E_minor/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        1344,
+        1856
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/12_Études,_Op.25/No.8_in_D_flat_major/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/12_Études,_Op.25/No.8_in_D_flat_major/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 4,
+      "performance_dataset_counts": {
+        "ASAP": 4
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/Ballade_No.1_in_G_minor,_Op.23/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/Ballade_No.1_in_G_minor,_Op.23/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 18,
+      "performance_dataset_counts": {
+        "ASAP": 18
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/Ballade_No.3_in_A_flat_major,_Op.47/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/Ballade_No.3_in_A_flat_major,_Op.47/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        3953,
+        4465
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/Ballade_No.4_in_F_minor,_Op.52,_B.146/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/Ballade_No.4_in_F_minor,_Op.52,_B.146/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 12,
+      "performance_dataset_counts": {
+        "ASAP": 12
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/Barcarolle_in_F_sharp_major,_Op.60/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/Barcarolle_in_F_sharp_major,_Op.60/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 9,
+      "performance_dataset_counts": {
+        "ASAP": 9
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/Berceuse_in_D_flat_major,_Op.57/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/Berceuse_in_D_flat_major,_Op.57/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 5,
+      "performance_dataset_counts": {
+        "ASAP": 5
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/Piano_Sonata_No.2_in_B_flat_minor,_Op.35/1._Grave_-_Doppio_movimento/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/Piano_Sonata_No.2_in_B_flat_minor,_Op.35/1._Grave_-_Doppio_movimento/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 4,
+      "performance_dataset_counts": {
+        "ASAP": 4
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/Piano_Sonata_No.2_in_B_flat_minor,_Op.35/2._Scherzo_-_Più_lento_-_Tempo_I/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/Piano_Sonata_No.2_in_B_flat_minor,_Op.35/2._Scherzo_-_Più_lento_-_Tempo_I/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/Piano_Sonata_No.2_in_B_flat_minor,_Op.35/3._Marche_funèbre_(Lento)/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/Piano_Sonata_No.2_in_B_flat_minor,_Op.35/3._Marche_funèbre_(Lento)/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        448,
+        960
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/Piano_Sonata_No.2_in_B_flat_minor,_Op.35/4._Finale_(Presto)/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/Piano_Sonata_No.2_in_B_flat_minor,_Op.35/4._Finale_(Presto)/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/Piano_Sonata_No.3_in_B_minor,_Op.58/2._Scherzo._Molto_vivace/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/Piano_Sonata_No.3_in_B_minor,_Op.58/2._Scherzo._Molto_vivace/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 9,
+      "performance_dataset_counts": {
+        "ASAP": 9
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/Piano_Sonata_No.3_in_B_minor,_Op.58/3._Largo/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/Piano_Sonata_No.3_in_B_minor,_Op.58/3._Largo/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 9,
+      "performance_dataset_counts": {
+        "ASAP": 9
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/Piano_Sonata_No.3_in_B_minor,_Op.58/4._Finale._Presto_non_tanto/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/Piano_Sonata_No.3_in_B_minor,_Op.58/4._Finale._Presto_non_tanto/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 9,
+      "performance_dataset_counts": {
+        "ASAP": 9
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/Polonaise_No.6_in_A_flat_major,_Op.53,_\"Heroic\"/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/Polonaise_No.6_in_A_flat_major,_Op.53,_\"Heroic\"/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        4928,
+        5440
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/Scherzo_No.1_in_B_minor,_Op.20,_B.65/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/Scherzo_No.1_in_B_minor,_Op.20,_B.65/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 4,
+      "performance_dataset_counts": {
+        "ASAP": 4
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Chopin,_Frédéric/Scherzo_No.3_in_C_sharp_minor,_Op.39,_B.125/score_ASAP_refined.json",
+      "score_source": "Chopin,_Frédéric/Scherzo_No.3_in_C_sharp_minor,_Op.39,_B.125/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Debussy,_Claude/Images,_Book_1,_L.110/1._Reflets_dans_l'eau/score_ASAP_refined.json",
+      "score_source": "Debussy,_Claude/Images,_Book_1,_L.110/1._Reflets_dans_l'eau/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Haydn,_Joseph/Piano_Sonata_No.13,_Partita_in_G_major,_Hob.XVI:6/1._Allegro_(G_major)/score_ASAP_refined.json",
+      "score_source": "Haydn,_Joseph/Piano_Sonata_No.13,_Partita_in_G_major,_Hob.XVI:6/1._Allegro_(G_major)/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Haydn,_Joseph/Piano_Sonata_No.58,_Keyboard_Sonata_in_C_major,_Hob.XVI:48/1._Andante_con_espressione_(C_major)/score_ASAP_refined.json",
+      "score_source": "Haydn,_Joseph/Piano_Sonata_No.58,_Keyboard_Sonata_in_C_major,_Hob.XVI:48/1._Andante_con_espressione_(C_major)/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Haydn,_Joseph/Piano_Sonata_No.58,_Keyboard_Sonata_in_C_major,_Hob.XVI:48/2._Rondo._Presto_(C_major)/score_ASAP_refined.json",
+      "score_source": "Haydn,_Joseph/Piano_Sonata_No.58,_Keyboard_Sonata_in_C_major,_Hob.XVI:48/2._Rondo._Presto_(C_major)/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        448,
+        960
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Haydn,_Joseph/Piano_Sonata_No.59,_Keyboard_Sonata_in_E_flat_major,_Hob.XVI:49/1._Allegro_(E_flat_major)/score_ASAP_refined.json",
+      "score_source": "Haydn,_Joseph/Piano_Sonata_No.59,_Keyboard_Sonata_in_E_flat_major,_Hob.XVI:49/1._Allegro_(E_flat_major)/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        2085,
+        2597
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Liszt,_Franz/12_Etudes_d'exécution_transcendante,_S.139/1._Prélude._Presto_(C_major)/score_ASAP_refined.json",
+      "score_source": "Liszt,_Franz/12_Etudes_d'exécution_transcendante,_S.139/1._Prélude._Presto_(C_major)/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Liszt,_Franz/12_Etudes_d'exécution_transcendante,_S.139/10._Allegro_agitato_molto_(F_minor)/score_ASAP_refined.json",
+      "score_source": "Liszt,_Franz/12_Etudes_d'exécution_transcendante,_S.139/10._Allegro_agitato_molto_(F_minor)/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 16,
+      "performance_dataset_counts": {
+        "ASAP": 16
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Liszt,_Franz/12_Etudes_d'exécution_transcendante,_S.139/11._Harmonies_du_soir._Andantino_(D_flat_major)/score_ASAP_refined.json",
+      "score_source": "Liszt,_Franz/12_Etudes_d'exécution_transcendante,_S.139/11._Harmonies_du_soir._Andantino_(D_flat_major)/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        1344,
+        1856
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Liszt,_Franz/12_Etudes_d'exécution_transcendante,_S.139/3._Paysage._Poco_adagio_(F_major)/score_ASAP_refined.json",
+      "score_source": "Liszt,_Franz/12_Etudes_d'exécution_transcendante,_S.139/3._Paysage._Poco_adagio_(F_major)/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Liszt,_Franz/12_Etudes_d'exécution_transcendante,_S.139/4._Mazeppa_(D_minor)/score_ASAP_refined.json",
+      "score_source": "Liszt,_Franz/12_Etudes_d'exécution_transcendante,_S.139/4._Mazeppa_(D_minor)/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 11,
+      "performance_dataset_counts": {
+        "ASAP": 11
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Liszt,_Franz/12_Etudes_d'exécution_transcendante,_S.139/5._Feux_follets._Allegretto_(B_flat_major)/score_ASAP_refined.json",
+      "score_source": "Liszt,_Franz/12_Etudes_d'exécution_transcendante,_S.139/5._Feux_follets._Allegretto_(B_flat_major)/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 11,
+      "performance_dataset_counts": {
+        "ASAP": 11
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Liszt,_Franz/12_Etudes_d'exécution_transcendante,_S.139/9._Ricordanza_(A_flat_major)/score_ASAP_refined.json",
+      "score_source": "Liszt,_Franz/12_Etudes_d'exécution_transcendante,_S.139/9._Ricordanza_(A_flat_major)/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        448,
+        960
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Liszt,_Franz/2_Etudes_de_Concert,_S.145/1._Waldesrauschen/score_ASAP_refined.json",
+      "score_source": "Liszt,_Franz/2_Etudes_de_Concert,_S.145/1._Waldesrauschen/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 6,
+      "performance_dataset_counts": {
+        "ASAP": 6
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Liszt,_Franz/2_Etudes_de_Concert,_S.145/2._Gnomenreigen/score_ASAP_refined.json",
+      "score_source": "Liszt,_Franz/2_Etudes_de_Concert,_S.145/2._Gnomenreigen/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 4,
+      "performance_dataset_counts": {
+        "ASAP": 4
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Liszt,_Franz/Années_de_pèlerinage,_2nd_Year,_S.162_\"Italy_Supplement\"/1._Gondoliera_(Gondolier's_Song)/score_ASAP_refined.json",
+      "score_source": "Liszt,_Franz/Années_de_pèlerinage,_2nd_Year,_S.162_\"Italy_Supplement\"/1._Gondoliera_(Gondolier's_Song)/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        1344,
+        1856
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Liszt,_Franz/Ballade_No.2,_S.171/score_ASAP_refined.json",
+      "score_source": "Liszt,_Franz/Ballade_No.2,_S.171/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 6,
+      "performance_dataset_counts": {
+        "ASAP": 6
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Liszt,_Franz/Grandes_études_de_Paganini,_S.141/3._La_campanella/score_ASAP_refined.json",
+      "score_source": "Liszt,_Franz/Grandes_études_de_Paganini,_S.141/3._La_campanella/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 29,
+      "performance_dataset_counts": {
+        "ASAP": 29
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Liszt,_Franz/Grandes_études_de_Paganini,_S.141/6._Theme_and_Variations/score_ASAP_refined.json",
+      "score_source": "Liszt,_Franz/Grandes_études_de_Paganini,_S.141/6._Theme_and_Variations/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 5,
+      "performance_dataset_counts": {
+        "ASAP": 5
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Liszt,_Franz/Hungarian_Rhapsody_No.6_in_D_flat_major,_S.244/score_ASAP_refined.json",
+      "score_source": "Liszt,_Franz/Hungarian_Rhapsody_No.6_in_D_flat_major,_S.244/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        4480,
+        4992
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Liszt,_Franz/Piano_Sonata_in_B_minor,_S.178/score_ASAP_refined.json",
+      "score_source": "Liszt,_Franz/Piano_Sonata_in_B_minor,_S.178/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 7,
+      "performance_dataset_counts": {
+        "ASAP": 7
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Mozart,_Wolfgang_Amadeus/Piano_Sonata_No.11_in_A_major,_K.331/3._Alla_Turca._Allegretto/score_ASAP_refined.json",
+      "score_source": "Mozart,_Wolfgang_Amadeus/Piano_Sonata_No.11_in_A_major,_K.331/3._Alla_Turca._Allegretto/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        448,
+        960
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Mozart,_Wolfgang_Amadeus/Piano_Sonata_No.12_in_F_major,_K.332/1._Allegro/score_ASAP_refined.json",
+      "score_source": "Mozart,_Wolfgang_Amadeus/Piano_Sonata_No.12_in_F_major,_K.332/1._Allegro/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 4,
+      "performance_dataset_counts": {
+        "ASAP": 4
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Mozart,_Wolfgang_Amadeus/Piano_Sonata_No.12_in_F_major,_K.332/2._Adagio/score_ASAP_refined.json",
+      "score_source": "Mozart,_Wolfgang_Amadeus/Piano_Sonata_No.12_in_F_major,_K.332/2._Adagio/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        448,
+        960
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Mozart,_Wolfgang_Amadeus/Piano_Sonata_No.12_in_F_major,_K.332/3._Allegro_assai/score_ASAP_refined.json",
+      "score_source": "Mozart,_Wolfgang_Amadeus/Piano_Sonata_No.12_in_F_major,_K.332/3._Allegro_assai/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        1792,
+        2304
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Prokofiev,_Sergey/Toccata,_Op.11/score_ASAP_refined.json",
+      "score_source": "Prokofiev,_Sergey/Toccata,_Op.11/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 8,
+      "performance_dataset_counts": {
+        "ASAP": 8
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Rachmaninoff,_Sergei/10_Preludes,_Op.23/No.4_in_D_major/score_ASAP_refined.json",
+      "score_source": "Rachmaninoff,_Sergei/10_Preludes,_Op.23/No.4_in_D_major/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        448,
+        960
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Rachmaninoff,_Sergei/10_Preludes,_Op.23/No.6_in_E_flat_major:_Andante/score_ASAP_refined.json",
+      "score_source": "Rachmaninoff,_Sergei/10_Preludes,_Op.23/No.6_in_E_flat_major:_Andante/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        448,
+        960
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Rachmaninoff,_Sergei/13_Preludes,_Op.32/No.10_in_B_minor:_Lento/score_ASAP_refined.json",
+      "score_source": "Rachmaninoff,_Sergei/13_Preludes,_Op.32/No.10_in_B_minor:_Lento/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        448,
+        960
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Rachmaninoff,_Sergei/13_Preludes,_Op.32/No.5_in_G_major:_Moderato/score_ASAP_refined.json",
+      "score_source": "Rachmaninoff,_Sergei/13_Preludes,_Op.32/No.5_in_G_major:_Moderato/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        448,
+        960
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Ravel,_Maurice/Gaspard_de_la_nuit,_M.55/Ondine/score_ASAP_refined.json",
+      "score_source": "Ravel,_Maurice/Gaspard_de_la_nuit,_M.55/Ondine/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 7,
+      "performance_dataset_counts": {
+        "ASAP": 7
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Ravel,_Maurice/Miroirs,_M.43/3._Une_barque_sur_l'océan/score_ASAP_refined.json",
+      "score_source": "Ravel,_Maurice/Miroirs,_M.43/3._Une_barque_sur_l'océan/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        3584,
+        4096
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Ravel,_Maurice/Miroirs,_M.43/4._Alborada_del_gracioso/score_ASAP_refined.json",
+      "score_source": "Ravel,_Maurice/Miroirs,_M.43/4._Alborada_del_gracioso/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 10,
+      "performance_dataset_counts": {
+        "ASAP": 10
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Ravel,_Maurice/Pavane_pour_une_infante_défunte,_M.19/score_ASAP_refined.json",
+      "score_source": "Ravel,_Maurice/Pavane_pour_une_infante_défunte,_M.19/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Schubert,_Franz/4_Impromptus,_Op.90,_D.899/1._Allegro_molto_moderato/score_ASAP_refined.json",
+      "score_source": "Schubert,_Franz/4_Impromptus,_Op.90,_D.899/1._Allegro_molto_moderato/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 4,
+      "performance_dataset_counts": {
+        "ASAP": 4
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Schubert,_Franz/4_Impromptus,_Op.90,_D.899/2._Allegro/score_ASAP_refined.json",
+      "score_source": "Schubert,_Franz/4_Impromptus,_Op.90,_D.899/2._Allegro/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 7,
+      "performance_dataset_counts": {
+        "ASAP": 7
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Schubert,_Franz/4_Impromptus,_Op.90,_D.899/3._Andante/score_ASAP_refined.json",
+      "score_source": "Schubert,_Franz/4_Impromptus,_Op.90,_D.899/3._Andante/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 12,
+      "performance_dataset_counts": {
+        "ASAP": 12
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Schubert,_Franz/4_Impromptus,_Op.90,_D.899/4._Allegretto/score_ASAP_refined.json",
+      "score_source": "Schubert,_Franz/4_Impromptus,_Op.90,_D.899/4._Allegretto/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        2688,
+        3200
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Schubert,_Franz/4_Impromptus_Op.142,_D.935/No.1_in_F_minor:_Allegro_moderato/score_ASAP_refined.json",
+      "score_source": "Schubert,_Franz/4_Impromptus_Op.142,_D.935/No.1_in_F_minor:_Allegro_moderato/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 4,
+      "performance_dataset_counts": {
+        "ASAP": 4
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Schubert,_Franz/4_Impromptus_Op.142,_D.935/No.3_in_B_flat:_Theme_(Andante)_with_Variations/score_ASAP_refined.json",
+      "score_source": "Schubert,_Franz/4_Impromptus_Op.142,_D.935/No.3_in_B_flat:_Theme_(Andante)_with_Variations/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 8,
+      "performance_dataset_counts": {
+        "ASAP": 8
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Schubert,_Franz/6_Moments_musicaux,_Op.94_D.780/No.1_in_C_(Moderato)/score_ASAP_refined.json",
+      "score_source": "Schubert,_Franz/6_Moments_musicaux,_Op.94_D.780/No.1_in_C_(Moderato)/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        1792,
+        2304
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Schubert,_Franz/6_Moments_musicaux,_Op.94_D.780/No.3_in_F_minor_(Allegro_moderato)/score_ASAP_refined.json",
+      "score_source": "Schubert,_Franz/6_Moments_musicaux,_Op.94_D.780/No.3_in_F_minor_(Allegro_moderato)/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        543,
+        1055
+      ],
+      "estimated_performances": 1,
+      "performance_dataset_counts": {
+        "ASAP": 1
+      },
+      "valid_examples": 1,
+      "valid_asap_examples": 1,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Schubert,_Franz/Fantasy_in_C_major,_D.760,_Op.15_\"Wanderer-Fantasy\"/score_ASAP_refined.json",
+      "score_source": "Schubert,_Franz/Fantasy_in_C_major,_D.760,_Op.15_\"Wanderer-Fantasy\"/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        10752,
+        11264
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Schubert,_Franz/Piano_Sonata_No.13_in_A_major,_D.664_(Op.posth.120)/2._Andante/score_ASAP_refined.json",
+      "score_source": "Schubert,_Franz/Piano_Sonata_No.13_in_A_major,_D.664_(Op.posth.120)/2._Andante/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        818,
+        1330
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Schubert,_Franz/Piano_Sonata_No.18_in_G_major,_D.894_\"Fantasie\"/2._Andante/score_ASAP_refined.json",
+      "score_source": "Schubert,_Franz/Piano_Sonata_No.18_in_G_major,_D.894_\"Fantasie\"/2._Andante/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 9,
+      "performance_dataset_counts": {
+        "ASAP": 9
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Schumann,_Robert/Arabeske,_Op.18/score_ASAP_refined.json",
+      "score_source": "Schumann,_Robert/Arabeske,_Op.18/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        448,
+        960
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Schumann,_Robert/Kreisleriana,_Op.16/1._Äußerst_bewegt/score_ASAP_refined.json",
+      "score_source": "Schumann,_Robert/Kreisleriana,_Op.16/1._Äußerst_bewegt/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Schumann,_Robert/Kreisleriana,_Op.16/2._Sehr_innig_und_nicht_zu_rasch/score_ASAP_refined.json",
+      "score_source": "Schumann,_Robert/Kreisleriana,_Op.16/2._Sehr_innig_und_nicht_zu_rasch/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        448,
+        960
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Schumann,_Robert/Kreisleriana,_Op.16/3._Sehr_aufgeregt/score_ASAP_refined.json",
+      "score_source": "Schumann,_Robert/Kreisleriana,_Op.16/3._Sehr_aufgeregt/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Schumann,_Robert/Kreisleriana,_Op.16/4._Sehr_langsam/score_ASAP_refined.json",
+      "score_source": "Schumann,_Robert/Kreisleriana,_Op.16/4._Sehr_langsam/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Schumann,_Robert/Kreisleriana,_Op.16/5._Sehr_lebhaft/score_ASAP_refined.json",
+      "score_source": "Schumann,_Robert/Kreisleriana,_Op.16/5._Sehr_lebhaft/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Schumann,_Robert/Kreisleriana,_Op.16/6._Sehr_langsam/score_ASAP_refined.json",
+      "score_source": "Schumann,_Robert/Kreisleriana,_Op.16/6._Sehr_langsam/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        217,
+        729
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Schumann,_Robert/Kreisleriana,_Op.16/7._Sehr_rasch/score_ASAP_refined.json",
+      "score_source": "Schumann,_Robert/Kreisleriana,_Op.16/7._Sehr_rasch/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        0,
+        512
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Schumann,_Robert/Toccata_in_C_major,_Op.7/score_ASAP_refined.json",
+      "score_source": "Schumann,_Robert/Toccata_in_C_major,_Op.7/score_ASAP_refined.mid",
+      "selected": true,
+      "valid_window": [
+        2240,
+        2752
+      ],
+      "estimated_performances": 2,
+      "performance_dataset_counts": {
+        "ASAP": 2
+      },
+      "valid_examples": 2,
+      "valid_asap_examples": 2,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Scriabin,_Aleksandr/12_Etudes,_Op.8/No.11_in_B_flat_minor/score_MS_refined.json",
+      "score_source": "Scriabin,_Aleksandr/12_Etudes,_Op.8/No.11_in_B_flat_minor/score_MS_refined.mid",
+      "selected": true,
+      "valid_window": [
+        874,
+        1386
+      ],
+      "estimated_performances": 3,
+      "performance_dataset_counts": {
+        "ASAP": 3
+      },
+      "valid_examples": 3,
+      "valid_asap_examples": 3,
+      "valid_non_asap_examples": 0
+    },
+    {
+      "path": "data/ASAP_processed_pedal_group/Scriabin,_Aleksandr/Piano_Sonata_No.5_in_F_sharp_major,_Op.53/score_ASAP_refined.json",
+      "score_source": "Scriabin,_Aleksandr/Piano_Sonata_No.5_in_F_sharp_major,_Op.53/score_ASAP_refined.mid",
+      "selected": false,
+      "valid_window": null,
+      "estimated_performances": 9,
+      "performance_dataset_counts": {
+        "ASAP": 9
+      },
+      "valid_examples": 0,
+      "valid_asap_examples": 0,
+      "valid_non_asap_examples": 0
+    }
+  ]
+}
