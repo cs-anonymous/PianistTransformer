@@ -146,6 +146,8 @@ def materialize_feedback(model_config, logits, strategy, score_shared_raw):
 def evaluate_k(model, model_config, loader, device, rollout_k, materialize_strategy, feedback_strategy):
     totals = {}
     total_weight = 0.0
+    loss_total = 0.0
+    loss_weight = 0.0
     model.eval()
     with torch.no_grad():
         for batch in tqdm(loader, desc=f"k={rollout_k}", leave=False):
@@ -187,6 +189,14 @@ def evaluate_k(model, model_config, loader, device, rollout_k, materialize_strat
                 compute_pn=("ioi", "duration", "velocity", "pedal"),
                 compute_pp=("ioi", "duration", "velocity", "pedal"),
             )
+            if outputs.loss is not None:
+                # Trainer's evaluation_loop repeats each batch loss once per
+                # example before taking the mean; match that convention so
+                # this diagnostic is comparable to logged eval_loss.
+                loss_weight_batch = float(attention_mask.shape[0])
+                if loss_weight_batch > 0.0:
+                    loss_total += float(outputs.loss.detach().float().cpu()) * loss_weight_batch
+                    loss_weight += loss_weight_batch
             weight = float(len(torch.unique(group_index).detach().cpu()))
             total_weight += weight
             for key, value in metrics.items():
@@ -194,6 +204,8 @@ def evaluate_k(model, model_config, loader, device, rollout_k, materialize_strat
     if total_weight <= 0:
         raise ValueError("No grouped validation windows were evaluated")
     averaged = {key: value / total_weight for key, value in totals.items()}
+    if loss_weight > 0.0:
+        averaged["tf_loss"] = loss_total / loss_weight
     raw = {}
     for prefix, human in (("pn", HUMAN_PN), ("pp", HUMAN_PP)):
         rel_terms3 = []
@@ -226,7 +238,10 @@ def main():
         if args.rollout_ks is not None
         else config.get("validation_rollout_k", 16)
     )
-    fixed_scheme = config.get("fixed_window_split_scheme")
+    # The fixed-window scheme defines the synthetic train/valid windows. It
+    # must not be applied when the caller explicitly evaluates the real test
+    # split, which is stored in the metadata as a separate split.
+    fixed_scheme = config.get("fixed_window_split_scheme") if args.split == "valid" else None
     manifest_split = config.get("fixed_window_base_split", "train") if fixed_scheme else args.split
     window_split_name = config.get("fixed_window_eval_split_name", args.split) if fixed_scheme else None
     dataset_split = manifest_split if fixed_scheme else args.split

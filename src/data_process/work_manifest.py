@@ -111,6 +111,7 @@ def build_work_manifest(
     window_split_scheme=None,
     window_split_name=None,
     window_split_summary_path=None,
+    exclude_windows_overlapping_valid=False,
     prepared_sidecar_tag=None,
 ):
     columns = [
@@ -173,6 +174,7 @@ def build_work_manifest(
                 split_name=window_split_name,
                 canonical_windows=windows,
                 summary_path=window_split_summary_path,
+                exclude_overlapping_valid=exclude_windows_overlapping_valid,
             )
         if not windows:
             continue

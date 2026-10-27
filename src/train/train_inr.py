@@ -1302,6 +1302,17 @@ def distributed_info():
 
 
 def configure_eval_schedule(train_config, train_examples):
+    # When a run explicitly requests epoch evaluation, do not derive a
+    # step interval from the estimated manifest size.  The sidecar-filtered
+    # dataset can contain fewer examples than that estimate, which otherwise
+    # makes validation drift to 1.04, 2.08, ... epochs.
+    if bool(train_config.get("force_epoch_eval", False)):
+        train_config["eval_strategy"] = "epoch"
+        train_config["save_strategy"] = "epoch"
+        train_config.setdefault("load_best_model_at_end", True)
+        train_config.setdefault("metric_for_best_model", "eval_loss")
+        train_config.setdefault("greater_is_better", False)
+        return
     asap_only = str(train_config.get("train_performance_dataset", "")).strip().upper() == "ASAP"
     if asap_only:
         world_size = int(os.environ.get("WORLD_SIZE", "1") or 1)
@@ -1326,6 +1337,18 @@ def configure_eval_schedule(train_config, train_examples):
         train_config["eval_steps"] = int(train_config["force_eval_steps"])
     if train_config.get("force_save_steps") is not None:
         train_config["save_steps"] = int(train_config["force_save_steps"])
+    if train_config.get("convergence_diagnostics", False):
+        # The estimated manifest size differs from actual sidecar-filtered size.
+        # True epoch boundaries avoid drifting step-based checkpoint aliases.
+        train_config["eval_strategy"] = "epoch"
+        train_config["save_strategy"] = "epoch"
+    if train_config.get("disable_train_eval", False):
+        # Capped development manifests can legitimately have no validation rows.
+        # Keep epoch checkpointing, while preventing Trainer from reducing an
+        # empty eval dataloader to missing eval_loss metrics.
+        train_config["eval_strategy"] = "no"
+        train_config["save_strategy"] = "epoch"
+        train_config["load_best_model_at_end"] = False
     train_config.setdefault("load_best_model_at_end", True)
     train_config.setdefault("metric_for_best_model", "eval_loss")
     train_config.setdefault("greater_is_better", False)
@@ -1384,6 +1407,11 @@ class PianoCoReNodeSFTDataset(Dataset):
         legacy_dual_timing_head=False,
         multi_perf_group_size=1,
         multi_perf_min_group_size=3,
+        pn_velocity_target_cache=False,
+        pn_velocity_target_min_performances=2,
+        pn_velocity_target_bins=128,
+        pn_velocity_target_min=-0.5,
+        pn_velocity_target_max=127.5,
     ):
         super().__init__()
         self.split = split
@@ -1409,6 +1437,13 @@ class PianoCoReNodeSFTDataset(Dataset):
         self.legacy_dual_timing_head = bool(legacy_dual_timing_head)
         self.multi_perf_group_size = max(1, int(multi_perf_group_size or 1))
         self.multi_perf_min_group_size = max(2, int(multi_perf_min_group_size or 3))
+        self.pn_velocity_target_cache = bool(pn_velocity_target_cache)
+        self.pn_velocity_target_min_performances = max(2, int(pn_velocity_target_min_performances or 2))
+        self.pn_velocity_target_bins = max(2, int(pn_velocity_target_bins or 128))
+        self.pn_velocity_target_min = float(pn_velocity_target_min)
+        self.pn_velocity_target_max = float(pn_velocity_target_max)
+        if self.pn_velocity_target_max <= self.pn_velocity_target_min:
+            raise ValueError("pn_velocity_target_max must be greater than pn_velocity_target_min")
         self.use_style_tokens = bool(use_style_tokens)
         self.perf_style_stats_mode = str(perf_style_stats_mode or "prefix").lower()
         if self.perf_style_stats_mode not in {"prefix", "window"}:
@@ -1910,6 +1945,56 @@ class PianoCoReNodeSFTDataset(Dataset):
         label_cache[cache_key] = (labels, label_bins)
         return labels, label_bins
 
+    def _pn_velocity_target_for_performances(self, prepared, performances):
+        """Build one immutable per-note empirical velocity PMF for a score.
+
+        This is deliberately cached per selected performance set, so a capped
+        train manifest cannot silently use performances that were not sampled.
+        The aggregation is count-based and therefore independent of source order.
+        """
+        if not self.pn_velocity_target_cache:
+            return None
+        source_keys = tuple(sorted(str(self._performance_cache_key(perf)) for perf in performances))
+        cache = prepared.setdefault("pn_velocity_target_cache", {})
+        if source_keys in cache:
+            return cache[source_keys]
+        if len(performances) < self.pn_velocity_target_min_performances:
+            result = None
+            cache[source_keys] = result
+            return result
+
+        note_count = len(prepared["score"]["score_raw"])
+        counts = np.zeros((note_count, self.pn_velocity_target_bins), dtype=np.float32)
+        valid_counts = np.zeros((note_count,), dtype=np.float32)
+        width = self.pn_velocity_target_max - self.pn_velocity_target_min
+        for perf in sorted(performances, key=lambda item: str(self._performance_cache_key(item))):
+            labels, _ = self._performance_labels(prepared, perf)
+            values = np.asarray(labels, dtype=np.float32)
+            if values.ndim != 2 or values.shape[0] != note_count or values.shape[1] < 3:
+                raise ValueError(
+                    "PN velocity target requires aligned labels with shape "
+                    f"[notes, >=3], got {values.shape}"
+                )
+            velocity = values[:, 2] * 127.0
+            finite = np.isfinite(velocity)
+            indices = np.floor(
+                (np.clip(velocity, self.pn_velocity_target_min, self.pn_velocity_target_max - 1e-6)
+                 - self.pn_velocity_target_min)
+                / width * self.pn_velocity_target_bins
+            ).astype(np.int64)
+            indices = np.clip(indices, 0, self.pn_velocity_target_bins - 1)
+            for note_index in np.flatnonzero(finite):
+                counts[note_index, indices[note_index]] += 1.0
+                valid_counts[note_index] += 1.0
+        available = valid_counts >= float(self.pn_velocity_target_min_performances)
+        pmf = counts / np.maximum(valid_counts[:, None], 1.0)
+        result = (
+            torch.from_numpy(pmf).contiguous(),
+            torch.from_numpy(available.astype(np.bool_)).contiguous(),
+        )
+        cache[source_keys] = result
+        return result
+
     def _style_creator_id(self, prepared):
         meta = prepared.get("meta")
         composer = str(meta.get("composer") or "") if isinstance(meta, dict) else ""
@@ -2001,7 +2086,7 @@ class PianoCoReNodeSFTDataset(Dataset):
                 flush=True,
             )
 
-    def _sample_for_performance(self, prepared, perf, start, end, index):
+    def _sample_for_performance(self, prepared, perf, start, end, index, pn_velocity_target=None):
         score = prepared["score"]
         labels, label_bins = self._performance_labels(prepared, perf)
         interpolated = perf["interpolated"]
@@ -2038,6 +2123,10 @@ class PianoCoReNodeSFTDataset(Dataset):
             sample["labels_epr_bins"] = labels_epr_bins
         if label_mask is not None:
             sample["label_mask"] = label_mask
+        if pn_velocity_target is not None:
+            target_pmf, target_mask = pn_velocity_target
+            sample["pn_velocity_target_pmf"] = target_pmf[start:end]
+            sample["pn_velocity_target_mask"] = target_mask[start:end]
         return sample
 
     def __getitem__(self, index):
@@ -2062,6 +2151,7 @@ class PianoCoReNodeSFTDataset(Dataset):
         if not performances:
             raise IndexError(f"No performances for split={self.split} in {item['path']}")
 
+        pn_velocity_target = self._pn_velocity_target_for_performances(prepared, performances)
         if self.multi_perf_group_size > 1:
             group_start = int(perf_slot) * self.multi_perf_group_size
             group = performances[group_start : group_start + self.multi_perf_group_size]
@@ -2071,7 +2161,9 @@ class PianoCoReNodeSFTDataset(Dataset):
                 )
             return {
                 "pn_group_examples": [
-                    self._sample_for_performance(prepared, perf, start, end, index)
+                    self._sample_for_performance(
+                        prepared, perf, start, end, index, pn_velocity_target=pn_velocity_target
+                    )
                     for perf in group
                 ]
             }
@@ -2079,7 +2171,9 @@ class PianoCoReNodeSFTDataset(Dataset):
         # A tiny number of PianoCoRe-A rows were skipped for pitch mismatch. If
         # metadata counted one of those rows, wrap to a valid performance instead.
         perf = performances[int(perf_slot) % len(performances)]
-        sample = self._sample_for_performance(prepared, perf, start, end, index)
+        sample = self._sample_for_performance(
+            prepared, perf, start, end, index, pn_velocity_target=pn_velocity_target
+        )
         dagger_prefix = self._dagger_prefix_cache.get(index)
         if dagger_prefix is not None:
             sample["dagger_prefix_continuous"] = dagger_prefix
@@ -2207,6 +2301,54 @@ def _cdf_w1_from_pmfs(pred_pmf, target_pmf, centers):
     widths = centers[1:] - centers[:-1]
     cdf_delta = pred_pmf.cumsum(dim=-1) - target_pmf.cumsum(dim=-1)
     return (cdf_delta[..., :-1].abs() * widths).sum(dim=-1)
+
+
+def _pn_cached_velocity_cdf_w1_loss(
+    config,
+    logits,
+    attention_mask,
+    target_pmf,
+    target_mask,
+):
+    """PN velocity CDF-W1 against an offline same-score empirical target.
+
+    The target is detached CPU data assembled from train performances. This
+    term is intentionally separate from the legacy in-batch group W1 path.
+    """
+    zero = logits.sum() * 0.0
+    if target_pmf is None or target_mask is None:
+        return zero
+    if str(getattr(config, "epr_distribution", "point")).lower() not in {
+        "dlm", "discretized_logistic_mixture"
+    }:
+        return zero
+    params = _split_epr_mixture_params(config, logits)
+    log_probs = _dlm_log_bin_probs(
+        config,
+        params["velocity_logits"],
+        params["velocity_loc"],
+        params["velocity_log_scale"],
+        "velocity",
+    )
+    pred_pmf = log_probs.exp().float()
+    target_pmf = target_pmf.to(device=pred_pmf.device, dtype=pred_pmf.dtype)
+    target_pmf = target_pmf / target_pmf.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    if target_pmf.shape[-1] != pred_pmf.shape[-1]:
+        raise ValueError(
+            "PN velocity target bins do not match model bins: "
+            f"target={target_pmf.shape[-1]} model={pred_pmf.shape[-1]}"
+        )
+    target_mask = target_mask.to(device=pred_pmf.device, dtype=torch.bool)
+    valid = attention_mask.bool() & target_mask
+    if not valid.any():
+        return zero
+    cdf_delta = pred_pmf.cumsum(dim=-1) - target_pmf.cumsum(dim=-1)
+    lo = float(getattr(config, "dlm_velocity_min", -0.5))
+    hi = float(getattr(config, "dlm_velocity_max", 127.5))
+    widths = (hi - lo) / float(pred_pmf.shape[-1])
+    per_note = cdf_delta[..., :-1].abs().sum(dim=-1) * widths
+    normalizer = max(float(getattr(config, "pn_velocity_w1_normalizer", 10.580359191566208)), 1e-6)
+    return (per_note * valid.to(dtype=per_note.dtype)).sum() / valid.sum().clamp_min(1) / normalizer
 
 
 def _histogram_from_weighted_values(values, weights, centers):
@@ -2404,6 +2546,23 @@ def _pn_pp_metric_w1_loss(config, logits, labels, score_shared_raw, attention_ma
 
 
 class NodeSFTTrainer(Trainer):
+    def create_scheduler(self, num_training_steps, optimizer=None):
+        protocol = getattr(self, "convergence_protocol", None)
+        if not protocol:
+            return super().create_scheduler(num_training_steps, optimizer=optimizer)
+        if self.lr_scheduler is None:
+            steps_per_epoch = num_training_steps / float(self.args.num_train_epochs)
+            warmup_steps = self.args.get_warmup_steps(num_training_steps)
+            drop_step = round(float(protocol.get("convergence_lr_drop_epoch", 24)) * steps_per_epoch)
+            low_factor = float(protocol.get("convergence_low_lr_factor", 0.1))
+            def multiplier(step):
+                if step < warmup_steps:
+                    return float(step) / max(1, warmup_steps)
+                return 1.0 if step < drop_step else low_factor
+            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer or self.optimizer, multiplier)
+            self._created_lr_scheduler = True
+        return self.lr_scheduler
+
     def _model_config(self, model):
         return model.module.config if hasattr(model, "module") else model.config
 
@@ -2975,9 +3134,68 @@ class NodeSFTTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         group_index = inputs.pop("pn_group_index", None)
         inputs.pop("pn_group_sizes", None)
+        pn_velocity_target_pmf = inputs.pop("pn_velocity_target_pmf", None)
+        pn_velocity_target_mask = inputs.pop("pn_velocity_target_mask", None)
         outputs = model(**inputs)
         loss = outputs.loss
         config = self._model_config(model)
+        rollout_train_weight = float(getattr(config, "rollout_train_weight", 0.0) or 0.0)
+        rollout_train_k = int(getattr(config, "rollout_train_k", 1) or 1)
+        if self.model.training and rollout_train_weight != 0.0 and rollout_train_k > 0:
+            if rollout_train_k != 1:
+                raise ValueError(
+                    "rollout_train_k currently supports only k=1; use dagger_prefix_training "
+                    "or extend the explicit multi-pass training path before setting k>1"
+                )
+            if getattr(outputs, "logits", None) is None:
+                raise ValueError("rollout training requires model logits")
+            feedback = _materialize_epr_prediction(
+                config,
+                outputs.logits,
+                sampling_strategy=str(getattr(config, "rollout_train_feedback_strategy", "sample")),
+                score_shared_raw=inputs.get("score_shared_raw"),
+            ).detach()
+            rollout_inputs = dict(inputs)
+            # The second pass is conditioned on the model's own detached
+            # prediction, while its logits and loss remain differentiable.
+            rollout_inputs["decoder_feedback_continuous"] = feedback
+            rollout_outputs = model(**rollout_inputs)
+            if rollout_outputs.loss is None:
+                raise ValueError("rollout training requires a differentiable second-pass loss")
+            rollout_loss = rollout_outputs.loss
+            loss = loss + rollout_train_weight * rollout_loss
+            if self.is_world_process_zero():
+                accumulator = getattr(self, "_train_loss_component_sums", None)
+                if accumulator is None:
+                    accumulator = {}
+                    self._train_loss_component_sums = accumulator
+                accumulator["rollout_k1"] = accumulator.get("rollout_k1", 0.0) + float(
+                    rollout_loss.detach().cpu()
+                )
+        cached_velocity_lambda = float(
+            getattr(config, "pn_cached_velocity_cdf_w1_lambda", 0.0)
+        )
+        if (
+            cached_velocity_lambda != 0.0
+            and getattr(outputs, "logits", None) is not None
+            and pn_velocity_target_pmf is not None
+        ):
+            cached_velocity = _pn_cached_velocity_cdf_w1_loss(
+                config,
+                outputs.logits,
+                inputs["attention_mask"],
+                pn_velocity_target_pmf,
+                pn_velocity_target_mask,
+            )
+            loss = loss + cached_velocity_lambda * cached_velocity
+            if self.model.training and self.is_world_process_zero():
+                accumulator = getattr(self, "_train_loss_component_sums", None)
+                if accumulator is None:
+                    accumulator = {}
+                    self._train_loss_component_sums = accumulator
+                accumulator["pn_cached_velocity_cdf_w1"] = accumulator.get(
+                    "pn_cached_velocity_cdf_w1", 0.0
+                ) + float(cached_velocity.detach().cpu())
         if (
             self.model.training
             and bool(getattr(config, "gradnorm", False))
@@ -3295,7 +3513,10 @@ class NodeSFTTrainer(Trainer):
             if tmp_dir.exists():
                 shutil.rmtree(tmp_dir, ignore_errors=True)
             try:
-                shutil.copytree(source, tmp_dir)
+                # Epoch aliases serve inference. Retain full optimizer state in
+                # rotating checkpoint-N directories, without multiplying it.
+                ignore = shutil.ignore_patterns("optimizer.pt") if getattr(self, "retain_optimizer_state", False) else None
+                shutil.copytree(source, tmp_dir, ignore=ignore)
                 (tmp_dir / ".epoch_source").write_text(
                     json.dumps(
                         {
@@ -3345,8 +3566,24 @@ class NodeSFTTrainer(Trainer):
 
     def _save_checkpoint(self, model, trial):
         super()._save_checkpoint(model, trial)
+        self._drop_optimizer_state()
         self._sync_epoch_checkpoint_aliases()
         self._sync_checkpoint_best_alias()
+        if getattr(self, "retain_optimizer_state", False) and self.is_world_process_zero():
+            checkpoint_dir = Path(self.args.output_dir) / f"checkpoint-{self.state.global_step}"
+            (checkpoint_dir / ".checkpoint_complete").write_text(str(self.state.global_step) + "\n")
+
+    def _drop_optimizer_state(self):
+        # Do not keep the (large) optimizer state on disk; model weights suffice.
+        if getattr(self, "retain_optimizer_state", False):
+            return
+        if not self.is_world_process_zero():
+            return
+        output_dir = Path(self.args.output_dir)
+        checkpoint_dir = output_dir / f"checkpoint-{self.state.global_step}"
+        optimizer_file = checkpoint_dir / "optimizer.pt"
+        if optimizer_file.exists():
+            optimizer_file.unlink()
 
     def _rollout_eval_enabled(self):
         return bool(getattr(self, "rollout_eval_enabled", False))
@@ -3633,6 +3870,26 @@ class NodeSFTDataCollator:
             labels_epr_bins_tensors = [
                 torch.tensor(example["labels_epr_bins"], dtype=torch.long) for example in examples
             ]
+        pn_velocity_target_tensors = None
+        pn_velocity_target_mask_tensors = None
+        if any("pn_velocity_target_pmf" in example for example in examples):
+            target_bins = next(
+                int(torch.as_tensor(example["pn_velocity_target_pmf"]).shape[-1])
+                for example in examples
+                if "pn_velocity_target_pmf" in example
+            )
+            pn_velocity_target_tensors = []
+            pn_velocity_target_mask_tensors = []
+            for example in examples:
+                length = len(example["labels_continuous"])
+                if "pn_velocity_target_pmf" in example:
+                    pmf = torch.as_tensor(example["pn_velocity_target_pmf"], dtype=torch.float32)
+                    mask = torch.as_tensor(example["pn_velocity_target_mask"], dtype=torch.bool)
+                else:
+                    pmf = torch.zeros((length, target_bins), dtype=torch.float32)
+                    mask = torch.zeros((length,), dtype=torch.bool)
+                pn_velocity_target_tensors.append(pmf)
+                pn_velocity_target_mask_tensors.append(mask)
         dagger_prefix_tensors = None
         if self.dagger_prefix_training:
             dagger_prefix_tensors = []
@@ -3801,6 +4058,17 @@ class NodeSFTDataCollator:
                 labels_epr_bins_tensors,
                 batch_first=True,
                 padding_value=0,
+            )
+        if pn_velocity_target_tensors is not None:
+            batch["pn_velocity_target_pmf"] = pad_sequence(
+                pn_velocity_target_tensors,
+                batch_first=True,
+                padding_value=0.0,
+            )
+            batch["pn_velocity_target_mask"] = pad_sequence(
+                pn_velocity_target_mask_tensors,
+                batch_first=True,
+                padding_value=False,
             )
         return batch
 
@@ -4199,6 +4467,14 @@ def create_model(train_config):
         pp_duration_w1_lambda=train_config.get("pp_duration_w1_lambda", 0.0),
         pn_velocity_w1_lambda=train_config.get("pn_velocity_w1_lambda", 0.0),
         pp_velocity_w1_lambda=train_config.get("pp_velocity_w1_lambda", 0.0),
+        pn_cached_velocity_cdf_w1_lambda=train_config.get(
+            "pn_cached_velocity_cdf_w1_lambda", 0.0
+        ),
+        rollout_train_weight=train_config.get("rollout_train_weight", 0.0),
+        rollout_train_k=train_config.get("rollout_train_k", 1),
+        rollout_train_feedback_strategy=train_config.get(
+            "rollout_train_feedback_strategy", "sample"
+        ),
         ioi_w1_normalizer=train_config.get("ioi_w1_normalizer", 22.772456164440005),
         duration_w1_normalizer=train_config.get("duration_w1_normalizer", 75.08565114668764),
         velocity_w1_normalizer=train_config.get("velocity_w1_normalizer", 10.580359191566208),
@@ -4691,6 +4967,9 @@ def main():
             window_split_scheme=fixed_window_split_scheme,
             window_split_name=train_config.get("fixed_window_train_split_name", "train"),
             window_split_summary_path=fixed_window_split_summary_path,
+            exclude_windows_overlapping_valid=train_config.get(
+                "exclude_windows_overlapping_valid", False
+            ),
             prepared_sidecar_tag=train_config.get("prepared_sidecar_tag"),
         )
     else:
@@ -4725,6 +5004,7 @@ def main():
             window_split_scheme=fixed_window_split_scheme,
             window_split_name=train_config.get("fixed_window_eval_split_name", "valid"),
             window_split_summary_path=fixed_window_split_summary_path,
+            exclude_windows_overlapping_valid=False,
             prepared_sidecar_tag=train_config.get("prepared_sidecar_tag"),
         )
         train_config["eval_split"] = train_config.get("fixed_window_eval_split_name", "valid")
@@ -4792,6 +5072,13 @@ def main():
         legacy_dual_timing_head=train_config.get("legacy_dual_timing_head", False),
         multi_perf_group_size=train_config.get("multi_perf_group_size", 1),
         multi_perf_min_group_size=train_config.get("multi_perf_min_group_size", 3),
+        pn_velocity_target_cache=train_config.get("pn_velocity_target_cache", False),
+        pn_velocity_target_min_performances=train_config.get(
+            "pn_velocity_target_min_performances", 2
+        ),
+        pn_velocity_target_bins=train_config.get("dlm_velocity_bins", 128),
+        pn_velocity_target_min=train_config.get("dlm_velocity_min", -0.5),
+        pn_velocity_target_max=train_config.get("dlm_velocity_max", 127.5),
     )
     eval_dataset = PianoCoReNodeSFTDataset(
         eval_manifest,
@@ -4825,6 +5112,7 @@ def main():
         source_vocab=train_config.get("style_source_vocab"),
         perf_style_stats_mode=train_config.get("perf_style_stats_mode", "prefix"),
         legacy_dual_timing_head=train_config.get("legacy_dual_timing_head", False),
+        pn_velocity_target_cache=False,
     )
 
     model = create_model(train_config)
@@ -4896,6 +5184,14 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
     )
+    trainer.retain_optimizer_state = bool(train_config.get("retain_optimizer_state", False))
+    if train_config.get("convergence_diagnostics", False):
+        from src.train.convergence_diagnostics import ConvergenceDiagnostics
+        trainer.convergence_protocol = dict(train_config)
+        trainer.add_callback(ConvergenceDiagnostics(
+            trainer, train_config, _compute_integrated_loss_components,
+            _pn_cached_velocity_cdf_w1_loss,
+        ))
     trainer.dagger_prefix_training = dagger_prefix_training
     trainer.dagger_cache_type = train_config.get("dagger_cache_type", "tf_pred")
     trainer.dagger_cache_scope = train_config.get("dagger_cache_scope", "random")
@@ -4963,12 +5259,19 @@ def main():
 
     resume_path = train_config.get("resume_path")
     resume_trainer_state = bool(train_config.get("resume_trainer_state", True))
+    if resume_path and resume_trainer_state and train_config.get("require_full_resume_state", False):
+        required = ["optimizer.pt", "scheduler.pt", "rng_state.pth", "trainer_state.json", ".checkpoint_complete"]
+        missing = [name for name in required if not (Path(resume_path) / name).exists()]
+        if missing:
+            raise ValueError(f"Strict continuation requires complete state; missing {missing} in {resume_path}")
     if dagger_prefix_training and bool(train_config.get("dagger_refresh_at_train_start", True)):
         trainer.refresh_dagger_prefix_cache(reason="train_start")
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
     trainer.train(resume_from_checkpoint=resume_path if resume_path and resume_trainer_state else None)
     trainer.save_model()
+    if train_config.get("convergence_diagnostics", False):
+        trainer.save_state()
     dist_ready = torch.distributed.is_available() and torch.distributed.is_initialized()
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.distributed.barrier()

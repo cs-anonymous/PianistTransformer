@@ -46,6 +46,34 @@ def _candidate_entries(manifest, performance_dataset, selection_seed):
     return entries
 
 
+def _set_validation_window_position(entries, manifest, position, selection_seed):
+    """Replace random validation windows with an edge window when requested.
+
+    ``edge`` chooses the first or last canonical window deterministically per
+    work.  This keeps validation at a score boundary while avoiding a fixed
+    bias toward only the beginning or only the ending of every work.
+    """
+    position = str(position or "random").lower()
+    if position == "random":
+        return entries
+    by_path = {str(item["path"]): list(item["windows"]) for item in manifest}
+    for entry in entries:
+        windows = by_path.get(str(entry["path"]), [])
+        if not windows:
+            continue
+        if position == "first":
+            entry["eval_window"] = [int(windows[0][0]), int(windows[0][1])]
+        elif position == "last":
+            entry["eval_window"] = [int(windows[-1][0]), int(windows[-1][1])]
+        elif position == "edge":
+            rng = random.Random(f"edge:{selection_seed}:{entry['score_source']}")
+            window = windows[0] if rng.randrange(2) == 0 else windows[-1]
+            entry["eval_window"] = [int(window[0]), int(window[1])]
+        else:
+            raise ValueError(f"Unsupported validation window position: {position}")
+    return entries
+
+
 def _select_primary_asap(entries, target_examples):
     ordered = sorted(
         entries,
@@ -136,6 +164,8 @@ def build_fixed_scheme(
     selection_seed,
     min_asap_valid_works=0,
     min_asap_performances=2,
+    valid_window_position="random",
+    exclude_overlapping_valid=False,
 ):
     asap_total_examples = 0
     non_asap_total_examples = 0
@@ -152,6 +182,8 @@ def build_fixed_scheme(
 
     asap_entries = _candidate_entries(manifest, "ASAP", selection_seed)
     non_asap_entries = _candidate_entries(manifest, "non-ASAP", selection_seed)
+    _set_validation_window_position(asap_entries, manifest, valid_window_position, selection_seed)
+    _set_validation_window_position(non_asap_entries, manifest, valid_window_position, selection_seed)
 
     selected = _select_primary_asap(asap_entries, asap_target)
     selected = _augment_non_asap(non_asap_entries, selected, non_asap_target)
@@ -175,7 +207,14 @@ def build_fixed_scheme(
         eval_window = selected_entry["eval_window"] if selected_entry else None
         window_assignments = []
         for window in windows:
+            overlaps_valid = (
+                eval_window is not None
+                and int(window[0]) < int(eval_window[1])
+                and int(eval_window[0]) < int(window[1])
+            )
             split = "valid" if eval_window is not None and list(window) == list(eval_window) else "train"
+            if exclude_overlapping_valid and overlaps_valid and split != "valid":
+                split = "excluded"
             window_assignments.append({"window": window, "split": split})
         counts = item.get("performance_dataset_counts") or {}
         asap_count = int(counts.get("ASAP", 0))
@@ -231,6 +270,8 @@ def build_fixed_scheme(
             "selected_works": int(sum(1 for row in summary_rows if row["selected"])),
             "min_asap_valid_works": int(min_asap_valid_works),
             "min_asap_performances": int(min_asap_performances),
+            "valid_window_position": str(valid_window_position),
+            "exclude_overlapping_valid": bool(exclude_overlapping_valid),
         },
         "assignments_by_path": by_path,
         "work_summaries": summary_rows,
@@ -285,6 +326,17 @@ def main():
     parser.add_argument("--selection-seed", type=int, default=42)
     parser.add_argument("--min-asap-valid-works", type=int, default=0)
     parser.add_argument("--min-asap-performances", type=int, default=2)
+    parser.add_argument(
+        "--valid-window-position",
+        choices=["random", "first", "last", "edge"],
+        default="random",
+        help="Validation window selection policy; edge chooses first/last deterministically per work.",
+    )
+    parser.add_argument(
+        "--exclude-overlapping-valid",
+        action="store_true",
+        help="Mark train windows intersecting the validation interval as excluded.",
+    )
     parser.add_argument("--output-summary", default=None)
     parser.add_argument("--skip-sidecars", action="store_true")
     parser.add_argument("--workers", type=int, default=36)
@@ -309,6 +361,8 @@ def main():
         selection_seed=args.selection_seed,
         min_asap_valid_works=args.min_asap_valid_works,
         min_asap_performances=args.min_asap_performances,
+        valid_window_position=args.valid_window_position,
+        exclude_overlapping_valid=args.exclude_overlapping_valid,
     )
     scheme_payload = dict(built["scheme"])
 

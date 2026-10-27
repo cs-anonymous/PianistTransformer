@@ -45,8 +45,19 @@ class BestLastTrainer(Trainer):
 
     def _save_checkpoint(self, model, trial):
         super()._save_checkpoint(model, trial)
+        self._drop_optimizer_state()
         self._sync_checkpoint_best_alias()
         self._cleanup_checkpoints()
+
+    def _drop_optimizer_state(self):
+        # Do not keep the (large) optimizer state on disk; model weights suffice.
+        if not self.args.should_save:
+            return
+        output_dir = Path(self.args.output_dir)
+        checkpoint_dir = output_dir / f"checkpoint-{self.state.global_step}"
+        optimizer_file = checkpoint_dir / "optimizer.pt"
+        if optimizer_file.exists():
+            optimizer_file.unlink()
 
     def _cleanup_checkpoints(self, checkpoint_prefix="checkpoint", use_mtime=False):
         if not self.args.should_save:

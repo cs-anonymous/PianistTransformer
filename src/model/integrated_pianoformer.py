@@ -333,6 +333,10 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         pp_duration_w1_lambda=0.0,
         pn_velocity_w1_lambda=0.0,
         pp_velocity_w1_lambda=0.0,
+        pn_cached_velocity_cdf_w1_lambda=0.0,
+        rollout_train_weight=0.0,
+        rollout_train_k=1,
+        rollout_train_feedback_strategy="sample",
         ioi_w1_normalizer=22.772456164440005,
         duration_w1_normalizer=75.08565114668764,
         velocity_w1_normalizer=10.580359191566208,
@@ -635,6 +639,14 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         self.pp_duration_w1_lambda = float(pp_duration_w1_lambda)
         self.pn_velocity_w1_lambda = float(pn_velocity_w1_lambda)
         self.pp_velocity_w1_lambda = float(pp_velocity_w1_lambda)
+        self.pn_cached_velocity_cdf_w1_lambda = float(pn_cached_velocity_cdf_w1_lambda)
+        self.rollout_train_weight = float(rollout_train_weight)
+        self.rollout_train_k = int(rollout_train_k)
+        self.rollout_train_feedback_strategy = str(rollout_train_feedback_strategy or "sample")
+        if self.rollout_train_weight < 0.0:
+            raise ValueError("rollout_train_weight must be non-negative")
+        if self.rollout_train_k < 0:
+            raise ValueError("rollout_train_k must be non-negative")
         self.ioi_w1_normalizer = float(ioi_w1_normalizer)
         self.duration_w1_normalizer = float(duration_w1_normalizer)
         self.velocity_w1_normalizer = float(velocity_w1_normalizer)

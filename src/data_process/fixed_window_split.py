@@ -54,7 +54,14 @@ def _load_fixed_window_split_index(summary_path, scheme_name):
     return index
 
 
-def load_windows_from_fixed_split(path, scheme_name, split_name, canonical_windows=None, summary_path=None):
+def load_windows_from_fixed_split(
+    path,
+    scheme_name,
+    split_name,
+    canonical_windows=None,
+    summary_path=None,
+    exclude_overlapping_valid=False,
+):
     if summary_path:
         index = _load_fixed_window_split_index(summary_path, scheme_name)
         entry = index.get(str(path)) or index.get(_normalized_work_path(path))
@@ -82,6 +89,16 @@ def load_windows_from_fixed_split(path, scheme_name, split_name, canonical_windo
         if str(split_name) == "train":
             if valid_window is None:
                 return canonical_windows
+            if exclude_overlapping_valid:
+                return [
+                    window
+                    for window in canonical_windows
+                    if window != valid_window
+                    and not (
+                        int(window[0]) < int(valid_window[1])
+                        and int(valid_window[0]) < int(window[1])
+                    )
+                ]
             return [window for window in canonical_windows if window != valid_window]
         raise ValueError(
             f"Unsupported fixed window split name={split_name} with summary-backed lookup for {path}"
