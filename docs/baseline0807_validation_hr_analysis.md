@@ -46,17 +46,22 @@ The denominators are fixed human reference Wasserstein values:
 
 ```text
 PN:
-  ioi       26.554209906777686
-  duration 105.54706686568747
-  velocity 11.716304664046339
-  pedal    0.246551332481009
+  ioi       22.772456164440005
+  duration  75.08565114668764
+  velocity  10.580359191566208
+  pedal      0.249896225481232
 
 PP:
-  ioi       7.952391192015138
-  duration 25.9246360560533
-  velocity 3.057647553002258
-  pedal    0.07682493502888045
+  ioi        5.030337670706154
+  duration  20.449834140491266
+  velocity   3.070947106636113
+  pedal      0.0777161535190955
 ```
+
+These anchors are from the score-span-normalized Human leave-one-out evaluation
+(`human_leave_one_score_span_eval_binary.json`), which is the reference protocol
+used by the paper tables. Older validation artifacts using the previous
+leave-one-out protocol should not be compared numerically with this scale.
 
 The validation script still emits `pn_hr3` and `pp_hr3` for the old
 ioi/duration/velocity-only view, but the corrected selection and analysis use

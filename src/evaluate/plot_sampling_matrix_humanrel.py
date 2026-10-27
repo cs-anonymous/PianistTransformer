@@ -49,16 +49,16 @@ def crop_near_white_border(path, padding=12, threshold=248):
 
 
 HUMAN_PN = {
-    "ioi_wass": 26.554209906777686,
-    "duration_wass": 105.54706686568747,
-    "velocity_wass": 11.716304664046339,
-    "pedal_wass": 0.246551332481009,
+    "ioi_wass": 22.772456164440005,
+    "duration_wass": 75.08565114668764,
+    "velocity_wass": 10.580359191566208,
+    "pedal_wass": 0.24989622548123183,
 }
 HUMAN_PP = {
-    "ioi_wass": 7.952391192015138,
-    "duration_wass": 25.9246360560533,
-    "velocity_wass": 3.057647553002258,
-    "pedal_wass": 0.07682493502888045,
+    "ioi_wass": 5.030337670706154,
+    "duration_wass": 20.449834140491266,
+    "velocity_wass": 3.070947106636113,
+    "pedal_wass": 0.0777161535190955,
 }
 
 
