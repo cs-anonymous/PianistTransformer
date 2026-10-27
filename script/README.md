@@ -44,3 +44,18 @@ Quick official-checkpoint evaluation helpers are also retained:
 bash script/run_pt_official_cheap15_2gpu.sh
 bash script/run_pt_official_redownload_cheap15.sh
 ```
+
+## CINR serial-attribute ablation
+
+The experimental `attribute_4n` decoder predicts IOI, duration, velocity, and
+pedal in four autoregressive steps per note while retaining CINR's DLM output
+parameterization. It is currently implemented for the T5 CINR DLM path.
+Because the decoder sequence is four times longer, the launcher defaults to a
+per-device microbatch of 4 and an effective global batch of 64:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash script/run_cinr_serial_attribute_4n.sh
+```
+
+The matching note-level configuration remains
+`configs/inr_epr/cinr__default_dlm_k1_bounded5.json`.

@@ -152,8 +152,8 @@ if declares_asap_only:
 cfg["use_style_tokens"] = False
 cfg.setdefault("pedal_representation", "binary_4")
 target = str(cfg.get("epr_timing_target", "floor_log_deviation")).lower()
-if target not in {"floor_log_deviation", "floor_log_dev"}:
-    raise SystemExit("Only epr_timing_target=floor_log_deviation is supported")
+if target not in {"floor_log_deviation", "floor_log_dev", "linear_residual", "ratio"}:
+    raise SystemExit(f"Unsupported epr_timing_target={target}")
 pedal_representation = str(cfg.get("pedal_representation", "binary_4")).lower()
 pedal_aliases = {"binary4": "binary_4", "pedal4_binary": "binary_4"}
 pedal_representation = pedal_aliases.get(pedal_representation, pedal_representation)

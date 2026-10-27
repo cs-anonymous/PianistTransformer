@@ -37,6 +37,7 @@ from src.model.integrated_pianoformer import (
     _materialize_epr_prediction,
     _split_epr_mixture_params,
     _torch_floor_log_reconstruct,
+    _torch_reconstruct_timing_target,
     _zero_score_ioi_mask,
 )
 from src.data_process.work_manifest import build_work_manifest
@@ -495,7 +496,7 @@ def pedal_representation_dim(pedal_representation="binary_4"):
 
 def default_epr_output_dim(epr_timing_target="floor_log_deviation", pedal_representation="binary_4", legacy_dual_timing_head=False):
     if not _uses_floor_log_deviation_target(epr_timing_target):
-        raise ValueError("Only epr_timing_target=floor_log_deviation is supported")
+        raise ValueError(f"Unsupported epr_timing_target={epr_timing_target}")
     pedal_dim = pedal_representation_dim(pedal_representation)
     return 3 + pedal_dim
 
@@ -615,7 +616,11 @@ def performance_label_bins(perf, timing_bins=5000, value_bins=128):
 
 
 def _uses_floor_log_deviation_target(epr_timing_target):
-    return str(epr_timing_target or "").lower() in {"floor_log_deviation", "floor_log_dev"}
+    # All supported timing targets share the score-conditioned EPR label path;
+    # their numeric transforms are selected in normalize_*_dev below.
+    return str(epr_timing_target or "").lower() in {
+        "floor_log_deviation", "floor_log_dev", "linear_residual", "ratio"
+    }
 
 
 def normalize_ioi_dev(
@@ -624,15 +629,27 @@ def normalize_ioi_dev(
     epr_timing_target="floor_log_deviation",
     log_scale=50.0,
 ):
-    if not _uses_floor_log_deviation_target(epr_timing_target):
-        raise ValueError("Only epr_timing_target=floor_log_deviation is supported")
-    return math.log(max(float(perf_ioi_ms), 1.0)) - math.log(max(float(score_ioi_ms), 1.0))
+    target = str(epr_timing_target or "floor_log_deviation").lower()
+    if target in {"floor_log_deviation", "floor_log_dev"}:
+        return math.log(max(float(perf_ioi_ms), 1.0)) - math.log(max(float(score_ioi_ms), 1.0))
+    if target == "linear_residual":
+        return (float(perf_ioi_ms) - float(score_ioi_ms)) / 1000.0
+    if target == "ratio":
+        if float(score_ioi_ms) <= 1.0 and float(perf_ioi_ms) <= 1.0:
+            return 1.0
+        return float(perf_ioi_ms) / max(float(score_ioi_ms), 1.0)
+    raise ValueError(f"Unsupported epr_timing_target={epr_timing_target}")
 
 
 def normalize_duration_dev(score_duration_ms, perf_duration_ms, epr_timing_target="floor_log_deviation", log_scale=50.0):
-    if not _uses_floor_log_deviation_target(epr_timing_target):
-        raise ValueError("Only epr_timing_target=floor_log_deviation is supported")
-    return math.log(max(float(perf_duration_ms), 1.0)) - math.log(max(float(score_duration_ms), 1.0))
+    target = str(epr_timing_target or "floor_log_deviation").lower()
+    if target in {"floor_log_deviation", "floor_log_dev"}:
+        return math.log(max(float(perf_duration_ms), 1.0)) - math.log(max(float(score_duration_ms), 1.0))
+    if target == "linear_residual":
+        return (float(perf_duration_ms) - float(score_duration_ms)) / 1000.0
+    if target == "ratio":
+        return float(perf_duration_ms) / max(float(score_duration_ms), 1.0)
+    raise ValueError(f"Unsupported epr_timing_target={epr_timing_target}")
 
 
 def performance_dev_velocity_pedal4_binary_rows(
@@ -2377,8 +2394,10 @@ def _batched_histogram_from_weighted_values(values, weights, centers):
 
 def _timing_raw_pmf_from_dlm(config, log_probs, score_time_ms, feature, zero_mask=None):
     probs = log_probs.exp()
-    dev_centers = _dlm_bin_centers(config, feature, log_probs, zero_mask=zero_mask).expand_as(probs)
-    raw_centers = score_time_ms.float().clamp_min(1.0).unsqueeze(-1) * torch.exp(dev_centers.float())
+    target_centers = _dlm_bin_centers(config, feature, log_probs, zero_mask=zero_mask).expand_as(probs)
+    raw_centers = _torch_reconstruct_timing_target(
+        config, score_time_ms.float().unsqueeze(-1), target_centers
+    )
     return probs, raw_centers
 
 
@@ -2450,8 +2469,8 @@ def _pn_pp_metric_w1_loss(config, logits, labels, score_shared_raw, attention_ma
         "velocity": (velocity_log_probs.exp(), _dlm_bin_centers(config, "velocity", velocity_log_probs).expand_as(velocity_log_probs).float()),
     }
     targets = {
-        "ioi": _torch_floor_log_reconstruct(score_shared_raw[..., 0], labels[..., 0]).clamp(0.0, float(getattr(config, "ioi_w1_max", 8000.0))),
-        "duration": _torch_floor_log_reconstruct(score_shared_raw[..., 1], labels[..., 1]).clamp(0.0, float(getattr(config, "duration_w1_max", 8000.0))),
+        "ioi": _torch_reconstruct_timing_target(config, score_shared_raw[..., 0], labels[..., 0]).clamp(0.0, float(getattr(config, "ioi_w1_max", 8000.0))),
+        "duration": _torch_reconstruct_timing_target(config, score_shared_raw[..., 1], labels[..., 1]).clamp(0.0, float(getattr(config, "duration_w1_max", 8000.0))),
         "velocity": (labels[..., 2].float() * 127.0).clamp(
         float(getattr(config, "dlm_velocity_min", -0.5)),
         float(getattr(config, "dlm_velocity_max", 127.5)),
@@ -4077,6 +4096,18 @@ def create_model(train_config):
     dtype = torch.bfloat16 if train_config.get("bf16", False) and torch.cuda.is_available() else torch.float32
     backbone_type = train_config.get("backbone_type", "t5").lower()
     task_type = train_config.get("task_type", "epr").lower()
+    decoder_task_token_mode = str(train_config.get("decoder_task_token_mode", "note") or "note").lower()
+    if decoder_task_token_mode in {"attribute_4n", "serial_attribute_4n", "4n_attributes"}:
+        if backbone_type not in {"t5", "t5gemma"}:
+            raise ValueError("decoder_task_token_mode=attribute_4n currently requires backbone_type=t5")
+        if str(train_config.get("epr_distribution", "")).lower() not in {
+            "dlm", "discretized_logistic_mixture"
+        } or str(train_config.get("velocity_distribution", "dlm")).lower() not in {
+            "dlm", "discretized_logistic_mixture"
+        }:
+            raise ValueError("decoder_task_token_mode=attribute_4n currently requires CINR DLM timing/velocity heads")
+        if str(train_config.get("output_task_embedding_mode", "four")).lower() not in {"four", "4"}:
+            raise ValueError("decoder_task_token_mode=attribute_4n requires output_task_embedding_mode=four")
     input_feature_mode = infer_input_feature_mode(train_config)
     epr_timing_target = str(train_config.get("epr_timing_target", "floor_log_deviation")).lower()
     timing_control_mode = resolve_timing_control_mode(
@@ -4085,8 +4116,8 @@ def create_model(train_config):
     )
     if task_type != "epr":
         raise ValueError("Only task_type=epr is supported")
-    if epr_timing_target not in {"floor_log_deviation", "floor_log_dev"}:
-        raise ValueError("Only epr_timing_target=floor_log_deviation is supported")
+    if epr_timing_target not in {"floor_log_deviation", "floor_log_dev", "linear_residual", "ratio"}:
+        raise ValueError(f"Unsupported epr_timing_target={epr_timing_target}")
     use_timing_scale_bit = False
     note_embedding_mode = str(train_config.get("note_embedding_mode", "sine")).lower()
     slot_share_role_encoders = train_config.get("slot_share_role_encoders")
@@ -4411,10 +4442,10 @@ def create_model(train_config):
         dlm_velocity_bins=train_config.get("dlm_velocity_bins", 128),
         dlm_ioi_zero_min=train_config.get("dlm_ioi_zero_min", 0.0),
         dlm_ioi_zero_max=train_config.get("dlm_ioi_zero_max", 5.0),
-        dlm_ioi_nonzero_min=-2.0,
-        dlm_ioi_nonzero_max=1.0,
-        dlm_duration_min=-2.0,
-        dlm_duration_max=1.0,
+        dlm_ioi_nonzero_min=train_config.get("dlm_ioi_nonzero_min", -1.0 if epr_timing_target == "linear_residual" else (0.1353352832366127 if epr_timing_target == "ratio" else -2.0)),
+        dlm_ioi_nonzero_max=train_config.get("dlm_ioi_nonzero_max", 1.0 if epr_timing_target == "linear_residual" else (2.718281828459045 if epr_timing_target == "ratio" else 1.0)),
+        dlm_duration_min=train_config.get("dlm_duration_min", -1.0 if epr_timing_target == "linear_residual" else (0.1353352832366127 if epr_timing_target == "ratio" else -2.0)),
+        dlm_duration_max=train_config.get("dlm_duration_max", 1.0 if epr_timing_target == "linear_residual" else (2.718281828459045 if epr_timing_target == "ratio" else 1.0)),
         dlm_velocity_min=train_config.get("dlm_velocity_min", -0.5),
         dlm_velocity_max=train_config.get("dlm_velocity_max", 127.5),
         dlm_scale_min=train_config.get("dlm_scale_min", 1e-3),
@@ -4526,6 +4557,7 @@ def create_model(train_config):
             "dinr_output_deviation_numerical_coordinates", True
         ),
         epr_timing_target=epr_timing_target,
+        timing_residual_scale_ms=train_config.get("timing_residual_scale_ms", 1000.0),
         timing_control_mode=timing_control_mode,
         timing_log_scale=train_config.get("timing_log_scale", 50.0),
         use_timing_scale_bit=use_timing_scale_bit,
@@ -4864,10 +4896,9 @@ def main():
     if task_type != "epr":
         raise ValueError("Only task_type=epr is supported")
     if str(train_config.get("epr_timing_target", "floor_log_deviation")).lower() not in {
-        "floor_log_deviation",
-        "floor_log_dev",
+        "floor_log_deviation", "floor_log_dev", "linear_residual", "ratio"
     }:
-        raise ValueError("Only epr_timing_target=floor_log_deviation is supported")
+        raise ValueError(f"Unsupported epr_timing_target={train_config.get('epr_timing_target')}")
     train_config["timing_control_mode"] = timing_control_mode
     train_config["use_timing_scale_bit"] = False
     musical_feature_mode = str(

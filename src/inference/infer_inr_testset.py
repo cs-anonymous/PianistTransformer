@@ -155,8 +155,8 @@ def load_config(path: Path, checkpoint: str | None):
         config["resume_path"] = checkpoint
     config.setdefault("pedal_representation", "binary_4")
     target = str(config.get("epr_timing_target", "floor_log_deviation")).lower()
-    if target not in {"floor_log_deviation", "floor_log_dev"}:
-        raise ValueError("Only epr_timing_target=floor_log_deviation is supported")
+    if target not in {"floor_log_deviation", "floor_log_dev", "linear_residual", "ratio"}:
+        raise ValueError(f"Unsupported epr_timing_target={target}")
     config["legacy_dual_timing_head"] = False
     if config.get("task_type", "epr").lower() == "epr" and "output_continuous_dim" not in config:
         config["output_continuous_dim"] = default_epr_output_dim(
