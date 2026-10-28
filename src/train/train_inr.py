@@ -484,14 +484,15 @@ def normalize_pedal_representation(pedal_representation="binary_4"):
     value = str(pedal_representation or "binary_4").lower()
     aliases = {"binary4": "binary_4", "pedal4_binary": "binary_4"}
     value = aliases.get(value, value)
-    if value != "binary_4":
-        raise ValueError("Only pedal_representation=binary_4 is supported")
+    if value not in {"binary_4", "none", "off"}:
+        raise ValueError("pedal_representation must be binary_4 or none")
+    if value == "off":
+        value = "none"
     return value
 
 
 def pedal_representation_dim(pedal_representation="binary_4"):
-    normalize_pedal_representation(pedal_representation)
-    return 4
+    return 4 if normalize_pedal_representation(pedal_representation) == "binary_4" else 0
 
 
 def default_epr_output_dim(epr_timing_target="floor_log_deviation", pedal_representation="binary_4", legacy_dual_timing_head=False):
@@ -546,13 +547,16 @@ def _raw_value_rows(perf, *keys):
 
 
 def _compose_label_raw_rows(perf, pedal_representation="binary_4", pedal_binary_threshold=64.0):
-    normalize_pedal_representation(pedal_representation)
+    representation = normalize_pedal_representation(pedal_representation)
     shared_rows = perf.get("label_shared_raw")
     if shared_rows is None:
         if "label_raw" in perf:
             shared_rows = [row[:3] for row in perf["label_raw"]]
         else:
             return None
+
+    if representation == "none":
+        return [list(shared[:3]) for shared in shared_rows]
 
     pedal_rows = _raw_value_rows(perf, "label_pedal4_raw", "pedal4_raw")
     if pedal_rows is None:
@@ -661,8 +665,26 @@ def performance_dev_velocity_pedal4_binary_rows(
     legacy_dual_timing_head=False,
     pedal_representation="binary_4",
 ):
-    normalize_pedal_representation(pedal_representation)
+    representation = normalize_pedal_representation(pedal_representation)
     shared_rows = perf.get("label_shared_raw")
+    if representation == "none":
+        if shared_rows is None:
+            if "label_raw" not in perf:
+                return None
+            shared_rows = [row[:3] for row in perf["label_raw"]]
+        if len(score_shared_raw) != len(shared_rows):
+            raise ValueError(
+                f"score_raw/label_shared_raw length mismatch: {len(score_shared_raw)} vs {len(shared_rows)}"
+            )
+        return [
+            [
+                normalize_ioi_dev(score_row[0], perf_row[0], epr_timing_target=epr_timing_target, log_scale=log_scale),
+                normalize_duration_dev(score_row[1], perf_row[1], epr_timing_target=epr_timing_target, log_scale=log_scale),
+                min(max(float(perf_row[2]), 0.0), 127.0) / 127.0,
+            ]
+            for score_row, perf_row in zip(score_shared_raw, shared_rows)
+        ]
+
     pedal_rows = _raw_value_rows(perf, "label_pedal4_raw", "pedal4_raw")
     if shared_rows is None or pedal_rows is None:
         if "label_raw" not in perf:
@@ -1613,8 +1635,11 @@ class PianoCoReNodeSFTDataset(Dataset):
             and payload.get("kind") == "inr_multi_target_ready_sidecar"
             and bool(payload.get("legacy_dual_timing_head", False))
             == bool(self.legacy_dual_timing_head)
-            and normalize_pedal_representation(payload.get("pedal_representation"))
-            == normalize_pedal_representation(self.pedal_representation)
+            and (
+                normalize_pedal_representation(payload.get("pedal_representation"))
+                == normalize_pedal_representation(self.pedal_representation)
+                or normalize_pedal_representation(self.pedal_representation) == "none"
+            )
         )
 
     def _is_raw_sidecar_signature(self, signature):
@@ -1644,7 +1669,7 @@ class PianoCoReNodeSFTDataset(Dataset):
                 return False
             if self.task_type.lower() == "epr" and _uses_floor_log_deviation_target(self.epr_timing_target):
                 has_shared = "label_shared_raw" in perf or "label_raw" in perf
-                has_pedal = "label_pedal4_raw" in perf or "pedal4_raw" in perf or "label_raw" in perf
+                has_pedal = self.pedal_representation == "none" or "label_pedal4_raw" in perf or "pedal4_raw" in perf or "label_raw" in perf
                 if not (has_shared and has_pedal):
                     return False
         return True
@@ -1738,7 +1763,11 @@ class PianoCoReNodeSFTDataset(Dataset):
                     if target not in labels_by_target:
                         break
                     selected_perf = dict(perf)
-                    selected_perf["labels"] = labels_by_target[target]
+                    selected_perf["labels"] = (
+                        [row[:3] for row in labels_by_target[target]]
+                        if normalize_pedal_representation(self.pedal_representation) == "none"
+                        else labels_by_target[target]
+                    )
                     selected_performances.append(selected_perf)
                 else:
                     selected["performances"] = selected_performances
@@ -2478,12 +2507,13 @@ def _pn_pp_metric_w1_loss(config, logits, labels, score_shared_raw, attention_ma
     }
     centers = {feature: _fixed_metric_centers(config, feature, logits) for feature in features}
     zero = logits.sum() * 0.0
-    all_features = (*features, "pedal")
+    has_pedal = pedal_representation_dim(getattr(config, "pedal_representation", "binary_4")) > 0
+    all_features = (*features, "pedal") if has_pedal else features
     pn_terms = {feature: [] for feature in all_features}
     pp_terms = {feature: [] for feature in all_features}
     compute_pn = set(compute_pn)
     compute_pp = set(compute_pp)
-    pedal_logits = params.get("pedal_binary_logits")
+    pedal_logits = params.get("pedal_binary_logits") if has_pedal else None
     pedal_probs = torch.sigmoid(pedal_logits.float()) if pedal_logits is not None else None
     pedal_targets = labels[..., 3:7].float().clamp(0.0, 1.0) if labels.shape[-1] >= 7 else None
 
@@ -3336,6 +3366,13 @@ class NodeSFTTrainer(Trainer):
                 # _accumulate_train_loss_components below increments the shared count.
         self._accumulate_train_loss_components(inputs, outputs)
         self._accumulate_eval_loss_components(inputs, outputs)
+        if self.model.training and getattr(self, "record_epoch_train_loss", False):
+            count = int(inputs["attention_mask"].shape[0])
+            if not hasattr(self, "_epoch_loss_sum"):
+                self._epoch_loss_sum = loss.detach().double().new_zeros(())
+                self._epoch_loss_count = 0
+            self._epoch_loss_sum += loss.detach().double() * count
+            self._epoch_loss_count += count
         return (loss, outputs) if return_outputs else loss
 
     def log(self, logs, *args, **kwargs):
@@ -3585,6 +3622,17 @@ class NodeSFTTrainer(Trainer):
 
     def _save_checkpoint(self, model, trial):
         super()._save_checkpoint(model, trial)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            # A non-saving rank can reach HF's directory-existence check
+            # before rank 0 creates the first/best checkpoint. Synchronize
+            # after saving and set the same best path on every rank; otherwise
+            # only rank 0 may enter the final load-best barrier.
+            torch.distributed.barrier()
+            best_step = getattr(self.state, "best_global_step", None)
+            if best_step:
+                best_dir = Path(self._get_output_dir(trial)) / f"checkpoint-{best_step}"
+                if best_dir.is_dir():
+                    self.state.best_model_checkpoint = str(best_dir)
         self._drop_optimizer_state()
         self._sync_epoch_checkpoint_aliases()
         self._sync_checkpoint_best_alias()
@@ -3712,6 +3760,17 @@ class NodeSFTTrainer(Trainer):
         return metrics
 
     def evaluate(self, *args, **kwargs):
+        if getattr(self, "_epoch_loss_count", 0) > 0:
+            totals = torch.stack([
+                self._epoch_loss_sum,
+                self._epoch_loss_sum.new_tensor(self._epoch_loss_count),
+            ])
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(totals)
+            total, count = totals.cpu().tolist()
+            self.log({"epoch_train_loss": total / count, "epoch_train_examples": int(count)})
+            self._epoch_loss_sum.zero_()
+            self._epoch_loss_count = 0
         eval_started = time.time()
         if self.is_world_process_zero():
             print(
@@ -5250,6 +5309,7 @@ def main():
     trainer.rollout_eval_materialize_strategy = train_config.get("rollout_eval_materialize_strategy", "sample")
     trainer.rollout_eval_feedback_strategy = train_config.get("rollout_eval_feedback_strategy", "sample")
     trainer.save_epoch_aliases = train_config.get("save_epoch_aliases")
+    trainer.record_epoch_train_loss = bool(train_config.get("record_epoch_train_loss", False))
     trainer.save_epoch_alias_tolerance = train_config.get("save_epoch_alias_tolerance", 1e-3)
     trainer.loss_component_logging_steps = train_config.get(
         "loss_component_logging_steps",

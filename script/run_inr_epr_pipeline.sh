@@ -72,7 +72,9 @@ MASTER_PORT="${MASTER_PORT:-}"
 if [[ "${GPU_COUNT}" -gt 1 && -z "${MASTER_PORT}" ]]; then
   MASTER_PORT="$(python -c "import socket; s=socket.socket(); s.bind(('', 0)); print(s.getsockname()[1]); s.close()")"
 fi
-SAMPLING_GPU="${GPU_LIST[0]}"
+# Keep the full visible GPU list for sampling. The inference worker pool maps
+# worker_idx to cuda:worker_idx modulo the visible device count.
+SAMPLING_GPU="${CUDA_VISIBLE_DEVICES:-0}"
 
 latest_train_dir() {
   local root="$1" marker="$2"

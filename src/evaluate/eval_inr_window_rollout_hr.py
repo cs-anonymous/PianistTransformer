@@ -57,7 +57,7 @@ def parse_int_list(text):
 
 
 def filter_manifest_performance_dataset(manifest, performance_dataset):
-    if performance_dataset is None:
+    if performance_dataset is None or str(performance_dataset).strip().upper() == "ALL":
         return manifest
     out = []
     wanted = str(performance_dataset)
@@ -179,6 +179,9 @@ def evaluate_k(model, model_config, loader, device, rollout_k, materialize_strat
                         batch["score_shared_raw"],
                     ).detach()
 
+            hr_features = ("ioi", "duration", "velocity")
+            if int(getattr(model_config, "pedal_representation_dim", 0) or 0) > 0 or str(getattr(model_config, "pedal_representation", "binary_4")) == "binary_4":
+                hr_features = ("ioi", "duration", "velocity", "pedal")
             metrics = _pn_pp_metric_w1_loss(
                 model_config,
                 outputs.logits,
@@ -186,8 +189,8 @@ def evaluate_k(model, model_config, loader, device, rollout_k, materialize_strat
                 batch["score_shared_raw"],
                 attention_mask,
                 group_index,
-                compute_pn=("ioi", "duration", "velocity", "pedal"),
-                compute_pp=("ioi", "duration", "velocity", "pedal"),
+                compute_pn=hr_features,
+                compute_pp=hr_features,
             )
             if outputs.loss is not None:
                 # Trainer's evaluation_loop repeats each batch loss once per
@@ -210,7 +213,10 @@ def evaluate_k(model, model_config, loader, device, rollout_k, materialize_strat
     for prefix, human in (("pn", HUMAN_PN), ("pp", HUMAN_PP)):
         rel_terms3 = []
         rel_terms4 = []
-        for feature in ("ioi", "duration", "velocity", "pedal"):
+        features = ("ioi", "duration", "velocity")
+        if "pn_pedal_w1" in averaged:
+            features = (*features, "pedal")
+        for feature in features:
             key = f"{prefix}_{feature}_w1"
             raw_key = f"{prefix}_{feature}_w1_raw"
             raw_value = averaged[key] * _normalizer(model_config, prefix, feature)
@@ -245,6 +251,11 @@ def main():
     manifest_split = config.get("fixed_window_base_split", "train") if fixed_scheme else args.split
     window_split_name = config.get("fixed_window_eval_split_name", args.split) if fixed_scheme else None
     dataset_split = manifest_split if fixed_scheme else args.split
+    performance_dataset_filter = (
+        None
+        if str(args.performance_dataset).strip().upper() in {"", "ALL", "NONE"}
+        else args.performance_dataset
+    )
     manifest = build_work_manifest(
         metadata_path=config["metadata_path"],
         refined_dir=config["refined_dir"],
@@ -253,18 +264,27 @@ def main():
         overlap_ratio=config["overlap_ratio"],
         min_notes=config["min_notes"],
         max_works=None,
-        performance_dataset=args.performance_dataset,
+        performance_dataset=performance_dataset_filter,
+        include_all_performance_dataset=config.get("eval_include_all_performance_dataset"),
+        max_non_asap_performances_per_work=config.get("max_eval_non_asap_performances_per_work"),
+        selection_seed=int(config.get("seed", 42)),
         skip_work_paths=config.get("skip_work_paths"),
         prepared_sidecar_tag=config.get("prepared_sidecar_tag"),
         window_split_scheme=fixed_scheme,
         window_split_name=window_split_name,
         window_split_summary_path=config.get("fixed_window_split_summary_path"),
     )
+    # Metadata can include performances that failed alignment upstream. Check
+    # the usable sidecar sources before declaring a work eligible for HR.
+    eligibility_dataset = make_dataset(config, manifest, dataset_split=dataset_split)
     eligible_manifest = [
         item
-        for item in manifest
-        if item.get("windows") and int(item.get("estimated_performances", 0) or 0) >= 2
+        for item in eligibility_dataset.items
+        if item.get("windows") and int(item.get("effective_performances", 0) or 0) >= 2
     ]
+    for item in eligible_manifest:
+        item["estimated_performances"] = item["effective_performances"]
+    del eligibility_dataset
     available_works = len(eligible_manifest)
     model = load_model(config, device)
     model_config = model.module.config if hasattr(model, "module") else model.config
@@ -290,7 +310,7 @@ def main():
             if args.fail_on_insufficient_works:
                 raise ValueError(message)
             continue
-        selected = choose_distinct_work_windows(manifest, m=m, seed=args.seed + m)
+        selected = choose_distinct_work_windows(eligible_manifest, m=m, seed=args.seed + m)
         selected_windows = [
             {
                 "work_path": str(item["path"]),

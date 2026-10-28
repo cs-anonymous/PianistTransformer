@@ -247,9 +247,18 @@ def load_score_from_node(
     performance_source=None,
     disable_musical_features=False,
     pedal_control_dim=4,
+    prepared_sidecar_tag=None,
 ):
-    with open(path, "r", encoding="utf-8") as file:
-        work = json.load(file)
+    if prepared_sidecar_tag:
+        sidecar = path.with_suffix(f".{prepared_sidecar_tag}.pt")
+        work = torch.load(sidecar, map_location="cpu", weights_only=False)
+        stat = path.stat()
+        identity = {"path": str(path.resolve()), "mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
+        if work.get("_source_identity") != identity:
+            raise ValueError(f"Stale inference sidecar: {sidecar}")
+    else:
+        with open(path, "r", encoding="utf-8") as file:
+            work = json.load(file)
     score = work["score"]
     pitch = score["pitch"]
     continuous = build_epr_score_input_rows(
@@ -657,6 +666,7 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
         task_type="epr",
         disable_musical_features=config.get("disable_musical_features", False),
         pedal_control_dim=pedal_representation_dim(config.get("pedal_representation", "binary_4")),
+        prepared_sidecar_tag=config.get("prepared_sidecar_tag"),
     )
     score = loaded["score"]
     windows = build_windows(len(pitch), config["block_notes"], config["overlap_ratio"])
@@ -684,6 +694,16 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
         score_stem,
     )
     score_midi_path = score_midi_dir / score_source
+    if str(config.get("eval_gt_time_normalization", "none")).lower() == "score_onset_span":
+        # Use the same score timing that conditions the model and normalizes
+        # GT. A guessed legacy refined-MIDI directory may no longer exist.
+        score_midi_path = args.output_dir / "score_midis" / f"{score_stem}.mid"
+        score_midi_path.parent.mkdir(parents=True, exist_ok=True)
+        score_midi = note_features_to_midi(
+            pitch=pitch, continuous=[row[:3] for row in score["score_raw"]],
+            target_ticks_per_beat=500, target_tempo=120, normalized=False,
+        )
+        score_midi.dump(str(score_midi_path))
     original_gt_paths = [str((score_midi_dir / gt_rel).resolve()) for gt_rel in gt_rel_paths]
     if gt_midi_bundle is None:
         gt_paths = original_gt_paths
@@ -811,8 +831,11 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
             normalized=False,
         )
         raw_path = raw_dir / f"{score_stem}__{plan['suffix']}.json"
-        target_key = "predicted_target7"
-        timing_representation = "target7_floor_log_dev_velocity_binary4"
+        target_key = "predicted_target"
+        timing_representation = (
+            "target3_floor_log_dev_velocity" if pred_continuous.shape[-1] == 3
+            else "target7_floor_log_dev_velocity_binary4"
+        )
         raw_payload = {
             "score_source": score_source,
             "performance_source": plan.get("performance_source"),
@@ -845,6 +868,8 @@ def predict_one_work(model, device, config, work, args, score_midi_dir, midi_dir
     return {
         "score_source": score_source,
         "score_midi": str(score_midi_path.resolve()),
+        "score_json": str(Path(work["path"]).resolve()),
+        "score_prepared_sidecar_tag": config.get("prepared_sidecar_tag"),
         "prediction_paths": prediction_paths,
         "raw_output_paths": raw_output_paths,
         "ground_truth_paths": gt_paths,

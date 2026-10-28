@@ -12,3 +12,15 @@
 8. M0 的 evaluator 复现性实验可以在 CPU 上运行；M1/M2/M4 的每个 inference 任务固定单卡并高并发；M3 训练任务遵守显存限制，不能与高并发 inference 共用同一张卡。
 
 推荐的进程布局是：先把每个独立 inference 任务分配给固定 GPU，再在该 GPU 上以 8 个并发槽运行任务；一个槽完成后立即补充同 GPU 队列中的下一个任务。调度器需要避免使用会随父 shell 退出而终止的后台子进程，长任务使用独立 session，并保留 launcher 日志。
+
+# 论文质量指标评估约定
+
+论文主表、rebuttal 表格以及任何跨模型质量比较中的 PP/PN Wasserstein 和 Human Relevance，必须使用 score-span-normalized 的时间协议。对每首曲目和每个生成样本，按 score onset span 对性能 timing 做一个全局缩放；human reference 也必须使用同一 score-span 协议。不能把未经缩放的绝对时间结果与 normalized 结果放在同一质量表中。
+
+PianoFlow、ScorePerformer 或其他外部模型的结果在进入质量表前，必须先检查 prediction manifest、GT manifest 和 normalization report。只有明确完成 score-span normalization 的结果才可与 INR、PT、VirtuosoNet 和 DExter 的主表数值比较。若外部模型尚未完成该归一化，只报告效率或单独标注为 absolute-time audit，不报告其可比的质量结论。
+
+评估记录中必须同时写明：时间缩放是否应用于 prediction 和 GT、tempo map 的来源、pedal support（二值或原始 CC64）、样本数、test score 数，以及 HR 使用的 human anchor 文件。任何因固定 120 BPM、缺少 CC64 或未应用 score tempo map 造成的协议差异，都必须在表格和 rebuttal 中明确标注。
+
+musical51 模型的训练和 inference 必须读取相同布局的 tagged sidecar，并核对 source identity。不能将 JSON 中的 compact9 特征直接当成 musical51 的原始特征。score-span 评估使用与模型输入一致的 `score_raw` 时间基准；需要 MIDI 时在实验目录中显式序列化，不能依赖迁移前的 `data/refined` 路径。
+
+逐 epoch 的 teacher-forced analytic/histogram HR 是训练诊断。若它使用 raw training timing targets，必须明确标注，不能作为 score-span-normalized AR 测试 HR 写入论文质量表。数据规模同时记录 metadata 演奏数和实际可用演奏数，并保留上游对齐失败的排除原因。

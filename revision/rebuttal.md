@@ -28,12 +28,10 @@ CINR has low velocity Wasserstein distances (PP = 6.18; PN = 16.99), but only mo
 
 We thank the reviewer for identifying these precedents. VirtuosoNet already predicts expressive parameters note by note. It uses regression to produce a specific value for each parameter. Compound-token methods also place several symbolic attributes at one sequence position. MusicBERT uses OctupleMIDI for masked-token pretraining, and MIDI2Score converts performance MIDI to a score. These works establish important precedents for note-level prediction and compound representations. INSPIRE studies aligned, score-conditioned generation of expressive performance MIDI, where the model predicts distributions over timing, velocity, and pedal controls.
 
-ScorePerformer is a close note-level precedent; CINR differs in its typed MLP-based numerical inputs, per-attribute distribution heads, and explicit score-relative log-ratio target.
+We will revise the paper to describe our contribution more precisely. The paper's main design has three components:
 
-We will revise the paper to describe our contribution more precisely. For CINR, the main design has three components:
-
-1. **Typed attribute representation and embedding.** We identify each score and performance attribute as categorical, continuous, or binary. Separate encoders preserve these types and fuse them into one vector per aligned note. In CINR, numerical timing, duration, and velocity values enter through continuous MLP encoders rather than token embeddings.
-2. **Attribute-matched output parameterizations and distribution modeling.** CINR predicts IOI, duration, and velocity with separate single-component discretized-logistic distributions. Pedal is modeled with four binary logits. These heads provide a distribution for each expressive numerical attribute.
+1. **Typed attribute representation and embedding.** We identify each score and performance attribute as categorical, continuous, or binary. Separate encoders preserve these types and fuse them into one vector per aligned note. CINR maps numerical timing, duration, and velocity values with MLP encoders, while DINR maps their quantized values with categorical value tables.
+2. **Attribute-matched output parameterizations and distribution modeling.** The continuous variant predicts IOI, duration, and velocity with separate single-component discretized-logistic distributions. Pedal is modeled with four binary logits. These heads provide a distribution for each expressive numerical attribute.
 3. **Score-relative log-timing targets.** We predict timing changes relative to the score on a log scale. This gives a compact target for expressive timing. The absolute-timing ablation shows substantially worse timing metrics.
 
 Our empirical study evaluates these choices on ASAP. CINR performs better than DINR on most non-pedal metrics. Its note-level decoder also reduces autoregressive steps and inference cost relative to flat token decoders.
@@ -170,6 +168,18 @@ Here, $I_i^p$, $D_i^p$, and $V_i^p$ are performed IOI, duration, and velocity. $
 
 Table 1 gives each attribute's type, range, and number of modeled values. Pitch has 128 categorical values. IOI and duration are continuous values, log-mapped from 0–8000 ms to [0, 9] and represented with 256 bins. Velocity ranges from 0 to 127 and uses 128 values. Pedal has four binary snapshots, taken at 0%, 25%, 50%, and 75% of each note, for 16 possible patterns. The musical slot combines three categorical score features, each with 145 values, and six binary annotations, for 64 annotation patterns.
 
+## Response to R4: scope of the architectural contribution
+
+We agree with the reviewer that the Transformer encoder-decoder and autoregressive training procedure use standard components. We position the contribution at the problem formulation for aligned expressive piano rendering. INSPIRE has three components:
+
+1. **Typed attribute representation and embedding.** Score and performance fields have different structures. Pitch and musical fields are categorical, timing and velocity are numerical, and pedal is binary. INSPIRE uses separate encoders for these types and fuses their outputs into one representation for each aligned note. CINR maps numerical timing, duration, and velocity values with MLP encoders, while DINR maps their quantized values with categorical value tables. This preserves the numerical structure of the inputs before the Transformer processes them.
+
+2. **Attribute-matched output parameterizations and distribution modeling.** The output fields also require different models. INSPIRE uses categorical heads for the discrete variant and conditional distributions for numerical timing, duration, and velocity in the continuous variant. The four pedal states use binary logits. These heads match the output model to each attribute and allow the continuous variant to represent uncertainty and variation in expressive controls.
+
+3. **Score-relative log-timing targets.** INSPIRE predicts timing changes relative to the score in log space. A fixed multiplicative change then has the same target scale across different score intervals. This gives the timing heads a compact target and reduces the effect of the notated time scale. The absolute-timing ablation produces much larger PP IOI and duration distances, which supports the value of this target formulation.
+
+These choices change the input representation, prediction space, and timing target within a standard sequence-modeling backbone. Our ablations examine their effects. The relative-versus-absolute timing comparison isolates the timing target, while the CINR/DINR comparison changes both numerical input encoding and output parameterization. We will make this scope explicit and state that the main novelty lies in the problem formulation and its empirical analysis.
+
 ## Response to R4: why include DINR, and notation in its output head
 
 DINR helps us study how to represent numerical attributes in EPR. A standard categorical table learns a separate embedding for each value. DINR can add a numerical coordinate to each embedding. This gives the discrete values information about their order and scale. In the slot-sum ablation, coordinates reduce PP HR from 3.78 to 3.05 and PN HR from 1.79 to 1.68. The effect varies with the slot representation. CINR models the same attributes with continuous distributions. In Table 2, it performs better on most non-pedal metrics. These results compare categorical values, coordinate-aware values, and continuous modeling. Both variants use BCE for pedal, so pedal results do not distinguish their numerical representations.
@@ -194,3 +204,35 @@ $$
 $$
 
 At inference, softmax converts each logit vector into a categorical distribution for sampling. The four pedal states use BCE. We will add these definitions next to the DINR equations in the paper.
+
+## Response to R4: full PianoCoRe-A training and experimental scope
+
+We thank the reviewer for raising this point. We have now trained the same slot-sum INSPIRE configuration on the full PianoCoRe-A training portion and then fine-tuned it on ASAP. This experiment tests whether the method can be trained beyond the benchmark subset. A full comparison of all baselines on PianoCoRe-A remains future work.
+
+ASAP remains the main benchmark for the method comparison. It provides the fixed aligned split used by the compared EPR systems. This shared protocol is conventional in EPR comparisons. PianoCoRe-A is newer, much larger, and has a different source distribution from ASAP. Pretraining on PianoCoRe-A therefore need not improve performance on ASAP. Retraining every baseline on PianoCoRe-A would also change both the data and the comparison protocol, and would require substantially longer runs. We therefore keep ASAP for the matched results and use full PianoCoRe-A training as a complementary scalability experiment.
+
+The current study is a controlled comparison of the representation and output design on the shared EPR benchmark. The full-corpus run adds evidence that the same design can train at a larger scale.
+
+The dataset sizes are shown below. Performance hours sum the refined performance durations. Score-note counts are summed over unique refined score files. The training rows use the exact records retained by our run. Nine unusable alignments were removed after the audit.
+
+| Dataset and scope | Works | Performances | Score notes | Performance hours | Window examples |
+|---|---:|---:|---:|---:|---:|
+| PianoCoRe-A collection | 1,936 | 157,207 | 3,514,117 | 12,345.2 | — |
+| PianoCoRe-A training run | 1,780 | 141,710 | 3,184,866 | 10,826.1 | 781,846 |
+| ASAP collection | 207 | 978 | 570,623 | 87.5 | — |
+| ASAP training run | 188 | 887 | 505,584 | 75.4 | 6,475 |
+
+Thus, the full PianoCoRe-A training run contains about 9.5 times as many works, 6.3 times as many score notes, and 160 times as many aligned performances as the ASAP training run. The window-example ratio is 121 times because each PianoCoRe-A work has many performances and the two collections use different window distributions.
+
+The measured training costs were:
+
+| Run | Epochs | Hardware | Wall-clock time | GPU-hours |
+|---|---:|---|---:|---:|
+| PianoCoRe-A pretraining | 4 | 2 × RTX 3090 | 14.36 h | 28.7 |
+| ASAP fine-tuning | 8 | 2 × RTX 3090 | 11.9 min | 0.40 |
+
+The full run used global batch size 64. Its validation loss decreased from 15.25 at epoch 1 to 14.61 at epoch 4. The teacher-forced PP/PN HR was 3.28/1.38 at epoch 4, with the lowest diagnostic HR of 3.21/1.34 at epoch 3. These values confirm that the full-data run trains normally; they are validation diagnostics and use the raw timing targets. The final ASAP evaluation uses the same score-span-normalized autoregressive protocol as Table 2.
+
+Runtime does not scale linearly with the number of records. The full-data run used four pretraining epochs, while the original ASAP-only study used sixteen epochs. The larger collection therefore received fewer passes.
+
+The sub-one-GPU-hour entries in Table 2 describe the original ASAP-only runs. They do not include full PianoCoRe-A pretraining. The full pretraining cost is higher because the training set is much larger. Its 14.36-hour wall time on two GPUs is still well below the one-to-two-week range cited by the reviewer. Training time depends on hardware, batch size, epoch budget, and initialization, so figures from different papers are not directly comparable. We will clarify that ASAP is the controlled benchmark for the reported cross-method comparison. Full PianoCoRe-A retraining of all baselines, together with a matched cross-dataset comparison, remains future work because of its substantially higher computational cost.

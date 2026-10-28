@@ -164,14 +164,15 @@ def normalize_pedal_representation(pedal_representation="binary_4"):
     value = str(pedal_representation or "binary_4").lower()
     aliases = {"binary4": "binary_4", "pedal4_binary": "binary_4"}
     value = aliases.get(value, value)
-    if value != "binary_4":
-        raise ValueError("Only pedal_representation=binary_4 is supported")
+    if value not in {"binary_4", "none", "off"}:
+        raise ValueError("pedal_representation must be binary_4 or none")
+    if value == "off":
+        value = "none"
     return value
 
 
 def pedal_representation_dim(pedal_representation="binary_4"):
-    normalize_pedal_representation(pedal_representation)
-    return 4
+    return 4 if normalize_pedal_representation(pedal_representation) == "binary_4" else 0
 
 
 def score_note_input_schema(config_or_value=None):
@@ -1009,7 +1010,7 @@ class IntegratedNoteEncoder(nn.Module):
         self.decoder_target_dim = (
             max(0, int(self.continuous_dim) - self.mask_dim)
             if self.role == "decoder" and self.schema == "perf_target"
-            else 7
+            else 3 + self.pedal_dim
         )
         self.decoder_target_mask_dim = 3
         shared_dinr_encoder = str(getattr(config, "epr_distribution", "point")).lower() in DINR_DISTRIBUTIONS
@@ -1262,12 +1263,16 @@ class IntegratedNoteEncoder(nn.Module):
                 self.embedding_depth,
                 self.activation,
             )
-            self.slot_perf_pedal_projection = _make_mlp(
-                self.pedal_dim,
-                self.slot_dim,
-                self.slot_dim,
-                self.embedding_depth,
-                self.activation,
+            self.slot_perf_pedal_projection = (
+                _make_mlp(
+                    self.pedal_dim,
+                    self.slot_dim,
+                    self.slot_dim,
+                    self.embedding_depth,
+                    self.activation,
+                )
+                if self.pedal_dim > 0
+                else None
             )
             if self.slot_version in {"slot6", "slot7", "slot9", "slot12"}:
                 onset_embeddings = 18 if self.musical_dim == 51 else 147
@@ -1730,7 +1735,7 @@ class IntegratedNoteEncoder(nn.Module):
                     missing_perf[3] if is_decoder and missing_perf is not None else None,
                     missing_replacement,
                 )
-                if is_decoder
+                if is_decoder and self.pedal_dim > 0
                 else self._slot_mask_embedding(4, pitch_embeds).expand_as(pitch_embeds)
             )
             ioi_embedding = self._slot_value_encode_with_missing(
@@ -1749,8 +1754,9 @@ class IntegratedNoteEncoder(nn.Module):
                 self._slot_apply_gate(1, ioi_embedding),
                 self._slot_apply_gate(2, self._slot_value_encode_with_missing(duration_projection, duration_features, value_mask, 2, field=1, role=value_role, missing_mask=missing_perf[1] if is_decoder and missing_perf is not None else None, missing_replacement=missing_replacement)),
                 self._slot_apply_gate(3, self._slot_value_encode_with_missing(velocity_projection, velocity_features, value_mask, 3, field=0, role=value_role, velocity=True, missing_mask=missing_perf[2] if is_decoder and missing_perf is not None else None, missing_replacement=missing_replacement)),
-                self._slot_apply_gate(4, pedal_embedding),
             ]
+            if self.pedal_dim > 0:
+                slot_embeddings.append(self._slot_apply_gate(4, pedal_embedding))
         else:
             if not is_decoder:
                 perf_slots = [
@@ -1762,8 +1768,9 @@ class IntegratedNoteEncoder(nn.Module):
                     self._slot_value_encode_with_missing(self.slot_perf_ioi_projection, perf_ioi, m_perf, 4, field=0, role=1, missing_mask=missing_perf[0] if missing_perf is not None else None, missing_replacement=missing_replacement),
                     self._slot_value_encode_with_missing(self.slot_perf_duration_projection, perf_duration, m_perf, 5, field=1, role=1, missing_mask=missing_perf[1] if missing_perf is not None else None, missing_replacement=missing_replacement),
                     self._slot_value_encode_with_missing(self.slot_perf_velocity_projection, perf_velocity, m_perf, 6, field=0, role=1, velocity=True, missing_mask=missing_perf[2] if missing_perf is not None else None, missing_replacement=missing_replacement),
-                    self._slot_encode_with_missing(self.slot_perf_pedal_projection, perf_pedal, m_perf, 7, missing_perf[3] if missing_perf is not None else None, missing_replacement),
                 ]
+                if self.pedal_dim > 0:
+                    perf_slots.append(self._slot_encode_with_missing(self.slot_perf_pedal_projection, perf_pedal, m_perf, 7, missing_perf[3] if missing_perf is not None else None, missing_replacement))
             score_ioi_embedding = self._slot_value_encode(self.slot_score_ioi_projection, score_ioi, m_score, 1, field=0, role=0)
             score_ioi_embedding = score_ioi_embedding + self._zero_score_ioi_condition(score_ioi, score_ioi_embedding)
             slot_embeddings = [
@@ -1774,8 +1781,9 @@ class IntegratedNoteEncoder(nn.Module):
                 self._slot_apply_gate(4, perf_slots[0]),
                 self._slot_apply_gate(5, perf_slots[1]),
                 self._slot_apply_gate(6, perf_slots[2]),
-                self._slot_apply_gate(7, perf_slots[3]),
             ]
+            if self.pedal_dim > 0:
+                slot_embeddings.append(self._slot_apply_gate(7, perf_slots[3]))
         if self.slot_version in {"slot6", "slot7", "slot9", "slot12"}:
             musical_base = len(slot_embeddings)
             if self.musical_dim == 9:
@@ -2605,15 +2613,19 @@ class IntegratedContinuousDecoder(nn.Module):
                 expand_ratio=decoder_head_expand_ratio,
                 shrink_ratio=decoder_head_shrink_ratio,
             )
-        self.pedal_head = _make_decoder_head(
-            perf_dim,
-            pedal_output_dim,
-            head_hidden_dim,
-            depth=head_depth,
-            activation=activation,
-            layout=decoder_head_layout,
-            expand_ratio=decoder_head_expand_ratio,
-            shrink_ratio=decoder_head_shrink_ratio,
+        self.pedal_head = (
+            _make_decoder_head(
+                perf_dim,
+                pedal_output_dim,
+                head_hidden_dim,
+                depth=head_depth,
+                activation=activation,
+                layout=decoder_head_layout,
+                expand_ratio=decoder_head_expand_ratio,
+                shrink_ratio=decoder_head_shrink_ratio,
+            )
+            if self.pedal_dim > 0
+            else None
         )
         self.generic_head = _make_decoder_head(
             score_dim,
@@ -2696,6 +2708,8 @@ class IntegratedContinuousDecoder(nn.Module):
     def forward(self, hidden_states, score_shared_raw=None):
         if _uses_epr_targets(self.config):
             shared = self._shared_outputs(hidden_states, score_shared_raw=score_shared_raw)
+            if self.pedal_head is None:
+                return shared
             pedal_hidden = self._task_hidden(hidden_states[..., self.perf_slice], "pedal")
             pedal = self.pedal_head(pedal_hidden)
             if self.epr_distribution in {
@@ -2773,12 +2787,13 @@ def _split_epr_categorical_logits(config, raw_outputs):
     duration_end = ioi_end + timing_bins
     velocity_end = duration_end + value_bins
     pedal_start = velocity_end
-    pedal_end = pedal_start + 4 * value_bins
+    pedal_dim = pedal_representation_dim(getattr(config, "pedal_representation", "binary_4"))
+    pedal_end = pedal_start + pedal_dim * value_bins
     return {
         "ioi": raw_outputs[..., :ioi_end],
         "duration": raw_outputs[..., ioi_end:duration_end],
         "velocity": raw_outputs[..., duration_end:velocity_end],
-        "pedal": raw_outputs[..., pedal_start:pedal_end].reshape(*raw_outputs.shape[:-1], 4, value_bins),
+        "pedal": raw_outputs[..., pedal_start:pedal_end].reshape(*raw_outputs.shape[:-1], pedal_dim, value_bins),
     }
 
 
@@ -2871,7 +2886,7 @@ def _attach_simple_pedal_params(config, params, raw_outputs, cursor):
     if representation == "binary_4":
         params["pedal_binary_logits"] = raw_outputs[..., cursor : cursor + 4]
         return params
-    raise ValueError("Only pedal_representation=binary_4 is supported")
+    return params
 
 
 def _mask_count(mask):
@@ -3327,7 +3342,10 @@ def _target7_to_raw7(score_shared_raw, target_predictions, config=None):
         perf_ioi_ms = perf_ioi_ms.clamp(0.0, max_ms)
         perf_duration_ms = perf_duration_ms.clamp(0.0, max_ms)
     velocity = target_predictions[..., 2].clamp(0.0, 1.0) * 127.0
-    pedal = pedal_raw4(3)
+    if pedal_dim == 0:
+        pedal = target_predictions.new_empty(*target_predictions.shape[:-1], 0)
+    else:
+        pedal = pedal_raw4(3)
     return torch.cat([perf_ioi_ms.unsqueeze(-1), perf_duration_ms.unsqueeze(-1), velocity.unsqueeze(-1), pedal], dim=-1)
 
 
@@ -3460,14 +3478,10 @@ def _target_predictions_to_feedback7(config, target_predictions):
         raise ValueError(f"Expected EPR target values, got shape {tuple(target_predictions.shape)}")
     if not _uses_inr_epr_targets(config):
         raise ValueError("Unsupported score-conditioned EPR timing target")
-    return torch.cat(
-        [
-            target_predictions[..., 0:2],
-            target_predictions[..., 2:3].clamp(0.0, 1.0),
-            target_predictions[..., 3 : 3 + pedal_dim].clamp(0.0, 1.0),
-        ],
-        dim=-1,
-    )
+    parts = [target_predictions[..., 0:2], target_predictions[..., 2:3].clamp(0.0, 1.0)]
+    if pedal_dim > 0:
+        parts.append(target_predictions[..., 3 : 3 + pedal_dim].clamp(0.0, 1.0))
+    return torch.cat(parts, dim=-1)
 
 
 def _extract_integrated_score_musical(config, score_input_continuous):
@@ -5180,8 +5194,11 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean", s
                 sigma_min=sigma_min,
                 sigma_max=sigma_max,
             ).clamp(0.0, 1.0)
+        shared = torch.stack([ioi, duration, velocity], dim=-1)
+        if pedal_representation_dim(getattr(config, "pedal_representation", "binary_4")) == 0:
+            return shared
         pedal = _materialize_pedal_params(config, params, sampling_strategy=sampling_strategy)
-        return torch.cat([torch.stack([ioi, duration, velocity], dim=-1), pedal], dim=-1)
+        return torch.cat([shared, pedal], dim=-1)
 
     if distribution in SN_DISTRIBUTIONS:
         params = _split_epr_mixture_params(config, raw_outputs)
@@ -5225,8 +5242,11 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean", s
             sigma_min=sigma_min,
             sigma_max=sigma_max,
         ).clamp(0.0, 1.0)
+        shared = torch.cat([logdev, velocity.unsqueeze(-1)], dim=-1)
+        if pedal_representation_dim(getattr(config, "pedal_representation", "binary_4")) == 0:
+            return shared
         pedal = _materialize_pedal_params(config, params, sampling_strategy=sampling_strategy)
-        return torch.cat([logdev, velocity.unsqueeze(-1), pedal], dim=-1)
+        return torch.cat([shared, pedal], dim=-1)
 
     if distribution == "beta_mu_kappa":
         params = _split_epr_distribution_params(raw_outputs)
@@ -5291,10 +5311,14 @@ def _materialize_epr_prediction(config, raw_outputs, sampling_strategy="mean", s
             return value
 
         shared = torch.stack([decode_shared(0), decode_shared(1), decode_shared(2)], dim=-1)
+        if pedal_representation_dim(getattr(config, "pedal_representation", "binary_4")) == 0:
+            return shared
         pedal = _materialize_pedal_params(config, params, sampling_strategy=sampling_strategy)
         return torch.cat([shared, pedal], dim=-1)
 
     shared = raw_outputs[..., :3].clamp(0.0, 1.0)
+    if pedal_representation_dim(getattr(config, "pedal_representation", "binary_4")) == 0:
+        return shared
     pedal = _materialize_pedal_raw(
         config,
         raw_outputs[..., -pedal_representation_dim(getattr(config, "pedal_representation", "binary_4")) :],
@@ -6735,13 +6759,20 @@ def _compute_integrated_loss_components(
             detail_components["velocity_sn_nll"] = loss_velocity
         pedal_representation = normalize_pedal_representation(getattr(config, "pedal_representation", "binary_4"))
         pedal_dim = pedal_representation_dim(pedal_representation)
-        loss_pedal, pedal_logits_for_detail, pedal_target_for_detail, pedal_names, pedal_detail_mask = _pedal_loss_components(
-            config,
-            params["pedal_binary_logits"],
-            labels_continuous[..., 3 : 3 + pedal_dim],
-            pedal_mask,
-            detail_components,
-        )
+        if pedal_dim == 0:
+            loss_pedal = loss_velocity.new_zeros(())
+            pedal_logits_for_detail = None
+            pedal_target_for_detail = None
+            pedal_names = ()
+            pedal_detail_mask = None
+        else:
+            loss_pedal, pedal_logits_for_detail, pedal_target_for_detail, pedal_names, pedal_detail_mask = _pedal_loss_components(
+                config,
+                params["pedal_binary_logits"],
+                labels_continuous[..., 3 : 3 + pedal_dim],
+                pedal_mask,
+                detail_components,
+            )
         detail_components.update(
             {
                 "ioi_dlm_nll": loss_ioi,
