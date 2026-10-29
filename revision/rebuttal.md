@@ -203,36 +203,48 @@ $$
 \mathcal{L}_{\mathrm{DINR}}=\sum_{a\in\{I,D,V\}}\mathrm{CE}(\ell_i^a,q_a(y_i^a)) + \mathrm{BCE}(\hat p_i,p_i).
 $$
 
-At inference, softmax converts each logit vector into a categorical distribution for sampling. The four pedal states use BCE. We will add these definitions next to the DINR equations in the paper.
+At inference, softmax converts each logit vector into a categorical distribution for sampling. The four pedal states use BCE.
+
+## Response to R4: notation and definition audit
+
+We thank the reviewer for highlighting the readability issue. We agree that the submitted DINR equation was under-specified: it displayed the IOI and velocity logits, left the duration logit implicit through the shared timing table, and did not define the query projections, value tables, biases, or the role of softmax and cross-entropy next to the equation. The corrected DINR equations and definitions are given above. We will make the same definitions explicit in the paper.
+
+We also checked the remaining notation. We will distinguish raw score/performance timing from the score-relative log residual, state that Table 1 reports raw attribute ranges while timing heads use residual bins, and define the four pedal states at their first use. Our audit found local omissions and ambiguous cross-references; it did not find conflicting model definitions. We will add a final notation pass to remove these local ambiguities.
 
 ## Response to R4: full PianoCoRe-A training and experimental scope
 
-We thank the reviewer for raising this point. We have now trained the same slot-sum INSPIRE configuration on the full PianoCoRe-A training portion and then fine-tuned it on ASAP. This experiment tests whether the method can be trained beyond the benchmark subset. A full comparison of all baselines on PianoCoRe-A remains future work.
+We thank the reviewer for raising this point. ASAP is the shared aligned benchmark used by the compared EPR systems. This is the conventional controlled protocol in the cited EPR comparisons. It gives a controlled comparison of the representation and output design. PianoCoRe-A is newer and combines several transcription sources with a smaller set of Disklavier recordings, while ASAP consists of Disklavier performances. Their data distributions therefore differ, and PianoCoRe-A training need not improve ASAP results. We retain ASAP for the main comparison. A full PianoCoRe-A comparison with all baselines remains future work.
 
-ASAP remains the main benchmark for the method comparison. It provides the fixed aligned split used by the compared EPR systems. This shared protocol is conventional in EPR comparisons. PianoCoRe-A is newer, much larger, and has a different source distribution from ASAP. Pretraining on PianoCoRe-A therefore need not improve performance on ASAP. Retraining every baseline on PianoCoRe-A would also change both the data and the comparison protocol, and would require substantially longer runs. We therefore keep ASAP for the matched results and use full PianoCoRe-A training as a complementary scalability experiment.
+We also trained the same slot-sum INSPIRE configuration on the full PianoCoRe-A training portion. The comparison below reports the scale and cost of the full run and the 16-epoch ASAP protocol used in the paper. Performance hours sum refined performance durations, and score notes are summed over unique refined score files.
 
-The current study is a controlled comparison of the representation and output design on the shared EPR benchmark. The full-corpus run adds evidence that the same design can train at a larger scale.
+| Training setting | Works | Performances | Score notes | Performance hours | Window examples | Epochs | Training cost |
+|---|---:|---:|---:|---:|---:|---:|---|
+| PianoCoRe-A full training | 1,780 | 141,710 | 3,184,866 | 10,826.1 | 781,846 | 4 | 14.36 h wall-clock; 28.7 GPU-h on 2 × RTX 3090 |
+| ASAP benchmark training | 188 | 887 | 505,584 | 75.4 | 6,475 | 16 | 0.6 GPU-h reported in Table 2 |
 
-The dataset sizes are shown below. Performance hours sum the refined performance durations. Score-note counts are summed over unique refined score files. The training rows use the exact records retained by our run. Nine unusable alignments were removed after the audit.
+We used four epochs for PianoCoRe-A. This already processes 48,868 optimizer steps on the full collection, while 16 ASAP epochs process only about 1,632 steps because each ASAP epoch is small. The larger corpus therefore receives many more updates despite the shorter epoch budget. Its measured 14.36-hour wall time is still below the one-to-two-week range cited by the reviewer. Reproducing every baseline on this heterogeneous collection remains future work because it requires substantially longer training and a separate cross-dataset study.
 
-| Dataset and scope | Works | Performances | Score notes | Performance hours | Window examples |
-|---|---:|---:|---:|---:|---:|
-| PianoCoRe-A collection | 1,936 | 157,207 | 3,514,117 | 12,345.2 | — |
-| PianoCoRe-A training run | 1,780 | 141,710 | 3,184,866 | 10,826.1 | 781,846 |
-| ASAP collection | 207 | 978 | 570,623 | 87.5 | — |
-| ASAP training run | 188 | 887 | 505,584 | 75.4 | 6,475 |
+## Response to R3: subjective evaluation
 
-Thus, the full PianoCoRe-A training run contains about 9.5 times as many works, 6.3 times as many score notes, and 160 times as many aligned performances as the ASAP training run. The window-example ratio is 121 times because each PianoCoRe-A work has many performances and the two collections use different window distributions.
+We thank the reviewer for emphasizing the importance of perceptual evaluation. In addition to the PP/PN Wasserstein results, the media supplement provides matched score excerpts, human performances, and generated examples, while the new beat-level analysis compares the temporal and velocity curves with human references. CINR and the Pianist Transformer obtain tempo correlations of 0.135 and 0.120, and velocity correlations of 0.141 and 0.505, respectively. These two additions complement the distributional metrics with audible examples and measures of local temporal structure.
 
-The measured training costs were:
+For the requested distributional comparison, we recomputed PP KL and JS on the 19 ASAP test scores. We use the original saved predictions and score-onset-span-normalized human references. Timing uses 256 uniformly spaced bins over $[-2,1]$ for duration and nonzero-score IOI, and 256 bins over $[0,5]$ for zero-score IOI. Velocity uses 128 bins over $[-0.5,127.5]$. Lower values indicate closer distributional agreement.
 
-| Run | Epochs | Hardware | Wall-clock time | GPU-hours |
-|---|---:|---|---:|---:|
-| PianoCoRe-A pretraining | 4 | 2 × RTX 3090 | 14.36 h | 28.7 |
-| ASAP fine-tuning | 8 | 2 × RTX 3090 | 11.9 min | 0.40 |
+| Method | IOI KL | IOI JS | Dur. KL | Dur. JS | Vel. KL | Vel. JS |
+|---|---:|---:|---:|---:|---:|---:|
+| Human | 0.148 | 0.024 | 0.139 | 0.029 | 0.093 | 0.019 |
+| Score MIDI | 3.046 | 0.549 | 5.056 | 0.673 | 5.695 | 0.506 |
+| ScorePerformer | 5.023 | 0.419 | 2.028 | 0.303 | 4.644 | 0.354 |
+| DExter | 7.243 | 0.410 | 2.403 | 0.294 | 1.662 | 0.182 |
+| VirtuosoNet | 6.473 | 0.493 | 2.479 | 0.320 | 0.739 | 0.178 |
+| Pianist Transformer | 5.315 | 0.233 | 0.697 | **0.068** | **0.114** | **0.025** |
+| DINR (slot-sum) | 1.006 | 0.202 | **0.502** | **0.104** | 1.084 | 0.155 |
+| CINR (slot-sum) | **0.349** | **0.089** | 0.598 | 0.145 | 0.341 | 0.044 |
 
-The full run used global batch size 64. Its validation loss decreased from 15.25 at epoch 1 to 14.61 at epoch 4. The teacher-forced PP/PN HR was 3.28/1.38 at epoch 4, with the lowest diagnostic HR of 3.21/1.34 at epoch 3. These values confirm that the full-data run trains normally; they are validation diagnostics and use the raw timing targets. The final ASAP evaluation uses the same score-span-normalized autoregressive protocol as Table 2.
+Under this protocol, CINR has the lowest IOI KL and JS among the learned systems and lower velocity KL and JS than the external EPR baselines. DINR has lower duration KL and JS, while Pianist Transformer has lower velocity KL and JS. Human and Score MIDI provide reference anchors; Human is a leave-one-out comparison among performances of the same score.
 
-Runtime does not scale linearly with the number of records. The full-data run used four pretraining epochs, while the original ASAP-only study used sixteen epochs. The larger collection therefore received fewer passes.
+We plan a blinded listening study on eight ASAP test scores. We will select scores for which all six model conditions have valid aligned outputs. For each score, we will prepare a representative 30-s excerpt from CINR, DINR, Pianist Transformer, ScorePerformer, DExter, and VirtuosoNet. A human performance and the corresponding Score MIDI will be provided as labeled reference tracks. They will not enter the model ranking.
 
-The sub-one-GPU-hour entries in Table 2 describe the original ASAP-only runs. They do not include full PianoCoRe-A pretraining. The full pretraining cost is higher because the training set is much larger. Its 14.36-hour wall time on two GPUs is still well below the one-to-two-week range cited by the reviewer. Training time depends on hardware, batch size, epoch budget, and initialization, so figures from different papers are not directly comparable. We will clarify that ASAP is the controlled benchmark for the reported cross-method comparison. Full PianoCoRe-A retraining of all baselines, together with a matched cross-dataset comparison, remains future work because of its substantially higher computational cost.
+Every condition will use the same synthesizer, loudness normalization, excerpt boundaries, and score presentation. The score image will be shown. Model identities will be anonymized, and the presentation order will be randomized for each listener. We will recruit 20 listeners from varied general backgrounds without selecting for computer-science or professional-music expertise.
+
+Each listener will rank the six model clips by overall naturalness. Ties will receive their mid-rank. With $K=6$ model conditions, rank $r$ becomes the normalized Borda score $b=(K-r)/(K-1)$, so the best and worst ranks receive 1 and 0. We will average $b$ over the eight scores for each listener and then over listeners. We will report participant-level 95\% bootstrap confidence intervals and use a repeated-measures Friedman test followed by Holm-corrected pairwise Wilcoxon signed-rank tests. This yields one preference score for each generated method while keeping the human and score tracks as references.

@@ -146,7 +146,10 @@ def build_sidecar_for_work(
         prepared["meta"] = dict(work["meta"])
     prepared["performance_time_normalization"] = performance_time_normalization or "none"
     dataset._save_prepared_to_disk(path, prepared)
-    return dataset._prepared_disk_cache_path(path)
+    cache_path = dataset._prepared_disk_cache_path(path)
+    if cache_path is None:
+        cache_path = dataset._prepared_sidecar_paths(path)[0]
+    return cache_path
 
 
 def build_ready_sidecar_for_work(

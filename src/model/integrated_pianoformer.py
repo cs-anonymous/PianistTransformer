@@ -278,10 +278,10 @@ class IntegratedPianoT5GemmaConfig(PianoT5GemmaConfig):
         dlm_velocity_bins=128,
         dlm_ioi_zero_min=0.0,
         dlm_ioi_zero_max=5.0,
-        dlm_ioi_nonzero_min=-2.0,
-        dlm_ioi_nonzero_max=1.0,
-        dlm_duration_min=-2.0,
-        dlm_duration_max=1.0,
+        dlm_ioi_nonzero_min=-2.5,
+        dlm_ioi_nonzero_max=1.5,
+        dlm_duration_min=-2.5,
+        dlm_duration_max=1.5,
         dlm_velocity_min=-0.5,
         dlm_velocity_max=127.5,
         dlm_scale_min=1e-3,
@@ -6227,8 +6227,8 @@ def _dlm_feature_range(config, feature, zero_mask=None):
         return lo, hi
     if feature == "duration":
         return (
-            float(getattr(config, "dlm_duration_min", -3.0)),
-            float(getattr(config, "dlm_duration_max", 2.0)),
+            float(getattr(config, "dlm_duration_min", -2.5)),
+            float(getattr(config, "dlm_duration_max", 1.5)),
         )
     if feature in {"velocity", "pedal"}:
         return (
