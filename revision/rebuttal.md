@@ -248,3 +248,32 @@ We plan a blinded listening study on eight ASAP test scores. We will select scor
 Every condition will use the same synthesizer, loudness normalization, excerpt boundaries, and score presentation. The score image will be shown. Model identities will be anonymized, and the presentation order will be randomized for each listener. We will recruit 20 listeners from varied general backgrounds without selecting for computer-science or professional-music expertise.
 
 Each listener will rank the six model clips by overall naturalness. Ties will receive their mid-rank. With $K=6$ model conditions, rank $r$ becomes the normalized Borda score $b=(K-r)/(K-1)$, so the best and worst ranks receive 1 and 0. We will average $b$ over the eight scores for each listener and then over listeners. We will report participant-level 95\% bootstrap confidence intervals and use a repeated-measures Friedman test followed by Holm-corrected pairwise Wilcoxon signed-rank tests. This yields one preference score for each generated method while keeping the human and score tracks as references.
+
+## Response to AI: stability of reported results
+
+We thank the reviewer for identifying the apparent inconsistency among the reported CINR results. The values 2.38, 2.54, and 2.08 come from different model configurations. Their range therefore does not measure run-to-run instability. Table 2 uses the slot-sum CINR checkpoint (`extra/rep_slot_sum`). Table 3's ablation uses the canonical slot+MLP CINR configuration: DLM k1, a 5\% timing-scale bound, and a T5 8+4 backbone. Figure 4 uses the logistic slot+MLP CINR model for its sampling sweep. The ablation and sampling sweep therefore do not use the Table 2 slot-sum model.
+
+We measured training-seed and sampling-seed variation on the complete 19-score test set, with three generated performances per score. Each comparison includes the original Table 2 run and two new runs. For the training-seed comparison, the two new runs use independently trained slot-sum checkpoints with a fixed sampling seed. For the sampling-seed comparison, the Table 2 checkpoint is fixed and two independent sampling seeds are used. All runs use the same score-span evaluation protocol. The table reports the mean and sample standard deviation over three runs:
+
+| Source of variation | Three runs included | PP HR | PN HR |
+|---|---|---:|---:|
+| Training seed | Original Table 2 checkpoint + 2 independently trained checkpoints; fixed sampling seed | 2.374 $\pm$ 0.072 | 1.578 $\pm$ 0.020 |
+| Sampling seed | Original Table 2 sample set + 2 independent sampling seeds; fixed checkpoint | 2.329 $\pm$ 0.041 | 1.576 $\pm$ 0.010 |
+
+The training-seed variation is larger than the sampling-seed variation, especially for PP HR. Both sources remain close to the reported Table 2 values, and neither explains the 2.54 or 2.08 values: those values belong to the separate ablation and sampling-sweep configurations described above. We will state these configuration identities and the three-run stability results explicitly in the revision.
+
+## Response to AI: handling zero-score IOI
+
+We thank the reviewer for pointing out that the zero-score-IOI case needs an explicit definition. For a note with $I_i^s=0$, the log-floor transform gives $g(I_i^s)=0$, so its target is $\Delta I_i=\log(\max(I_i^p,1\,\mathrm{ms}))$. Both variants use a separate zero-IOI support, $[0,5]$, with 256 values. CINR uses this support for its discretized-logistic head; DINR quantizes the same range with its categorical head. At inference, the predicted log IOI is reconstructed as $\hat I_i^p=\exp(\Delta I_i)\,\mathrm{ms}$, giving a represented range of approximately 1--148 ms. The support $[-2,1]$ applies only to notes with nonzero score IOI; its $e^1$ ms bound does not apply to zero-score-IOI notes.
+
+Zero-score-IOI notes are modeled by both heads. Figure 2 excludes them only when plotting score-relative deviations. On the 19-score test split, 30,735 of 65,039 notes (47.3\%) have zero score IOI. Among the 197,891 aligned zero-score-IOI targets across 82 reference performances, 612 (0.31\%) exceed the $[0,5]$ support. CINR maps these targets to the highest bin; DINR masks them from its IOI cross-entropy loss. We will state the support, reconstruction, and variant-specific boundary handling in Sections 3--4, and note the small upper-tail truncation when discussing chord-note alignment.
+
+## Response to AI: controlled efficiency comparison
+
+We thank the reviewer for pointing out that the $K^2$ argument applies only to the self-attention term. We use it as a theoretical motivation for shorter sequences, not as a complete explanation of end-to-end runtime. We therefore ran a controlled sequence-length experiment within the CINR implementation.
+
+The paper CINR emits one output step per note. The control serializes the same note attributes into four autoregressive output steps while keeping the backbone, data, decoding procedure, and evaluation workload fixed. On the 19-score ASAP test set with three samples per score, inference increased from about 6.0 to 30.4 GPU-minutes, a 5.1$\times$ increase. This result directly measures the cost of decoder serialization in the same model family.
+
+For the CINR and Pianist Transformer timing entries, we used the same two RTX 3090 GPUs, bfloat16 inference, global batch size 64, cache enabled with node-cache size 16, and eight sampling workers. GPU-minutes are summed across workers, and both entries use the same 19 scores with three samples per score. The public PianoFlow and archived ScorePerformer timings are reported separately because their released implementations and timing records have additional protocol limitations; they are not used to establish the INR--Pianist Transformer ratio.
+
+Pianist Transformer emits approximately eight performance tokens per note and also performs an encoder-side token mapping. The 4-step CINR control already incurs a five-fold slowdown, so the reported 20-fold CINR--Pianist Transformer gap is consistent with the larger decoder sequence and the additional mapping work. The controlled result supports decoder sequence length as the dominant efficiency factor while leaving room for implementation-level differences. We will add the timing protocol and the serial-CINR control to the efficiency discussion and qualify the $K^2$ statement accordingly.

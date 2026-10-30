@@ -38,10 +38,12 @@ def _load_fixed_window_split_index(summary_path, scheme_name):
     for row in payload.get("work_summaries", []):
         work_path = row.get("path")
         valid_window = row.get("valid_window")
+        valid_windows = row.get("valid_windows")
         train_window_count = int(row.get("train_window_count", 0) or 0)
         valid_window_count = int(row.get("valid_window_count", 0) or 0)
         entry = {
             "valid_window": valid_window,
+            "valid_windows": valid_windows,
             "train_window_count": train_window_count,
             "valid_window_count": valid_window_count,
         }
@@ -76,30 +78,37 @@ def load_windows_from_fixed_split(
                 f"canonical_windows is required when using fixed split summary {summary_path} for {path}"
             )
         canonical_windows = [(int(window[0]), int(window[1])) for window in canonical_windows]
-        valid_window = entry.get("valid_window")
-        valid_window = (
-            (int(valid_window[0]), int(valid_window[1]))
-            if isinstance(valid_window, (list, tuple)) and len(valid_window) == 2
-            else None
-        )
+        raw_valid_windows = entry.get("valid_windows")
+        if isinstance(raw_valid_windows, list):
+            valid_windows = [
+                (int(window[0]), int(window[1]))
+                for window in raw_valid_windows
+                if isinstance(window, (list, tuple)) and len(window) == 2
+            ]
+        else:
+            valid_window = entry.get("valid_window")
+            valid_windows = (
+                [(int(valid_window[0]), int(valid_window[1]))]
+                if isinstance(valid_window, (list, tuple)) and len(valid_window) == 2
+                else []
+            )
         if str(split_name) == "valid":
-            if valid_window is None:
-                return []
-            return [valid_window]
+            return valid_windows
         if str(split_name) == "train":
-            if valid_window is None:
+            if not valid_windows:
                 return canonical_windows
             if exclude_overlapping_valid:
                 return [
                     window
                     for window in canonical_windows
-                    if window != valid_window
-                    and not (
-                        int(window[0]) < int(valid_window[1])
-                        and int(valid_window[0]) < int(window[1])
+                    if not any(
+                        int(window[0]) < int(valid[1])
+                        and int(valid[0]) < int(window[1])
+                        for valid in valid_windows
                     )
                 ]
-            return [window for window in canonical_windows if window != valid_window]
+            valid_set = set(valid_windows)
+            return [window for window in canonical_windows if window not in valid_set]
         raise ValueError(
             f"Unsupported fixed window split name={split_name} with summary-backed lookup for {path}"
         )
