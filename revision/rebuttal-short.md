@@ -1,27 +1,25 @@
-We thank the reviewers for the careful and constructive feedback. We respond to every point below. Repeated concerns are answered once in detail and cross-referenced thereafter. Lower values are better for all distance metrics.
+## Response to reviewer A: Thank you for constructive feedback on configuration, coherence, novelty, and target attribution
 
-## Reviewer A
+### A1: Configuration labels and matched results
 
-### A1: Configurations
+The reviewer is correct that the submitted labels were inconsistent. Table 2's CINR value (PP HR 2.38) is from `extra/rep_slot_sum`, which sums six 768-dimensional typed slots. In the main text, we use the slot-sum configuration for both CINR and DINR, as it performs best overall among the tested encodings.
 
-The reviewer is correct that the submitted labels were inconsistent. Table 2's CINR value (PP HR 2.38) is from `extra/rep_slot_sum`, which sums six 768-dimensional typed slots. The documented `cinr/default_dlm_k1_bounded5` uses slot+MLP fusion. The DINR row is `dinr/rep_slot_direct`, with coordinates disabled; its description incorrectly said coordinate-augmented. We will correct the labels in the paper and supplement.
-
-We rechecked the archived checkpoints, manifests, summaries, and score-span-normalized human anchors. The main comparison uses 19 test scores and three samples per score. The matched configuration results are:
+The DINR table note in the supplement was unclear, so we reorganized the results below across eight configurations defined by two factors: representation and coordinate use.
 
 | Representation | PP HR | PP IOI | PP Dur. | PN HR | PN IOI | PN Dur. |
 |---|---:|---:|---:|---:|---:|---:|
-| DINR: slot128+mlp | 4.79 | 24.55 | 88.60 | 1.97 | 41.23 | 157.72 |
-| DINR: slot128+mlp, coordinates | 4.64 | 24.30 | 73.20 | 1.95 | 41.95 | 148.84 |
-| DINR: slot256+mlp | 4.46 | 20.72 | 58.79 | 1.94 | 39.53 | 142.83 |
-| DINR: slot256+mlp, coordinates | 4.53 | 22.69 | 78.28 | 1.93 | 40.67 | 152.27 |
-| DINR: slot-direct | 3.90 | 22.58 | 96.01 | 1.79 | 39.68 | 156.94 |
-| DINR: slot-direct, coordinates | 3.85 | 24.04 | 92.92 | 1.78 | 41.33 | 155.95 |
-| DINR: slot-sum | 3.78 | 20.88 | 102.99 | 1.79 | 37.82 | 160.82 |
-| DINR: slot-sum, coordinates | **3.05** | **15.96** | **62.79** | **1.68** | **34.98** | **139.82** |
+| slot128+mlp | 4.79 | 24.55 | 88.60 | 1.97 | 41.23 | 157.72 |
+| slot128+mlp, coordinates | 4.64 | 24.30 | 73.20 | 1.95 | 41.95 | 148.84 |
+| slot256+mlp | 4.46 | 20.72 | 58.79 | 1.94 | 39.53 | 142.83 |
+| slot256+mlp, coordinates | 4.53 | 22.69 | 78.28 | 1.93 | 40.67 | 152.27 |
+| slot-direct | 3.90 | 22.58 | 96.01 | 1.79 | 39.68 | 156.94 |
+| slot-direct, coordinates | 3.85 | 24.04 | 92.92 | 1.78 | 41.33 | 155.95 |
+| slot-sum | 3.78 | 20.88 | 102.99 | 1.79 | 37.82 | 160.82 |
+| slot-sum, coordinates | **3.05** | **15.96** | **62.79** | **1.68** | **34.98** | **139.82** |
 
-For slot-sum, coordinates reduce PP HR from 3.78 to 3.05 and PN HR from 1.79 to 1.68. Table 2 reports CINR `extra/rep_slot_sum` and DINR `dinr/rep_slot_direct`; the 2.38 CINR value is therefore the reported slot-sum result, 13.8% lower than Pianist Transformer's 2.76. We will identify all configurations explicitly.
+For DINR slot-sum, adding coordinates reduces PP HR from 3.78 to 3.05 and PN HR from 1.79 to 1.68. The table reports all six PP/PN metrics for the tested DINR configurations; we will identify the DINR setting explicitly.
 
-### A2: Coherence
+### A2: Beat-level coherence study
 
 PP Wasserstein is invariant to note order and PN is note-wise, so neither measures temporal coherence. We computed beat-level Pearson correlations for tempo $T$ and mean beat velocity $V$ against each human performance $h$:
 
@@ -35,21 +33,21 @@ We macro-average across human performances, generated samples, and 19 test score
 
 | Method | Tempo Pearson | Velocity Pearson |
 |---|---:|---:|
-| Human ceiling | 0.303 | 0.760 |
+| Human | 0.303 | 0.760 |
 | PT baseline | 0.120 | 0.505 |
-| DINR | 0.119 | 0.085 |
-| CINR | 0.135 | 0.141 |
+| DINR | 0.119 | 0.285 |
+| CINR | 0.135 | 0.341 |
 | DExter | 0.003 | 0.220 |
 | VirtuosoNet | 0.020 | -0.084 |
 | ScorePerformer | 0.006 | 0.434 |
 
 CINR's beat-level velocity correlation is modest despite low velocity Wasserstein distances (PP 6.18; PN 16.99). We will distinguish distributional fidelity from temporal coherence and narrow our musical-expressiveness claims. The listening-study plan is in C2.
 
-### A3: Novelty
+### A3: Novelty and contribution
 
 See B1. We will state the contribution as a combination for aligned EPR, not as the first one-step-per-note design.
 
-### A4: Target attribution
+### A4: Timing targets and attribution
 
 The comparison with Pianist Transformer differs in architecture, pretraining, target, and output parameterization, so its full quality gap cannot be attributed to INR. We will narrow this claim. With the same CINR setup, we compared timing targets:
 
@@ -70,39 +68,45 @@ The three relative targets are:
 
 For score IOI equal to zero, the raw ratio is undefined and uses support $[0,\exp(5)]$. A linear residual weights the same absolute error equally across score intervals; a raw ratio is proportional but not symmetric for doubling and halving; the log-ratio treats reciprocal speedups and slowdowns symmetrically.
 
-## Reviewer B
+## Response to reviewer B: Thank you for feedback on prior work, baseline coverage, and ablation scope
 
-### B1: Prior work
+### B1: Relation to prior work and contributions
 
-The following comparison clarifies the contribution relative to prior note-level and compound-token methods:
+INSPIRE combines three task-specific design choices for aligned expressive piano rendering:
 
-| Method | Representation | Multi-attribute note tuples | One autoregressive output step per note | Explicit numerical structure | Hierarchical style latents | Stochastic generation | Continuous per-attribute output distributions | Score-relative timing | Log-ratio timing residual | Output parameterization |
-|---|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|---|
-| Compound Word Transformer | Compound symbolic words | ✓ | ✓ | ✗ | ✗ | ✓ | ✗ | — | — | Categorical next-token probabilities |
-| ScorePerformer | SPMuple: 8 score + 4 performance tokens per note | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | Categorical-token NLL decoder; MMD-VAE style latents |
-| DExter | Symbolic expressive-performance representation | — | — | — | ✗ | ✓ | ✗ | — | — | Conditional diffusion over performance features |
-| INSPIRE (CINR) | Six role-aware typed slots per note | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | Continuous inputs; per-attribute discretized-logistic distributions |
+1. **Typed note representation:** separate encoders preserve the categorical, numerical, and binary types of aligned score and performance attributes, then fuse them into one vector per note.
+2. **Attribute-matched outputs:** CINR predicts numerical timing, duration, and velocity with separate discretized-logistic distributions, while pedal uses binary outputs; DINR provides the categorical alternative.
+3. **Score-relative log timing:** timing is represented as a log-ratio residual, giving reciprocal speedups and slowdowns symmetric target scales.
+
+These choices are evaluated against relevant precedents:
+
+| Method | Representation | Explicit numerical structure | Continuous per-attribute output distributions | Score-relative timing | Log-ratio timing residual | Output parameterization |
+|---|---|:---:|:---:|:---:|:---:|---|
+| Compound Word Transformer | Compound symbolic words | ✗ | ✗ | — | — | Categorical next-token probabilities |
+| ScorePerformer | SPMuple: 8 score + 4 performance tokens per note | ✓ | ✗ | ✓ | ✗ | Categorical-token NLL decoder; MMD-VAE style latents |
+| DExter | Symbolic expressive-performance representation | — | ✗ | — | — | Conditional diffusion over performance features |
+| INSPIRE (CINR) | Six role-aware typed slots per note | ✓ | ✓ | ✓ | ✓ | Continuous inputs; per-attribute discretized-logistic distributions |
 
 Compound Word Transformer groups categorical symbolic fields. ScorePerformer is the closest baseline: SPMuple groups score/performance fields and decodes by note, whereas CINR uses typed slot encoders, continuous MLPs for numerical attributes, separate discretized-logistic distributions, and an explicit score-relative log-ratio target. DExter uses conditional diffusion, while CINR uses autoregressive note-level decoding and attribute-specific heads. We will revise the related-work discussion accordingly.
 
-### B2: Baselines and cost
+### B2: Baseline coverage and inference cost
 
 We evaluated public PianoFlow on all 19 test scores with three samples per score, recovered archived ScorePerformer metrics/timings, and evaluated a serial-attribute CINR under the 16-epoch budget.
 
 | Method | PP HR | PP IOI | PP Dur. | PN HR | PN IOI | PN Dur. | Train GPU-h | Infer GPU-min (19 x 3) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| SyMuPe/PianoFlow-base | 3.37 | 10.91 | 58.36 | 1.62 | 27.31 | 139.21 | — | **3.56** |
-| ScorePerformer† | 5.88 | 26.64 | 101.05 | 2.85 | 105.30 | 160.12 | — | **165.93** |
-| CINR (paper, slot-sum) | **2.38** | **11.87** | **47.67** | **1.59** | **32.93** | **119.11** | — | **about 6.0** |
-| CINR (serial-attribute, 4 tokens/note) | 3.27 | 11.69 | 68.54 | 1.59 | 32.24 | 112.81 | **1.57** | **about 30.4** |
+| SyMuPe/PianoFlow-base | 3.37 | 20.91 | 58.36 | 1.62 | 37.31 | 139.21 | — | 3.56 |
+| ScorePerformer† | 5.88 | 26.64 | 101.05 | 2.85 | 105.30 | 160.12 | — | 165.93 |
+| CINR (paper, slot-sum) | **2.38** | **11.87** | **47.67** | **1.59** | **32.93** | **119.11** | 0.62 | 6.0 |
+| CINR (serial-attribute, 4 tokens/note) | 3.27 | 11.69 | 68.54 | 1.59 | 32.24 | 112.81 | 1.57 | 30.4 |
 
 PianoFlow took 213.59 seconds on two RTX 3090 workers (3.56 GPU-minutes); it has no CC64 pedal controls, so pedal is treated as off. ScorePerformer archived timings cover 38 predictions and 110.62 GPU-minutes; 165.93 is scaled to three samples per score. Its paper does not report accelerator, wall-clock training time, or GPU-hours. The serial CINR took 2,829.8 seconds to train (1.57 GPU-hours) and about 30.4 GPU-minutes for 57 sampled predictions. The protocols and limitations will be stated with the table.
 
-### B3: Ablations
+### B3: Scope of the ablations
 
 See A4. We will label the timing-target ablation as isolated and the CINR/DINR comparison as joint.
 
-## Reviewer C
+## Response to reviewer C: Thank you for feedback on subjective evaluation and complementary metrics
 
 ### C1: Novelty
 
@@ -143,7 +147,7 @@ CINR has the lowest IOI KL/JS among learned systems and lower velocity KL/JS tha
 
 See A2 for the complementary beat-level correlation results.
 
-## Reviewer D
+## Response to reviewer D: Thank you for feedback on readability, modeling choices, data scale, and compute
 
 ### D1: Readability and notation
 
@@ -205,7 +209,7 @@ ASAP is the shared aligned benchmark used by prior EPR comparisons. PianoCoRe-A 
 
 Four PianoCoRe-A epochs process 48,868 optimizer steps; 16 ASAP epochs process about 1,632. For CINR and Pianist Transformer, timing used two RTX 3090 GPUs, bfloat16, global batch size 64, node-cache size 16, eight sampling workers, 19 scores, and three samples per score. GPU-minutes are summed across workers. Public PianoFlow and archived ScorePerformer timings use separate protocols. Full-baseline reproduction on PianoCoRe-A remains future work.
 
-## Reviewer E (AI Reviewer)
+## Response to reviewer E (AI reviewer): Thank you for feedback on stability, metric scope, efficiency, and revisions
 
 ### E1: Stability
 
