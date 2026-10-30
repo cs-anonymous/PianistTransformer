@@ -1,7 +1,7 @@
 # Response to reviewer A: configuration, coherence, novelty, and target attribution
 
 ## A1: Configurations
-Table 2's CINR PP HR=2.38 is slot-sum (sum of six 768-d typed slots), not slot+MLP. Main text uses slot-sum for both CINR/DINR; it performs best overall among tested encodings. The supplement's DINR table note was unclear; below are its 8 configurations across 4 representations, each with coordinates off/on.
+Table 2's CINR PP HR=2.38 is slot-sum (sum of six 768-d typed slots). Main text uses slot-sum for both CINR/DINR; it performs best overall among tested encodings. The supplement's DINR table note was unclear; below are its 8 configurations.
 
 |Representation|Coord.|PP HR|PP IOI|PN HR|PN IOI|
 |---|:---:|---:|---:|---:|---:|
@@ -33,49 +33,46 @@ Macro-average over human performances, generated samples, and 19 test scores.
 
 CINR velocity correlation is modest despite low velocity Wasserstein (PP=6.18; PN=16.99). We will separate distributional fidelity from coherence and narrow expressiveness claims; listening plan: C2.
 
-## A3: See B1
+## A3: contribution see B1
 ## A4: Timing targets and attribution
 Pianist Transformer differs in architecture, pretraining, target, and output parameterization; its full quality gap cannot be attributed to INR. Same-CINR timing-target results:
 
 |CINR variant/target|PP HR|PP IOI|PN HR|PN IOI|
 |---|---:|---:|---:|---:|
-|Log-ratio residual (paper)|2.38|11.87|1.59|32.93|
+|Log residual (paper)|2.38|11.87|1.59|32.93|
 |Linear residual, $[-1000,1000]$ ms|3.26|13.68|1.77|37.17|
 |Raw ratio, $[0.135,2.718]$|3.27|13.73|1.69|33.38|
-|Serial-attribute CINR, 4 tokens/note|3.27|11.69|1.59|32.24|
 
-Log-ratio gives lowest aggregate HR and PP timing distances within CINR. Absolute timing raises PP IOI/duration 11.87/47.67→272.30/480.38: evidence for target formulation, not isolated INR; we will narrow attribution. Serial row uses 4 attribute tokens/note and slot+MLP; main row uses slot-sum, so this is not a fully matched sequence-compression estimate.
-
-Targets: log-ratio residual, paper target, nonzero-IOI support $[-2,1]$; linear $z=(t_{perf}-t_{score})/1000$, support $[-1,1]$; raw ratio $z=t_{perf}/\max(t_{score},1\,ms)$, nonzero-score support $[0.135,2.718]$. At zero score IOI raw ratio is undefined; support $[0,\exp(5)]$. Linear residual equally weights absolute error across score intervals; raw ratio is proportional but not symmetric for doubling/halving; log-ratio makes reciprocal speedups/slowdowns symmetric.
+Log residual gives lowest aggregate HR and PP timing distances within CINR. Absolute timing raises PP IOI/duration 11.87/47.67→272.30/480.38: evidence for target formulation, not isolated INR; we will narrow attribution.
 
 # Response to reviewer B: prior work, baselines, and ablations
 
 ## B1: Prior work and contribution
-INSPIRE combines (1) typed note representation: separate encoders preserve categorical/numerical/binary types of aligned score/performance attributes and fuse one vector/note; (2) attribute-matched outputs: CINR predicts numerical timing/duration/velocity with separate discretized-logistic distributions and binary pedal; DINR is categorical alternative; (3) score-relative log timing: log-ratio residual gives reciprocal speedups/slowdowns symmetric target scales.
+INSPIRE combines:
+- typed note representation: separate encoders preserve categorical/numerical/binary types of aligned score/performance attributes and fuse one vector/note;
+- attribute-matched outputs: CINR predicts numerical timing/duration/velocity with separate discretized-logistic distributions and binary pedal; DINR is categorical alternative;
+- score-relative log timing: log residual gives reciprocal speedups/slowdowns symmetric target scales.
 
+We will clarify these distinctions in related work:
 - **Compound Word Transformer:** groups categorical symbolic fields; CINR targets aligned score-conditioned performance and models numerical controls with attribute-specific distributions.
-- **ScorePerformer:** SPMuple groups 8 score+4 performance tokens/note and decodes by note; CINR uses typed slots, continuous numerical MLP inputs, separate discretized-logistic outputs, and log-ratio timing.
+- **ScorePerformer:** SPMuple groups 8 score+4 performance tokens/note and decodes by note; CINR uses typed slots, continuous numerical MLP inputs, separate discretized-logistic outputs, and log residual timing.
 - **DExter:** conditional diffusion over expressive features; CINR autoregressive note decoding with attribute-specific heads.
 
-We will clarify these distinctions in related work.
-
 ## B2: Baselines and cost
-Public PianoFlow evaluated on all 19 test scores, 3 samples/score; archived ScorePerformer metrics/timings recovered; serial-attribute CINR evaluated within 16-epoch budget.
-
-|Method|PP HR|PP IOI|PN HR|PN IOI|Train GPU-h|Infer GPU-min (19x3)|
+|Method|PP HR|PP IOI|PN HR|PN IOI|Train GPU-h|Infer GPU-min|
 |---|---:|---:|---:|---:|---:|---:|
 |SyMuPe/PianoFlow-base|3.37|20.91|1.62|37.31|—|3.56|
-|ScorePerformer†|5.88|26.64|2.85|105.30|—|165.93|
+|ScorePerformer†|5.88|26.64|2.85|105.30|—|55.31|
 |CINR (paper, slot-sum)|2.38|11.87|1.59|32.93|0.62|6.0|
 |CINR (serial, 4 tokens/note)|3.27|11.69|1.59|32.24|1.57|30.4|
 
 PianoFlow: 213.59 s on 2 RTX 3090 workers=3.56 GPU-min; no CC64, pedal off. ScorePerformer archived timing: 38 predictions, 110.62 GPU-min; 165.93 scales to 3 samples/score. Its paper gives 70,000 iterations, batch 128, but no accelerator, wall time, or GPU-h. Serial CINR: 2,829.8 s=1.57 GPU-h training; 57 samples=15m12s on 2 GPUs=about 30.4 GPU-min. Training GPU-h unavailable for pretrained baselines and archived paper CINR. Protocol/count differences and limits will be stated.
 
-## B3: See A4
+## B3: ablation see A4
 
 # Response to reviewer C: subjective evaluation and complementary metrics
 
-## C1: See B1
+## C1: contribution see B1
 ## C2: Subjective evaluation
 Media supplement has matched score excerpts, human performances, and generated examples; no preliminary listening results. Plan: blinded study, 8 ASAP test scores; 30-s clips from CINR, DINR, Pianist Transformer, ScorePerformer, DExter, VirtuosoNet; same synthesizer, loudness normalization, excerpt boundaries; randomized order, hidden model IDs. 20 listeners rank naturalness; human and Score MIDI are labeled references, not ranked. For $K=6$, rank $r$ maps to normalized Borda $b=(K-r)/(K-1)$. Report participant-level 95% bootstrap intervals, repeated-measures Friedman test, Holm-corrected pairwise Wilcoxon tests. Claims limited to distributional fidelity; listening study is planned validation.
 
@@ -106,8 +103,7 @@ For the DINR head, $h_i$ is the decoder state; $H_I,H_D,H_V$ are query MLPs; $C_
 $$\ell_i^a=H_a(h_i)C_T^\top+b_a,\quad a\in\{I,D\};\qquad \ell_i^V=H_V(h_i)C_V^\top+b_V,$$
 $$p_i^a=\operatorname{softmax}(\ell_i^a),\quad a\in\{I,D,V\}.$$
 
-## D3: Modeling contribution
-Transformer encoder-decoder and AR training are standard. Contribution: aligned-EPR formulation—typed attribute embedding, matched output distributions, score-relative log-timing. Relative-vs-absolute comparison isolates target; CINR/DINR jointly changes input encoding and output parameterization. We will clarify scope and not claim a new Transformer architecture.
+## D3: contribution see B1
 
 ## D4: Data and compute
 ASAP is shared aligned benchmark in prior EPR comparisons. PianoCoRe-A combines transcription sources and fewer Disklavier recordings; distributions differ. Full PianoCoRe-A slot-sum INSPIRE training:
@@ -131,14 +127,14 @@ ASAP is shared aligned benchmark in prior EPR comparisons. PianoCoRe-A combines 
 
 Training-seed variation larger, especially PP HR; both remain near Table 2. Neither explains 2.54/2.08; these are separate ablation/sampling configurations.
 
-## E2: See A2
-## E3: See B1
-## E4: See A4
+## E2: metric see A2
+## E3: contribution see B1
+## E4: ablation see A4
 ## E5: Zero-score IOI
 For $I_i^s=0$, $g(I_i^s)=0$ and
 $$\Delta I_i=\log(\max(I_i^p,1\,ms)).$$
 Both variants: separate zero-IOI support $[0,5]$, 256 values; inference $\hat I_i^p=\exp(\Delta I_i)\,ms$≈1–148 ms; nonzero support $[-2,1]$ does not apply. Test: 30,735/65,039 notes (47.3%) have zero score IOI; 612/197,891 aligned targets (0.31%) exceed $[0,5]$. CINR maps them to highest bin; DINR masks them from IOI CE. We will document handling/truncation.
 
-## E6: See D4
+## E6: efficiency see D4
 ## E7: Other revisions
 Organize around 3 hypotheses: note integration reduces decoding cost; numerical parameterization supplies ordinal structure; score-relative timing simplifies target. Add role-by-slot table; clarify continuous inputs vs discretized likelihood outputs; finite-support parameters ($s_a^{min},s_a^{max}$, 5% bound, endpoint tails); score-pitch copying; pedal-to-CC64 reconstruction; validation-window selection; Fig. 4 split. Full-baseline PianoCoRe-A, second corpus, stratification by chord density/ornamentation/alignment quality, and joint timing/velocity/pedal output distribution remain valuable follow-up studies.
