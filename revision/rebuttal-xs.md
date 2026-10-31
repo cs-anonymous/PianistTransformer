@@ -1,41 +1,40 @@
 # Response to reviewer A: configuration, coherence, novelty, and target attribution
 
 ## A1: Configurations
-Table 2's CINR PP HR=2.38 is slot-sum (sum of six 768-d typed slots). Main text uses slot-sum for both CINR/DINR; it performs best overall among tested encodings. The supplement's DINR table note was unclear; below are its 8 configurations.
+The paper's configuration labels are incorrect: both reported CINR and DINR results use slot-sum (six 768-d typed slots). The supplement's DINR note was unclear; below are all 6 configurations.
 
 |Representation|Coord.|PP HR|PP IOI|PN HR|PN IOI|
 |---|:---:|---:|---:|---:|---:|
 |slot128+mlp|✗|4.79|24.55|1.97|41.23|
 ||✓|4.64|24.30|1.95|41.95|
-|slot256+mlp|✗|4.46|20.72|1.94|39.53|
-||✓|4.53|22.69|1.93|40.67|
 |slot-direct|✗|3.90|22.58|1.79|39.68|
 ||✓|3.85|24.04|1.78|41.33|
 |slot-sum|✗|3.78|20.88|1.79|37.82|
 ||✓|3.05|15.96|1.68|34.98|
 
-For DINR slot-sum, coordinates reduce PP/PN HR 3.78/1.79→3.05/1.68. Table reports PP/PN HR and IOI across all DINR configurations; we will identify the slot-sum setting.
+Among tested DINR encodings, slot-sum performs best overall; adding coordinates improves all three reported metrics. We will correct the paper's configuration labels.
 
 ## A2: Beat-level coherence
-PP Wasserstein is order-invariant; PN is note-wise; neither measures temporal coherence. For tempo $T$, mean beat velocity $V$, and human performance $h$, beat-level Pearson correlations are:
+To measure coherence beyond order-invariant PP and note-wise PN, we define beat-level Pearson correlations of tempo $T$ and mean beat velocity $V$ against human performance $h$:
 $$r_T^{(s,x,h)}=\operatorname{Corr}_{b\in\mathcal B_s}(T_{s,b}^{x},T_{s,b}^{h}),\quad r_V^{(s,x,h)}=\operatorname{Corr}_{b\in\mathcal B_s}(V_{s,b}^{x},V_{s,b}^{h}).$$
 Macro-average over human performances, generated samples, and 19 test scores.
 
 |Method|Tempo Pearson|Velocity Pearson|
 |---|---:|---:|
 |Human|0.303|0.760|
-|PT baseline|0.120|0.505|
+|ScorePerformer|0.006|0.434|
+|DExter|0.003|0.220|
+|VirtuosoNet|0.020|0.084|
+|PT|0.120|0.505|
 |DINR|0.119|0.285|
 |CINR|0.135|0.341|
-|DExter|0.003|0.220|
-|VirtuosoNet|0.020|-0.084|
-|ScorePerformer|0.006|0.434|
 
-CINR velocity correlation is modest despite low velocity Wasserstein (PP=6.18; PN=16.99). We will separate distributional fidelity from coherence and narrow expressiveness claims; listening plan: C2.
+
+The beat-level correlations are consistent with the paper's PN Wasserstein results. INSPIRE correlates reasonably on tempo (CINR 0.135; DINR 0.119), but less strongly on velocity (0.341; 0.285). We plan a subjective evaluation in C2.
 
 ## A3: contribution see B1
 ## A4: Timing targets and attribution
-Pianist Transformer differs in architecture, pretraining, target, and output parameterization; its full quality gap cannot be attributed to INR. Same-CINR timing-target results:
+To clarify attribution, we ran a timing-target ablation with the same CINR setup:
 
 |CINR variant/target|PP HR|PP IOI|PN HR|PN IOI|
 |---|---:|---:|---:|---:|
@@ -43,30 +42,30 @@ Pianist Transformer differs in architecture, pretraining, target, and output par
 |Linear residual, $[-1000,1000]$ ms|3.26|13.68|1.77|37.17|
 |Raw ratio, $[0.135,2.718]$|3.27|13.73|1.69|33.38|
 
-Log residual gives lowest aggregate HR and PP timing distances within CINR. Absolute timing raises PP IOI/duration 11.87/47.67→272.30/480.38: evidence for target formulation, not isolated INR; we will narrow attribution.
+Log residual yields the best aggregate HR and PP timing results; absolute timing raises PP IOI/duration from 11.87/47.67 to 272.30/480.38. This supports the log-residual target.
 
 # Response to reviewer B: prior work, baselines, and ablations
 
 ## B1: Prior work and contribution
-INSPIRE combines:
-- typed note representation: separate encoders preserve categorical/numerical/binary types of aligned score/performance attributes and fuse one vector/note;
-- attribute-matched outputs: CINR predicts numerical timing/duration/velocity with separate discretized-logistic distributions and binary pedal; DINR is categorical alternative;
-- score-relative log timing: log residual gives reciprocal speedups/slowdowns symmetric target scales.
+INSPIRE's contributions for aligned EPR:
+1. **Typed note fusion:** separate encoders preserve categorical/numerical/binary score and performance attributes in one vector/note.
+2. **Attribute-matched outputs:** CINR uses separate discretized-logistic distributions for numerical timing/duration/velocity and binary pedal; DINR provides categorical heads.
+3. **Score-relative log residual:** makes reciprocal speedups/slowdowns symmetric.
 
-We will clarify these distinctions in related work:
-- **Compound Word Transformer:** groups categorical symbolic fields; CINR targets aligned score-conditioned performance and models numerical controls with attribute-specific distributions.
-- **ScorePerformer:** SPMuple groups 8 score+4 performance tokens/note and decodes by note; CINR uses typed slots, continuous numerical MLP inputs, separate discretized-logistic outputs, and log residual timing.
-- **DExter:** conditional diffusion over expressive features; CINR autoregressive note decoding with attribute-specific heads.
+Differences from prior work:
+- **Compound Word Transformer:** groups categorical symbolic fields; CINR handles aligned score-conditioned performance with numerical attribute-specific distributions.
+- **ScorePerformer:** SPMuple groups 8 score+4 performance tokens/note and decodes by note; CINR uses typed slots, continuous numerical MLP inputs, separate discretized-logistic outputs, and log-residual timing.
+- **DExter:** conditional diffusion; CINR autoregressive note decoding with attribute-specific heads.
 
 ## B2: Baselines and cost
 |Method|PP HR|PP IOI|PN HR|PN IOI|Train GPU-h|Infer GPU-min|
 |---|---:|---:|---:|---:|---:|---:|
-|SyMuPe/PianoFlow-base|3.37|20.91|1.62|37.31|—|3.56|
-|ScorePerformer†|5.88|26.64|2.85|105.30|—|55.31|
+|SyMuPe/PianoFlow-base|3.37|20.91|1.62|37.31|—|7.12|
+|ScorePerformer†|5.88|26.64|2.85|105.30|—|165.93|
 |CINR (paper, slot-sum)|2.38|11.87|1.59|32.93|0.62|6.0|
 |CINR (serial, 4 tokens/note)|3.27|11.69|1.59|32.24|1.57|30.4|
 
-PianoFlow: 213.59 s on 2 RTX 3090 workers=3.56 GPU-min; no CC64, pedal off. ScorePerformer archived timing: 38 predictions, 110.62 GPU-min; 165.93 scales to 3 samples/score. Its paper gives 70,000 iterations, batch 128, but no accelerator, wall time, or GPU-h. Serial CINR: 2,829.8 s=1.57 GPU-h training; 57 samples=15m12s on 2 GPUs=about 30.4 GPU-min. Training GPU-h unavailable for pretrained baselines and archived paper CINR. Protocol/count differences and limits will be stated.
+Inference GPU-min sums computation across both RTX 3090s. PianoFlow lacks CC64, so pedal is off; ScorePerformer timing is estimated by scaling its archived run to the shared sample count, and its GPU setup and training time are unreported. CINR achieves the best HR and inference efficiency in this comparison.
 
 ## B3: ablation see A4
 
@@ -95,7 +94,7 @@ CINR: lowest IOI KL/JS among learned systems and lower velocity KL/JS than exter
 # Response to reviewer D: readability, modeling, data scale, and compute
 
 ## D1: Readability and notation
-EPR maps a symbolic piano score $X$ to its aligned expressive performance $Y$. For $N$ aligned notes, the first equation states autoregressive conditional generation: each note output $y_i$ depends on the score and previous outputs $y_{<i}$. We will introduce EPR before this equation and define its terms at first use; the remaining notation and concepts will be defined in the paper.
+EPR maps a symbolic piano score $X$ to its aligned expressive performance $Y$. For $N$ aligned notes, the first equation states autoregressive conditional generation: each note output $y_i$ depends on the score and previous outputs $y_{<i}$. The remaining notation and concepts are already defined in the main text. Our feature definitions follow MIDI2Score (Beyer and Dai, 2024); to improve readability, we will define the adopted symbols more explicitly and use shorter sentences.
 $$p_\theta(Y\mid X)=\prod_{i=1}^{N}p_\theta(y_i\mid X,y_{<i}).$$
 
 ## D2: DINR
@@ -137,4 +136,4 @@ Both variants: separate zero-IOI support $[0,5]$, 256 values; inference $\hat I_
 
 ## E6: efficiency see D4
 ## E7: Other revisions
-Organize around 3 hypotheses: note integration reduces decoding cost; numerical parameterization supplies ordinal structure; score-relative timing simplifies target. Add role-by-slot table; clarify continuous inputs vs discretized likelihood outputs; finite-support parameters ($s_a^{min},s_a^{max}$, 5% bound, endpoint tails); score-pitch copying; pedal-to-CC64 reconstruction; validation-window selection; Fig. 4 split. Full-baseline PianoCoRe-A, second corpus, stratification by chord density/ornamentation/alignment quality, and joint timing/velocity/pedal output distribution remain valuable follow-up studies.
+Organize around 3 hypotheses: note integration reduces decoding cost; numerical parameterization supplies ordinal structure; score-relative timing simplifies target. Add role-by-slot table; clarify continuous inputs vs discretized likelihood outputs; finite-support parameters ($s_a^{min},s_a^{max}$, 5% bound, endpoint tails); score-pitch copying; pedal-to-CC64 reconstruction; validation-window selection; Fig. 4 split. Full PianoCoRe-A, second corpus, stratification by chord density/ornamentation/alignment quality, and joint timing/velocity/pedal output distribution remain valuable follow-up studies.
